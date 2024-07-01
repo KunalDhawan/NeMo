@@ -477,6 +477,9 @@ def generate_cluster_labels(segment_ranges: List[str], cluster_labels: List[int]
         if offset is not None:
             stt = float(stt) + offset
             end = float(end) + offset
+        if 20 <= idx <= 24:
+            print(f"idx: {idx}, stt: {stt}, end: {end}, label:{label}")
+            import ipdb; ipdb.set_trace()
         lines.append(f"{stt} {end} {tag}")
     cont_lines = get_contiguous_stamps(lines)
     diar_hyp = merge_stamps(cont_lines)
@@ -772,7 +775,7 @@ def perform_clustering_embs(
             labels, lines = generate_cluster_labels(timestamps, cluster_labels, offset=audio_rttm_map.get('offset', 0))
         else:
             labels, lines = generate_cluster_labels(timestamps, cluster_labels, offset=None)
-
+        
         if out_rttm_dir:
             labels_to_rttmfile(labels, uniq_id, out_rttm_dir)
             lines_cluster_labels.extend([f'{uniq_id} {seg_line}\n' for seg_line in lines])

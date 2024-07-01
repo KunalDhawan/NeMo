@@ -127,3 +127,14 @@ class MultiBinaryAccuracy(Metric):
             logging.warn("self.f1_score contains NaN value. Returning -1 instead of NaN value.")
             self.f1_score = -1
         return self.f1_score
+
+    def compute_pr(self):
+        """
+        Compute F1 score from the accumulated values. Return -1 if the F1 score is NaN.
+        """
+        self.precision = self.true_positive_count / (self.true_positive_count + self.false_positive_count + self.eps)
+        self.recall = self.true_positive_count / (self.true_positive_count + self.false_negative_count + self.eps)
+        return self.precision, self.recall
+
+
+
