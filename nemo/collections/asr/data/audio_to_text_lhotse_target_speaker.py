@@ -78,6 +78,8 @@ class LhotseSpeechToTextTgtSpkBpeDataset(torch.utils.data.Dataset):
         if self.add_separater_audio:
             self.separater_audio = self.separate_sound(self.separater_freq, self.cfg.sample_rate, self.separater_duration, self.separater_unvoice_ratio)
         self.add_special_token = self.cfg.get('add_special_token',True)
+        if self.add_special_token:
+            self.special_token=self.cfg.get('special_token','<|beep|>')
         self.fix_query_audio_end_time = self.cfg.get('fix_query_audio_end_time',False)
         if self.fix_query_audio_end_time:
             self.query_audio_end_time = 10
@@ -124,9 +126,10 @@ class LhotseSpeechToTextTgtSpkBpeDataset(torch.utils.data.Dataset):
                 audio = torch.cat([query_audio, audio], axis = 1)
                 audio_lens = audio_lens + query_audio_lens
         if self.add_special_token:
-            tokens = [torch.as_tensor(self.tokenizer('<|spltoken0|> ' + c.supervisions[0].text, c.supervisions[0].language)) for c in cuts]
+            tokens = [torch.as_tensor(self.tokenizer(self.special_token + ' ' + c.supervisions[0].text, c.supervisions[0].language)) for c in cuts]
         else:
             tokens = [torch.as_tensor(self.tokenizer(c.supervisions[0].text, c.supervisions[0].language)) for c in cuts]
+
         token_lens = torch.tensor([t.size(0) for t in tokens], dtype=torch.long)
         tokens = collate_vectors(tokens, padding_value=0)
         spk_targets = collate_matrices(spk_targets)
@@ -243,7 +246,7 @@ class LhotseSpeechToTextTgtSpkBpeDataset(torch.utils.data.Dataset):
                             et = (
                                         compute_num_samples(rttm_sup.end, cut.sampling_rate)
                                         if rttm_sup.end < cut.duration
-                                        else compute_num_samples(rttm_sup.duration, cut.sampling_rate)
+                                        else compute_num_samples(cut.duration, cut.sampling_rate)
                                     )                   
                             
                             #map start time (st) and end time (et) to encoded hidden location
@@ -271,7 +274,7 @@ class LhotseSpeechToTextTgtSpkBpeDataset(torch.utils.data.Dataset):
                             et = (
                                         compute_num_samples(rttm_sup.end, cut.sampling_rate)
                                         if rttm_sup.end < cut.duration
-                                        else compute_num_samples(rttm_sup.duration, cut.sampling_rate)
+                                        else compute_num_samples(cut.duration, cut.sampling_rate)
                                     )                   
                             
                             #map start time (st) and end time (et) to encoded hidden location
@@ -299,7 +302,7 @@ class LhotseSpeechToTextTgtSpkBpeDataset(torch.utils.data.Dataset):
                         et = (
                                     compute_num_samples(rttm_sup.end, cut.sampling_rate)
                                     if rttm_sup.end < cut.duration
-                                    else compute_num_samples(rttm_sup.duration, cut.sampling_rate)
+                                    else compute_num_samples(cut.duration, cut.sampling_rate)
                                 )                   
                         
                         #map start time (st) and end time (et) to encoded hidden location
@@ -307,8 +310,6 @@ class LhotseSpeechToTextTgtSpkBpeDataset(torch.utils.data.Dataset):
                         et_encoder_loc = get_hidden_length_from_sample_length(et, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)
 
                         mask[speaker_idx, query_hidden_len + st_encoder_loc:query_hidden_len + et_encoder_loc] = 1
-
-        
 
         return mask
 
