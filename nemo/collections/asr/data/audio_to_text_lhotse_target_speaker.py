@@ -34,9 +34,13 @@ from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralT
 
 from nemo.collections.asr.parts.utils.asr_multispeaker_utils import (
     get_hidden_length_from_sample_length, 
-    get_mask_from_segments,
     find_segments_from_rttm,
     shuffle_spk_mapping,
+)
+
+from nemo.collections.asr.parts.utils.asr_tgtspeaker_utils import (
+    get_separator_audio,
+    get_query_cut
 )
 
 class LhotseSpeechToTextTgtSpkBpeDataset(torch.utils.data.Dataset):
@@ -76,7 +80,7 @@ class LhotseSpeechToTextTgtSpkBpeDataset(torch.utils.data.Dataset):
         self.separater_duration = self.cfg.get('separater_duration',1)
         self.separater_unvoice_ratio = self.cfg.get('separater_unvoice_ratio', 0.3)
         if self.add_separater_audio:
-            self.separater_audio = self.separate_sound(self.separater_freq, self.cfg.sample_rate, self.separater_duration, self.separater_unvoice_ratio)
+            self.separater_audio = get_separator_audio(self.separater_freq, self.cfg.sample_rate, self.separater_duration, self.separater_unvoice_ratio)
         self.add_special_token = self.cfg.get('add_special_token',True)
         if self.add_special_token:
             self.special_token=self.cfg.get('special_token','<|beep|>')
@@ -85,17 +89,6 @@ class LhotseSpeechToTextTgtSpkBpeDataset(torch.utils.data.Dataset):
             self.query_audio_end_time = 10
         self.inference_mode = self.cfg.get('inference_mode', False)
     
-    @staticmethod
-    def separate_sound(freq, sr, duration, ratio):
-        # Generate time values
-        t = np.linspace(0, duration, int(sr * duration), endpoint=False)
-
-        # Generate sine wave
-        y = np.sin(2 * np.pi * freq * t) * 0.1
-
-        y[:int(sr * duration * ratio )] = 0
-        y[-int(sr * duration * ratio ):] = 0
-        return y
 
     def __getitem__(self, cuts) -> Tuple[torch.Tensor, ...]:
         cuts, spk_mappings = shuffle_spk_mapping(cuts=cuts, num_speakers=self.num_speakers, shuffle_spk_mapping=self.shuffle_spk_mapping, pattern=self.spk_token_pattern)
@@ -105,7 +98,7 @@ class LhotseSpeechToTextTgtSpkBpeDataset(torch.utils.data.Dataset):
             spk_targets = [torch.transpose(torch.zeros(self.num_speakers, get_hidden_length_from_sample_length(cut.num_samples, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame)), 0, 1) for cut in cuts]
             audio, audio_lens, cuts = self.load_audio(cuts)
         else:
-            query_cuts = CutSet.from_cuts(self.get_query_cut(c) for c in cuts)
+            query_cuts = CutSet.from_cuts(get_query_cut(c) for c in cuts)
             spk_targets = [torch.transpose(torch.as_tensor(self.speaker_to_target_tgt_speaker_0(c, q, self.num_speakers, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame, self.spk_tar_all_zero), dtype=torch.float32), 0, 1) for c, q in zip(cuts,query_cuts)]
             audio, audio_lens, cuts = self.load_audio(cuts)
             query_audio, query_audio_lens, query_cuts = self.load_audio(query_cuts)
@@ -129,42 +122,12 @@ class LhotseSpeechToTextTgtSpkBpeDataset(torch.utils.data.Dataset):
             tokens = [torch.as_tensor(self.tokenizer(self.special_token + ' ' + c.supervisions[0].text, c.supervisions[0].language)) for c in cuts]
         else:
             tokens = [torch.as_tensor(self.tokenizer(c.supervisions[0].text, c.supervisions[0].language)) for c in cuts]
-
+            
         token_lens = torch.tensor([t.size(0) for t in tokens], dtype=torch.long)
         tokens = collate_vectors(tokens, padding_value=0)
         spk_targets = collate_matrices(spk_targets)
         return audio, audio_lens, tokens, token_lens, spk_targets, spk_mappings
     
-    def get_query_cut(self, cut):
-        '''
-        Extract query from the cut and saved as a separate cut
-
-        Args:
-            cut: An audio cut. The cut should contain keys "query_audio_filepath", "query_offet", "query_duration"
-
-        Returns:
-            query_cut: a cut containing query information
-        '''    
-        if 'query_audio_filepath' in cut.custom:
-            query_rec = Recording.from_file(cut.query_audio_filepath)
-            query_sups = [SupervisionSegment(id=query_rec.id+'_query'+str(cut.query_offset)+'-'+str(cut.query_offset + cut.query_duration), recording_id = query_rec.id, start = 0, duration = cut.query_duration, speaker = cut.query_speaker_id)]
-            query_cut = MonoCut(id = query_rec.id +'_query'+str(cut.query_offset)+'-'+str(cut.query_offset + cut.query_duration),
-                                start = cut.query_offset,
-                                duration = cut.query_duration,
-                                channel = 0,
-                                recording = query_rec,
-                                supervisions = query_sups)
-            return query_cut
-        else:
-            query_rec = cut.recording
-            query_sups = [SupervisionSegment(id=cut.id+'_query_dummy', recording_id = query_rec.id, start = 0, duration = 0, speaker = None)]
-            query_cut = MonoCut(id = cut.id +'_query_no_ts_'+str(cut.start)+'_'+str(cut.duration),
-                                start = 0,
-                                duration = 0,
-                                channel = 0,
-                                recording = query_rec,
-                                supervisions = query_sups)
-            return query_cut
 
     def speaker_to_target_tgt_speaker_0(
         self,
