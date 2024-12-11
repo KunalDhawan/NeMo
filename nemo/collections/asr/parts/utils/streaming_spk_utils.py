@@ -28,7 +28,7 @@ from nemo.collections.asr.parts.preprocessing.features import normalize_batch
 from nemo.collections.asr.parts.utils.audio_utils import get_samples
 from nemo.core.classes import IterableDataset
 from nemo.core.neural_types import LengthsType, MelSpectrogramType, NeuralType
-from nemo.collections.asr.data.audio_to_text_lhotse_target_speaker import LhotseSpeechToTextTgtSpkBpeDataset
+from nemo.collections.asr.parts.utils.asr_tgtspeaker_utils import get_separator_audio
 
 # Minimum number of tokens required to assign a LCS merge step, otherwise ignore and
 # select all i-1 and ith buffer tokens to merge.
@@ -340,7 +340,7 @@ class CacheAwareStreamingAudioTgtSpkBuffer(CacheAwareStreamingAudioSpkBuffer):
         query_audio = get_samples(query_audio_filepath)
         query_audio = query_audio[int(sample['query_offset'] * 16000) : int((sample['query_offset'] + sample['query_duration']) * 16000)]
         #separater audio
-        separater = LhotseSpeechToTextTgtSpkBpeDataset.separate_sound(freq=500, sr=16000, duration=1, ratio=0.3)
+        separater = get_separator_audio(freq=500, sr=16000, duration=1, ratio=0.3)
         separater = np.float32(separater)
         audio = np.concatenate([query_audio, separater, audio])
         processed_signal, processed_signal_length, stream_id = self.append_audio(audio, stream_id)

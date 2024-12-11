@@ -128,15 +128,15 @@ class EncDecRNNTTgtSpkBPEModel(EncDecRNNTSpkBPEModel):
 
     def conformer_stream_step(
         self,
-        #audio_signal: torch.Tensor,
+        audio_signal: torch.Tensor,
         processed_signal: torch.Tensor,
-        # spk_targets: torch.Tensor,
-        # global_mapping: dict,
-        # text_idx: int,
-        # token_idx: int,
-        # raw_texts: str,
-        # prev_spk: str,
-        # audio_signal_lengths: torch.Tensor = None,
+        spk_targets: torch.Tensor,
+        global_mapping: dict,
+        text_idx: int,
+        token_idx: int,
+        raw_texts: str,
+        prev_spk: str,
+        audio_signal_lengths: torch.Tensor = None,
         processed_signal_length: torch.Tensor = None,
         cache_last_channel: torch.Tensor = None,
         cache_last_time: torch.Tensor = None,
@@ -148,7 +148,6 @@ class EncDecRNNTTgtSpkBPEModel(EncDecRNNTSpkBPEModel):
         return_transcription: bool = True,
         return_log_probs: bool = False,
     ):
-        import ipdb; ipdb.set_trace()
         """
         For detailed usage, please refer to ASRModuleMixin.conformer_stream_step
         """
@@ -188,31 +187,13 @@ class EncDecRNNTTgtSpkBPEModel(EncDecRNNTSpkBPEModel):
                     diar_preds = spk_targets 
                 else:
                     raise ValueError("`spk_targets` is required for speaker supervision strategy 'rttm'")
-            
             elif self.cfg.spk_supervision_strategy == 'diar':
                 with torch.set_grad_enabled(not self.cfg.freeze_diar):
-                    # diar_preds, _preds, attn_score_stack, total_memory_list, encoder_states_list = self.forward_diar(audio_signal, audio_signal_lengths)
-                    # if self.binarize_diar_preds_threshold:
-                    #     diar_preds = torch.where(diar_preds > self.binarize_diar_preds_threshold, torch.tensor(1), torch.tensor(0)).to(encoded.device)
-                    # if diar_preds is None:
-                    #     raise ValueError("`diar_pred`is required for speaker supervision strategy 'diar'")
-                    (
-                        mem_last_time,
-                        fifo_last_time,
-                        mem_preds,
-                        fifo_preds,
-                        diar_pred_out_stream
-                    ) = self.diar_model.forward_streaming_step(
-                        processed_signal=processed_signal.transpose(1, 2),
-                        processed_signal_length=processed_signal_length,
-                        mem_last_time=mem_last_time,
-                        fifo_last_time=fifo_last_time,
-                        previous_pred_out=diar_pred_out_stream,
-                        left_offset=0,
-                        right_offset=0,
-                    )
-                    
-            
+                    diar_preds, _preds, attn_score_stack, total_memory_list, encoder_states_list = self.forward_diar(audio_signal, audio_signal_lengths)
+                    if self.binarize_diar_preds_threshold:
+                        diar_preds = torch.where(diar_preds > self.binarize_diar_preds_threshold, torch.tensor(1), torch.tensor(0)).to(encoded.device)
+                    if diar_preds is None:
+                        raise ValueError("`diar_pred`is required for speaker supervision strategy 'diar'")
             elif self.cfg.spk_supervision_strategy == 'mix':
                 with torch.set_grad_enabled(not self.cfg.freeze_diar):
                     diar_preds, _preds, attn_score_stack, total_memory_list, encoder_states_list = self.forward_diar(audio_signal, audio_signal_lengths)
