@@ -75,7 +75,6 @@ def setup_model(cfg: DictConfig, map_location: torch.device) -> Tuple[ASRModel, 
             if 'diar_model_path' in cfg:
                 orig_config.diar_model_path = cfg.diar_model_path
             new_config = orig_config
-            # import ipdb; ipdb.set_trace()
             asr_model = imported_class.restore_from(
                 restore_path=cfg.model_path, strict = False, map_location=map_location, override_config_path=new_config
             )

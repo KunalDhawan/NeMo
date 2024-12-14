@@ -299,9 +299,9 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
 
 
     def train_val_forward(self, batch, batch_nb):
-
+        # import ipdb; ipdb.set_trace()
         signal, signal_len, transcript, transcript_len, spk_targets, spk_mappings = batch
-        logging.info("ASR step")
+
         # forward() only performs encoder forward
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
             encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
@@ -310,7 +310,6 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
         
 
         encoded = torch.transpose(encoded, 1, 2) # B * D * T -> B * T * D
-        logging.info("Diar Step")
         if self.diar == True:
             if self.cfg.spk_supervision_strategy == 'rttm':
                 if spk_targets is not None:
@@ -581,7 +580,6 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
 
         if not isinstance(self, asr_models.EncDecCTCModel) and return_log_probs is True:
             logging.info("return_log_probs can only be True for CTC models.")
-        logging.info("ASR step")
         (
             encoded,
             encoded_len,
@@ -681,7 +679,6 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
             else:
                 decoding = self.decoding
                 decoder = self.decoder
-
             log_probs = decoder(encoder_output=encoded)
             predictions_tensor = log_probs.argmax(dim=-1, keepdim=False)
 
