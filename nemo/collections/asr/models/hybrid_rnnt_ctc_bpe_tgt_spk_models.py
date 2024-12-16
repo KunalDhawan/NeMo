@@ -1,4 +1,4 @@
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,53 +18,34 @@ from typing import Dict, List, Optional, Union
 
 import numpy as np
 import torch
-import torch.nn.functional as F
+from lightning.pytorch import Trainer
 from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
-from pytorch_lightning import Trainer
 
-from nemo.collections.asr.data.audio_to_text_lhotse_speaker import LhotseSpeechToTextSpkBpeDataset
-
-import nemo.collections.asr.models as asr_models
-from nemo.core.classes.mixins import AccessMixin
-from nemo.collections.asr.parts.mixins.asr_adapter_mixins import ASRAdapterModelMixin
-from nemo.collections.asr.parts.mixins.streaming import StreamingEncoder
-from nemo.collections.asr.parts.utils import asr_module_utils
-from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
-from nemo.collections.asr.data.audio_to_text_dali import AudioToCharDALIDataset, DALIOutputs
-from nemo.collections.asr.parts.utils.asr_multispeaker_utils import apply_spk_mapping
-
-from nemo.collections.asr.parts.mixins import (
-    ASRModuleMixin,
-    ASRTranscriptionMixin,
-    TranscribeConfig,
-    TranscriptionReturnType,
-)
-
-from nemo.collections.asr.models.rnnt_bpe_models import EncDecRNNTBPEModel
+from nemo.collections.asr.data import audio_to_text_dataset
+from nemo.collections.asr.data.audio_to_text import _AudioTextDataset
+from nemo.collections.asr.data.audio_to_text_dali import AudioToBPEDALIDataset
+from nemo.collections.asr.data.audio_to_text_lhotse_target_speaker import LhotseSpeechToTextTgtSpkBpeDataset
+from nemo.collections.asr.losses.ctc import CTCLoss
+from nemo.collections.asr.losses.rnnt import RNNTLoss
+from nemo.collections.asr.metrics.wer import WER
+from nemo.collections.asr.models.hybrid_rnnt_ctc_bpe_models import EncDecHybridRNNTCTCBPEModel
 from nemo.collections.asr.models.sortformer_diar_models import SortformerEncLabelModel
+from nemo.collections.asr.parts.mixins import ASRBPEMixin
+from nemo.collections.asr.parts.submodules.ctc_decoding import CTCBPEDecoding, CTCBPEDecodingConfig
+from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTBPEDecoding, RNNTBPEDecodingConfig
+from nemo.collections.asr.parts.utils.asr_batching import get_semi_sorted_batch_sampler
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
 from nemo.core.classes.common import PretrainedModelInfo
+from nemo.utils import logging, model_utils
+from nemo.core.classes.mixins import AccessMixin
+from nemo.collections.asr.data.audio_to_text_dali import DALIOutputs
 
-from nemo.utils import logging
 
-class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
-    """Base class for encoder decoder RNNT-based models with subword tokenization."""
-
-    @classmethod
-    def list_available_models(cls) -> List[PretrainedModelInfo]:
-        """
-        This method returns a list of pre-trained model which can be instantiated directly from NVIDIA's NGC cloud.
-
-        Returns:
-            List of available pre-trained models.
-        """
-        results = []
-
-        return results
+class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
+    """Base class for encoder decoder RNNT-based models with auxiliary CTC decoder/loss and subword tokenization."""
 
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
         super().__init__(cfg=cfg, trainer=trainer)
-        
         if 'diar_model_path' in self.cfg:
             self.diar = True
             # Initialize the speaker branch
@@ -154,65 +135,6 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
         if self.cfg.freeze_diar:
            self.diarization_model.eval()
 
-
-
-    def _setup_dataloader_from_config(self, config: Optional[Dict]):
-        if config.get("use_lhotse"):
-            return get_lhotse_dataloader_from_config(
-                config,
-                global_rank=self.global_rank,
-                world_size=self.world_size,
-                dataset=LhotseSpeechToTextSpkBpeDataset(cfg = config, tokenizer=self.tokenizer,),
-            )
-
-    def _setup_transcribe_dataloader(self, config: Dict) -> 'torch.utils.data.DataLoader':
-        """
-        Setup function for a temporary data loader which wraps the provided audio file.
-
-        Args:
-            config: A python dictionary which contains the following keys:
-            paths2audio_files: (a list) of paths to audio files. The files should be relatively short fragments. \
-                Recommended length per file is between 5 and 25 seconds.
-            batch_size: (int) batch size to use during inference. \
-                Bigger will result in better throughput performance but would use more memory.
-            temp_dir: (str) A temporary directory where the audio manifest is temporarily
-                stored.
-
-        Returns:
-            A pytorch DataLoader for the given audio file(s).
-        """
-        if 'manifest_filepath' in config:
-            manifest_filepath = config['manifest_filepath']
-            batch_size = config['batch_size']
-        else:
-            manifest_filepath = os.path.join(config['temp_dir'], 'manifest.json')
-            batch_size = min(config['batch_size'], len(config['paths2audio_files']))
-
-        dl_config = {
-            'manifest_filepath': manifest_filepath,
-            'sample_rate': self.preprocessor._sample_rate,
-            'batch_size': batch_size,
-            'shuffle': False,
-            'num_workers': config.get('num_workers', min(batch_size, os.cpu_count() - 1)),
-            'pin_memory': True,
-            'use_lhotse': True,
-            'use_bucketing': False,
-            'channel_selector': config.get('channel_selector', None),
-            'use_start_end_token': self.cfg.validation_ds.get('use_start_end_token', False),
-            'num_speakers': self.cfg.test_ds.get('num_speakers',4),
-            'spk_tar_all_zero': self.cfg.test_ds.get('spk_tar_all_zero',False),
-            'num_sample_per_mel_frame': self.cfg.test_ds.get('num_sample_per_mel_frame',160),
-            'num_mel_frame_per_asr_frame': self.cfg.test_ds.get('num_mel_frame_per_asr_frame',8),
-            'shuffle_spk_mapping': self.cfg.test_ds.get('shuffle_spk_mapping',False),
-            'inference_mode': self.cfg.test_ds.get('inference_mode', True)
-        }
-
-        if config.get("augmentor"):
-            dl_config['augmentor'] = config.get("augmentor")
-
-        temporary_datalayer = self._setup_dataloader_from_config(config=DictConfig(dl_config))
-        return temporary_datalayer
-    
     def forward_diar(
         self,
         input_signal=None,
@@ -399,6 +321,9 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
         if AccessMixin.is_access_enabled(self.model_guid):
             AccessMixin.reset_registry(self)
 
+        if self.is_interctc_enabled():
+            AccessMixin.set_access_enabled(access_enabled=True, guid=self.model_guid)
+
         encoded, encoded_len, transcript, transcript_len = self.train_val_forward(batch, batch_nb)
 
         # During training, loss must be computed, so decoder forward is necessary
@@ -410,6 +335,11 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
         else:
             log_every_n_steps = 1
             sample_id = batch_nb
+
+        if (sample_id + 1) % log_every_n_steps == 0:
+            compute_wer = True
+        else:
+            compute_wer = False
 
         # If experimental fused Joint-Loss-WER is not used
         if not self.joint.fuse_loss_wer:
@@ -432,7 +362,7 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
                 'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
             }
 
-            if (sample_id + 1) % log_every_n_steps == 0:
+            if compute_wer:
                 self.wer.update(
                     predictions=encoded,
                     predictions_lengths=encoded_len,
@@ -443,13 +373,7 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
                 self.wer.reset()
                 tensorboard_logs.update({'training_batch_wer': scores.float() / words})
 
-        else:
-            # If experimental fused Joint-Loss-WER is used
-            if (sample_id + 1) % log_every_n_steps == 0:
-                compute_wer = True
-            else:
-                compute_wer = False
-
+        else:  # If fused Joint-Loss-WER is used
             # Fused joint step
             loss_value, wer, _, _ = self.joint(
                 encoder_outputs=encoded,
@@ -463,18 +387,46 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
             # Add auxiliary losses, if registered
             loss_value = self.add_auxiliary_losses(loss_value)
 
-            # Reset access registry
-            if AccessMixin.is_access_enabled(self.model_guid):
-                AccessMixin.reset_registry(self)
-
             tensorboard_logs = {
-                'train_loss': loss_value,
                 'learning_rate': self._optimizer.param_groups[0]['lr'],
                 'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
             }
 
             if compute_wer:
                 tensorboard_logs.update({'training_batch_wer': wer})
+
+        if self.ctc_loss_weight > 0:
+            log_probs = self.ctc_decoder(encoder_output=encoded)
+            ctc_loss = self.ctc_loss(
+                log_probs=log_probs, targets=transcript, input_lengths=encoded_len, target_lengths=transcript_len
+            )
+            tensorboard_logs['train_rnnt_loss'] = loss_value
+            tensorboard_logs['train_ctc_loss'] = ctc_loss
+            loss_value = (1 - self.ctc_loss_weight) * loss_value + self.ctc_loss_weight * ctc_loss
+            if compute_wer:
+                self.ctc_wer.update(
+                    predictions=log_probs,
+                    targets=transcript,
+                    targets_lengths=transcript_len,
+                    predictions_lengths=encoded_len,
+                )
+                ctc_wer, _, _ = self.ctc_wer.compute()
+                self.ctc_wer.reset()
+                tensorboard_logs.update({'training_batch_wer_ctc': ctc_wer})
+
+        # note that we want to apply interctc independent of whether main ctc
+        # loss is used or not (to allow rnnt + interctc training).
+        # assuming ``ctc_loss_weight=0.3`` and interctc is applied to a single
+        # layer with weight of ``0.1``, the total loss will be
+        # ``loss = 0.9 * (0.3 * ctc_loss + 0.7 * rnnt_loss) + 0.1 * interctc_loss``
+        loss_value, additional_logs = self.add_interctc_losses(
+            loss_value, transcript, transcript_len, compute_wer=compute_wer
+        )
+        tensorboard_logs.update(additional_logs)
+        tensorboard_logs['train_loss'] = loss_value
+        # Reset access registry
+        if AccessMixin.is_access_enabled(self.model_guid):
+            AccessMixin.reset_registry(self)
 
         # Log items
         self.log_dict(tensorboard_logs)
@@ -487,10 +439,12 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
     
 
     def validation_pass(self, batch, batch_idx, dataloader_idx=0):
-
+        if self.is_interctc_enabled():
+            AccessMixin.set_access_enabled(access_enabled=True, guid=self.model_guid)
         encoded, encoded_len, transcript, transcript_len = self.train_val_forward(batch, batch_idx)
 
         tensorboard_logs = {}
+        loss_value = None
 
         # If experimental fused Joint-Loss-WER is not used
         if not self.joint.fuse_loss_wer:
@@ -544,232 +498,119 @@ class EncDecRNNTSpkBPEModel(EncDecRNNTBPEModel):
             tensorboard_logs['val_wer_denom'] = wer_denom
             tensorboard_logs['val_wer'] = wer
 
+        log_probs = self.ctc_decoder(encoder_output=encoded)
+        if self.compute_eval_loss:
+            ctc_loss = self.ctc_loss(
+                log_probs=log_probs, targets=transcript, input_lengths=encoded_len, target_lengths=transcript_len
+            )
+            tensorboard_logs['val_ctc_loss'] = ctc_loss
+            tensorboard_logs['val_rnnt_loss'] = loss_value
+            loss_value = (1 - self.ctc_loss_weight) * loss_value + self.ctc_loss_weight * ctc_loss
+            tensorboard_logs['val_loss'] = loss_value
+        self.ctc_wer.update(
+            predictions=log_probs,
+            targets=transcript,
+            targets_lengths=transcript_len,
+            predictions_lengths=encoded_len,
+        )
+        ctc_wer, ctc_wer_num, ctc_wer_denom = self.ctc_wer.compute()
+        self.ctc_wer.reset()
+        tensorboard_logs['val_wer_num_ctc'] = ctc_wer_num
+        tensorboard_logs['val_wer_denom_ctc'] = ctc_wer_denom
+        tensorboard_logs['val_wer_ctc'] = ctc_wer
+
         self.log('global_step', torch.tensor(self.trainer.global_step, dtype=torch.float32))
+
+        loss_value, additional_logs = self.add_interctc_losses(
+            loss_value,
+            transcript,
+            transcript_len,
+            compute_wer=True,
+            compute_loss=self.compute_eval_loss,
+            log_wer_num_denom=True,
+            log_prefix="val_",
+        )
+        if self.compute_eval_loss:
+            # overriding total loss value. Note that the previous
+            # rnnt + ctc loss is available in metrics as "val_final_loss" now
+            tensorboard_logs['val_loss'] = loss_value
+        tensorboard_logs.update(additional_logs)
+        # Reset access registry
+        if AccessMixin.is_access_enabled(self.model_guid):
+            AccessMixin.reset_registry(self)
 
         return tensorboard_logs
 
-    def diar_conformer_stream_step(
-        self,
-        step_num: float,
-        processed_signal: torch.Tensor,
-        processed_signal_length: torch.Tensor = None,
-        cache_last_channel: torch.Tensor = None,
-        cache_last_time: torch.Tensor = None,
-        cache_last_channel_len: torch.Tensor = None,
-        keep_all_outputs: bool = True,
-        previous_hypotheses: List[Hypothesis] = None,
-        previous_pred_out: torch.Tensor = None,
-        drop_extra_pre_encoded: int = None,
-        return_transcription: bool = True,
-        return_log_probs: bool = False,
-        mem_last_time: torch.Tensor = None,
-        fifo_last_time: torch.Tensor = None,
-        previous_diar_pred_out: torch.Tensor = None,
-        left_offset: torch.Tensor = 0,
-        right_offset: torch.Tensor = 0,
-    ):
-        if not isinstance(self, asr_models.EncDecRNNTModel) and not isinstance(self, asr_models.EncDecCTCModel):
-            raise NotImplementedError(f"stream_step does not support {type(self)}!")
+    def _setup_dataloader_from_config(self, config: Optional[Dict]):
 
-        if not isinstance(self.encoder, StreamingEncoder):
-            raise NotImplementedError(f"Encoder of this model does not support streaming!")
-
-        if isinstance(self, asr_models.EncDecRNNTModel) and return_transcription is False:
-            logging.info(
-                "return_transcription can not be False for Transducer models as decoder returns the transcriptions too."
+        if config.get("use_lhotse"):
+            return get_lhotse_dataloader_from_config(
+                config,
+                global_rank=self.global_rank,
+                world_size=self.world_size,
+                dataset=LhotseSpeechToTextTgtSpkBpeDataset(cfg = config,
+                    tokenizer=self.tokenizer,
+                ),
+                tokenizer=self.tokenizer,
             )
 
-        if not isinstance(self, asr_models.EncDecCTCModel) and return_log_probs is True:
-            logging.info("return_log_probs can only be True for CTC models.")
-        (
-            encoded,
-            encoded_len,
-            cache_last_channel_next,
-            cache_last_time_next,
-            cache_last_channel_next_len,
-        ) = self.encoder.cache_aware_stream_step(
-            processed_signal=processed_signal,
-            processed_signal_length=processed_signal_length,
-            cache_last_channel=cache_last_channel,
-            cache_last_time=cache_last_time,
-            cache_last_channel_len=cache_last_channel_len,
-            keep_all_outputs=keep_all_outputs,
-            drop_extra_pre_encoded=drop_extra_pre_encoded,
-        )
-        # import ipdb; ipdb.set_trace()
-        encoded = torch.transpose(encoded, 1, 2) # B * D * T -> B * T * D
-        # import ipdb; ipdb.set_trace()
-        # if step_num > 0:
-        #     left_offset = 8
-        #     processed_signal = processed_signal[..., 1:]
-        #     processed_signal_length -= 1
+    def _setup_transcribe_dataloader(self, config: Dict) -> 'torch.utils.data.DataLoader':
+        """
+        Setup function for a temporary data loader which wraps the provided audio file.
 
-    # if self.diar == True:
-        logging.info("Diar Step")
-        (
-            mem_last_time,
-            fifo_last_time,
-            mem_preds,
-            fifo_preds,
-            diar_pred_out_stream
-        ) = self.diarization_model.forward_streaming_step(
-            processed_signal=processed_signal.transpose(1, 2),
-            processed_signal_length=processed_signal_length,
-            mem_last_time=mem_last_time,
-            fifo_last_time=fifo_last_time,
-            previous_pred_out=previous_diar_pred_out,
-            left_offset=left_offset,
-            right_offset=right_offset,
-        )
-        # import ipdb; ipdb.set_trace()
-        diar_preds = diar_pred_out_stream[:,mem_preds.shape[1] + fifo_preds.shape[1]:,:]
-        if(diar_preds.shape[1]!=encoded.shape[1]):
-        # KD duct-tape solution for extending the speaker predictions 
-            asr_frame_count = encoded.shape[1]
-            diar_preds = self.fix_diar_output(diar_preds, asr_frame_count)
+        Args:
+            config: A python dictionary which contains the following keys:
+            paths2audio_files: (a list) of paths to audio files. The files should be relatively short fragments. \
+                Recommended length per file is between 5 and 25 seconds.
+            batch_size: (int) batch size to use during inference. \
+                Bigger will result in better throughput performance but would use more memory.
+            temp_dir: (str) A temporary directory where the audio manifest is temporarily
+                stored.
 
-        # Normalize the features
-        if self.norm == 'ln':
-            diar_preds = self.diar_norm(diar_preds)
-            encoded = self.asr_norm(encoded)
-        elif self.norm == 'l2':
-            diar_preds = torch.nn.functional.normalize(diar_preds, p=2, dim=-1)
-            encoded = torch.nn.functional.normalize(encoded, p=2, dim=-1)
-        
-        if diar_preds.shape[1] > encoded.shape[1]:
-            diar_preds = diar_preds[:, :encoded.shape[1], :]
-
-        if self.diar_kernel_type == 'sinusoidal':
-            speaker_infusion_asr = torch.matmul(diar_preds, self.diar_kernel.to(diar_preds.device))
-            if self.kernel_norm == 'l2':
-                speaker_infusion_asr = torch.nn.functional.normalize(speaker_infusion_asr, p=2, dim=-1)
-            encoded = speaker_infusion_asr + encoded
-        elif self.diar_kernel_type == 'metacat':
-            concat_enc_states = encoded.unsqueeze(2) * diar_preds.unsqueeze(3)
-            concat_enc_states = concat_enc_states.flatten(2,3)
-            encoded = self.joint_proj(concat_enc_states)
-        elif self.diar_kernel_type == 'metacat_residule':
-            #only pick speaker 0
-            concat_enc_states = encoded.unsqueeze(2) * diar_preds[:,:,:1].unsqueeze(3)
-            concat_enc_states = concat_enc_states.flatten(2,3)
-            encoded = encoded + self.joint_proj(concat_enc_states)    
-        elif self.diar_kernel_type == 'metacat_residule_early':
-            #only pick speaker 0
-            concat_enc_states = encoded.unsqueeze(2) * diar_preds[:,:,:1].unsqueeze(3)
-            concat_enc_states = concat_enc_states.flatten(2,3)
-            encoded = self.joint_proj(encoded + concat_enc_states)
-        elif self.diar_kernel_type == 'metacat_residule_projection':
-            #only pick speaker 0 and add diar_preds
-            concat_enc_states = encoded.unsqueeze(2) * diar_preds[:,:,:1].unsqueeze(3)
-            concat_enc_states = concat_enc_states.flatten(2,3)
-            encoded = encoded + concat_enc_states
-            concat_enc_states = torch.cat([encoded, diar_preds], dim = -1)
-            encoded = self.joint_proj(concat_enc_states)
+        Returns:
+            A pytorch DataLoader for the given audio file(s).
+        """
+        if 'manifest_filepath' in config:
+            manifest_filepath = config['manifest_filepath']
+            batch_size = config['batch_size']
         else:
-            concat_enc_states = torch.cat([encoded, diar_preds], dim=-1)
-            encoded = self.joint_proj(concat_enc_states)
-        # import ipdb; ipdb.set_trace()
-        encoded = torch.transpose(encoded, 1, 2) # B * T * D -> B * D * T
+            manifest_filepath = os.path.join(config['temp_dir'], 'manifest.json')
+            batch_size = min(config['batch_size'], len(config['paths2audio_files']))
 
-        if isinstance(self, asr_models.EncDecCTCModel) or (
-            isinstance(self, asr_models.EncDecHybridRNNTCTCModel) and self.cur_decoder == "ctc"
-        ):
-            if hasattr(self, "ctc_decoder"):
-                decoding = self.ctc_decoding
-                decoder = self.ctc_decoder
-            else:
-                decoding = self.decoding
-                decoder = self.decoder
-            log_probs = decoder(encoder_output=encoded)
-            predictions_tensor = log_probs.argmax(dim=-1, keepdim=False)
+        dl_config = {
+            'manifest_filepath': manifest_filepath,
+            'sample_rate': self.preprocessor._sample_rate,
+            'batch_size': batch_size,
+            'shuffle': False,
+            'num_workers': config.get('num_workers', min(batch_size, os.cpu_count() - 1)),
+            'pin_memory': True,
+            'use_lhotse': True,
+            'use_bucketing': False,
+            'channel_selector': config.get('channel_selector', None),
+            'use_start_end_token': self.cfg.validation_ds.get('use_start_end_token', False),
+            'num_speakers': self.cfg.test_ds.get('num_speakers',4),
+            'spk_tar_all_zero': self.cfg.test_ds.get('spk_tar_all_zero',False),
+            'num_sample_per_mel_frame': self.cfg.test_ds.get('num_sample_per_mel_frame',160),
+            'num_mel_frame_per_asr_frame': self.cfg.test_ds.get('num_mel_frame_per_asr_frame',8),
+            'shuffle_spk_mapping': self.cfg.test_ds.get('shuffle_spk_mapping',False),
+            'inference_mode': self.cfg.test_ds.get('inference_mode', True)
+        }
 
-            # Concatenate the previous predictions with the current one to have the full predictions.
-            # We drop the extra predictions for each sample by using the lengths returned by the encoder (encoded_len)
-            # Then create a list of the predictions for the batch. The predictions can have different lengths because of the paddings.
-            greedy_predictions = []
-            if return_transcription:
-                all_hyp_or_transcribed_texts = []
-            else:
-                all_hyp_or_transcribed_texts = None
-            for preds_idx, preds in enumerate(predictions_tensor):
-                if encoded_len is None:
-                    preds_cur = predictions_tensor[preds_idx]
-                else:
-                    preds_cur = predictions_tensor[preds_idx, : encoded_len[preds_idx]]
-                if previous_pred_out is not None:
-                    greedy_predictions_concat = torch.cat((previous_pred_out[preds_idx], preds_cur), dim=-1)
-                    encoded_len[preds_idx] += len(previous_pred_out[preds_idx])
-                else:
-                    greedy_predictions_concat = preds_cur
-                greedy_predictions.append(greedy_predictions_concat)
+        if config.get("augmentor"):
+            dl_config['augmentor'] = config.get("augmentor")
 
-                # TODO: make decoding more efficient by avoiding the decoding process from the beginning
-                if return_transcription:
-                    decoded_out = decoding.ctc_decoder_predictions_tensor(
-                        decoder_outputs=greedy_predictions_concat.unsqueeze(0),
-                        decoder_lengths=encoded_len[preds_idx : preds_idx + 1],
-                        return_hypotheses=False,
-                    )
-                    all_hyp_or_transcribed_texts.append(decoded_out[0][0])
-            best_hyp = None
-        else:
-            best_hyp, all_hyp_or_transcribed_texts = self.decoding.rnnt_decoder_predictions_tensor(
-                encoder_output=encoded,
-                encoded_lengths=encoded_len,
-                return_hypotheses=True,
-                partial_hypotheses=previous_hypotheses,
-            )
-            greedy_predictions = [hyp.y_sequence for hyp in best_hyp]
+        temporary_datalayer = self._setup_dataloader_from_config(config=DictConfig(dl_config))
+        return temporary_datalayer
 
-            if all_hyp_or_transcribed_texts is None:
-                all_hyp_or_transcribed_texts = best_hyp
 
-        result = [
-            greedy_predictions,
-            all_hyp_or_transcribed_texts,
-            cache_last_channel_next,
-            cache_last_time_next,
-            cache_last_channel_next_len,
-            best_hyp,
-            mem_last_time,
-            fifo_last_time,
-            mem_preds,
-            fifo_preds,
-            diar_pred_out_stream,
-        ]
-        if return_log_probs:
-            result.append(log_probs)
-            result.append(encoded_len)
+    @classmethod
+    def list_available_models(cls) -> List[PretrainedModelInfo]:
+        """
+        This method returns a list of pre-trained model which can be instantiated directly from NVIDIA's NGC cloud.
 
-        return tuple(result)
+        Returns:
+            List of available pre-trained models.
+        """
+        results = []
 
-    def _transcribe_forward(self, batch, trcfg:TranscribeConfig):
-        #modify config 
-        self.cfg.spk_supervision_strategy = 'diar'
-        #forward pass
-        encoded, encoded_len, _, _ = self.train_val_forward(batch, 0)
-        output = dict(encoded=encoded, encoded_len=encoded_len)
-        return output
-    
-    def _transcribe_output_processing(self, outputs,trcfg:TranscribeConfig):
-        encoded = outputs.pop('encoded')
-        encoded_len = outputs.pop('encoded_len')
-        best_hyp, all_hyp = self.decoding.rnnt_decoder_predictions_tensor(
-            encoded,
-            encoded_len,
-            return_hypotheses=True
-        )
-        # cleanup memory
-        del encoded, encoded_len
-
-        hypotheses = []
-        all_hypotheses = []
-
-        hypotheses += best_hyp
-        if all_hyp is not None:
-            all_hypotheses += all_hyp
-        else:
-            all_hypotheses += best_hyp
-
-        return (hypotheses, all_hypotheses)
-
+        return results
