@@ -27,7 +27,7 @@ import nemo.collections.asr as nemo_asr
 from nemo.collections.asr.metrics.wer import word_error_rate
 from nemo.collections.asr.models import ASRModel, EncDecHybridRNNTCTCModel, EncDecMultiTaskModel
 from nemo.collections.asr.parts.utils import manifest_utils, rnnt_utils
-from nemo.collections.asr.parts.utils.streaming_utils import FrameBatchASR, FrameBatchMultiTaskAED
+from nemo.collections.asr.parts.utils.streaming_tgt_spk_utils import FrameBatchASR_tgt_spk
 from nemo.collections.common.metrics.punct_er import OccurancePunctuationErrorRate
 from nemo.collections.common.parts.preprocessing.manifest import get_full_path
 from nemo.utils import logging, model_utils
@@ -35,6 +35,78 @@ from nemo.utils import logging, model_utils
 from omegaconf import open_dict, OmegaConf
 
 from nemo.collections.asr.parts.utils.asr_multispeaker_utils import apply_spk_mapping
+
+from nemo.collections.asr.parts.utils.transcribe_utils import wrap_transcription
+
+def get_buffered_pred_feat_tgt_spk(
+    asr: FrameBatchASR_tgt_spk,
+    frame_len: float,
+    tokens_per_chunk: int,
+    delay: int,
+    preprocessor_cfg: DictConfig,
+    model_stride_in_secs: int,
+    device: Union[List[int], int],
+    manifest: str = None,
+    filepaths: List[list] = None,
+) -> List[rnnt_utils.Hypothesis]:
+    """
+    Moved from examples/asr/asr_chunked_inference/ctc/speech_to_text_buffered_infer_ctc.py
+    Write all information presented in input manifest to output manifest and removed WER calculation.
+    """
+    # Create a preprocessor to convert audio samples into raw features,
+    # Normalization will be done per buffer in frame_bufferer
+    # Do not normalize whatever the model's preprocessor setting is
+    preprocessor_cfg.normalize = "None"
+    preprocessor = nemo_asr.models.EncDecCTCModelBPE.from_config_dict(preprocessor_cfg)
+    preprocessor.to(device)
+    hyps = []
+    refs = []
+
+    if filepaths and manifest:
+        raise ValueError("Please select either filepaths or manifest")
+    if filepaths is None and manifest is None:
+        raise ValueError("Either filepaths or manifest shoud not be None")
+    if filepaths:
+        for l in tqdm(filepaths, desc="Sample:"):
+            asr.reset()
+            asr.read_audio_file(l, delay, model_stride_in_secs)
+            hyp = asr.transcribe(tokens_per_chunk, delay)
+            hyps.append(hyp)
+    else:
+        with open(manifest, "r", encoding='utf_8') as mfst_f:
+            for l in tqdm(mfst_f, desc="Sample:"):
+                asr.reset()
+                row = json.loads(l.strip())
+                if 'text' in row:
+                    refs.append(row['text'])
+                audio_file = get_full_path(audio_file=row['audio_filepath'], manifest_file=manifest)
+                offset = row['offset']
+                duration = row['duration']
+                #query info
+                query_audio_file = row['query_audio_filepath']
+                query_offset = row['query_offset']
+                query_duration = row['query_duration']
+                #separater info
+                separater_freq = asr.asr_model.cfg.test_ds.separater_freq
+                separater_duration = asr.asr_model.cfg.test_ds.separater_duration
+                separater_unvoice_ratio = asr.asr_model.cfg.test_ds.separater_unvoice_ratio
+                # do not support partial audio
+                asr.read_audio_file(audio_file, offset, duration, query_audio_file, query_offset, query_duration, separater_freq, separater_duration, separater_unvoice_ratio, delay, model_stride_in_secs)
+                hyp = asr.transcribe(tokens_per_chunk, delay)
+                hyps.append(hyp)
+
+    if os.environ.get('DEBUG', '0') in ('1', 'y', 't'):
+        if len(refs) == 0:
+            print("ground-truth text does not present!")
+            for hyp in hyps:
+                print("hyp:", hyp)
+        else:
+            for hyp, ref in zip(hyps, refs):
+                print("hyp:", hyp)
+                print("ref:", ref)
+
+    wrapped_hyps = wrap_transcription(hyps)
+    return wrapped_hyps
 
 def setup_model(cfg: DictConfig, map_location: torch.device) -> Tuple[ASRModel, str]:
     """ Setup model from cfg and return model and model name for next step """
@@ -78,6 +150,8 @@ def setup_model(cfg: DictConfig, map_location: torch.device) -> Tuple[ASRModel, 
             asr_model = imported_class.restore_from(
                 restore_path=cfg.model_path, strict = False, map_location=map_location, override_config_path=new_config
             )
+            asr_model._init_diar_model()
+            asr_model.diarization_model.to(asr_model.device)
         else:
             asr_model = imported_class.restore_from(
                 restore_path=cfg.model_path,map_location=map_location,
@@ -134,7 +208,6 @@ def transcribe_partial_audio(
     device = next(asr_model.parameters()).device
     dither_value = asr_model.preprocessor.featurizer.dither
     pad_to_value = asr_model.preprocessor.featurizer.pad_to
-
     if decoder_type is not None:  # Hybrid model
         decode_function = (
             asr_model.decoding.rnnt_decoder_predictions_tensor

@@ -301,6 +301,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
         self, 
         audio_signal, 
         audio_signal_length, 
+        is_raw_waveform_input=True
     ):
         """
         Forward pass for training and inference.
@@ -317,8 +318,11 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             encoder_states_list (list): List containing total speaker memory for each step for debugging purposes
                 Dimension: [(batch_size, max. diar frame count, inner dim), ]
         """
-        processed_signal, processed_signal_length = self.process_signal(audio_signal=audio_signal, audio_signal_length=audio_signal_length)
-        processed_signal = processed_signal[:, :, :processed_signal_length.max()]
+        if is_raw_waveform_input:
+            processed_signal, processed_signal_length = self.process_signal(audio_signal=audio_signal, audio_signal_length=audio_signal_length)
+            processed_signal = processed_signal[:, :, :processed_signal_length.max()]
+        else:
+            processed_signal, processed_signal_length = audio_signal, audio_signal_length
         if self.streaming_mode:
             preds = self.forward_streaming(processed_signal, processed_signal_length)
         else:

@@ -118,7 +118,7 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
         """
 
         model_path = self.cfg.diar_model_path
-        # model_path = '/home/jinhanw/workdir/workdir_nemo_speaker_asr/dataloader/pipeline/checkpoints/sortformer/im303a-ft7_epoch6-19.nemo'
+        # model_path = '/home/jinhanw/workdir/workdir_nemo_diarization/checkpoints/sortformer_rebase/im303a-ft7_epoch6-19_sortformer_rebase.nemo'
 
         if model_path.endswith('.nemo'):
             pretrained_diar_model = SortformerEncLabelModel.restore_from(model_path, map_location="cpu")
@@ -142,8 +142,7 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
         is_raw_waveform_input=True,
     ):
         # preds, _preds, attn_score_stack, total_memory_list, encoder_states_list = self.diarization_model.forward(audio_signal=input_signal, audio_signal_length=input_signal_length, is_raw_waveform_input=is_raw_waveform_input)
-
-        preds = self.diarization_model.forward(audio_signal=input_signal, audio_signal_length=input_signal_length)
+        preds = self.diarization_model.forward(audio_signal=input_signal, audio_signal_length=input_signal_length, is_raw_waveform_input=is_raw_waveform_input)
 
 
         # return preds, _preds, attn_score_stack, total_memory_list, encoder_states_list
@@ -221,17 +220,21 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
 
 
     def train_val_forward(self, batch, batch_nb):
-        # import ipdb; ipdb.set_trace()
+
         signal, signal_len, transcript, transcript_len, spk_targets, spk_mappings = batch
 
         # forward() only performs encoder forward
-        if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
+        if (isinstance(batch, DALIOutputs) and batch.has_processed_signal) or signal.shape[1] == 80:
             encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
         else:
             encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
         
 
         encoded = torch.transpose(encoded, 1, 2) # B * D * T -> B * T * D
+        if signal.shape[1] == 80:
+            is_raw_waveform_input=False
+        else:
+            is_raw_waveform_input=True
         if self.diar == True:
             if self.cfg.spk_supervision_strategy == 'rttm':
                 if spk_targets is not None:
@@ -241,7 +244,7 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
             elif self.cfg.spk_supervision_strategy == 'diar':
                 with torch.set_grad_enabled(not self.cfg.freeze_diar):
                     # diar_preds, _preds, attn_score_stack, total_memory_list, encoder_states_list = self.forward_diar(signal, signal_len)
-                    diar_preds = self.forward_diar(signal, signal_len)
+                    diar_preds = self.forward_diar(signal, signal_len, is_raw_waveform_input)
                     if self.binarize_diar_preds_threshold:
                         diar_preds = torch.where(diar_preds > self.binarize_diar_preds_threshold, torch.tensor(1), torch.tensor(0)).to(encoded.device).half()
                 if diar_preds is None:
@@ -249,7 +252,7 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
             elif self.cfg.spk_supervision_strategy == 'mix':
                 with torch.set_grad_enabled(not self.cfg.freeze_diar):
                     # diar_preds, _preds, attn_score_stack, total_memory_list, encoder_states_list = self.forward_diar(signal, signal_len)
-                    diar_preds = self.forward_diar(signal, signal_len)
+                    diar_preds = self.forward_diar(signal, signal_len, is_raw_waveform_input)
                     if self.binarize_diar_preds_threshold:
                         diar_preds = torch.where(diar_preds > self.binarize_diar_preds_threshold, torch.tensor(1), torch.tensor(0)).to(encoded.device)
                 diar_preds = self._get_probablistic_mix(diar_preds=diar_preds, spk_targets=spk_targets, rttm_mix_prob=float(self.cfg.rttm_mix_prob))
