@@ -117,21 +117,8 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
         """
         Initialize the speaker model.
         """
-
-        model_path = self.cfg.diar_model_path
-        # model_path = '/home/jinhanw/workdir/workdir_nemo_diarization/checkpoints/sortformer_rebase/im303a-ft7_epoch6-19_sortformer_rebase.nemo'
-
-        if model_path.endswith('.nemo'):
-            pretrained_diar_model = SortformerEncLabelModel.restore_from(model_path, map_location="cpu")
-            logging.info("Diarization Model restored locally from {}".format(model_path))
-        elif model_path.endswith('.ckpt'):
-            pretrained_diar_model = SortformerEncLabelModel.load_from_checkpoint(model_path, map_location="cpu")
-            logging.info("Diarization Model restored locally from {}".format(model_path))
-        else:
-            pretrained_diar_model = None
-            logging.info("Model path incorrect")
-
-        self.diarization_model = pretrained_diar_model
+        
+        self.diarization_model = SortformerEncLabelModel(self.cfg.diar_model_cfg)
 
         if self.cfg.freeze_diar:
            self.diarization_model.eval()
