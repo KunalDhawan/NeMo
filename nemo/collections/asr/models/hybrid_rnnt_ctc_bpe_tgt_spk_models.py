@@ -109,73 +109,9 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
 
             #binarize diar_pred
             self.binarize_diar_preds_threshold = cfg.get('binarize_diar_preds_threshold', None)
-
-            # pre-encode level speaker kernel
-            if cfg.get('add_pre_encode_speaker_kernel', False):
-                self.add_pre_encode_speaker_kernel = True
-                self._init_pre_encode_speaker_kernel(cfg)
-            else:
-                self.add_pre_encode_speaker_kernel = False
         
         else:
             self.diar = False
-
-    def _init_pre_encode_speaker_kernel(self, cfg):
-            # layer normalization, ln, l2, or None
-        self.pre_end_spk_norm = cfg.get('pre_end_spk_norm', None)
-
-        if cfg.pre_end_spk_norm == 'ln':
-            self.pre_end_spk_asr_norm = torch.nn.LayerNorm(cfg.model_defaults.enc_hidden)
-            self.pre_end_spk_diar_norm = torch.nn.LayerNorm(4)
-
-        self.pre_end_spk_kernel_norm = cfg.get('pre_end_spk_kernel_norm',None)
-
-        # projection layer
-        self.pre_end_spk_diar_kernel_type = cfg.get('pre_end_spk_diar_kernel_type', None)
-
-        proj_in_size = self.num_speakers + cfg.model_defaults.enc_hidden
-        proj_out_size = cfg.model_defaults.enc_hidden
-        self.pre_end_spk_joint_proj = torch.nn.Sequential(
-            torch.nn.Linear(proj_in_size, proj_out_size*2),
-            torch.nn.ReLU(),
-            torch.nn.Linear(proj_out_size*2, proj_out_size)
-        )
-        self.pre_end_spk_diar_kernal = self.pre_end_spk_joint_proj
-
-        if self.pre_end_spk_diar_kernel_type == 'sinusoidal':
-            self.pre_end_spk_diar_kernel = self.get_sinusoid_position_encoding(self.num_speakers, cfg.model_defaults.enc_hidden)
-        elif self.pre_end_spk_diar_kernel_type == 'metacat':
-            # projection layer
-            proj_in_size = self.num_speakers * cfg.model_defaults.enc_hidden
-            proj_out_size = cfg.model_defaults.enc_hidden
-            self.pre_end_spk_joint_proj = torch.nn.Sequential(
-                torch.nn.Linear(proj_in_size, proj_out_size*2),
-                torch.nn.ReLU(),
-                torch.nn.Linear(proj_out_size*2, proj_out_size)
-            )
-            self.pre_end_spk_diar_kernel = self.pre_end_spk_joint_proj
-        elif self.pre_end_spk_diar_kernel_type == 'metacat_residule' or self.pre_end_spk_diar_kernel_type == 'metacat_residule_early':
-            # projection layer
-            proj_in_size = cfg.model_defaults.enc_hidden
-            proj_out_size = cfg.model_defaults.enc_hidden
-            self.pre_end_spk_joint_proj = torch.nn.Sequential(
-                torch.nn.Linear(proj_in_size, proj_out_size*2),
-                torch.nn.ReLU(),
-                torch.nn.Linear(proj_out_size*2, proj_out_size)
-            )
-            self.pre_end_spk_diar_kernel = self.pre_end_spk_joint_proj
-        elif self.diar_kernel_type == 'metacat_residule_projection':
-            proj_in_size = cfg.model_defaults.enc_hidden + self.num_speakers
-            proj_out_size = cfg.model_defaults.enc_hidden
-            self.pre_end_spk_joint_proj = torch.nn.Sequential(
-                torch.nn.Linear(proj_in_size, proj_out_size*2),
-                torch.nn.ReLU(),
-                torch.nn.Linear(proj_out_size*2, proj_out_size)
-            )
-            self.pre_end_spk_diar_kernel = self.pre_end_spk_joint_proj                
-
-        #binarize diar_pred
-        self.binarize_diar_preds_threshold = cfg.get('binarize_diar_preds_threshold', None)
 
     def _init_diar_model(self):
         """
@@ -705,61 +641,5 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
 
         encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
-        # import ipdb; ipdb.set_trace()
-        #encode speaker
-        if self.add_pre_encode_speaker_kernel and self.diar:
-            encoded = torch.transpose(encoded, 1, 2)
-            if(diar_preds.shape[1]!=encoded.shape[1]):
-            # KD duct-tape solution for extending the speaker predictions 
-                asr_frame_count = encoded.shape[1]
-                diar_preds = self.fix_diar_output(diar_preds, asr_frame_count)
-
-            # Normalize the features
-            if self.pre_end_spk_norm == 'ln':
-                diar_preds = self.pre_end_spk_diar_norm(diar_preds)
-                encoded = self.pre_end_spk_asr_norm(encoded)
-            elif self.pre_end_spk_norm == 'l2':
-                diar_preds = torch.nn.functional.normalize(diar_preds, p=2, dim=-1)
-                encoded = torch.nn.functional.normalize(encoded, p=2, dim=-1)
-            
-            if diar_preds.shape[1] > encoded.shape[1]:
-                diar_preds = diar_preds[:, :encoded.shape[1], :]
-
-            if self.pre_end_spk_diar_kernel_type == 'sinusoidal':
-                speaker_infusion_asr = torch.matmul(diar_preds, self.pre_end_spk_diar_kernel.to(diar_preds.device))
-                if self.kernel_norm == 'l2':
-                    speaker_infusion_asr = torch.nn.functional.normalize(speaker_infusion_asr, p=2, dim=-1)
-                encoded = speaker_infusion_asr + encoded
-            elif self.pre_end_spk_diar_kernel_type == 'metacat':
-                concat_enc_states = encoded.unsqueeze(2) * diar_preds.unsqueeze(3)
-                concat_enc_states = concat_enc_states.flatten(2,3)
-                encoded = self.pre_end_spk_joint_proj(concat_enc_states)
-            elif self.pre_end_spk_diar_kernel_type == 'metacat_residule':
-                #only pick speaker 0
-                concat_enc_states = encoded.unsqueeze(2) * diar_preds[:,:,:1].unsqueeze(3)
-                concat_enc_states = concat_enc_states.flatten(2,3)
-                encoded = encoded + self.pre_end_spk_joint_proj(concat_enc_states)    
-            elif self.pre_end_spk_diar_kernel_type == 'metacat_residule_early':
-                #only pick speaker 0
-                concat_enc_states = encoded.unsqueeze(2) * diar_preds[:,:,:1].unsqueeze(3)
-                concat_enc_states = concat_enc_states.flatten(2,3)
-                encoded = self.pre_end_spk_joint_proj(encoded + concat_enc_states)
-            elif self.pre_end_spk_diar_kernel_type == 'metacat_residule_projection':
-                #only pick speaker 0 and add diar_preds
-                concat_enc_states = encoded.unsqueeze(2) * diar_preds[:,:,:1].unsqueeze(3)
-                concat_enc_states = concat_enc_states.flatten(2,3)
-                encoded = encoded + concat_enc_states
-                concat_enc_states = torch.cat([encoded, diar_preds], dim = -1)
-                encoded = self.pre_end_spk_joint_proj(concat_enc_states)
-            else:
-                #projection
-                concat_enc_states = torch.cat([encoded, diar_preds], dim=-1)
-                encoded = self.pre_end_spk_joint_proj(concat_enc_states)
-            encoded = torch.transpose(encoded, 1, 2) # B * T * D -> B * D * T
-            
-        else:
-            encoded = encoded
         
-
-
         return encoded, encoded_len
