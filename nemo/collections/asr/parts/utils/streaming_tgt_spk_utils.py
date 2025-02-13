@@ -124,9 +124,9 @@ class FrameBatchASR_tgt_spk:
     def get_partial_samples(self, audio_file: str, offset: float, duration: float, target_sr: int = 16000, dtype: str = 'float32'):
         try:
             with sf.SoundFile(audio_file, 'r') as f:
-                start = int(offset * target_sr)
+                start = int(offset * f.samplerate)
                 f.seek(start)
-                end = int((offset + duration) * target_sr)
+                end = int((offset + duration) * f.samplerate)
                 samples = f.read(dtype=dtype, frames = end - start)
                 if f.samplerate != target_sr:
                     samples = librosa.core.resample(samples, orig_sr=f.samplerate, target_sr=target_sr)

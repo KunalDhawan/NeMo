@@ -46,6 +46,8 @@ def get_query_cut(cut):
     '''    
     if 'query_audio_filepath' in cut.custom:
         query_rec = Recording.from_file(cut.query_audio_filepath)
+        if query_rec.sampling_rate != 16000:
+            query_rec = query_rec.resample(sampling_rate=16000)
         query_sups = [SupervisionSegment(id=query_rec.id+'_query'+str(cut.query_offset)+'-'+str(cut.query_offset + cut.query_duration), recording_id = query_rec.id, start = 0, duration = cut.query_duration, speaker = cut.query_speaker_id)]
         query_cut = MonoCut(id = query_rec.id +'_query'+str(cut.query_offset)+'-'+str(cut.query_offset + cut.query_duration),
                             start = cut.query_offset,
