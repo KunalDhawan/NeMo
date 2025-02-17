@@ -56,7 +56,7 @@ class SortformerModules(NeuralModule, Exportable):
         tf_d_model: int = 192,
         subsampling_factor: int = 8,
         mem_len: int = 188,
-        fifo_len: int = 0,  
+        fifo_len: int = 0,
         step_len: int = 376,
         mem_refresh_rate: int = 1,
         use_memory_pe: bool = False,
@@ -68,6 +68,8 @@ class SortformerModules(NeuralModule, Exportable):
         use_causal_eval: bool = False,
         scores_add_rnd: float = 0,
         init_step_len: int = 999,
+        last_frames_num: int = 12,
+        last_frames_weight: int = 1,
     ):
         super().__init__()
         self.mem_sil_frames_per_spk = mem_sil_frames_per_spk
@@ -95,6 +97,8 @@ class SortformerModules(NeuralModule, Exportable):
         self.use_causal_eval = use_causal_eval
         self.scores_add_rnd = scores_add_rnd
         self.init_step_len = init_step_len
+        self.last_frames_num = last_frames_num
+        self.last_frames_weight = last_frames_weight
 
     def length_to_mask(self, lengths, max_length):
         """

@@ -439,11 +439,12 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         processed_signal, processed_signal_length = self.process_signal(audio_signal=audio_signal, audio_signal_length=audio_signal_length)
         processed_signal = processed_signal[:, :, :processed_signal_length.max()]
         if self.streaming_mode:
-            preds = self.forward_streaming(processed_signal, processed_signal_length)
+            preds, weights = self.forward_streaming(processed_signal, processed_signal_length)
         else:
             emb_seq, emb_seq_length = self.frontend_encoder(processed_signal=processed_signal, processed_signal_length=processed_signal_length)
             preds = self.forward_infer(emb_seq, emb_seq_length)
-        return preds
+            weights = None
+        return preds, weights
 
     @property
     def output_names(self):
@@ -484,6 +485,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         MEM_PREDS = None # memory predictions
         FIFO_QUEUE = None # memory to save the embedding from the latest chunks
         total_pred = None
+        total_weight = None
         spk_perm = None
 
         B, C, T = processed_signal.shape
@@ -516,7 +518,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         feat_len = processed_signal.shape[2]
         num_chunks = math.ceil(feat_len / (self.sortformer_modules.step_len * self.sortformer_modules.subsampling_factor))
         for (step_idx, chunk_feat_seq_t, feat_lengths, left_offset, right_offset) in tqdm(self.sortformer_modules.streaming_feat_loader(feat_seq=processed_signal, feat_seq_length=processed_signal_length), total=num_chunks, desc="Streaming Steps"):
-            MEM, FIFO_QUEUE, MEM_PREDS, _, total_pred, spk_perm = self.forward_streaming_step(
+            MEM, FIFO_QUEUE, MEM_PREDS, _, total_pred, spk_perm, total_weight = self.forward_streaming_step(
                 processed_signal=chunk_feat_seq_t,
                 processed_signal_length=feat_lengths,
                 fifo_last_time=FIFO_QUEUE,
@@ -526,6 +528,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 previous_spk_perm=spk_perm,
                 left_offset=left_offset,
                 right_offset=right_offset,
+                previous_weight=total_weight,
             )
 
         if att_mod:
@@ -539,7 +542,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         if T < max_T: #discard preds corresponding to padding
             n_frames = math.ceil(T / self.encoder.subsampling_factor)
             total_pred = total_pred[:,:n_frames,:]
-        return total_pred
+            total_weight = total_weight[:,:n_frames,:]
+        return total_pred, total_weight
 
     def forward_streaming_step(
         self,
@@ -549,6 +553,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         mem_last_time=None,
         mem_preds_last_time=None,
         previous_pred_out=None,
+        previous_weight=None,
         previous_spk_perm=None,
         left_offset=0,
         right_offset=0,
@@ -593,6 +598,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             fifo_last_time = self.sortformer_modules.init_memory(batch_size=B, d_model=self.sortformer_modules.fc_d_model, device=self.device)# memory to save the embedding from the latest chunks
         if previous_pred_out is None:
             previous_pred_out = self.sortformer_modules.init_memory(batch_size=B, d_model=self.sortformer_modules.unit_n_spks, device=self.device)
+        if previous_weight is None:
+            previous_weight  = self.sortformer_modules.init_memory(batch_size=B, d_model=self.sortformer_modules.unit_n_spks, device=self.device)
 
         chunk_pre_encode_embs, chunk_pre_encode_lengths = self.encoder.pre_encode(x=processed_signal, lengths=processed_signal_length)
 
@@ -614,17 +621,30 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             chunk_right_offset=math.ceil(right_offset / self.encoder.subsampling_factor),
         )
 
+        chunk_lengths = chunk_pre_encode_lengths - round(left_offset / self.encoder.subsampling_factor)
+        chunk_lengths = torch.clamp(chunk_lengths, min=0)
+        chunk_weights = self.sortformer_modules.length_to_mask(chunk_lengths, chunk_preds.shape[1]).int()
+
+        fz_index = torch.sum(chunk_weights, dim=1)
+        for b in range(chunk_weights.shape[0]):
+            beg = max(fz_index[b].item()-self.sortformer_modules.last_frames_num,0)
+            end = fz_index[b].item()
+            chunk_weights[b, beg:end] *= self.sortformer_modules.last_frames_weight
+
+#        logging.info(f"chunk_lengths={chunk_lengths}, chunk_weights shape: {chunk_weights.shape}, chunk_weights: {chunk_weights}")
+        chunk_weights = chunk_weights.unsqueeze(-1).expand(-1,-1,chunk_preds.shape[2])
         total_step_preds = torch.cat([previous_pred_out, chunk_preds], dim=1)
+        total_step_weights = torch.cat([previous_weight, chunk_weights], dim=1)
 
         if not self.training and self.sortformer_modules.visualization:
             self.chunk_preds_list.append(chunk_preds.detach().cpu().numpy())
             self.fifo_preds_list.append(fifo_preds.detach().cpu().numpy())
             self.mem_preds_list.append(mem_preds.detach().cpu().numpy())
 
-        return mem, fifo, mem_preds, fifo_preds, total_step_preds, spk_perm
+        return mem, fifo, mem_preds, fifo_preds, total_step_preds, spk_perm, total_step_weights
 
 
-    def _get_aux_train_evaluations(self, preds, targets, target_lens) -> dict:
+    def _get_aux_train_evaluations(self, preds, targets, target_lens, weights=None) -> dict:
         """
         Compute auxiliary training evaluations including losses and metrics.
 
@@ -645,8 +665,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         """
         targets_ats = get_ats_targets(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
         targets_pil = get_pil_targets(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
-        ats_loss = self.loss(probs=preds, labels=targets_ats, target_lens=target_lens)
-        pil_loss = self.loss(probs=preds, labels=targets_pil, target_lens=target_lens)
+        ats_loss = self.loss(probs=preds, labels=targets_ats, target_lens=target_lens, weights=weights)
+        pil_loss = self.loss(probs=preds, labels=targets_pil, target_lens=target_lens, weights=weights)
         loss = self.ats_weight * ats_loss + self.pil_weight * pil_loss
 
         self._accuracy_train(preds, targets_pil, target_lens)
@@ -683,13 +703,13 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             (dict): A dictionary containing the 'loss' key with the calculated loss value.
         """
         audio_signal, audio_signal_length, targets, target_lens = batch
-        preds = self.forward(audio_signal=audio_signal, audio_signal_length=audio_signal_length)
-        train_metrics = self._get_aux_train_evaluations(preds, targets, target_lens)
+        preds, weights = self.forward(audio_signal=audio_signal, audio_signal_length=audio_signal_length)
+        train_metrics = self._get_aux_train_evaluations(preds, targets, target_lens, weights)
         self._reset_train_metrics()
         self.log_dict(train_metrics, sync_dist=True, on_step=True, on_epoch=False, logger=True)
         return {'loss': train_metrics['loss']}
 
-    def _get_aux_validation_evaluations(self, preds, targets, target_lens) -> dict:
+    def _get_aux_validation_evaluations(self, preds, targets, target_lens, weights=None) -> dict:
         """
         Compute auxiliary validation evaluations including losses and metrics.
 
@@ -711,8 +731,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         targets_ats = get_ats_targets(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
         targets_pil = get_pil_targets(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
 
-        val_ats_loss = self.loss(probs=preds, labels=targets_ats, target_lens=target_lens)
-        val_pil_loss = self.loss(probs=preds, labels=targets_pil, target_lens=target_lens)
+        val_ats_loss = self.loss(probs=preds, labels=targets_ats, target_lens=target_lens, weights=weights)
+        val_pil_loss = self.loss(probs=preds, labels=targets_pil, target_lens=target_lens, weights=weights)
         val_loss = self.ats_weight * val_ats_loss + self.pil_weight * val_pil_loss
 
         self._accuracy_valid(preds, targets_pil, target_lens)
@@ -757,11 +777,11 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             dict: A dictionary containing various validation metrics for this batch.
         """
         audio_signal, audio_signal_length, targets, target_lens = batch
-        preds = self.forward(
+        preds, weights = self.forward(
             audio_signal=audio_signal,
             audio_signal_length=audio_signal_length,
         )
-        val_metrics = self._get_aux_validation_evaluations(preds, targets, target_lens)
+        val_metrics = self._get_aux_validation_evaluations(preds, targets, target_lens, weights)
         if isinstance(self.trainer.val_dataloaders, list) and len(self.trainer.val_dataloaders) > 1:
             self.validation_step_outputs[dataloader_idx].append(val_metrics)
         else:
@@ -851,7 +871,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 audio_signal = audio_signal.to(self.device)
                 audio_signal_length = audio_signal_length.to(self.device)
                 targets = targets.to(self.device)
-                preds = self.forward(
+                preds, _ = self.forward(
                     audio_signal=audio_signal,
                     audio_signal_length=audio_signal_length,
                 )

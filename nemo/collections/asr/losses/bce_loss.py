@@ -20,7 +20,6 @@ from nemo.core.neural_types import LabelsType, LengthsType, LossType, NeuralType
 
 __all__ = ['BCELoss']
 
-
 class BCELoss(Loss, Typing):
     """
     Computes Binary Cross Entropy (BCE) loss. The BCELoss class expects output from Sigmoid function.
@@ -33,6 +32,7 @@ class BCELoss(Loss, Typing):
             "probs": NeuralType(('B', 'T', 'C'), ProbsType()),
             'labels': NeuralType(('B', 'T', 'C'), LabelsType()),
             "target_lens": NeuralType(('B'), LengthsType()),
+            "weights": NeuralType(('B', 'T', 'C'), LabelsType()),
         }
 
     @property
@@ -69,7 +69,7 @@ class BCELoss(Loss, Typing):
         if class_normalization:
             self.reduction = 'none'
         else:
-            self.reduction = 'mean'
+            self.reduction = reduction
         self.loss_weight = weight
         self.loss_f = torch.nn.BCELoss(reduction=self.reduction)
         self.sorted_preds = sorted_preds
@@ -77,7 +77,7 @@ class BCELoss(Loss, Typing):
         self.eps = 1e-6
 
     @typecheck()
-    def forward(self, probs, labels, target_lens):
+    def forward(self, probs, labels, target_lens, weights=None):
         """
         Calculate binary cross entropy loss based on probs, labels and target_lens variables.
 
@@ -95,6 +95,10 @@ class BCELoss(Loss, Typing):
         """
         probs_list = [probs[k, : target_lens[k], :] for k in range(probs.shape[0])]
         targets_list = [labels[k, : target_lens[k], :] for k in range(labels.shape[0])]
+        if weights is not None:
+            weights_list = [weights[k, : target_lens[k], :] for k in range(labels.shape[0])]
+            weights = torch.cat(weights_list, dim=0)
+
         probs = torch.cat(probs_list, dim=0)
         labels = torch.cat(targets_list, dim=0)
         norm_weight = torch.zeros_like(labels).detach().clone()
@@ -128,7 +132,10 @@ class BCELoss(Loss, Typing):
         elif self.reduction == 'mean':
             loss = self.loss_f(probs, labels).mean()
         elif self.reduction == 'none':
-            if self.class_normalization in ['class', 'class_binary', 'binary']:
+            if weights is not None:
+                loss = self.loss_f(probs, labels) * weights
+                loss = loss.sum() / weights.sum()
+            elif self.class_normalization in ['class', 'class_binary', 'binary']:
                 loss = (binary_weight * norm_weight * self.loss_f(probs, labels)).sum()
             else:
                 loss = self.loss_f(probs, labels)
