@@ -110,8 +110,11 @@ class LhotseSpeechToTextQueryDiarTgtSpkBpeDataset(torch.utils.data.Dataset):
                 audio_w_query = collate_vectors(concat_list, padding_value = 0)
                 audio_w_query_lens = audio_lens + query_audio_lens + self.separater_duration * self.cfg.sample_rate
             else:
-                audio = torch.cat([query_audio, audio], axis = 1)
-                audio_lens = audio_lens + query_audio_lens
+                concat_list = []
+                for i in range(len(audio)):
+                    concat_list.append(torch.cat([query_audio[i,:query_audio_lens[i]],audio[i,:audio_lens[i]]]))
+                audio_w_query = collate_vectors(concat_list, padding_value = 0)
+                audio_w_query_lens = audio_lens + query_audio_lens
         if self.add_special_token:
             tokens = [torch.as_tensor(self.tokenizer(self.special_token + ' ' + c.supervisions[0].text, c.supervisions[0].language)) for c in cuts]
         else:

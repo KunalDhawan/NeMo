@@ -596,6 +596,12 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
             'spk_tar_all_zero': self.cfg.test_ds.get('spk_tar_all_zero',False),
             'num_sample_per_mel_frame': self.cfg.test_ds.get('num_sample_per_mel_frame',160),
             'num_mel_frame_per_asr_frame': self.cfg.test_ds.get('num_mel_frame_per_asr_frame',8),
+            'add_separater_audio': self.cfg.test_ds.get('add_separater_audio',True),
+            'separater_freq': self.cfg.test_ds.get('separater_freq',500),
+            'separater_duration': self.cfg.test_ds.get('separater_duration',1),
+            'separater_unvoice_ratio': self.cfg.test_ds.get('separater_unvoice_ratio', 0.3),
+            'fix_query_audio_end_time': self.cfg.test_ds.get('fix_query_audio_end_time', False),
+            'add_special_token': self.cfg.test_ds.get('add_special_token', True),
             'shuffle_spk_mapping': self.cfg.test_ds.get('shuffle_spk_mapping',False),
             'inference_mode': self.cfg.test_ds.get('inference_mode', True)
         }

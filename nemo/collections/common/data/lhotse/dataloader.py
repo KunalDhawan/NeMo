@@ -271,6 +271,9 @@ def get_lhotse_dataloader_from_config(
                     simulated_cuts += simulator.simulate(cuts_for_simulation, num_meetings=simulator_config.num_meetings, num_jobs=1, seed=global_rank*world_size+seed)
                 else:
                     raise ValueError('Invalid ms_data_type, chosen from msasr / tsasr')
+            logging.info(
+                f"Adding Simulated Cuts, size {len(simulated_cuts)}"
+            )
         if config.including_real_data:
             # cuts = CutSet.from_cuts(cuts + simulated_cuts)
             # only support uniform sampling, self-defined sampling TODO
