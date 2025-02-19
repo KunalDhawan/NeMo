@@ -98,8 +98,12 @@ class LhotseSpeechToTextTgtSpkBpeDataset(torch.utils.data.Dataset):
             spk_targets = [torch.transpose(torch.zeros(self.num_speakers, get_hidden_length_from_sample_length(cut.num_samples, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame)), 0, 1) for cut in cuts]
             audio, audio_lens, cuts = self.load_audio(cuts)
         else:
-            query_cuts = CutSet.from_cuts(get_query_cut(c) for c in cuts)        
-            spk_targets = [torch.transpose(torch.as_tensor(self.speaker_to_target_tgt_speaker_0(c, q, self.num_speakers, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame, self.spk_tar_all_zero), dtype=torch.float32), 0, 1) for c, q in zip(cuts,query_cuts)]
+            query_cuts = CutSet.from_cuts(get_query_cut(c) for c in cuts)
+            # if cuts[0].rttm_filepath is None or (not hasattr(cuts[0], 'rttm_filepath')):
+                #if rttm file is not provided, set spk_targets to be all zero
+            spk_targets = [torch.transpose(torch.zeros(self.num_speakers, get_hidden_length_from_sample_length(c.num_samples + q.num_samples + self.separater_duration * cuts[0].sampling_rate, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame)), 0, 1) for c, q in zip(cuts, query_cuts)]
+            # else:         
+            #     spk_targets = [torch.transpose(torch.as_tensor(self.speaker_to_target_tgt_speaker_0(c, q, self.num_speakers, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame, self.spk_tar_all_zero), dtype=torch.float32), 0, 1) for c, q in zip(cuts,query_cuts)]
             audio, audio_lens, cuts = self.load_audio(cuts)
             query_audio, query_audio_lens, query_cuts = self.load_audio(query_cuts)
             if self.add_separater_audio:
