@@ -528,7 +528,7 @@ def guess_parse_cutset(inp: Union[str, dict, omegaconf.DictConfig]) -> CutSet:
     if isinstance(inp, (dict, omegaconf.DictConfig)):
         try:
             config = make_structured_with_schema_warnings(OmegaConf.from_dotlist([f"{k}={v}" for k, v in inp.items()]))
-            cuts, _ = read_cutset_from_config(config)
+            cuts, _, _ = read_cutset_from_config(config)
             return cuts
         except Exception as e:
             raise RuntimeError(
@@ -544,7 +544,7 @@ def guess_parse_cutset(inp: Union[str, dict, omegaconf.DictConfig]) -> CutSet:
         else:
             # Assume anything else is a NeMo non-tarred manifest
             config = make_structured_with_schema_warnings(OmegaConf.from_dotlist([f"manifest_filepath={inp}"]))
-        cuts, _ = read_cutset_from_config(config)
+        cuts, _, _ = read_cutset_from_config(config)
         return cuts
     else:
         raise RuntimeError(f'Unsupported input type: {type(inp)} (expected a dict or a string)')

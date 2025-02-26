@@ -43,6 +43,8 @@ from nemo.collections.asr.parts.utils.asr_tgtspeaker_utils import (
     get_query_cut
 )
 
+from nemo.collections.common.data.lhotse.cutset import guess_parse_cutset 
+
 class LhotseSpeechToTextTgtSpkBpeDataset(torch.utils.data.Dataset):
     """
     This dataset is based on BPE datasets from audio_to_text.py. It has the same functionality of LhotseSpeechToTextBpeDataset but also yield speaker target tensor.
@@ -88,6 +90,11 @@ class LhotseSpeechToTextTgtSpkBpeDataset(torch.utils.data.Dataset):
         if self.fix_query_audio_end_time:
             self.query_audio_end_time = 10
         self.inference_mode = self.cfg.get('inference_mode', False)
+        self.query_noise_path = self.cfg.get('query_noise_path',None)
+        if self.query_noise_path:
+            self.query_noise_cut = guess_parse_cutset(self.query_noise_path)
+            self.query_noise_mix_prob = self.cfg.get('query_noise_mix_prob', 0.3)
+            self.query_snr = tuple(self.cfg.get('query_snr',(2.5, 12.5)))
     
 
     def __getitem__(self, cuts) -> Tuple[torch.Tensor, ...]:
@@ -98,7 +105,13 @@ class LhotseSpeechToTextTgtSpkBpeDataset(torch.utils.data.Dataset):
             spk_targets = [torch.transpose(torch.zeros(self.num_speakers, get_hidden_length_from_sample_length(cut.num_samples, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame)), 0, 1) for cut in cuts]
             audio, audio_lens, cuts = self.load_audio(cuts)
         else:
-            query_cuts = CutSet.from_cuts(get_query_cut(c) for c in cuts)        
+            query_cuts = CutSet.from_cuts(get_query_cut(c) for c in cuts)
+            if self.query_noise_path:
+                query_cuts = query_cuts.mix(self.query_noise_cut, 
+                                            preserve_id = 'left',
+                                            snr = self.query_snr,
+                                            mix_prob = self.query_noise_mix_prob,
+                                            random_mix_offset = True)
             spk_targets = [torch.transpose(torch.as_tensor(self.speaker_to_target_tgt_speaker_0(c, q, self.num_speakers, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame, self.spk_tar_all_zero), dtype=torch.float32), 0, 1) for c, q in zip(cuts,query_cuts)]
             audio, audio_lens, cuts = self.load_audio(cuts)
             query_audio, query_audio_lens, query_cuts = self.load_audio(query_cuts)

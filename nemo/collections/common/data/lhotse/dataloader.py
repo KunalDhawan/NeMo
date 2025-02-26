@@ -258,6 +258,7 @@ def get_lhotse_dataloader_from_config(
                         if simulator_config.get('save_to',None):
                             lsmix_cuts.to_jsonl(simulator_config.save_to)
                     simulated_cuts += lsmix_cuts
+                    del lsmix_cuts
                 elif simulator_config.ms_data_type == 'msasr':
                     #MS-ASR
                     simulator = LibriSpeechMixSimulator(
