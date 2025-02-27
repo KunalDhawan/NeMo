@@ -413,8 +413,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             input_signal=audio_signal, length=audio_signal_length
         )
         del audio_signal, audio_signal_length
-        if not self.training:
-            torch.cuda.empty_cache()
+        
         return processed_signal, processed_signal_length
 
     def forward(
