@@ -466,7 +466,7 @@ def write_transcription_to_seglst(
     output_jsons = []
     n_mix = cfg.mix
 
-    transcriptions = [tran for batch in transcriptions for tran in batch]
+    # transcriptions = [tran for batch in transcriptions for tran in batch]
     transcriptions = [transcriptions[i:i+n_mix] for i in range(0, len(transcriptions), n_mix)]
     for i in range(len(transcriptions)):
         audio_path = filepaths[i]
