@@ -1353,14 +1353,33 @@ class MultiSpeakerSimulator():
         cuts, 
         num_speakers, 
         simulator_type,
+        speaker_distribution,
         min_delay=0.5,
     ):
+        """
+        Args:
+            cuts (CutSet): The cutset that contains single-speaker audio cuts.
+                Please make sure that the cuts have the 'speaker_id' attribute.                    
+            num_speakers (int): The maximumnumber of speakers in the simulated audio.
+            simulator_type (str): The type of simulator to use.
+                - 'lsmix': LibriSpeechMix-style training sample.
+                - 'meeting': Meeting-style training sample.
+                - 'conversation': Conversation-style training sample.
+            speaker_distribution (list): The distribution of speakers in the simulated audio.
+                The length of the list is the maximum number of speakers.
+                The list elements are the weights for each speaker.
+            min_delay (float): The minimum delay between speakers
+                to avoid the same starting time for multiple speakers.
+        """
+    
         self.cuts = cuts
         self.min_delay = min_delay
         self.num_speakers = num_speakers
         self.simulator_type = simulator_type
+        assert len(speaker_distribution) == num_speakers, f"The length of speaker_distribution {len(speaker_distribution)} must be equal to num_speakers {num_speakers}"
+        self.speaker_distribution = [spk_dist / sum(speaker_distribution) for spk_dist in speaker_distribution]
 
-        logging.info(f"Grouping cuts by speaker_id...")
+        logging.info(f"Grouping cuts by speaker_id, this may take a few minutes...")
         self.spk_to_cuts = groupby(lambda x: x.speaker_id, self.cuts)
         self.speaker_ids = list(self.spk_to_cuts.keys())
         logging.info(f"Grouping cuts by speaker_id done.")
@@ -1368,9 +1387,9 @@ class MultiSpeakerSimulator():
         if simulator_type == 'lsmix':    
             self.simulator = self.LibriSpeechMixSimulator
         elif simulator_type == 'meeting':
-            self.simulator = None
+            self.simulator = self.MeetingSimulator
         elif simulator_type == 'conversation':
-            self.simulator = None
+            self.simulator = self.ConversationSimulator
 
     def __iter__(self):
         return self
@@ -1379,7 +1398,17 @@ class MultiSpeakerSimulator():
         return self.simulator()
 
     def LibriSpeechMixSimulator(self):
-        sampled_speaker_ids = random.sample(self.speaker_ids, self.num_speakers)
+        """
+        This function simulates a LibriSpeechMix-style training sample.
+        Ref:
+            Paper: https://arxiv.org/abs/2003.12687
+            Github: https://github.com/NaoyukiKanda/LibriSpeechMix
+        """
+        # Determine the number of speakers based on the speaker distribution
+        num_speakers = random.choices(range(self.num_speakers), weights=self.speaker_distribution, k=1)[0] + 1
+        # Sample the speakers
+        sampled_speaker_ids = random.sample(self.speaker_ids, num_speakers)
+        # Sample the cuts for each speaker
         mono_cuts = []
         for speaker_id in sampled_speaker_ids:
             cut = random.choice(self.spk_to_cuts[speaker_id])
@@ -1400,24 +1429,10 @@ class MultiSpeakerSimulator():
     
         mixed_cut = MixedCut(id='lsmix_' + '_'.join([track.cut.id for track in tracks]) + '_' + str(uuid4()), tracks=tracks)
         
-        # if self.data_type == "msasr":
-        #     # text = self.get_text(mixed_cut, speaker_token_position=self.speaker_token_position)
-        #     text = mono_cuts[0].text
-        #     sup = SupervisionSegment(id=mixed_cut.id, recording_id=mixed_cut.id, start=0, duration=mixed_cut.duration, text=text)
-        #     mixed_cut.tracks[0].cut.supervisions = [sup]
-
-        # if self.data_type == "tsasr":
-        #     query_speaker_id = random.choice(sampled_speaker_ids)
-        #     query_audio_path = random.choice(self.speaker_id2cut_ids[query_speaker_id])
-        #     pass # TODO: need to implement the query audio path
-
-        # if self.data_type == "diar":
-        #     pass # TODO: need to implement the diar data type
-        
         return mixed_cut
 
     def MeetingSimulator(self):
-        pass
+        raise NotImplementedError("MeetingSimulator is not implemented yet.")   
 
     def ConversationSimulator(self):
-        pass
+        raise NotImplementedError("ConversationSimulator is not implemented yet.")
