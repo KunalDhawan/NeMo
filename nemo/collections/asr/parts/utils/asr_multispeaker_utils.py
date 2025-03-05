@@ -1342,3 +1342,82 @@ def speaker_to_target(
         mask = (soft_mask > soft_thres).float()
 
     return mask
+
+class MultiSpeakerSimulator():
+    """
+    This class is used to simulate multi-speaker audio data,
+    which can be used for multi-speaker ASR and speaker diarization training.
+    """
+    def __init__(
+        self, 
+        cuts, 
+        num_speakers, 
+        simulator_type,
+        min_delay=0.5,
+    ):
+        self.cuts = cuts
+        self.min_delay = min_delay
+        self.num_speakers = num_speakers
+        self.simulator_type = simulator_type
+
+        logging.info(f"Grouping cuts by speaker_id...")
+        self.spk_to_cuts = groupby(lambda x: x.speaker_id, self.cuts)
+        self.speaker_ids = list(self.spk_to_cuts.keys())
+        logging.info(f"Grouping cuts by speaker_id done.")
+
+        if simulator_type == 'lsmix':    
+            self.simulator = self.LibriSpeechMixSimulator
+        elif simulator_type == 'meeting':
+            self.simulator = None
+        elif simulator_type == 'conversation':
+            self.simulator = None
+
+    def __iter__(self):
+        return self
+    
+    def __next__(self):
+        return self.simulator()
+
+    def LibriSpeechMixSimulator(self):
+        sampled_speaker_ids = random.sample(self.speaker_ids, self.num_speakers)
+        mono_cuts = []
+        for speaker_id in sampled_speaker_ids:
+            cut = random.choice(self.spk_to_cuts[speaker_id])
+            mono_cuts.append(cut)
+
+        tracks = []
+        offset = 0.0
+        for mono_cut in mono_cuts:
+            custom = {
+                    'pnc': 'no',
+                    'source_lang': 'en',
+                    'target_lang': 'en',
+                    'task': 'asr'
+                }
+            mono_cut.custom.update(custom)
+            tracks.append(MixTrack(cut=deepcopy(mono_cut), type=type(mono_cut), offset=offset))
+            offset += random.uniform(self.min_delay, mono_cut.duration)
+    
+        mixed_cut = MixedCut(id='lsmix_' + '_'.join([track.cut.id for track in tracks]) + '_' + str(uuid4()), tracks=tracks)
+        
+        # if self.data_type == "msasr":
+        #     # text = self.get_text(mixed_cut, speaker_token_position=self.speaker_token_position)
+        #     text = mono_cuts[0].text
+        #     sup = SupervisionSegment(id=mixed_cut.id, recording_id=mixed_cut.id, start=0, duration=mixed_cut.duration, text=text)
+        #     mixed_cut.tracks[0].cut.supervisions = [sup]
+
+        # if self.data_type == "tsasr":
+        #     query_speaker_id = random.choice(sampled_speaker_ids)
+        #     query_audio_path = random.choice(self.speaker_id2cut_ids[query_speaker_id])
+        #     pass # TODO: need to implement the query audio path
+
+        # if self.data_type == "diar":
+        #     pass # TODO: need to implement the diar data type
+        
+        return mixed_cut
+
+    def MeetingSimulator(self):
+        pass
+
+    def ConversationSimulator(self):
+        pass
