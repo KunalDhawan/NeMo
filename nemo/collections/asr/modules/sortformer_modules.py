@@ -56,7 +56,7 @@ class SortformerModules(NeuralModule, Exportable):
         tf_d_model: int = 192,
         subsampling_factor: int = 8,
         mem_len: int = 188,
-        fifo_len: int = 0,  
+        fifo_len: int = 188,  
         step_len: int = 376,
         mem_refresh_rate: int = 1,
         use_memory_pe: bool = False,
@@ -86,28 +86,28 @@ class SortformerModules(NeuralModule, Exportable):
         self.visualization: bool = False
         self.log = False
 
-    def length_to_mask(self, context_embs):
+    def length_to_mask(self, emb_lengths, max_len=None):
         """
         Convert length values to encoder mask input tensor.
 
         Args:
-            lengths (torch.Tensor): tensor containing lengths of sequences
-            max_len (int): maximum sequence length
+            emb_lengths (torch.Tensor): tensor containing lengths of the sequences
 
         Returns:
             mask (torch.Tensor): tensor of shape (batch_size, max_len) containing 0's
                                 in the padded region and 1's elsewhere
         """
-        lengths = torch.tensor([context_embs.shape[1]] * context_embs.shape[0])
-        batch_size = context_embs.shape[0]
-        max_len = context_embs.shape[1]
-        # create a tensor with the shape (batch_size, 1) filled with ones
-        row_vector = torch.arange(max_len).unsqueeze(0).expand(batch_size, -1).to(lengths.device)
+        batch_size = emb_lengths.shape[0]
+        if max_len is None:
+            max_len = int(emb_lengths.max().item())
+
+        # create a tensor with the shape (batch_size, max_len) with rows filled with consecutive nums upto max len
+        row_vector = torch.arange(max_len).unsqueeze(0).expand(batch_size, -1).to(emb_lengths.device)
         # create a tensor with the shape (batch_size, max_len) filled with lengths
-        length_matrix = lengths.unsqueeze(1).expand(-1, max_len).to(lengths.device)
+        length_matrix = emb_lengths.unsqueeze(1).expand(-1, max_len).to(emb_lengths.device)
         # create a mask by comparing the row vector and length matrix
         mask = row_vector < length_matrix
-        return mask.float().to(context_embs.device)
+        return mask.float().to(emb_lengths.device)
     
     def streaming_feat_loader(self, feat_seq):
         """
@@ -163,7 +163,7 @@ class SortformerModules(NeuralModule, Exportable):
     def init_memory(self, batch_size, d_model=192, device=None):
         return torch.zeros(batch_size, 0, d_model).to(device)
 
-    def update_memory_FIFO(self, mem, fifo, chunk, preds, chunk_left_offset=0, chunk_right_offset=0):
+    def update_memory_FIFO(self, mem, mem_length, fifo, fifo_length, chunk, chunk_length, preds, chunk_left_offset, chunk_right_offset):
         """
         update the FIFO queue and memory buffer with the chunk of embeddings and speaker predictions
         Args:
@@ -179,55 +179,52 @@ class SortformerModules(NeuralModule, Exportable):
                 only the chunk[:, chunk_left_offset:chunk_len+chunk_left_offset] is used for FIFO queue
 
         Returns:
+            chunk_preds (torch.Tensor): speaker predictions of the chunk embeddings
+                Dimension: (batch_size, chunk_len, num_spks)
             mem (torch.Tensor): updated memory buffer
                 Dimension: (batch_size, mem_len, emb_dim)
             fifo (torch.Tensor): updated FIFO queue
                 Dimension: (batch_size, fifo_len, emb_dim)
-            chunk_preds (torch.Tensor): speaker predictions of the chunk embeddings
-                Dimension: (batch_size, chunk_len, num_spks)
         """
+
+        mem = mem.unsqueeze(0).to(chunk.device)
+        fifo = fifo.unsqueeze(0).to(chunk.device)
+        chunk = chunk.unsqueeze(0).to(chunk.device)
+        preds = preds.unsqueeze(0).to(chunk.device)
+
+        chunk_len_orig = chunk.shape[1]
 
         B, T, D = mem.shape
 
         lc, rc = chunk_left_offset, chunk_right_offset
-        mem_len, fifo_len, chunk_len = mem.shape[1], fifo.shape[1], chunk.shape[1] - lc - rc
+        mem_len, fifo_len, chunk_len = mem_length, fifo_length, (chunk_length - lc - rc)
 
+        mem = mem[:, :mem_len]
+        fifo = fifo[:, :fifo_len]
         mem_preds, fifo_preds = preds[:, :mem_len], preds[:, mem_len:mem_len + fifo_len]
+
         chunk = chunk[:, lc:chunk_len + lc]
         chunk_preds = preds[:, mem_len + fifo_len + lc:mem_len + fifo_len + chunk_len + lc]
 
-        if self.fifo_len == 0:
-            assert fifo_len == self.fifo_len
-            pop_out_embs, pop_out_preds = chunk, chunk_preds
-        else:
-            fifo = torch.cat([fifo, chunk], dim=1)
-            if fifo.size(1) <= self.fifo_len:
-                pop_out_embs, pop_out_preds = self.init_memory(B, D, mem.device), self.init_memory(B, self.unit_n_spks, mem.device)
-            else:
-                if self.mem_refresh_rate == 0: # clear fifo queue when it reaches the max_fifo_len and update memory buffer
-                    pop_out_embs  = fifo[:, :fifo_len]
-                    pop_out_preds = fifo_preds
-                    fifo = self.init_memory(B, D, mem.device)
-                elif self.mem_refresh_rate == 1: # pop out the oldest chunk from the fifo queue and update memory buffer
-                    pop_out_embs  = fifo[:, :-self.fifo_len]
-                    pop_out_preds = fifo_preds[:, :pop_out_embs.shape[1]]
-                    fifo = fifo[:, -self.fifo_len:]
-                    assert pop_out_embs.shape[1] > 0
-                else:
-                    # pop out self.mem_refresh_rate oldest chunks from the fifo queue and update memory buffer
-                    pop_out_embs = fifo[:, :chunk_len*self.mem_refresh_rate] 
-                    pop_out_preds = fifo_preds[:, :pop_out_embs.shape[1]]
-                    fifo = fifo[:, pop_out_embs.shape[1]:]
-                
-        if pop_out_embs.shape[1] > 0: # only update memory buffer when pop_out_embs is not empty
-            mem = torch.cat([mem, pop_out_embs], dim=1)
-            if mem.shape[1] > self.mem_len:
-                mem = self._compress_memory(mem, torch.cat([mem_preds, pop_out_preds], dim=1))
+        pop_out_embs, pop_out_preds = self.init_memory(B, D, mem.device), self.init_memory(B, self.unit_n_spks, mem.device)
+        
+        fifo = torch.cat([fifo, chunk], dim=1)
+        delim = max(fifo.shape[1] - self.fifo_len, 0)
+        pop_out_embs  = fifo[:, :delim]
+        pop_out_preds = fifo_preds[:, :pop_out_embs.shape[1]]
+        fifo = fifo[:, delim:]
             
-        if self.log:
-            logging.info(f"MC mem: {mem.shape}, chunk: {chunk.shape}, fifo: {fifo.shape}, chunk_preds: {chunk_preds.shape}")
+        mem = torch.cat([mem, pop_out_embs], dim=1)
+        if mem.shape[1] > self.mem_len:
+            mem = self._compress_memory(mem, torch.cat([mem_preds, pop_out_preds], dim=1))
             
-        return mem, fifo, mem_preds, fifo_preds, chunk_preds
+        chunk_preds = torch.cat([chunk_preds, torch.zeros(B, chunk_len_orig - chunk_preds.shape[1], chunk_preds.shape[2]).to(chunk.device)], dim=1)
+        mem_len = mem.shape[1]
+        mem = torch.cat([mem, torch.zeros(B, self.mem_len - mem.shape[1], D).to(mem.device)], dim=1)
+        fifo_len = fifo.shape[1]
+        fifo = torch.cat([fifo, torch.zeros(B, self.fifo_len - fifo.shape[1], D).to(fifo.device)], dim=1)
+
+        return chunk_preds, chunk_len, mem, mem_len, fifo, fifo_len
     
     def _compress_memory(self, emb_seq, preds):
         """.
@@ -260,16 +257,13 @@ class SortformerModules(NeuralModule, Exportable):
         emb_seq_sil_mean = emb_seq_sil_sum / sil_count # Shape: (B, emb_dim)
         emb_seq_sil_mean = emb_seq_sil_mean.unsqueeze(1).expand(-1, n_spk*mem_len_per_spk, -1) # Shape: (B, n_spk*mem_len_for_spk, emb_dim)
 
-        if self.use_memory_pe:
-            #add position embeddings
-            start_pos=0
-            position_ids = torch.arange(start=start_pos, end=start_pos + n_frames, dtype=torch.long, device=preds.device)
-            position_ids = position_ids.unsqueeze(0).repeat(preds.size(0), 1)
-            preds = preds + self.memory_position_embedding(position_ids)
+        # if self.use_memory_pe:
+        #     #add position embeddings
+        #     start_pos=0
+        #     position_ids = torch.arange(start=start_pos, end=start_pos + n_frames, dtype=torch.long, device=preds.device)
+        #     position_ids = position_ids.unsqueeze(0).repeat(preds.size(0), 1)
+        #     preds = preds + self.memory_position_embedding(position_ids)
 
-        #get frame importance scores
-        encoder_mask = self.length_to_mask(preds)
-        # scores = self.transformer_memory_compressor(encoder_states=preds, encoder_mask=encoder_mask) # Shape: (B, n_frames, n_spk)
         scores = preds
 #        logging.info(f"MC scores: {scores[0,:,:]}")
 
@@ -297,8 +291,8 @@ class SortformerModules(NeuralModule, Exportable):
         valid_topk_mask = topk_values != float('-inf')
         topk_indices = torch.where(valid_topk_mask, topk_indices, torch.tensor(9999))  # Replace invalid indices with 9999
 
-        if last_n_sil_per_spk > 0: #add number of silence frames in the end of each block
-            topk_indices = torch.cat([topk_indices, torch.full((B, last_n_sil_per_spk, n_spk), 9999, device=topk_indices.device)], dim=1) # Shape: (B, mem_len_for_spk, n_spk)
+        # if last_n_sil_per_spk > 0: #add number of silence frames in the end of each block
+        topk_indices = torch.cat([topk_indices, torch.full((B, last_n_sil_per_spk, n_spk), 9999, device=topk_indices.device)], dim=1) # Shape: (B, mem_len_for_spk, n_spk)
 
         topk_indices = topk_indices.permute(0, 2, 1) # Shape: (B, n_spk, mem_len_for_spk)
 
@@ -312,7 +306,7 @@ class SortformerModules(NeuralModule, Exportable):
         topk_indices_flatten[is_inf] = 0 # set a placeholder index instead of 9999 to make gather work
 
         # expand topk indices to emb_dim in last dimension to use gather
-        topk_indices_expanded = topk_indices_flatten.unsqueeze(-1).expand(-1, -1, emb_dim) # Shape: (B, n_spk*mem_len_for_spk, emb_dim)
+        topk_indices_expanded = topk_indices_flatten.unsqueeze(-1).expand(-1, -1, emb_dim).to(torch.int64) # Shape: (B, n_spk*mem_len_for_spk, emb_dim)
 
         # gather memory buffer including placeholder embeddings for silence frames
         emb_seq_gathered = torch.gather(emb_seq, 1, topk_indices_expanded) # Shape: (B, n_spk*mem_len_for_spk, emb_dim)

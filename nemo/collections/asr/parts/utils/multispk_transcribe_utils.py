@@ -144,6 +144,11 @@ def fix_frame_time_step(
         List[int]: Adjusted frame indices sequence.
     """    
     if len(new_tokens) != len(frame_inds_seq):
+        if cfg.log:
+            logging.warning(
+                f"Length of new token sequence ({len(new_tokens)}) does not match" 
+                f"the length of frame indices sequence ({len(frame_inds_seq)}). Skipping this chunk."
+            )
         # Sometimes there is a mismatch in the number of tokens between the new tokens and the frame indices sequence.
         if len(frame_inds_seq) > len(new_words):
             # Get unique frame indices sequence
@@ -158,11 +163,6 @@ def fix_frame_time_step(
         elif len(frame_inds_seq) < len(new_tokens):
             deficit = len(new_tokens) - len(frame_inds_seq)
             frame_inds_seq = [frame_inds_seq[0]] * deficit + frame_inds_seq
-        if cfg.log:
-            logging.warning(
-                f"Length of new token sequence ({len(new_tokens)}) does not match" 
-                f"the length of frame indices sequence ({len(frame_inds_seq)}). Skipping this chunk."
-            )
     return frame_inds_seq
 
 def get_simulated_softmax(cfg, speaker_sigmoid: torch.Tensor) -> torch.Tensor:
@@ -744,8 +744,6 @@ class SpeakerTaggedASR:
         (
             mem_last_time,
             fifo_last_time,
-            mem_preds,
-            fifo_preds,
             diar_pred_out_stream
         ) = self.diar_model.forward_streaming_step(
             processed_signal=chunk_audio.transpose(1, 2),
@@ -819,8 +817,6 @@ class SpeakerTaggedASR:
         (
             mem_last_time,
             fifo_last_time,
-            mem_preds,
-            fifo_preds,
             diar_pred_out_stream
         ) = self.diar_model.forward_streaming_step(
             processed_signal=chunk_audio.transpose(1, 2),
