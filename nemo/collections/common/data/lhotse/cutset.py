@@ -598,10 +598,10 @@ def read_nemo_manifest(config) -> tuple[CutSet, bool]:
 @data_type_parser("multi_speaker_simulator")
 def read_multi_speaker_simulator(config: DictConfig) -> tuple[CutSet, bool]:
     
-    single_speaker_cuts = CutSet(LazyNeMoIterator(config.manifest_filepath))
+    # single_speaker_cuts = CutSet(LazyNeMoIterator(config.manifest_filepath))
     multi_speaker_cuts = CutSet(
         MultiSpeakerSimulator(
-            single_speaker_cuts,
+            manifest_filepath=config.manifest_filepath,
             num_speakers=config.num_speakers,
             speaker_distribution=config.speaker_distribution,
             simulator_type=config.simulator_type,

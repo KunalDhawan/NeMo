@@ -13,6 +13,7 @@
 # limitations under the License.
 import re
 import math
+import json
 import random
 import logging
 from copy import deepcopy
@@ -26,9 +27,11 @@ from scipy.stats import norm
 
 import torch.utils.data
 from lhotse.cut.set import mix
-from lhotse.cut import CutSet, MixedCut, MonoCut, MixTrack
+from lhotse.cut import Cut, CutSet, MixedCut, MonoCut, MixTrack
 from lhotse import SupervisionSet, SupervisionSegment, dill_enabled, AudioSource, Recording
-from lhotse.utils import uuid4
+from lhotse.utils import uuid4, compute_num_samples, ifnone
+from lhotse.lazy import LazyIteratorChain, LazyJsonlIterator
+
 
 from typing import Optional, Union, List, Tuple, Dict, Any
 
@@ -1350,7 +1353,7 @@ class MultiSpeakerSimulator():
     """
     def __init__(
         self, 
-        cuts, 
+        manifest_filepath, 
         num_speakers, 
         simulator_type,
         speaker_distribution,
@@ -1372,17 +1375,17 @@ class MultiSpeakerSimulator():
                 to avoid the same starting time for multiple speakers.
         """
     
-        self.cuts = cuts
+        self.manifests = LazyJsonlIterator(manifest_filepath)
         self.min_delay = min_delay
         self.num_speakers = num_speakers
         self.simulator_type = simulator_type
         assert len(speaker_distribution) == num_speakers, f"The length of speaker_distribution {len(speaker_distribution)} must be equal to num_speakers {num_speakers}"
         self.speaker_distribution = [spk_dist / sum(speaker_distribution) for spk_dist in speaker_distribution]
 
-        logging.info(f"Grouping cuts by speaker_id, this may take a few minutes...")
-        self.spk_to_cuts = groupby(lambda x: x.speaker_id, self.cuts)
-        self.speaker_ids = list(self.spk_to_cuts.keys())
-        logging.info(f"Grouping cuts by speaker_id done.")
+        logging.info(f"Grouping samples by speaker_id, this may take a few minutes...")
+        self.spk2manifests = groupby(lambda x: x["speaker_id"], self.manifests)
+        self.speaker_ids = list(self.spk2manifests.keys())
+        logging.info(f"Grouping samples by speaker_id done.")
 
         if simulator_type == 'lsmix':    
             self.simulator = self.LibriSpeechMixSimulator
@@ -1411,8 +1414,8 @@ class MultiSpeakerSimulator():
         # Sample the cuts for each speaker
         mono_cuts = []
         for speaker_id in sampled_speaker_ids:
-            cut = random.choice(self.spk_to_cuts[speaker_id])
-            mono_cuts.append(cut)
+            manifest = random.choice(self.spk2manifests[speaker_id])
+            mono_cuts.append(self.json_to_cut(manifest))
 
         tracks = []
         offset = 0.0
@@ -1436,3 +1439,63 @@ class MultiSpeakerSimulator():
 
     def ConversationSimulator(self):
         raise NotImplementedError("ConversationSimulator is not implemented yet.")
+    
+    def json_to_cut(self, json_dict):
+        """
+        Convert a json dictionary to a Cut instance.
+        """
+        audio_path = json_dict["audio_filepath"]
+        duration = json_dict["duration"]
+        offset = json_dict.get("offset", None)
+        cut = self._create_cut(
+            audio_path=audio_path, offset=offset, duration=duration, sampling_rate=json_dict.get("sampling_rate", None)
+        )
+        # Note that start=0 and not start=offset because supervision's start if relative to the
+        # start of the cut; and cut.start is already set to offset
+        cut.supervisions.append(
+            SupervisionSegment(
+                id=cut.id,
+                recording_id=cut.recording_id,
+                start=0,
+                duration=cut.duration,
+                text=json_dict.get("text"),
+                language=json_dict.get("language", "en"),
+            )
+        )
+        cut.custom = json_dict
+
+        return cut
+
+    def _create_cut(
+        self,
+        audio_path: str,
+        offset: float,
+        duration: float,
+        sampling_rate: int | None = None,
+    ) -> Cut:
+        
+        recording = self._create_recording(audio_path, duration, sampling_rate)
+        cut = recording.to_cut()
+        if offset is not None:
+            cut = cut.truncate(offset=offset, duration=duration, preserve_id=True)
+            cut.id = f"{cut.id}-{round(offset * 1e2):06d}-{round(duration * 1e2):06d}"
+        return cut
+    
+    def _create_recording(
+        self,
+        audio_path: str,
+        duration: float,
+        sampling_rate: int | None = None,
+    ) -> Recording:
+        if sampling_rate is not None:
+            # TODO(pzelasko): It will only work with single-channel audio in the current shape.
+            return Recording(
+                id=audio_path,
+                sources=[AudioSource(type="file", channels=[0], source=audio_path)],
+                sampling_rate=sampling_rate,
+                num_samples=compute_num_samples(duration, sampling_rate),
+                duration=duration,
+                channel_ids=[0],
+            )
+        else:
+            return Recording.from_file(audio_path)
