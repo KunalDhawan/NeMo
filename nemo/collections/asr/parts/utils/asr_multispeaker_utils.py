@@ -1356,14 +1356,15 @@ class MultiSpeakerSimulator():
         manifest_filepath, 
         num_speakers, 
         simulator_type,
-        speaker_distribution,
         min_delay=0.5,
     ):
         """
         Args:
             cuts (CutSet): The cutset that contains single-speaker audio cuts.
                 Please make sure that the cuts have the 'speaker_id' attribute.                    
-            num_speakers (int): The maximumnumber of speakers in the simulated audio.
+            num_speakers (int): The number of speakers in the simulated audio.
+                We only simulate the samples with the fixed number of speakers.
+                The variation of the number of speakers is controlled by the weights in Lhotse dataloader config.
             simulator_type (str): The type of simulator to use.
                 - 'lsmix': LibriSpeechMix-style training sample.
                 - 'meeting': Meeting-style training sample.
@@ -1379,13 +1380,9 @@ class MultiSpeakerSimulator():
         self.min_delay = min_delay
         self.num_speakers = num_speakers
         self.simulator_type = simulator_type
-        assert len(speaker_distribution) == num_speakers, f"The length of speaker_distribution {len(speaker_distribution)} must be equal to num_speakers {num_speakers}"
-        self.speaker_distribution = [spk_dist / sum(speaker_distribution) for spk_dist in speaker_distribution]
 
-        logging.info(f"Grouping samples by speaker_id, this may take a few minutes...")
         self.spk2manifests = groupby(lambda x: x["speaker_id"], self.manifests)
         self.speaker_ids = list(self.spk2manifests.keys())
-        logging.info(f"Grouping samples by speaker_id done.")
 
         if simulator_type == 'lsmix':    
             self.simulator = self.LibriSpeechMixSimulator
@@ -1407,10 +1404,8 @@ class MultiSpeakerSimulator():
             Paper: https://arxiv.org/abs/2003.12687
             Github: https://github.com/NaoyukiKanda/LibriSpeechMix
         """
-        # Determine the number of speakers based on the speaker distribution
-        num_speakers = random.choices(range(self.num_speakers), weights=self.speaker_distribution, k=1)[0] + 1
         # Sample the speakers
-        sampled_speaker_ids = random.sample(self.speaker_ids, num_speakers)
+        sampled_speaker_ids = random.sample(self.speaker_ids, self.num_speakers)
         # Sample the cuts for each speaker
         mono_cuts = []
         for speaker_id in sampled_speaker_ids:
