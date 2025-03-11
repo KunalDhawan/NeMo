@@ -154,12 +154,22 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
         if self.cfg.freeze_diar:
             pretrained_diar_model.eval()
 
-        # Register diarization model to be excluded from checkpoints
+        # Register diarization model 
         self.register_nemo_submodule(
             name="diarization_model",
             model=pretrained_diar_model,
             config_field="diarization_model" 
         )
+
+        # Change the diarization model cfg for streaming inference
+        if self.cfg.streaming_mode:
+            self.diarization_model.streaming_mode = self.cfg.streaming_mode
+            self.diarization_model.sortformer_modules.step_len = self.cfg.step_len
+            self.diarization_model.sortformer_modules.mem_len = self.cfg.mem_len
+            self.diarization_model.sortformer_modules.step_left_context = self.cfg.step_left_context
+            self.diarization_model.sortformer_modules.step_right_context = self.cfg.step_right_context
+            self.diarization_model.sortformer_modules.fifo_len = self.cfg.fifo_len
+            self.diarization_model.sortformer_modules.mem_refresh_rate = self.cfg.mem_refresh_rate
 
     def forward_diar(
         self,

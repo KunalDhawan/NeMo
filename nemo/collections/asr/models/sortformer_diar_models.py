@@ -563,8 +563,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             )
 
         del processed_signal, processed_signal_length, MEM, FIFO_QUEUE
-        if not self.training:
-            torch.cuda.empty_cache()
 
         if T < max_T: #discard preds corresponding to padding
             n_frames = math.ceil(T / self.encoder.subsampling_factor)
