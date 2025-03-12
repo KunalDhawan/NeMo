@@ -9,11 +9,12 @@
 
 # Canary model family
 
-# | Model               | Num Params | Encoder Layers | Decoder Layers | Max Seq Length | ASR Enc Hidden | LM Enc Hidden | LM Dec Hidden |
-# |---------------------|------------|----------------|----------------|----------------|----------------|---------------|---------------|
-# | canary-1b           | 1B         | 24             | 24             | 512            | 1024           | 512           | 1024          |
-# | canary-1b-flash     | 883M       | 32             | 4              | 1024           | 1024           | 1024          | 1024          |
-# | canary-180m-flash   | 180M       | 32             | 4              | 1024           | 512            | 1024          | 1024          |
+# |         Model        | Num Params |  encoder.n_layers | transf_decoder.config_dict.num_layers | transf_decoder.config_dict.max_sequence_length | model_defaults.asr_enc_hidden | model_defaults.lm_dec_hidden |
+# |:--------------------:|:----------:|:-----------------:|:-------------------------------------:|:----------------------------------------------:|:-----------------------------:|:----------------------------:|
+# |      canary-1b       |     1B     |        24         |                     24                |                        512                     |              1024             |             1024             |
+# |   canary-1b-flash    |    883M    |        32         |                     4                 |                       1024                     |              1024             |             1024             |
+# |  canary-180m-flash   |    182M    |        17         |                     4                 |                       1024                     |               512             |             1024             |
+
 
 
 
