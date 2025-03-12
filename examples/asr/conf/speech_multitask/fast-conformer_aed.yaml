@@ -16,8 +16,6 @@
 # |  canary-180m-flash   |    182M    |        17         |                     4                 |                       1024                     |               512             |             1024             |
 
 
-
-
 name: "FastConformer-Transformer-MultiTask"
 
 # Note: for larger models (1B+ params) initializing from a pretrained encoder
@@ -113,7 +111,7 @@ model:
     window_size: 0.025
     window_stride: 0.01
     window: "hann"
-    features: 80
+    features: 128
     n_fft: 512
     log: true
     frame_splicing: 1
