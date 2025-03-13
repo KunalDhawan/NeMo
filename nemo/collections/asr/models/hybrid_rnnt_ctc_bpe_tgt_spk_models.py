@@ -254,13 +254,11 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
                 raise ValueError(f"Invalid RTTM strategy {self.cfg.spk_supervision_strategy} is not supported.")
 
         if (isinstance(batch, DALIOutputs) and batch.has_processed_signal) or signal.shape[1] == 80:
-            encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len, diar_preds=diar_preds)
+            encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
         else:
-            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len, diar_preds=diar_preds)
+            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
     
         encoded = torch.transpose(encoded, 1, 2) # B * D * T -> B * T * D
-        
-
         if self.diar == True:        
             # Speaker mapping shuffling to equalize the speaker label's distributions
             if self.cfg.shuffle_spk_mapping:
