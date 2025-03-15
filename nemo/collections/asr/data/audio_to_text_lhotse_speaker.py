@@ -92,7 +92,7 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
                     if '<|spltoken0|>' in cut.tracks[0].cut.custom['text']:
                         text_per_speaker = self.split_text(cut.tracks[0].cut.custom['text'])
                     else:
-                        text_per_speaker = [cut.custom['text']]
+                        text_per_speaker = [cut.tracks[0].cut.custom['text']]
                 else:
                     for track in cut.tracks:
                         if isinstance(track.cut, MonoCut):
