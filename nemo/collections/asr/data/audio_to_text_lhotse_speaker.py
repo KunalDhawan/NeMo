@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 import random
 from typing import Dict, Optional, Tuple
 import soundfile
@@ -77,29 +78,68 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
             spk_targets = None
 
         tokens = []
-        query_cuts = []
         query_speaker_ids = []
 
         for cut in cuts:
             non_padding_cuts = []
+            
             if isinstance(cut, MonoCut):
                 non_padding_cuts.append(cut)
+                text_per_speaker = self.split_text(cut.custom['text'])
             elif isinstance(cut, MixedCut):
-                for track in cut.tracks:
-                    if isinstance(track.cut, MonoCut):
-                        non_padding_cuts.append(track.cut)
+                if len(cut.tracks) == 2 and isinstance(cut.tracks[1].cut, PaddingCut):
+                    non_padding_cuts.append(cut)
+                    text_per_speaker = self.split_text(cut.tracks[0].cut.custom['text'])
+                else:
+                    for track in cut.tracks:
+                        if isinstance(track.cut, MonoCut):
+                            non_padding_cuts.append(track.cut)
+                    text_per_speaker = [cut.custom['text'] for cut in non_padding_cuts]
 
+            
             if self.fixed_spk_id is None: # Randomly select a speaker during training
-                query_spk_id = random.choice(range(len(non_padding_cuts)))
+                query_spk_id = random.choice(range(len(text_per_speaker)))
             else: # fix the speaker id for inference
                 query_spk_id = self.fixed_spk_id
-            query_cut = non_padding_cuts[query_spk_id]
-            tokens.append(torch.as_tensor(self.tokenizer(query_cut.custom['text'], cut.supervisions[0].language)))
+
+            text = text_per_speaker[query_spk_id]
+            tokens.append(torch.as_tensor(self.tokenizer(text, cut.supervisions[0].language)))
             query_speaker_ids.append(query_spk_id)
-            query_cuts.append(query_cut)
 
         token_lens = torch.tensor([t.size(0) for t in tokens], dtype=torch.long)
         tokens = collate_vectors(tokens, padding_value=0)
         query_speaker_ids = torch.tensor(query_speaker_ids, dtype=torch.long)
 
         return audio, audio_lens, tokens, token_lens, spk_targets, query_speaker_ids
+
+    def split_text(self, text, speaker_token='<|spltoken*|>'):
+        """
+        Split text by speaker tokens and group text from the same speaker.
+        
+        Args:
+            text (str): Input text with speaker tokens
+            speaker_token (str): Base speaker token pattern, where * will be replaced with numbers
+        
+        Returns:
+            list[str]: List of concatenated text for each speaker. Returns [text] if no speaker tokens found.
+        """
+        # Replace * with a digit in the pattern
+        pattern = speaker_token.replace('*', r'\d+').replace('|', '\\|')
+        # pattern = '(<\|spltoken\d+\|>)'
+        
+        # Split text by speaker tokens
+        segments = re.split(rf'({pattern})', text.strip())
+
+        spks = []
+        spk2text = {}
+        
+        for i in range(1, len(segments), 2):  # Step by 2 to skip over text between speaker tags
+            speaker_tag = segments[i]
+            words = segments[i + 1]
+            if speaker_tag not in spks:
+                spk2text[speaker_tag] = words.strip()
+                spks.append(speaker_tag)
+            else:
+                spk2text[speaker_tag] += ' ' + words.strip()
+            
+        return [spk2text[spk] for spk in spks]
