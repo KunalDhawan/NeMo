@@ -89,14 +89,16 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
             elif isinstance(cut, MixedCut):
                 if len(cut.tracks) == 2 and isinstance(cut.tracks[1].cut, PaddingCut):
                     non_padding_cuts.append(cut)
-                    text_per_speaker = self.split_text(cut.tracks[0].cut.custom['text'])
+                    if '<|spltoken0|>' in cut.tracks[0].cut.custom['text']:
+                        text_per_speaker = self.split_text(cut.tracks[0].cut.custom['text'])
+                    else:
+                        text_per_speaker = [cut.custom['text']]
                 else:
                     for track in cut.tracks:
                         if isinstance(track.cut, MonoCut):
                             non_padding_cuts.append(track.cut)
                     text_per_speaker = [cut.custom['text'] for cut in non_padding_cuts]
 
-            
             if self.fixed_spk_id is None: # Randomly select a speaker during training
                 query_spk_id = random.choice(range(len(text_per_speaker)))
             else: # fix the speaker id for inference
