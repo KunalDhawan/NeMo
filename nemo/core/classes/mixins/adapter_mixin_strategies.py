@@ -133,7 +133,7 @@ class ResidualAddAdapterStrategy(AbstractAdapterStrategy):
         self.stochastic_depth = stochastic_depth
         self.l2_lambda = l2_lambda
 
-    def forward(self, input: torch.Tensor, adapter: torch.nn.Module, *, module: 'AdapterModuleMixin'):
+    def forward(self, input: torch.Tensor, adapter: torch.nn.Module, *, module: 'AdapterModuleMixin', additional_inputs: dict = {}):
         """
         A basic strategy, comprising of a residual connection over the input, after forward pass by
         the underlying adapter.
@@ -148,7 +148,7 @@ class ResidualAddAdapterStrategy(AbstractAdapterStrategy):
         Returns:
             The result tensor, after one of the active adapters has finished its forward passes.
         """
-        out = self.compute_output(input, adapter, module=module)
+        out = self.compute_output(input, adapter, module=module, additional_inputs=additional_inputs)
 
         # If not in training mode, or probability of stochastic depth is 0, skip step.
         p = self.stochastic_depth
@@ -166,7 +166,7 @@ class ResidualAddAdapterStrategy(AbstractAdapterStrategy):
         return result
 
     def compute_output(
-        self, input: torch.Tensor, adapter: torch.nn.Module, *, module: 'AdapterModuleMixin'
+        self, input: torch.Tensor, adapter: torch.nn.Module, *, module: 'AdapterModuleMixin', additional_inputs: dict = {}
     ) -> torch.Tensor:
         """
         Compute the output of a single adapter to some input.
@@ -181,7 +181,7 @@ class ResidualAddAdapterStrategy(AbstractAdapterStrategy):
         Returns:
             The result tensor, after one of the active adapters has finished its forward passes.
         """
-        out = adapter(input)
+        out = adapter(input, **additional_inputs)
         return out
 
     def apply_stochastic_depth(

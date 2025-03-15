@@ -98,11 +98,12 @@ class AttentionAdapterModuleMixin(adapter_mixins.AdapterModuleMixin):
         loc = input['loc']
         att_mask = input.get('att_mask', None)
         pos_emb = input.get('pos_emb', None)
+        additional_inputs = input.get('additional_inputs', {})
 
         from nemo.collections.common.parts import adapter_modules
 
         if isinstance(adapter_module, adapter_modules.LinearAdapter) and loc == 'post':
-            output = adapter_strategy(x, adapter_module, module=self)
+            output = adapter_strategy(x, adapter_module, module=self, additional_inputs=additional_inputs)
 
         elif isinstance(adapter_module, conformer_mha.MultiHeadAttention) and loc == 'mha':
             if self.self_attention_model == 'rel_pos':

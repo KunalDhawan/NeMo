@@ -95,6 +95,7 @@ class LinearAdapter(nn.Module, AdapterModuleUtil):
         activation: str = 'swish',
         norm_position: str = 'pre',
         dropout: float = 0.0,
+        bias: bool = False,
         adapter_strategy: adapter_mixin_strategies.ResidualAddAdapterStrategyConfig = None,
     ):
         super().__init__()
@@ -110,16 +111,16 @@ class LinearAdapter(nn.Module, AdapterModuleUtil):
         if norm_position == 'pre':
             self.module = nn.Sequential(
                 nn.LayerNorm(in_features),
-                nn.Linear(in_features, dim, bias=False),
+                nn.Linear(in_features, dim, bias=bias),
                 activation,
-                nn.Linear(dim, in_features, bias=False),
+                nn.Linear(dim, in_features, bias=bias),
             )
 
         elif norm_position == 'post':
             self.module = nn.Sequential(
-                nn.Linear(in_features, dim, bias=False),
+                nn.Linear(in_features, dim, bias=bias),
                 activation,
-                nn.Linear(dim, in_features, bias=False),
+                nn.Linear(dim, in_features, bias=bias),
                 nn.LayerNorm(in_features),
             )
 
@@ -143,7 +144,10 @@ class LinearAdapter(nn.Module, AdapterModuleUtil):
             self.module[-1].weight.data *= 0
             self.module[-1].bias.data *= 0
 
-    def forward(self, x):
+    def forward(self, x, vad_mask=None):
+        if vad_mask is not None:
+            x = x * vad_mask.unsqueeze(-1)
+
         x = self.module(x)
 
         # Add dropout if available
