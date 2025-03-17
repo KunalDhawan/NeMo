@@ -77,8 +77,6 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
         else:
             spk_targets = None
         
-        import ipdb; ipdb.set_trace()
-
         tokens = []
         query_speaker_ids = []
 
