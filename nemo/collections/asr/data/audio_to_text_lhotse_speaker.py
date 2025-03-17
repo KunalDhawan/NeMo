@@ -71,11 +71,13 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
     def __getitem__(self, cuts) -> Tuple[torch.Tensor, ...]:
 
         audio, audio_lens, cuts = self.load_audio(cuts)
-        if hasattr(cuts[0], 'rttm_filepath') and cuts[0].rttm_filepath or hasattr(cuts[0], 'speaker_id') and cuts[0].speaker_id:
+        if hasattr(cuts[0], 'rttm_filepath') and cuts[0].rttm_filepath or hasattr(cuts[0], 'speaker_id') and cuts[0].speaker_id or hasattr(cuts[0].tracks[0].cut, 'speaker_id'):
             spk_targets = [torch.as_tensor(speaker_to_target(cut, self.num_speakers, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame, self.spk_tar_all_zero), dtype=torch.float32) for cut in cuts]
             spk_targets = collate_matrices(spk_targets)
         else:
             spk_targets = None
+        
+        import ipdb; ipdb.set_trace()
 
         tokens = []
         query_speaker_ids = []
