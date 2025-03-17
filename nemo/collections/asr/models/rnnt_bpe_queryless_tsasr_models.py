@@ -203,7 +203,7 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
         if self.soft_decision:
             pass
         else:
-            spk_targets = (spk_targets > 0.5).astype(spk_targets.dtype)
+            spk_targets = (spk_targets > 0.5).to(spk_targets.dtype)
 
         return spk_targets
 
