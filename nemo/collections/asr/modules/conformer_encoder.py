@@ -567,6 +567,9 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             if self.reduction_position is not None and cache_last_channel is not None:
                 raise ValueError("Caching with reduction feature is not supported yet!")
 
+        if vad_mask is not None:
+            audio_signal = audio_signal * vad_mask.unsqueeze(-1)
+
         max_audio_length = audio_signal.size(1)
         if cache_last_channel is not None:
             cache_len = self.streaming_cfg.last_channel_cache_size
@@ -613,8 +616,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 pos_emb=pos_emb,
                 pad_mask=pad_mask,
                 cache_last_channel=cache_last_channel_cur,
-                cache_last_time=cache_last_time_cur,
-                vad_mask=vad_mask
+                cache_last_time=cache_last_time_cur
             )
 
             if cache_last_channel_cur is not None:

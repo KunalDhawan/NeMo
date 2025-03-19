@@ -144,10 +144,7 @@ class LinearAdapter(nn.Module, AdapterModuleUtil):
             self.module[-1].weight.data *= 0
             self.module[-1].bias.data *= 0
 
-    def forward(self, x, vad_mask=None):
-        if vad_mask is not None:
-            x = x * vad_mask.unsqueeze(-1)
-
+    def forward(self, x):
         x = self.module(x)
 
         # Add dropout if available

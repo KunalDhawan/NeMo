@@ -202,7 +202,7 @@ def perform_streaming(
                         binary_diar_preds=cfg.binary_diar_preds,
                         n_mix=cfg.mix,
                     )
-        
+        import ipdb; ipdb.set_trace()
         if debug_mode:
             logging.info(f"Streaming transcriptions: {extract_transcriptions(transcribed_texts)}")
         
