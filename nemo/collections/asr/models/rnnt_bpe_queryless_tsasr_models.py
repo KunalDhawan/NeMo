@@ -50,10 +50,6 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
         if self.cfg.get('diar_model_path', None):
             self.num_speakers = cfg.model_defaults.get('num_speakers', 4)
 
-            # config for speaker kernel
-            self.spk_kernel_type = cfg.get('spk_kernel_type', None)
-            self.spk_kernel_layers = cfg.get('spk_kernel_layers', [])
-
             self._init_diar_model(
                 model_path = self.cfg.diar_model_path,
                 num_speakers=self.cfg.model_defaults.get('num_speakers', 4),
