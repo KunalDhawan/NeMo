@@ -47,18 +47,6 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
         super().__init__(cfg=cfg, trainer=trainer)
 
-        if self.cfg.get('diar_model_path', None):
-            self.num_speakers = cfg.model_defaults.get('num_speakers', 4)
-
-            self._init_diar_model(
-                model_path = self.cfg.diar_model_path,
-                num_speakers=self.cfg.model_defaults.get('num_speakers', 4),
-                freeze_diar=self.cfg.freeze_diar,
-                soft_decision=self.cfg.soft_decision,
-                gt_decision=self.cfg.gt_decision,
-                streaming_mode=self.cfg.streaming_mode,
-            )
-
     def _init_diar_model(self, 
                          model_path = None,
                          num_speakers=None,

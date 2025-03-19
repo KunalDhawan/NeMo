@@ -161,6 +161,7 @@ class LinearAdapterConfig:
     activation: str = 'swish'
     norm_position: str = 'pre'
     dropout: float = 0.0
+    bias: bool = False
     adapter_strategy: Optional[Any] = field(
         default_factory=lambda: adapter_mixin_strategies.ResidualAddAdapterStrategyConfig()
     )
