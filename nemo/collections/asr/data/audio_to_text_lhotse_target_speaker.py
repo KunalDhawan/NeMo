@@ -31,6 +31,7 @@ from nemo.collections.asr.data.audio_to_text_lhotse import TokenizerWrapper
 from nemo.collections.common.tokenizers.aggregate_tokenizer import AggregateTokenizer
 from nemo.collections.common.tokenizers.tokenizer_spec import TokenizerSpec
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralType
+import json
 
 from nemo.collections.asr.parts.utils.asr_multispeaker_utils import (
     get_hidden_length_from_sample_length, 
@@ -41,7 +42,8 @@ from nemo.collections.asr.parts.utils.asr_multispeaker_utils import (
 from nemo.collections.asr.parts.utils.asr_tgtspeaker_utils import (
     get_separator_audio,
     get_query_cut,
-    speaker_to_target_w_query
+    speaker_to_target_w_query,
+    mix_noise
 )
 
 from nemo.collections.common.data.lhotse.cutset import guess_parse_cutset 
@@ -93,7 +95,8 @@ class LhotseSpeechToTextTgtSpkBpeDataset(torch.utils.data.Dataset):
         self.inference_mode = self.cfg.get('inference_mode', False)
         self.query_noise_path = self.cfg.get('query_noise_path',None)
         if self.query_noise_path:
-            self.query_noise_cut = guess_parse_cutset(self.query_noise_path)
+            with open(self.query_noise_path, 'r') as f:
+                self.query_noise_manifests = [json.loads(line) for line in f]
             self.query_noise_mix_prob = self.cfg.get('query_noise_mix_prob', 0.3)
             self.query_snr = tuple(self.cfg.get('query_snr',(2.5, 12.5)))
     
@@ -107,13 +110,6 @@ class LhotseSpeechToTextTgtSpkBpeDataset(torch.utils.data.Dataset):
             audio, audio_lens, cuts = self.load_audio(cuts)
         else:
             query_cuts = CutSet.from_cuts(get_query_cut(c) for c in cuts)
-            if self.query_noise_path:
-                query_cuts = query_cuts.mix(self.query_noise_cut, 
-                                            preserve_id = 'left',
-                                            snr = self.query_snr,
-                                            mix_prob = self.query_noise_mix_prob,
-                                            random_mix_offset = True)
-
             spk_targets = [torch.transpose(torch.as_tensor(speaker_to_target_w_query(
                 c, q, 
                 self.add_separater_audio,
@@ -124,6 +120,14 @@ class LhotseSpeechToTextTgtSpkBpeDataset(torch.utils.data.Dataset):
                 self.spk_tar_all_zero), 
                 dtype=torch.float32), 0, 1) for c, q in zip(cuts,query_cuts)]
             
+            if self.query_noise_path:
+                query_cuts = mix_noise(
+                    query_cuts,
+                    self.query_noise_manifests,
+                    snr = self.query_snr,
+                    mix_prob = self.query_noise_mix_prob,
+                )
+
             # spk_targets = [torch.transpose(torch.as_tensor(self.speaker_to_target_tgt_speaker_0(c, q, self.num_speakers, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame, self.spk_tar_all_zero), dtype=torch.float32), 0, 1) for c, q in zip(cuts,query_cuts)]
 
             audio, audio_lens, cuts = self.load_audio(cuts)

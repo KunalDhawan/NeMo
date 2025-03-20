@@ -19,13 +19,35 @@ from nltk.tokenize import SyllableTokenizer
 
 import torch.utils.data
 from lhotse.cut.set import mix
-from lhotse.cut import CutSet, MixedCut, MonoCut, MixTrack
+from lhotse.cut import Cut, CutSet, MixedCut, MonoCut, MixTrack
 from lhotse import SupervisionSet, SupervisionSegment, dill_enabled, AudioSource, Recording
 from lhotse.utils import uuid4, compute_num_samples
 from nemo.collections.asr.parts.utils.asr_multispeaker_utils import (
     get_hidden_length_from_sample_length,
     find_segments_from_rttm
 )
+
+def mix_noise(
+    cuts,
+    noise_manifests,
+    snr,
+    mix_prob,
+):
+    
+    mixed_cuts = []
+    assert 0.0 <= mix_prob <= 1.0, "mix_prob must be between 0.0 and 1.0"
+    for cut in cuts:
+        if random.uniform(0.0, 1.0) > mix_prob or cut.duration == 0:
+            mixed_cuts.append(cut)
+            continue
+        to_mix_manifest = random.choice(noise_manifests)
+        to_mix_cut = json_to_cut(to_mix_manifest)
+        to_mix_cut = to_mix_cut.resample(16000)
+        snr = random.uniform(*snr) if isinstance(snr, (list, tuple)) else snr
+        mixed = cut.mix(to_mix_cut, snr = snr)
+        mixed = mixed.truncate(duration=cut.duration)
+        mixed_cuts.append(mixed) 
+    return CutSet.from_cuts(mixed_cuts)
 
 
 def speaker_to_target_w_query(
@@ -275,6 +297,64 @@ def get_query_cut(cut):
                             supervisions = query_sups)
         return query_cut
     
+def json_to_cut(json_dict):
+    """
+    Convert a json dictionary to a Cut instance.
+    """
+    audio_path = json_dict["audio_filepath"]
+    duration = json_dict["duration"]
+    offset = json_dict.get("offset", None)
+    cut = _create_cut(
+        audio_path=audio_path, offset=offset, duration=duration, sampling_rate=json_dict.get("sampling_rate", None)
+    )
+    # Note that start=0 and not start=offset because supervision's start if relative to the
+    # start of the cut; and cut.start is already set to offset
+    cut.supervisions.append(
+        SupervisionSegment(
+            id=cut.id,
+            recording_id=cut.recording_id,
+            start=0,
+            duration=cut.duration,
+            text=json_dict.get("text"),
+            language=json_dict.get("language", "en"),
+        )
+    )
+    cut.custom = json_dict
+
+    return cut
+
+def _create_cut(
+    audio_path: str,
+    offset: float,
+    duration: float,
+    sampling_rate: int | None = None,
+) -> Cut:
+    
+    recording = _create_recording(audio_path, duration, sampling_rate)
+    cut = recording.to_cut()
+    if offset is not None:
+        cut = cut.truncate(offset=offset, duration=duration, preserve_id=True)
+        cut.id = f"{cut.id}-{round(offset * 1e2):06d}-{round(duration * 1e2):06d}"
+    return cut
+
+def _create_recording(
+    audio_path: str,
+    duration: float,
+    sampling_rate: int | None = None,
+) -> Recording:
+    if sampling_rate is not None:
+        # TODO(pzelasko): It will only work with single-channel audio in the current shape.
+        return Recording(
+            id=audio_path,
+            sources=[AudioSource(type="file", channels=[0], source=audio_path)],
+            sampling_rate=sampling_rate,
+            num_samples=compute_num_samples(duration, sampling_rate),
+            duration=duration,
+            channel_ids=[0],
+        )
+    else:
+        return Recording.from_file(audio_path)
+
 class LibriSpeechMixGenerator_tgt():
     def __init__(self):
         pass
