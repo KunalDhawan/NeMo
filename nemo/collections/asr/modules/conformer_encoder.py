@@ -568,6 +568,13 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 raise ValueError("Caching with reduction feature is not supported yet!")
 
         if vad_mask is not None:
+            # vad_mask: [B, T]
+            # audio_signal: [B, T, D]
+            if vad_mask.shape[1] < audio_signal.shape[1]:
+                vad_mask = nn.functional.pad(vad_mask, (0, audio_signal.shape[1] - vad_mask.shape[1]), mode='replicate')
+
+            if vad_mask.shape[1] > audio_signal.shape[1]:
+                vad_mask = vad_mask[:, -audio_signal.shape[1]:]
             audio_signal = audio_signal * vad_mask.unsqueeze(-1)
 
         max_audio_length = audio_signal.size(1)
