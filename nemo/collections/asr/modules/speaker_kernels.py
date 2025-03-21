@@ -43,13 +43,10 @@ class SpeakerMask(torch.nn.Module):
         x_masked = x * mask.unsqueeze(2)
         if self.residual:
             if self.mask_original:
-                print("mask_original and residual")
                 x = x_masked + self.feedforward(x_masked)
             else:
-                print("residual")
                 x = x + self.feedforward(x_masked)
         else:
-            print("no residual")
             x = self.feedforward(x_masked)
 
         return x
