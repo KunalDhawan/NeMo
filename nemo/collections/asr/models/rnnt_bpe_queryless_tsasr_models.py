@@ -170,6 +170,7 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
         
         if freeze_diar:
             pretrained_diar_model.eval()
+            pretrained_diar_model.freeze()
 
         # Register diarization model 
         self.register_nemo_submodule(
