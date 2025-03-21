@@ -157,7 +157,7 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
         self.dropout = nn.Dropout(dropout)
         self.norm_out = LayerNorm(d_model)
 
-    def forward(self, x, att_mask=None, pos_emb=None, pad_mask=None, cache_last_channel=None, cache_last_time=None, vad_mask=None):
+    def forward(self, x, att_mask=None, pos_emb=None, pad_mask=None, cache_last_channel=None, cache_last_time=None):
         """
         Args:
             x (torch.Tensor): input signals (B, T, d_model)
@@ -220,8 +220,6 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
                 'x': x,
                 'loc': 'post',
             }
-            if vad_mask is not None:
-                pack_input['additional_inputs'] = {'vad_mask': vad_mask}
             pack_input = self.forward_enabled_adapters(pack_input)
             x = pack_input['x']
 

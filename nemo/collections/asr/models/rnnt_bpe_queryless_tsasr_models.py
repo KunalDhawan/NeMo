@@ -266,7 +266,7 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
         if self.spec_augmentation is not None and self.training:
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
 
-        encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length, vad_mask=self.spk_targets)
+        encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
         return encoded, encoded_len
 
     def training_step(self, batch, batch_nb):
