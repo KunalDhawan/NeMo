@@ -53,6 +53,8 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
             # config for speaker kernel
             self.spk_kernel_type = cfg.get('spk_kernel_type', None)
             self.spk_kernel_layers = cfg.get('spk_kernel_layers', [])
+            self.spk_kernel_mask_original = cfg.get('spk_kernel_mask_original', True)
+            self.spk_kernel_residual = cfg.get('spk_kernel_residual', True)
 
             self._init_diar_model(
                 model_path = self.cfg.diar_model_path,
@@ -60,7 +62,7 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
                 freeze_diar=self.cfg.freeze_diar,
                 soft_decision=self.cfg.soft_decision,
                 gt_decision=self.cfg.gt_decision,
-                streaming_mode=self.cfg.streaming_mode,
+                streaming_mode=self.cfg.get('streaming_mode', False),
             )
             self._init_spk_kernel()
         
@@ -85,7 +87,7 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
         kernel_class = kernel_types[self.spk_kernel_type]
         for layer_idx in self.spk_kernel_layers:
             if kernel_class is not None:
-                self.spk_kernels[str(layer_idx)] = kernel_class(hidden_size, hidden_size)
+                self.spk_kernels[str(layer_idx)] = kernel_class(hidden_size, hidden_size, mask_original=self.spk_kernel_mask_original, residual=self.spk_kernel_residual)
 
         if self.spk_kernels:
             logging.info(f"Initialized speaker kernels for layers: {list(self.spk_kernels.keys())}")
@@ -178,7 +180,7 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
 
         # Change the diarization model cfg for streaming inference
         if self.streaming_mode:
-            self.diarization_model.streaming_mode = self.cfg.streaming_mode
+            self.diarization_model.streaming_mode = self.streaming_mode
             self.diarization_model.sortformer_modules.step_len = self.cfg.step_len
             self.diarization_model.sortformer_modules.mem_len = self.cfg.mem_len
             self.diarization_model.sortformer_modules.step_left_context = self.cfg.step_left_context

@@ -19,7 +19,7 @@ import torch.nn.functional as F
 __all__ = ['SpeakerMask', 'SpeakerConcat']
 
 class SpeakerMask(torch.nn.Module):
-    def __init__(self, input_size, output_size, mask_original=True):
+    def __init__(self, input_size, output_size, mask_original=True, residual=True):
         super().__init__()
         self.feedforward = torch.nn.Sequential(
             torch.nn.Linear(input_size, output_size*2),
@@ -27,6 +27,7 @@ class SpeakerMask(torch.nn.Module):
             torch.nn.Linear(output_size*2, output_size)
         )
         self.mask_original = mask_original
+        self.residual = residual
         
     def forward(self, x, mask):
         """
@@ -40,10 +41,16 @@ class SpeakerMask(torch.nn.Module):
             mask = mask[:, -x.shape[1]:]
 
         x_masked = x * mask.unsqueeze(2)
-        if self.mask_original:
-            x = x_masked + self.feedforward(x_masked)
+        if self.residual:
+            if self.mask_original:
+                print("mask_original and residual")
+                x = x_masked + self.feedforward(x_masked)
+            else:
+                print("residual")
+                x = x + self.feedforward(x_masked)
         else:
-            x = x + self.feedforward(x_masked)
+            print("no residual")
+            x = self.feedforward(x_masked)
 
         return x
     
