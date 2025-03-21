@@ -175,8 +175,8 @@ def main(cfg):
         soft_decision=cfg.model.soft_decision,
         gt_decision=cfg.model.gt_decision,
         streaming_mode=cfg.model.streaming_mode,
+        streaming_cfg=cfg.model.streaming_cfg,
     )
-
     # Setup model for finetuning (train and validation only)
     model.setup_training_data(cfg.model.train_ds)
 

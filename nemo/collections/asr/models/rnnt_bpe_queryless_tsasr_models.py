@@ -53,7 +53,8 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
                          freeze_diar=None,
                          soft_decision=None,
                          gt_decision=None,
-                         streaming_mode=None):
+                         streaming_mode=None,
+                         streaming_cfg=None):
         """
         Initialize the speaker model.
         """
@@ -90,13 +91,13 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
 
         # Change the diarization model cfg for streaming inference
         if self.streaming_mode:
-            self.diarization_model.streaming_mode = self.cfg.streaming_mode
-            self.diarization_model.sortformer_modules.step_len = self.cfg.step_len
-            self.diarization_model.sortformer_modules.mem_len = self.cfg.mem_len
-            self.diarization_model.sortformer_modules.step_left_context = self.cfg.step_left_context
-            self.diarization_model.sortformer_modules.step_right_context = self.cfg.step_right_context
-            self.diarization_model.sortformer_modules.fifo_len = self.cfg.fifo_len
-            self.diarization_model.sortformer_modules.mem_refresh_rate = self.cfg.mem_refresh_rate
+            self.diarization_model.streaming_mode = self.streaming_mode
+            self.diarization_model.sortformer_modules.step_len = streaming_cfg.step_len
+            self.diarization_model.sortformer_modules.mem_len = streaming_cfg.mem_len
+            self.diarization_model.sortformer_modules.step_left_context = streaming_cfg.step_left_context
+            self.diarization_model.sortformer_modules.step_right_context = streaming_cfg.step_right_context
+            self.diarization_model.sortformer_modules.fifo_len = streaming_cfg.fifo_len
+            self.diarization_model.sortformer_modules.mem_refresh_rate = streaming_cfg.mem_refresh_rate
 
     def forward_diar(
         self,
