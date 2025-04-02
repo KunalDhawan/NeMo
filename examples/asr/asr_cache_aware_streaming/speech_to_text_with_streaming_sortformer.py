@@ -123,7 +123,7 @@ class DiarizationConfig:
     num_workers: int = 8
     random_seed: Optional[int] = None  # seed number going to be used in seed_everything()
     bypass_postprocessing: bool = True # If True, postprocessing will be bypassed
-    log: bool = True # If True, log will be printed
+    log: bool = False # If True, log will be printed
     
     # Eval Settings: (0.25, False) should be default setting for sortformer eval.
     collar: float = 0.25 # Collar in seconds for DER calculation
