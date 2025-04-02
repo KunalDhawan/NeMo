@@ -35,7 +35,7 @@ from nemo.collections.asr.parts.utils.speaker_utils import (
 audio_rttm_map as get_audio_rttm_map,
 rttm_to_labels,
 )
-from examples.asr.asr_cache_aware_streaming.start_words import COMMON_SENTENCE_STARTS
+# from examples.asr.asr_cache_aware_streaming.start_words import COMMON_SENTENCE_STARTS
 from nemo.collections.asr.parts.utils.diarization_utils import (
 print_sentences,
 get_color_palette,
@@ -53,7 +53,7 @@ from nemo.collections.asr.parts.utils.speaker_utils import (
 audio_rttm_map as get_audio_rttm_map,
 rttm_to_labels,
 )
-from examples.asr.asr_cache_aware_streaming.start_words import COMMON_SENTENCE_STARTS
+# from examples.asr.asr_cache_aware_streaming.start_words import COMMON_SENTENCE_STARTS
 from nemo.collections.asr.parts.utils.diarization_utils import (
 print_sentences,
 get_color_palette,
@@ -443,9 +443,11 @@ class SpeakerTaggedASR:
         self._frame_len_sec = 0.08
         self._initial_steps = cfg.ignored_initial_frame_steps
         self._all_sentences = []
-        self._stt_words = COMMON_SENTENCE_STARTS
+        # self._stt_words = COMMON_SENTENCE_STARTS
+        self._stt_words = []
         self._init_evaluator() 
         self._frame_hop_length = self.asr_model.encoder.streaming_cfg.valid_out_len
+        self.seglst_dict_list = []
     
     def _init_evaluator(self):  
         self.online_evaluators, self._word_and_ts_seq, self._sentence_and_ts_seq = [], [], []
@@ -528,11 +530,12 @@ class SpeakerTaggedASR:
                 'text': ''}
         
     def text_post_processing(self, sentence):
-        sentence['text'] =  sentence['text'].replace("twenty twenty twenty twenty twenty twenty twenty twenty twenty twenty twenty twenty twenty twenty twenty twenty twenty twenty twenty twenty twenty three", "twenty twenty three")
         if self.cfg.uppercase_first_letter and len(sentence['text']) > 1:
-            sentence['text'] = sentence['text'][:1].upper() + sentence['text'][1:]
+            # sentence['text'] = sentence['text'][:1].upper() + sentence['text'][1:]
+            sentence['text'] = sentence['text'][:1].lower() + sentence['text'][1:]
         if self.cfg.remove_pnc:
-            sentence['text'] = sentence['text'].lower().replace('.', '').replace(',', '').replace('!', '').replace('?', '').upper()
+            # sentence['text'] = sentence['text'].lower().replace('.', '').replace(',', '').replace('!', '').replace('?', '').upper()
+            sentence['text'] = sentence['text'].lower().replace('.', '').replace(',', '').replace('!', '').replace('?', '').lower()
         return sentence
     
     
@@ -694,6 +697,23 @@ class SpeakerTaggedASR:
                 word_and_ts_seq = correct_speaker_assignments(word_and_ts_seq=word_and_ts_seq, 
                                                                 sentence_render_length=self._sentence_render_length)
         return word_and_ts_seq
+    
+    def _save_seglst_dicts(self, word_and_ts_seq):
+        """ 
+        Save the word_and_ts_seq dictionary to a seglst file.
+        
+        Args:
+            word_and_ts_seq: Dictionary containing word and time-related information.
+        """
+        # import ipdb; ipdb.set_trace()
+        # seglst_list = []
+        # for word_dict in word_and_ts_seq['words']:
+        #     seglst_list.append({
+        #                         'start_time': word_dict['start_time'], 
+        #                         'end_time': word_dict['end_time'], 
+        #                         'speaker': word_dict['speaker'], 
+        #                         'word': word_dict['word']})
+        # write_seglst(f'{self.cfg.print_path}'.replace(".sh", f"_seglst.sh"), seg
 
     @measure_eta 
     def perform_streaming_stt_spk(
@@ -756,6 +776,8 @@ class SpeakerTaggedASR:
             left_offset=left_offset,
             right_offset=right_offset,
         )
+        # if step_num > 30:
+        #     import ipdb; ipdb.set_trace()
         transcribed_speaker_texts = [None] * len(self.test_manifest_dict)
         for idx, (uniq_id, data_dict) in enumerate(self.test_manifest_dict.items()): 
             if not (len( previous_hypotheses[idx].text) == 0 and step_num <= self._initial_steps):
@@ -769,9 +791,6 @@ class SpeakerTaggedASR:
                 if len(self._word_and_ts_seq[idx]["words"]) > 0:
                     self._word_and_ts_seq[idx] = self.get_sentences_values(session_trans_dict=self._word_and_ts_seq[idx], 
                                                                            sentence_render_length=self._sentence_render_length)
-                    if self.cfg.eval_mode:
-                        der, cpwer, is_update = self.online_evaluators[idx].evaluate_inloop(hyp_seglst=self._word_and_ts_seq[idx]["sentences"], 
-                                                                                            end_step_time=self._word_and_ts_seq[idx]["sentences"][-1]["end_time"])
                     if self.cfg.generate_scripts:
                         transcribed_speaker_texts[idx] = \
                             print_sentences(sentences=self._word_and_ts_seq[idx]["sentences"], 
@@ -877,9 +896,6 @@ class SpeakerTaggedASR:
                 if len(self._word_and_ts_seq[speaker_index]["words"]) > 0:
                     self._word_and_ts_seq[speaker_index] = self.get_sentences_values(session_trans_dict=self._word_and_ts_seq[speaker_index], 
                                                                            sentence_render_length=self._sentence_render_length)
-                    if self.cfg.eval_mode:
-                        der, cpwer, is_update = self.online_evaluators[speaker_index].evaluate_inloop(hyp_seglst=self._word_and_ts_seq[speaker_index]["sentences"], 
-                                                                                            end_step_time=self._word_and_ts_seq[speaker_index]["sentences"][-1]["end_time"])
                     if self.cfg.generate_scripts:
                         transcribed_speaker_texts[speaker_index] = \
                             print_sentences(sentences=self._word_and_ts_seq[speaker_index]["sentences"], 

@@ -163,7 +163,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             logging.warning(f"Could not load dataset as `manifest_filepath` was None. Provided config : {config}")
             return None
 
-        logging.info(f"Loading dataset from {config.manifest_filepath}")
+        # logging.info(f"Loading dataset from {config.manifest_filepath}")
 
         if self._trainer is not None:
             global_rank = self._trainer.global_rank
@@ -612,7 +612,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             chunk_left_offset=round(left_offset / self.encoder.subsampling_factor),
             chunk_right_offset=math.ceil(right_offset / self.encoder.subsampling_factor),
         )
-
         total_step_preds = torch.cat([previous_pred_out, chunk_preds], dim=1)
 
         if not self.training and self.sortformer_modules.visualization:
@@ -815,14 +814,14 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.batch_f1_accs_list.append(f1_acc)
         self.batch_precision_list.append(precision)
         self.batch_recall_list.append(recall)
-        logging.info(f"batch {batch_idx}: f1_acc={f1_acc}, precision={precision}, recall={recall}")
+        # logging.info(f"batch {batch_idx}: f1_acc={f1_acc}, precision={precision}, recall={recall}")
 
         self._accuracy_test_ats(preds, targets_ats, target_lens)
         f1_acc_ats, precision_ats, recall_ats = self._accuracy_test_ats.compute()
         self.batch_f1_accs_ats_list.append(f1_acc_ats)
-        logging.info(
-            f"batch {batch_idx}: f1_acc_ats={f1_acc_ats}, precision_ats={precision_ats}, recall_ats={recall_ats}"
-        )
+        # logging.info(
+        #     f"batch {batch_idx}: f1_acc_ats={f1_acc_ats}, precision_ats={precision_ats}, recall_ats={recall_ats}"
+        # )
 
         self._accuracy_test.reset()
         self._accuracy_test_ats.reset()
@@ -862,10 +861,10 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                     self.preds_total_list.extend(torch.split(preds, [1] * preds.shape[0]))
                 torch.cuda.empty_cache()
 
-        logging.info(f"Batch F1Acc. MEAN: {torch.mean(torch.tensor(self.batch_f1_accs_list))}")
-        logging.info(f"Batch Precision MEAN: {torch.mean(torch.tensor(self.batch_precision_list))}")
-        logging.info(f"Batch Recall MEAN: {torch.mean(torch.tensor(self.batch_recall_list))}")
-        logging.info(f"Batch ATS F1Acc. MEAN: {torch.mean(torch.tensor(self.batch_f1_accs_ats_list))}")
+        # logging.info(f"Batch F1Acc. MEAN: {torch.mean(torch.tensor(self.batch_f1_accs_list))}")
+        # logging.info(f"Batch Precision MEAN: {torch.mean(torch.tensor(self.batch_precision_list))}")
+        # logging.info(f"Batch Recall MEAN: {torch.mean(torch.tensor(self.batch_recall_list))}")
+        # logging.info(f"Batch ATS F1Acc. MEAN: {torch.mean(torch.tensor(self.batch_f1_accs_ats_list))}")
 
     def on_validation_epoch_end(self) -> Optional[dict[str, dict[str, torch.Tensor]]]:
         """Run validation with sync_dist=True."""
