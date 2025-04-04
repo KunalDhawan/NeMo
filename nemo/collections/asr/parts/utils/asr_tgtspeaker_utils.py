@@ -49,6 +49,24 @@ def mix_noise(
         mixed_cuts.append(mixed) 
     return CutSet.from_cuts(mixed_cuts)
 
+def rir_augment(cuts, prob):
+    mixed_cuts = []
+    for cut in cuts:
+        if random.uniform(0.0, 1.0) > prob:
+            mixed_cuts.append(cut)
+        else:
+            mixed_cuts.append(cut.reverb_rir())
+    return CutSet.from_cuts(mixed_cuts)
+
+def codec_augment(cuts, prob):
+    mixed_cuts = []
+    for cut in cuts:
+        if random.uniform(0.0, 1.0) > prob:
+            mixed_cuts.append(cut)
+        else:
+            mixed_cuts.append(cut.narrowband('mulaw'))
+    return CutSet.from_cuts(mixed_cuts)
+
 
 def speaker_to_target_w_query(
         a_cut, 

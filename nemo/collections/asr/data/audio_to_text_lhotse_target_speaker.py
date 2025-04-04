@@ -43,7 +43,9 @@ from nemo.collections.asr.parts.utils.asr_tgtspeaker_utils import (
     get_separator_audio,
     get_query_cut,
     speaker_to_target_w_query,
-    mix_noise
+    mix_noise,
+    rir_augment,
+    codec_augment
 )
 
 from nemo.collections.common.data.lhotse.cutset import guess_parse_cutset 
@@ -93,13 +95,20 @@ class LhotseSpeechToTextTgtSpkBpeDataset(torch.utils.data.Dataset):
         if self.fix_query_audio_end_time:
             self.query_audio_end_time = 10
         self.inference_mode = self.cfg.get('inference_mode', False)
-        self.query_noise_path = self.cfg.get('query_noise_path',None)
-        if self.query_noise_path:
+        #augmentation config
+        self.query_noise_augment = self.cfg.get('query_noise_augment', False)
+        self.query_rir_augment = self.cfg.get('query_rir_augment', False)
+        self.query_rir_prob = self.cfg.get('query_rir_prob', 0.3)
+        self.query_codec_augment = self.cfg.get('query_codec_augment', False)
+        self.query_codec_prob = self.cfg.get('query_codec_prob', 0.3)
+        if self.query_noise_augment:
+            self.query_noise_path = self.cfg.get('query_noise_path',None)
+            if not self.query_noise_path:
+                raise ValueError('query_noise_path is not set')
             with open(self.query_noise_path, 'r') as f:
                 self.query_noise_manifests = [json.loads(line) for line in f]
             self.query_noise_mix_prob = self.cfg.get('query_noise_mix_prob', 0.3)
             self.query_snr = tuple(self.cfg.get('query_snr',(2.5, 12.5)))
-    
 
     def __getitem__(self, cuts) -> Tuple[torch.Tensor, ...]:
         cuts, spk_mappings = shuffle_spk_mapping(cuts=cuts, num_speakers=self.num_speakers, shuffle_spk_mapping=self.shuffle_spk_mapping, pattern=self.spk_token_pattern)
@@ -120,13 +129,20 @@ class LhotseSpeechToTextTgtSpkBpeDataset(torch.utils.data.Dataset):
                 self.spk_tar_all_zero), 
                 dtype=torch.float32), 0, 1) for c, q in zip(cuts,query_cuts)]
             
-            if self.query_noise_path:
+            # order matters: rir_augment and codec_augment (output monocut) should be applied before mix_noise (output mixedcut)
+            if self.query_rir_augment:
+                query_cuts = rir_augment(query_cuts, prob = self.query_rir_prob)
+            if self.query_codec_augment:
+                query_cuts = codec_augment(query_cuts, prob = self.query_codec_prob)
+
+            if self.query_noise_augment:
                 query_cuts = mix_noise(
                     query_cuts,
                     self.query_noise_manifests,
                     snr = self.query_snr,
                     mix_prob = self.query_noise_mix_prob,
                 )
+
 
             # spk_targets = [torch.transpose(torch.as_tensor(self.speaker_to_target_tgt_speaker_0(c, q, self.num_speakers, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame, self.spk_tar_all_zero), dtype=torch.float32), 0, 1) for c, q in zip(cuts,query_cuts)]
 
