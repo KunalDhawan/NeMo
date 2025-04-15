@@ -144,7 +144,16 @@ class LinearAdapter(nn.Module, AdapterModuleUtil):
             self.module[-1].weight.data *= 0
             self.module[-1].bias.data *= 0
 
-    def forward(self, x):
+    def forward(self, x, mask=None):
+        if mask is not None:
+            if mask.shape[1] < x.shape[1]:
+                mask = nn.functional.pad(mask, (0, x.shape[1] - mask.shape[1]), mode='replicate')
+
+            if mask.shape[1] > x.shape[1]:
+                mask = mask[:, -x.shape[1]:]
+
+            x = x * mask.unsqueeze(2)
+
         x = self.module(x)
 
         # Add dropout if available
@@ -152,7 +161,6 @@ class LinearAdapter(nn.Module, AdapterModuleUtil):
             x = self.dropout(x)
 
         return x
-
 
 @dataclass
 class LinearAdapterConfig:

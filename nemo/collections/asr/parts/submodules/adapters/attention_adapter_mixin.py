@@ -60,6 +60,7 @@ class AttentionAdapterModuleMixin(adapter_mixins.AdapterModuleMixin):
         *,
         adapter_name: str,
         adapter_strategy: 'nemo.core.classes.mixins.adapter_mixin_strategies.AbstractAdapterStrategy',
+        additional_input={},
     ):
         """
         Perform the forward step of a single adapter module on some input data.

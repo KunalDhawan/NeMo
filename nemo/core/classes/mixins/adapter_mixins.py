@@ -494,7 +494,7 @@ class AdapterModuleMixin(ABC):
         for name in adapter_names:
             logging.info(f"Unfrozen adapter : {name}")
 
-    def forward_enabled_adapters(self, input: 'torch.Tensor'):
+    def forward_enabled_adapters(self, input: 'torch.Tensor', additional_input={}):
         """
         Forward's all active adapters one by one with the provided input, and chaining the outputs of each
         adapter layer to the next.
@@ -526,7 +526,7 @@ class AdapterModuleMixin(ABC):
 
             # Call a single adapter's forward, and accept its output as the new input for the next adapter.
             input = self.forward_single_enabled_adapter_(
-                input, adapter_module, adapter_name=adapter_name, adapter_strategy=strategy
+                input, adapter_module, adapter_name=adapter_name, adapter_strategy=strategy, additional_input=additional_input
             )
 
         return input
@@ -580,6 +580,7 @@ class AdapterModuleMixin(ABC):
         *,
         adapter_name: str,
         adapter_strategy: 'nemo.core.classes.mixins.adapter_mixin_strategies.AbstractAdapterStrategy',
+        additional_input={},
     ):
         """
         Perform the forward step of a single adapter module on some input data.
@@ -600,7 +601,7 @@ class AdapterModuleMixin(ABC):
             The result tensor, after the current active adapter has finished its forward pass.
         """
         # (input: torch.Tensor, adapter: torch.nn.Module, *, module: 'AdapterModuleMixin')
-        output = adapter_strategy(input, adapter_module, module=self)
+        output = adapter_strategy(input, adapter_module, module=self, additional_input=additional_input)
         return output
 
     def check_supported_adapter_type_(

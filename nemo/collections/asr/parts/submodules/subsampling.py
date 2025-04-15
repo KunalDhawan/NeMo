@@ -17,7 +17,11 @@ import math
 import torch
 import torch.nn as nn
 from torch.nn import LayerNorm
+from omegaconf import DictConfig
 
+from nemo.collections.asr.parts.utils import adapter_utils
+from nemo.core.classes import adapter_mixins
+from nemo.core.classes.mixins import AdapterModuleMixin
 from nemo.collections.asr.parts.submodules.causal_convs import CausalConv1D, CausalConv2D
 from nemo.utils import logging
 
@@ -59,7 +63,7 @@ class StackingSubsampling(torch.nn.Module):
         return x, lengths
 
 
-class ConvSubsampling(torch.nn.Module):
+class ConvSubsampling(torch.nn.Module, AdapterModuleMixin):
     """Convolutional subsampling which supports VGGNet and striding approach introduced in:
     VGGNet Subsampling: Transformer-transducer: end-to-end speech recognition with self-attention (https://arxiv.org/pdf/1910.12977.pdf)
     Striding Subsampling: "Speech-Transformer: A No-Recurrence Sequence-to-Sequence Model for Speech Recognition" by Linhao Dong et al. (https://ieeexplore.ieee.org/document/8462506)
@@ -382,7 +386,7 @@ class ConvSubsampling(torch.nn.Module):
     def get_streaming_cache_size(self):
         return [0, self.subsampling_factor + 1]
 
-    def forward(self, x, lengths):
+    def forward(self, x, lengths, vad_mask=None):
         lengths = calc_length(
             lengths,
             all_paddings=self._left_padding + self._right_padding,
@@ -433,6 +437,12 @@ class ConvSubsampling(torch.nn.Module):
         # Transpose to Channel Last mode
         else:
             x = x.transpose(1, 2)
+
+        # Adapter module forward step
+        if self.is_adapter_available():
+            # Call the adapters
+            additional_input = {'mask': vad_mask }
+            x = self.forward_enabled_adapters(x, additional_input=additional_input)
 
         return x, lengths
 
@@ -561,6 +571,17 @@ class ConvSubsampling(torch.nn.Module):
         ):
             raise ValueError("subsampling_conv_chunking_factor should be -1, 1, or a power of 2")
         self.subsampling_conv_chunking_factor = subsampling_conv_chunking_factor
+
+    # Adapter method overrides
+    def add_adapter(self, name: str, cfg: DictConfig):
+        # Update the config with correct input dim
+        cfg = self._update_adapter_cfg_input_dim(cfg)
+        # Add the adapter
+        super().add_adapter(name=name, cfg=cfg)
+
+    def _update_adapter_cfg_input_dim(self, cfg: DictConfig):
+        cfg = adapter_utils.update_adapter_cfg_input_dim(self, cfg, module_dim=self._feat_out)
+        return cfg
 
 
 def calc_length(lengths, all_paddings, kernel_size, stride, ceil_mode, repeat_num=1):
@@ -691,3 +712,8 @@ class SubsamplingReductionModule(nn.Module):
             x = torch.transpose(x, 1, 2)  # [B, T, C]
 
         return x, lengths
+
+# Add the adapter compatible modules to the registry
+for cls in [ConvSubsampling]:
+    if adapter_mixins.get_registered_adapter(cls) is None:
+        adapter_mixins.register_adapter(cls, cls)  # base class is adapter compatible itself

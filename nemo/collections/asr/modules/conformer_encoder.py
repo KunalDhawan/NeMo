@@ -555,9 +555,9 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             audio_signal = torch.transpose(audio_signal, 1, 2)
 
             if isinstance(self.pre_encode, nn.Linear):
-                audio_signal = self.pre_encode(audio_signal)
+                audio_signal = self.pre_encode(audio_signal, vad_mask=vad_mask)
             else:
-                audio_signal, length = self.pre_encode(x=audio_signal, lengths=length)
+                audio_signal, length = self.pre_encode(x=audio_signal, lengths=length, vad_mask=vad_mask)
                 length = length.to(torch.int64)
                 # self.streaming_cfg is set by setup_streaming_cfg(), called in the init
                 if self.streaming_cfg.drop_extra_pre_encoded > 0 and cache_last_channel is not None:
@@ -566,16 +566,6 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
 
             if self.reduction_position is not None and cache_last_channel is not None:
                 raise ValueError("Caching with reduction feature is not supported yet!")
-
-        if vad_mask is not None:
-            # vad_mask: [B, T]
-            # audio_signal: [B, T, D]
-            if vad_mask.shape[1] < audio_signal.shape[1]:
-                vad_mask = nn.functional.pad(vad_mask, (0, audio_signal.shape[1] - vad_mask.shape[1]), mode='replicate')
-
-            if vad_mask.shape[1] > audio_signal.shape[1]:
-                vad_mask = vad_mask[:, -audio_signal.shape[1]:]
-            audio_signal = audio_signal * vad_mask.unsqueeze(-1)
 
         max_audio_length = audio_signal.size(1)
         if cache_last_channel is not None:
@@ -1133,19 +1123,20 @@ class ConformerEncoderAdapter(ConformerEncoder, adapter_mixins.AdapterModuleMixi
         cfg = self._update_adapter_cfg_input_dim(cfg)
         for conformer_layer in self.layers:  # type: adapter_mixins.AdapterModuleMixin
             conformer_layer.add_adapter(name, cfg)
+        self.pre_encode.add_adapter(name, cfg)
 
     def is_adapter_available(self) -> bool:
-        return any([conformer_layer.is_adapter_available() for conformer_layer in self.layers])
+        return any([conformer_layer.is_adapter_available() for conformer_layer in self.layers]) or self.pre_encode.is_adapter_available()
 
     def set_enabled_adapters(self, name: Optional[str] = None, enabled: bool = True):
         for conformer_layer in self.layers:  # type: adapter_mixins.AdapterModuleMixin
             conformer_layer.set_enabled_adapters(name=name, enabled=enabled)
-
+        self.pre_encode.set_enabled_adapters(name=name, enabled=enabled)
     def get_enabled_adapters(self) -> List[str]:
         names = set([])
         for conformer_layer in self.layers:  # type: adapter_mixins.AdapterModuleMixin
             names.update(conformer_layer.get_enabled_adapters())
-
+        names.update(self.pre_encode.get_enabled_adapters())
         names = sorted(list(names))
         return names
 
