@@ -157,9 +157,9 @@ def perform_streaming(
         batch_size=batch_size
     )
 
-    previous_hypotheses = None
+    previous_hypotheses = [Hypothesis(score=0, y_sequence=[]) for i in range(cfg.mix)]
     streaming_buffer_iter = iter(streaming_buffer)
-    asr_pred_out_stream, diar_pred_out_stream  = None, None
+    asr_pred_out_stream, diar_pred_out_stream  = [torch.tensor([]) for i in range(cfg.mix)], None
     mem_last_time, fifo_last_time = None, None
     left_offset, right_offset = 0, 0
 
@@ -198,13 +198,15 @@ def perform_streaming(
                         fifo_last_time=fifo_last_time,
                         left_offset=left_offset,
                         right_offset=right_offset,
+                        att_context_size=cfg.att_context_size,
                         pad_and_drop_preencoded=False,
                         binary_diar_preds=cfg.binary_diar_preds,
                         n_mix=cfg.mix,
+                        vad=cfg.get("vad", False)
                     )
         
         if debug_mode:
-            logging.info(f"Streaming transcriptions: {extract_transcriptions(transcribed_texts)}")
+            logging.info(f"Streaming transcriptions: {extract_transcriptions(previous_hypotheses)}")
         
         loop_end_time = time.time()
         feat_frame_count += (chunk_audio.shape[-1] - cfg.discarded_frames)
@@ -216,9 +218,10 @@ def perform_streaming(
             time.sleep(max(0, (chunk_audio.shape[-1] - cfg.discarded_frames)*cfg.feat_len_sec - 
                            (loop_end_time - loop_start_time) - time_diff * cfg.finetune_realtime_ratio))
     
-    final_streaming_tran = extract_transcriptions(transcribed_texts)
+    final_streaming_tran = extract_transcriptions(previous_hypotheses)
+    # torch.save(diar_pred_out_stream, "diar_pred_out_stream.pt")
     
-    return final_streaming_tran, final_offline_tran
+    return final_streaming_tran, final_offline_tran, diar_pred_out_stream
 
 
 @hydra_runner(config_name="DiarizationConfig", schema=DiarizationConfig)
@@ -367,7 +370,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         processed_signal, processed_signal_length, stream_id = streaming_buffer.append_audio_file(
             args.audio_file, stream_id=-1
         )
-        streaming_tran, offline_tran = perform_streaming(
+        streaming_tran, offline_tran, diar_pred_out_stream = perform_streaming(
             cfg=cfg,
             asr_model=asr_model,
             diar_model=diar_model,
@@ -390,6 +393,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
 
         start_time = time.time()
         all_streaming_tran = []
+        all_diar_pred_out_stream = []
         streaming_buffer = CacheAwareStreamingAudioBuffer(
             model=asr_model,
             online_normalization=online_normalization,
@@ -406,21 +410,25 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
 
             if (sample_idx + 1) % args.batch_size == 0 or sample_idx == len(samples) - 1:
                 logging.info(f"Starting to stream samples {sample_idx - len(streaming_buffer) + 1} to {sample_idx}...")
-                streaming_tran, offline_tran = perform_streaming(
+                streaming_tran, offline_tran, diar_pred_out_stream = perform_streaming(
                     cfg=cfg,
                     asr_model=asr_model,
                     diar_model=diar_model,
                     streaming_buffer=streaming_buffer,
                 )
                 all_streaming_tran.extend(streaming_tran)
+                all_diar_pred_out_stream.append(diar_pred_out_stream)
                 streaming_buffer.reset_buffer()
-                
-        if args.output_path is not None:
+        
 
+        if args.output_path is not None:
+            torch.save(all_diar_pred_out_stream, args.output_path.replace('.json', '_diar_pred_out_stream.pt'))
             hyp_json = args.output_path
             records = []
             
             for i, hyp in enumerate(all_streaming_tran):
+                if hyp == "" or hyp is None:
+                    return
                 idx = i // args.mix
                 mod = i % args.mix
                 audio_filepath = samples[idx]["audio_filepath"]

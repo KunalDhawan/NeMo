@@ -372,6 +372,7 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
         return_log_probs: bool = False,
         spk_targets: torch.Tensor = None,
         n_mix = 1,
+        vad=False
     ):
         """
         It simulates a forward step with caching for streaming purposes.
@@ -400,7 +401,78 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
             encoded_len: the length of the output log_probs + history chunk log_probs, only returned when return_log_probs=True
         """
         # Multi-instance inference
-        if len(spk_targets.size()) == 3:
+        # N: # speakers
+        # B x T x N
+        spk_targets = spk_targets[:, :, :n_mix] 
+        if vad:
+            # import ipdb; ipdb.set_trace()
+            max_probs = torch.max(spk_targets, dim=1).values # B x N
+            valid_speakers = max_probs > 0.5 # B x N
+            if valid_speakers.sum() == 0:
+                return previous_pred_out, previous_hypotheses, cache_last_channel, cache_last_time, cache_last_channel_len, previous_hypotheses
+            valid_speaker_ids = torch.where(valid_speakers)[1] # B x N
+
+            # spk_targets: (B, T, N) -> (BN, T)
+            spk_targets = spk_targets.transpose(1, 2).reshape(-1, spk_targets.size(1)) 
+            # 
+            self.spk_targets = spk_targets[valid_speakers.reshape(-1)]
+
+            mi_processed_signal = []
+            mi_processed_signal_length = []
+            for i in range(processed_signal.size(0)):
+                mi_processed_signal.append(processed_signal[[i]].repeat(valid_speakers[i].sum(), 1, 1))
+                mi_processed_signal_length.append(processed_signal_length[[i]].repeat(valid_speakers[i].sum()))
+            
+            processed_signal = torch.cat(mi_processed_signal, dim=0)
+            processed_signal_length = torch.cat(mi_processed_signal_length, dim=0)
+            
+            # processed_signal: (B, T, D) -> (BN, T, D)
+            # processed_signal = processed_signal.unsqueeze(1).repeat(1, n_mix, 1, 1).reshape(-1, processed_signal.size(1), processed_signal.size(2))
+            # processed_signal_length = processed_signal_length.unsqueeze(1).repeat(1, n_mix).reshape(-1)
+            
+            if cache_last_channel_len.shape[0] != n_mix:
+                cache_last_channel = cache_last_channel.unsqueeze(2).repeat(1, 1, n_mix, 1, 1).reshape(cache_last_channel.size(0), -1, cache_last_channel.size(2), cache_last_channel.size(3))
+                cache_last_time = cache_last_time.unsqueeze(2).repeat(1, 1, n_mix, 1, 1).reshape(cache_last_time.size(0), -1, cache_last_time.size(2), cache_last_time.size(3))
+                cache_last_channel_len = cache_last_channel_len.unsqueeze(1).repeat(1, n_mix).reshape(-1)
+            
+            cache_last_channel_spk = cache_last_channel[:, valid_speakers.reshape(-1)]
+            cache_last_time_spk = cache_last_time[:, valid_speakers.reshape(-1)]
+            cache_last_channel_len_spk = cache_last_channel_len[valid_speakers.reshape(-1)]
+            
+            previous_pred_out_spk = [previous_pred_out[i] for i in valid_speaker_ids]
+            previous_hypotheses_spk = [previous_hypotheses[i] for i in valid_speaker_ids]
+
+            (
+                asr_pred_out_stream_spk,
+                transcribed_texts_spk,
+                cache_last_channel_spk,
+                cache_last_time_spk,
+                cache_last_channel_len_spk,
+                previous_hypotheses_spk 
+            ) = super().conformer_stream_step(
+                processed_signal=processed_signal,
+                processed_signal_length=processed_signal_length,
+                cache_last_channel=cache_last_channel_spk,
+                cache_last_time=cache_last_time_spk,
+                cache_last_channel_len=cache_last_channel_len_spk,
+                keep_all_outputs=keep_all_outputs,
+                previous_hypotheses=previous_hypotheses_spk,
+                previous_pred_out=previous_pred_out_spk,
+                drop_extra_pre_encoded=drop_extra_pre_encoded,
+                return_transcription=return_transcription,
+                return_log_probs=return_log_probs
+            )
+
+            cache_last_channel[:, valid_speakers.reshape(-1)] = cache_last_channel_spk
+            cache_last_time[:, valid_speakers.reshape(-1)] = cache_last_time_spk
+            cache_last_channel_len[valid_speakers.reshape(-1)] = cache_last_channel_len_spk
+
+            for i, spk_idx in enumerate(valid_speaker_ids):
+                previous_hypotheses[spk_idx] = previous_hypotheses_spk[i]
+                previous_pred_out[spk_idx] = asr_pred_out_stream_spk[i]
+
+            return previous_pred_out, transcribed_texts_spk, cache_last_channel, cache_last_time, cache_last_channel_len, previous_hypotheses
+        else:
             # N: # speakers
             # spk_targets: (B, T, N) -> (BN, T)
             self.spk_targets = spk_targets[:, :, :n_mix].transpose(1, 2).reshape(-1, spk_targets.size(1))
@@ -409,21 +481,21 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
             processed_signal = processed_signal.unsqueeze(1).repeat(1, n_mix, 1, 1).reshape(-1, processed_signal.size(1), processed_signal.size(2))
             processed_signal_length = processed_signal_length.unsqueeze(1).repeat(1, n_mix).reshape(-1)
 
-        if cache_last_channel_len.shape[0] != processed_signal.shape[0]:
-            cache_last_channel = cache_last_channel.unsqueeze(2).repeat(1, 1, n_mix, 1, 1).reshape(cache_last_channel.size(0), -1, cache_last_channel.size(2), cache_last_channel.size(3))
-            cache_last_time = cache_last_time.unsqueeze(2).repeat(1, 1, n_mix, 1, 1).reshape(cache_last_time.size(0), -1, cache_last_time.size(2), cache_last_time.size(3))
-            cache_last_channel_len = cache_last_channel_len.unsqueeze(1).repeat(1, n_mix).reshape(-1)
+            if cache_last_channel_len.shape[0] != processed_signal.shape[0]:
+                cache_last_channel = cache_last_channel.unsqueeze(2).repeat(1, 1, n_mix, 1, 1).reshape(cache_last_channel.size(0), -1, cache_last_channel.size(2), cache_last_channel.size(3))
+                cache_last_time = cache_last_time.unsqueeze(2).repeat(1, 1, n_mix, 1, 1).reshape(cache_last_time.size(0), -1, cache_last_time.size(2), cache_last_time.size(3))
+                cache_last_channel_len = cache_last_channel_len.unsqueeze(1).repeat(1, n_mix).reshape(-1)
 
-        return super().conformer_stream_step(
-            processed_signal=processed_signal,
-            processed_signal_length=processed_signal_length,
-            cache_last_channel=cache_last_channel,
-            cache_last_time=cache_last_time,
-            cache_last_channel_len=cache_last_channel_len,
-            keep_all_outputs=keep_all_outputs,
-            previous_hypotheses=previous_hypotheses,
-            previous_pred_out=previous_pred_out,
-            drop_extra_pre_encoded=drop_extra_pre_encoded,
-            return_transcription=return_transcription,
-            return_log_probs=return_log_probs
-        )
+            return super().conformer_stream_step(
+                processed_signal=processed_signal,
+                processed_signal_length=processed_signal_length,
+                cache_last_channel=cache_last_channel,
+                cache_last_time=cache_last_time,
+                cache_last_channel_len=cache_last_channel_len,
+                keep_all_outputs=keep_all_outputs,
+                previous_hypotheses=previous_hypotheses,
+                previous_pred_out=previous_pred_out,
+                drop_extra_pre_encoded=drop_extra_pre_encoded,
+                return_transcription=return_transcription,
+                return_log_probs=return_log_probs
+            )

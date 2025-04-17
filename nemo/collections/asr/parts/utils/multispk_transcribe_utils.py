@@ -790,8 +790,10 @@ class SpeakerTaggedASR:
         right_offset,
         is_buffer_empty,
         pad_and_drop_preencoded,
+        att_context_size,
         binary_diar_preds,
         n_mix,
+        vad
     ):
         
         if step_num > 0:
@@ -815,6 +817,11 @@ class SpeakerTaggedASR:
         )
 
         spk_targets = diar_pred_out_stream
+
+        diar_max_len = att_context_size[-1] + 1
+        if spk_targets.shape[1] > diar_max_len:
+            spk_targets = spk_targets[:, -diar_max_len:]
+
         if binary_diar_preds:
             spk_targets = (spk_targets > 0.5).float()
         
@@ -825,6 +832,7 @@ class SpeakerTaggedASR:
             cache_last_time,
             cache_last_channel_len,
             previous_hypotheses,
+            # valid_speaker_ids,
         ) = self.asr_model.conformer_stream_step(
             processed_signal=chunk_audio,
             processed_signal_length=chunk_lengths,
@@ -839,40 +847,41 @@ class SpeakerTaggedASR:
             ),
             return_transcription=True,
             spk_targets=spk_targets,
-            n_mix=n_mix
+            n_mix=n_mix,
+            vad=vad
         )
 
         transcribed_speaker_texts = [None] * n_mix
-        uniq_id = list(self.test_manifest_dict.keys())[0]
-        if len(self._word_and_ts_seq) < n_mix:
-            self._word_and_ts_seq = [deepcopy(self._word_and_ts_seq[0]) for _ in range(n_mix)]
+        # uniq_id = list(self.test_manifest_dict.keys())[0]
+        # if len(self._word_and_ts_seq) < n_mix:
+        #     self._word_and_ts_seq = [deepcopy(self._word_and_ts_seq[0]) for _ in range(n_mix)]
 
         # step 1: save the word and time-stamp sequence for each speaker
         # import ipdb; ipdb.set_trace()
-        for idx in range(n_mix): 
-            if not (len( previous_hypotheses[idx].text) == 0 and step_num <= self._initial_steps):
-                # Get the word-level dictionaries for each word in the chunk
-                diar_pred_out_stream_idx = torch.zeros_like(diar_pred_out_stream)
-                diar_pred_out_stream_idx[:, :, idx] = diar_pred_out_stream[:, :, idx]
-                self._word_and_ts_seq[idx] = self.get_frame_and_words_online(uniq_id=uniq_id,
-                                                                            step_num=step_num, 
-                                                                            diar_pred_out_stream=diar_pred_out_stream_idx[0],
-                                                                            previous_hypothesis=previous_hypotheses[idx], 
-                                                                            word_and_ts_seq=self._word_and_ts_seq[idx],
-                                                                            )
-                if len(self._word_and_ts_seq[idx]["words"]) > 0:
-                    self._word_and_ts_seq[idx] = self.get_sentences_values(session_trans_dict=self._word_and_ts_seq[idx], 
-                                                                           sentence_render_length=self._sentence_render_length)
-                    if self.cfg.eval_mode:
-                        der, cpwer, is_update = self.online_evaluators[idx].evaluate_inloop(hyp_seglst=self._word_and_ts_seq[idx]["sentences"], 
-                                                                                            end_step_time=self._word_and_ts_seq[idx]["sentences"][-1]["end_time"])
-                    if self.cfg.generate_scripts:
-                        transcribed_speaker_texts[idx] = \
-                            print_sentences(sentences=self._word_and_ts_seq[idx]["sentences"], 
-                            color_palette=get_color_palette(), 
-                            params=self.cfg)
-                        write_txt(f'{self.cfg.print_path}'.replace(".sh", f"_{idx}.sh"), 
-                                  transcribed_speaker_texts[idx].strip())
+        # for idx in range(n_mix): 
+        #     if not (len( previous_hypotheses[idx].text) == 0 and step_num <= self._initial_steps):
+        #         # Get the word-level dictionaries for each word in the chunk
+        #         diar_pred_out_stream_idx = torch.zeros_like(diar_pred_out_stream)
+        #         diar_pred_out_stream_idx[:, :, idx] = diar_pred_out_stream[:, :, idx]
+        #         self._word_and_ts_seq[idx] = self.get_frame_and_words_online(uniq_id=uniq_id,
+        #                                                                     step_num=step_num, 
+        #                                                                     diar_pred_out_stream=diar_pred_out_stream_idx[0],
+        #                                                                     previous_hypothesis=previous_hypotheses[idx], 
+        #                                                                     word_and_ts_seq=self._word_and_ts_seq[idx],
+        #                                                                     )
+        #         if len(self._word_and_ts_seq[idx]["words"]) > 0:
+        #             self._word_and_ts_seq[idx] = self.get_sentences_values(session_trans_dict=self._word_and_ts_seq[idx], 
+        #                                                                    sentence_render_length=self._sentence_render_length)
+        #             if self.cfg.eval_mode:
+        #                 der, cpwer, is_update = self.online_evaluators[idx].evaluate_inloop(hyp_seglst=self._word_and_ts_seq[idx]["sentences"], 
+        #                                                                                     end_step_time=self._word_and_ts_seq[idx]["sentences"][-1]["end_time"])
+        #             if self.cfg.generate_scripts:
+        #                 transcribed_speaker_texts[idx] = \
+        #                     print_sentences(sentences=self._word_and_ts_seq[idx]["sentences"], 
+        #                     color_palette=get_color_palette(), 
+        #                     params=self.cfg)
+        #                 write_txt(f'{self.cfg.print_path}'.replace(".sh", f"_{idx}.sh"), 
+        #                           transcribed_speaker_texts[idx].strip())
         
         return (transcribed_speaker_texts,
                 transcribed_texts,
