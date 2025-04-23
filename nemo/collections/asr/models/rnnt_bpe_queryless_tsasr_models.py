@@ -205,7 +205,7 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
             # Get diarization predictions from model
             with torch.set_grad_enabled(not self.freeze_diar):
                 pred_spk_targets = self.diarization_model(audio_signal=audio_signal, audio_signal_length=audio_signal_length)
-                spk_targets = get_pil_targets(spk_targets.clone(), pred_spk_targets, self.speaker_permutations)
+                spk_targets = get_pil_targets(pred_spk_targets.clone(), spk_targets.clone(), self.speaker_permutations)
             
         if self.soft_decision:
             pass
