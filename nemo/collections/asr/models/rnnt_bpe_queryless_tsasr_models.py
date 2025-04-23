@@ -15,7 +15,7 @@
 import copy
 import os
 from typing import Dict, List, Optional, Union
-
+import itertools
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -37,6 +37,7 @@ from nemo.collections.asr.models.rnnt_bpe_models import EncDecRNNTBPEModel
 from nemo.collections.asr.models.sortformer_diar_models import SortformerEncLabelModel
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
 from nemo.collections.asr.modules.speaker_kernels import SpeakerMask, SpeakerConcat
+from nemo.collections.asr.parts.utils.asr_multispeaker_utils import get_pil_targets
 
 from nemo.core.classes.common import typecheck
 from nemo.utils import logging
@@ -49,6 +50,8 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
 
         if self.cfg.get('diar_model_path', None):
             self.num_speakers = cfg.model_defaults.get('num_speakers', 4)
+            speaker_inds = list(range(self.num_speakers))
+            self.speaker_permutations = torch.tensor(list(itertools.permutations(speaker_inds)))  # Get all permutations
 
             # config for speaker kernel
             self.spk_kernel_type = cfg.get('spk_kernel_type', None)
@@ -201,8 +204,9 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
         else:
             # Get diarization predictions from model
             with torch.set_grad_enabled(not self.freeze_diar):
-                spk_targets = self.diarization_model(audio_signal=audio_signal, audio_signal_length=audio_signal_length)
-
+                pred_spk_targets = self.diarization_model(audio_signal=audio_signal, audio_signal_length=audio_signal_length)
+                spk_targets = get_pil_targets(spk_targets.clone(), pred_spk_targets, self.speaker_permutations)
+            
         if self.soft_decision:
             pass
         else:
@@ -413,9 +417,9 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
             valid_speaker_ids = torch.where(valid_speakers)[1] # B x N
 
             # spk_targets: (B, T, N) -> (BN, T)
-            spk_targets = spk_targets.transpose(1, 2).reshape(-1, spk_targets.size(1)) 
+            spk_targets = spk_targets.transpose(1, 2).reshape(-1, spk_targets.size(1)) > 0.5
             # 
-            self.spk_targets = spk_targets[valid_speakers.reshape(-1)]
+            self.spk_targets = spk_targets[valid_speakers.reshape(-1)].float()
 
             mi_processed_signal = []
             mi_processed_signal_length = []
@@ -478,7 +482,7 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
             self.spk_targets = spk_targets[:, :, :n_mix].transpose(1, 2).reshape(-1, spk_targets.size(1))
 
             # processed_signal: (B, T, D) -> (BN, T, D)
-            processed_signal = processed_signal.unsqueeze(1).repeat(1, n_mix, 1, 1).reshape(-1, processed_signal.size(1), processed_signal.size(2))
+            processed_signal = processed_signal.unsqueeze(1).repeat(1, n_mix, 1, 1).reshape(-1, processed_signal.size(1), processed_signal.size(2)) 
             processed_signal_length = processed_signal_length.unsqueeze(1).repeat(1, n_mix).reshape(-1)
 
             if cache_last_channel_len.shape[0] != processed_signal.shape[0]:

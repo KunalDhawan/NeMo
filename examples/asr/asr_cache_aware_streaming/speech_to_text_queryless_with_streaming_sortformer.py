@@ -428,7 +428,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
             
             for i, hyp in enumerate(all_streaming_tran):
                 if hyp == "" or hyp is None:
-                    return
+                    continue
                 idx = i // args.mix
                 mod = i % args.mix
                 audio_filepath = samples[idx]["audio_filepath"]
