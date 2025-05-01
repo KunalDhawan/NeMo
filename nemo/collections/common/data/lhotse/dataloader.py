@@ -45,6 +45,7 @@ from nemo.collections.common.prompts.fn import get_prompt_format_fn
 from nemo.collections.asr.parts.utils.asr_multispeaker_utils import ConcatenationMeetingSimulator, MixMeetingSimulator, LibriSpeechMixGenerator, LibriSpeechMixSimulator
 from nemo.collections.asr.parts.utils.asr_tgtspeaker_utils import LibriSpeechMixGenerator_tgt, LibriSpeechMixSimulator_tgt
 from nemo.utils import logging
+import json
 
 
 @dataclass
@@ -197,8 +198,41 @@ def get_lhotse_dataloader_from_config(
     fix_random_seed(seed)
 
     # 1. Load a manifest as a Lhotse CutSet.
-    cuts, is_tarred, weights = read_cutset_from_config(config)
-    
+    cuts, is_tarred = read_cutset_from_config(config)
+
+
+    # Get weights from nemo-only manifest jsons
+    # Extract manifest paths from nemo type configs, nemo type are datasets doesn't need simulation so need to record weights to combine with simulated cuts
+    # weights will only be used when using collaborating with LibriSpeechMixSimulator_tgt
+    # Target_speaker_siimualtor will use "weights" specified in config.yaml
+    manifest_paths = []
+    def extract_nemo_manifests(cfg):
+        if isinstance(cfg, DictConfig):
+            if cfg.get('type') == 'nemo':
+                manifest_paths.append(cfg['manifest_filepath'])
+            elif cfg.get('input_cfg'):
+                for sub_cfg in cfg['input_cfg']:
+                    extract_nemo_manifests(sub_cfg)
+    if config.get('input_cfg'):
+        for cfg in config.input_cfg:
+            extract_nemo_manifests(cfg)
+    else:
+        manifest_paths.append(config.manifest_filepath)
+
+    weights = []
+    for manifest_path in manifest_paths:
+        if isinstance(manifest_path, str):
+            #single manifest
+            with open(manifest_path, 'r') as f:
+                manifest_json = [json.loads(line) for line in f]
+            weights.append(len(manifest_json))
+        elif isinstance(manifest_path, list):
+            #multiple manifests
+            for path in manifest_path:
+                with open(path, 'r') as f:
+                    manifest_json = [json.loads(line) for line in f]
+                weights.append(len(manifest_json))
+
     if config.generators is not None:
         #genertor use pre-defined mixed manifest to generator audio. It requires pre-generated rttm/audio_file_path. Only wav need to be mixed here. This is meant to alleviate the storage overhead for millions of mixed audio
         generated_cuts = CutSet()
@@ -208,7 +242,7 @@ def get_lhotse_dataloader_from_config(
                 cfg_for_generation = LhotseDataLoadingConfig()
                 cfg_for_generation = OmegaConf.create(cfg_for_generation)
                 cfg_for_generation.manifest_filepath = generator_config.manifest_filepath
-                cuts_for_generation, _, _ = read_cutset_from_config(cfg_for_generation)
+                cuts_for_generation, _,= read_cutset_from_config(cfg_for_generation)
             else:
                 raise ValueError ('Invalid generator manifest filepath')
             if generator_config.get('lsmix',False):
@@ -237,7 +271,7 @@ def get_lhotse_dataloader_from_config(
                 cfg_for_simulation = LhotseDataLoadingConfig()
                 cfg_for_simulation = OmegaConf.create(cfg_for_simulation)
                 cfg_for_simulation.manifest_filepath = simulator_config.manifest_filepath
-                cuts_for_simulation, _, _ = read_cutset_from_config(cfg_for_simulation)
+                cuts_for_simulation, _,= read_cutset_from_config(cfg_for_simulation)
             else:
                 raise ValueError ('Invalid simulator manifest filepath')
             if simulator_config.get('lsmix',False):

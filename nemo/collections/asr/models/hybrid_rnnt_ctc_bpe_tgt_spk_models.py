@@ -240,7 +240,7 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
                     # diar_preds, _preds, attn_score_stack, total_memory_list, encoder_states_list = self.forward_diar(signal, signal_len)
                     diar_preds = self.forward_diar(signal, signal_len, is_raw_waveform_input)
                     if self.binarize_diar_preds_threshold:
-                        diar_preds = torch.where(diar_preds > self.binarize_diar_preds_threshold, torch.tensor(1), torch.tensor(0)).to(encoded.device).half()
+                        diar_preds = torch.where(diar_preds > self.binarize_diar_preds_threshold, torch.tensor(1), torch.tensor(0)).to(signal.device).float()
                 if diar_preds is None:
                     raise ValueError("`diar_pred`is required for speaker supervision strategy 'diar'")
             elif self.cfg.spk_supervision_strategy == 'mix':

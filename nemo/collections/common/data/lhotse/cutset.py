@@ -28,6 +28,7 @@ from omegaconf import DictConfig, ListConfig, OmegaConf
 from nemo.collections.common.data.lhotse.nemo_adapters import LazyNeMoIterator, LazyNeMoTarredIterator
 from nemo.collections.common.data.lhotse.text_adapters import LhotseTextAdapter, LhotseTextPairAdapter
 from nemo.collections.common.parts.preprocessing.manifest import get_full_path
+from nemo.collections.asr.parts.utils.asr_tgtspeaker_utils import TargetSpeakerSimulator
 
 
 def read_cutset_from_config(config: DictConfig) -> Tuple[CutSet, bool]:
@@ -50,14 +51,14 @@ def read_cutset_from_config(config: DictConfig) -> Tuple[CutSet, bool]:
         is_tarred = config.get("shar_path") is not None
     if use_nemo_manifest:
         # Read NeMo manifest -- use the right wrapper depending on tarred/non-tarred.
-        cuts, weights = read_nemo_manifest(config, is_tarred)
+        cuts = read_nemo_manifest(config, is_tarred)
     else:
         # Read Lhotse manifest (again handle both tarred(shar)/non-tarred).
         cuts = read_lhotse_manifest(config, is_tarred)
-    return cuts, is_tarred, weights
+    return cuts, is_tarred
 
 
-KNOWN_DATASET_CONFIG_TYPES = frozenset(("nemo", "nemo_tarred", "lhotse", "lhotse_shar", "txt", "txt_pair", "group"))
+KNOWN_DATASET_CONFIG_TYPES = frozenset(("nemo", "nemo_tarred", "lhotse", "lhotse_shar", "txt", "txt_pair", "group", "tgt_speaker_simulator"))
 
 
 def read_dataset_config(config) -> tuple[CutSet, bool]:
@@ -154,6 +155,9 @@ def parse_group(grp_cfg: DictConfig, propagate_attrs: dict) -> [CutSet, bool]:
     elif grp_cfg.type == "lhotse":
         is_tarred = False
         cuts = read_lhotse_manifest(grp_cfg, is_tarred=is_tarred)
+    elif grp_cfg.type == 'tgt_speaker_simulator':
+        is_tarred = False
+        cuts = read_target_speaker_simulator(grp_cfg)
     # Note: "txt" and "txt_pair" have "is_tarred" set to True.
     #       The main reason is to enable combination of tarred audio and text dataloading,
     #       since we don't allow combination of tarred and non-tarred datasets.
@@ -488,8 +492,22 @@ def read_nemo_manifest(config, is_tarred: bool) -> CutSet:
             seed=config.shard_seed,
             force_finite=force_finite or metadata_only,
         )
-    return cuts, weights
+    return cuts
 
+def read_target_speaker_simulator(config: DictConfig) -> tuple[CutSet, bool]:
+    """Read NeMo manifest and return a Lhotse CutSet simulator for target speaker ASR."""
+    tgt_speaker_cuts = CutSet(
+        TargetSpeakerSimulator(
+            manifest_filepath=config.manifest_filepath,
+            num_speakers=config.num_speakers,
+            simulator_type=config.simulator_type,
+            min_delay=config.get("min_delay", 0.5),
+            max_delay_after_each_mono=config.get("max_delay_after_each_mono", 0),
+            non_query_sample=config.get("non_query_sample", False)
+        )
+    )
+
+    return tgt_speaker_cuts
 
 def mux(
     *cutsets: CutSet,

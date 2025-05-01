@@ -170,8 +170,21 @@ class FrameBatchASR_tgt_spk:
     def _get_batch_preds(self, keep_logits=False):
         device = self.asr_model.device
         for batch in iter(self.data_loader):
-            # import ipdb; ipdb.set_trace()
+            
             feat_signal, feat_signal_len = batch
+
+            # # padding silence after each buffer
+            # import numpy as np; import torch
+            # # Add padding silence to each sample
+            # batch_size = len(feat_signal)
+            # padding_len = 1 # in s
+            # batched_padding_silence =torch.tensor(np.array([np.zeros([16000*padding_len]) for _ in range(batch_size)]))
+            # feat_signal = torch.cat([feat_signal, batched_padding_silence], axis=-1)
+            # padding_len = padding_len*16000
+            # feat_signal_len += padding_len
+
+
+
             feat_signal, feat_signal_len = feat_signal.to(device), feat_signal_len.to(device)
             # forward_outs = self.asr_model(processed_signal=feat_signal, processed_signal_length=feat_signal_len)
             encoded, encoded_len, _, _ = self.asr_model.train_val_forward([feat_signal, feat_signal_len, None, None, None, None], 0)
@@ -182,13 +195,50 @@ class FrameBatchASR_tgt_spk:
                 predictions = log_probs.argmax(dim=-1, keepdim=False)
             else:
                 log_probs, encoded_len, predictions = forward_outs
-            #remove pred from query
+            # #remove pred from query
             log_probs = log_probs[:,self.query_pred_len:,:]
             predictions = predictions[:,self.query_pred_len:]
+
+            # hidden_padding_len = get_hidden_length_from_sample_length(padding_len, 160, 8)
+            # log_probs = log_probs[:,self.query_pred_len-1:-hidden_padding_len+1,:]
+            # predictions = predictions[:,self.query_pred_len-1:-hidden_padding_len+1]
+  
 
             preds = torch.unbind(predictions)
             for pred in preds:
                 self.all_preds.append(pred.cpu().numpy())
+            
+            save_intermediate_var = False
+            if save_intermediate_var:
+                import ipdb; ipdb.set_trace()
+                delay = 26
+                tokens_per_chunk = 2
+                buffer_logits = []
+                buffer_preds = []
+                for i, pred in enumerate(self.all_preds):
+                    decoded = pred.tolist()
+                    self.unmerged += decoded[max(0,len(decoded) - 1 - delay) : len(decoded) - 1 - delay + tokens_per_chunk]
+                    hypothesis = self.greedy_merge(self.unmerged)
+                    # print(hypothesis)
+                    buffer_preds.append(self.greedy_merge(decoded))
+                    buffer_logits.append(decoded)
+                import ipdb; ipdb.set_trace()
+                parent_dir = '/home/jinhanw/workdir/workdir_nemo_speaker_asr/dataloader/pipeline/decode_scripts/saved/temp/'
+                os.makedirs(parent_dir, exist_ok=True)
+                import pickle; import numpy as np;
+                with open(os.path.join(parent_dir, 'buffer_preds.pickle'), 'wb') as f:
+                    pickle.dump(buffer_preds, f)
+                with open(os.path.join(parent_dir, 'buffer_logits.pickle'), 'wb') as f:
+                    pickle.dump(buffer_logits, f)
+                with open(os.path.join(parent_dir, 'feat_signal.pickle'), 'wb') as f:
+                    pickle.dump(feat_signal, f)
+                with open(os.path.join(parent_dir, 'feat_signal_len.pickle'), 'wb') as f:
+                    pickle.dump(feat_signal_len, f)
+                with open(os.path.join(parent_dir,'diar_model.cfg'), 'w') as f:
+                    f.write(OmegaConf.to_yaml(self.asr_model.diarization_model._cfg))
+                import ipdb; ipdb.set_trace()
+
+            
             if keep_logits:
                 log_probs = torch.unbind(log_probs)
                 for log_prob in log_probs:

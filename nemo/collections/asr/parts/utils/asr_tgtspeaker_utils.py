@@ -19,6 +19,7 @@ from nltk.tokenize import SyllableTokenizer
 
 import torch.utils.data
 from lhotse.cut.set import mix
+from lhotse.lazy import LazyJsonlIterator
 from lhotse.cut import Cut, CutSet, MixedCut, MonoCut, MixTrack
 from lhotse import SupervisionSet, SupervisionSegment, dill_enabled, AudioSource, Recording
 from lhotse.utils import uuid4, compute_num_samples
@@ -264,6 +265,36 @@ def speaker_to_target_w_query(
 
     return mask
 
+def get_bounded_segment(start_time, total_duration, min_duration=1.0, max_duration=10.0):
+    """
+    Generate a segment within an audio clip with bounded duration.
+    
+    Args:
+        start_time (float): Start time of the audio in seconds
+        total_duration (float): Total duration of the audio in seconds
+        min_duration (float): Minimum allowed segment duration in seconds
+        max_duration (float): Maximum allowed segment duration in seconds
+    
+    Returns:
+        tuple: (segment_start, segment_duration)
+    """
+    import random
+    # Ensure max_duration doesn't exceed total_duration
+    max_duration = min(max_duration, total_duration)
+    
+    # Ensure min_duration is not greater than max_duration
+    min_duration = min(min_duration, max_duration)
+    
+    # Generate random duration within bounds
+    segment_duration = np.round(random.uniform(min_duration, max_duration), decimals=3)
+    
+    # Calculate maximum possible start time
+    max_start = total_duration - segment_duration
+    
+    # Generate random start time
+    segment_start = np.round(random.uniform(start_time, start_time + max_start), decimals=3)
+    
+    return segment_start, segment_duration
 
 def get_separator_audio(freq, sr, duration, ratio):
     # Generate time values
@@ -571,37 +602,6 @@ class LibriSpeechMixSimulator_tgt():
             if track.cut.speaker_id == query_speaker_id:
                 return track.cut.text
         return ValueError ('Error in finding query speaker in target utterance')
-        
-    def get_bounded_segment(self, start_time, total_duration, min_duration=1.0, max_duration=10.0):
-        """
-        Generate a segment within an audio clip with bounded duration.
-        
-        Args:
-            start_time (float): Start time of the audio in seconds
-            total_duration (float): Total duration of the audio in seconds
-            min_duration (float): Minimum allowed segment duration in seconds
-            max_duration (float): Maximum allowed segment duration in seconds
-        
-        Returns:
-            tuple: (segment_start, segment_duration)
-        """
-        import random
-        # Ensure max_duration doesn't exceed total_duration
-        max_duration = min(max_duration, total_duration)
-        
-        # Ensure min_duration is not greater than max_duration
-        min_duration = min(min_duration, max_duration)
-        
-        # Generate random duration within bounds
-        segment_duration = np.round(random.uniform(min_duration, max_duration), decimals=3)
-        
-        # Calculate maximum possible start time
-        max_start = total_duration - segment_duration
-        
-        # Generate random start time
-        segment_start = np.round(random.uniform(start_time, start_time + max_start), decimals=3)
-        
-        return segment_start, segment_duration
     
 
     def apply_speaker_distribution(self, num_meetings: int, speaker_count_distribution) -> Dict[int, int]:
@@ -645,3 +645,160 @@ class LibriSpeechMixSimulator_tgt():
             for i in tqdm(range(num_no_query_samples), desc=f"Simulating non existing query samples", ncols=128):
                 cut_set.extend(self._create_mixture(n_speakers=np.random.choice(np.arange(1, self.max_num_speakers+1)), non_query_sample=True))           
         return CutSet.from_cuts(cut_set).shuffle()
+
+
+class TargetSpeakerSimulator():
+    """
+    This class is used to simulate target-speaker audio data,
+    which can be used for target-speaker ASR and speaker diarization training.
+    """
+    def __init__(
+        self, 
+        manifest_filepath, 
+        num_speakers, 
+        simulator_type,
+        min_delay=0.5,
+        max_delay_after_each_mono: float = 0,
+        non_query_sample: bool = False,
+        query_duration: List[float] = [3, 10]
+    ):
+        """
+        Args:
+            manifest_filepath (str): The path to the manifest file.
+            num_speakers (int): The number of speakers in the simulated audio.
+            simulator_type (str): The type of simulator to use.
+                - 'lsmix': LibriSpeechMix-style training sample (mix single speaker audio).
+            min_delay (float): The minimum delay between speakers
+                to avoid the same starting time for multiple speakers.
+            max_delay_after_each_mono (float): The maximum delay of another mono cut after each mono cut. Default is 0, means audio mixtures guaranteed to overlap. 
+            non_query_sample (bool): Whether to sample a sample where query speaker not in target audio. Default is False.
+            query_duration (list): The duration of the query sample in s. Default is [3, 10].
+            TODO: add mono_duration (list): Select random start and duration for each single speaker audio according to mono_duration [min max]. Emprically, need to set min_duration > 0 if max_after_each_mono > 0!!!
+        """
+    
+        self.manifests = LazyJsonlIterator(manifest_filepath)
+        self.min_delay = min_delay
+        self.max_delay_after_each_mono = max_delay_after_each_mono
+        self.num_speakers = num_speakers
+        self.simulator_type = simulator_type
+        self.query_duration = query_duration
+        self.non_query_sample = non_query_sample
+
+        self.spk2manifests = groupby(lambda x: x["speaker_id"], self.manifests)
+        self.speaker_ids = list(self.spk2manifests.keys())
+
+        if simulator_type == 'lsmix':    
+            self.simulator = self.LibriSpeechMixSimulator_tgt
+        elif simulator_type == 'meeting':
+            #TODO
+            raise NotImplementedError("MeetingSimulator is not implemented yet.")
+        elif simulator_type == 'conversation':
+            #TODO
+            raise NotImplementedError("ConversationSimulator is not implemented yet.")
+
+    def __iter__(self):
+        return self
+    
+    def __next__(self):
+        return self.simulator()
+
+    def LibriSpeechMixSimulator_tgt(self):
+        """
+        This function simulates a LibriSpeechMix-style TS-ASR training sample.
+        Returns:
+            mixed_cut: a mixed cut containing target-speaker audio and query speaker audio.
+        """
+        # Sample the speakers
+        sampled_speaker_ids = random.sample(self.speaker_ids, self.num_speakers)
+        
+        # Create tracks for all speakers at once
+        tracks = []
+        offset = 0
+        
+        # Common custom dict to avoid recreating
+        base_custom = {
+            'pnc': 'no', 
+            'source_lang': 'en',
+            'target_lang': 'en',
+            'task': 'asr'
+        }
+
+        # Create tracks in a single loop
+        for speaker_id in sampled_speaker_ids:
+            manifest = random.choice(self.spk2manifests[speaker_id])
+            mono_cut = json_to_cut(manifest)
+            mono_cut.custom.update(base_custom)
+            tracks.append(MixTrack(cut=deepcopy(mono_cut), type=type(mono_cut), offset=offset))
+            offset += random.uniform(self.min_delay, mono_cut.duration + self.max_delay_after_each_mono)
+
+        # Create mixed cut
+        mixed_cut = MixedCut(
+            id='lsmix_' + '_'.join([track.cut.id for track in tracks]) + '_' + str(uuid4()),
+            tracks=tracks
+        )
+
+        # # Handle query speaker selection
+        query_speaker_id = random.choice(list(set(self.speaker_ids) - set(sampled_speaker_ids))) if self.non_query_sample else random.choice(sampled_speaker_ids)
+
+        # # Get query cut
+        query_manifest = random.choice(self.spk2manifests[query_speaker_id])
+        query_cut = json_to_cut(query_manifest)
+        # query_speaker_id = mono_cut.speaker_id
+        # query_cut = mono_cut
+
+        # Create supervision
+        text = self.get_text(mixed_cut, query_speaker_id) if not self.non_query_sample else ""
+        sup = SupervisionSegment(
+            id=mixed_cut.id,
+            recording_id=mixed_cut.id,
+            start=0,
+            duration=mixed_cut.duration,
+            text=text
+        )
+
+        # Get query segment bounds
+        query_offset, query_duration = get_bounded_segment(
+            query_cut.start,
+            query_cut.duration,
+            min_duration=self.query_duration[0],
+            max_duration=self.query_duration[1]
+        )
+
+        # Update cut with final metadata
+        custom = {
+            **base_custom,
+            'query_audio_filepath': query_cut.recording.sources[0].source,
+            'query_speaker_id': query_speaker_id,
+            'query_offset': query_offset,
+            'query_duration': query_duration,
+            'query_rttm_filepath': query_cut.rttm_filepath if hasattr(query_cut, 'rttm_filepath') else None,
+            'custom': None
+        }
+        
+        mixed_cut.tracks[0].cut.supervisions = [sup]
+        mixed_cut.tracks[0].cut.custom.update(custom)
+
+        return mixed_cut
+    
+    def get_text(self, cut: MixedCut, query_speaker_id) -> str:
+        """
+        Get the text of the query speaker in the target utterance.
+        Args:
+            cut (MixedCut): The mixed cut containing target-speaker audio and query speaker audio.
+            query_speaker_id (str): The id of the query speaker.
+        Returns:
+            text (str): The text of the query speaker in the target utterance.
+        """
+        for i, track in enumerate(cut.tracks):
+            if track.cut.speaker_id == query_speaker_id:
+                return track.cut.text
+        return ValueError ('Error in finding query speaker in target utterance')
+
+
+    def MeetingSimulator(self):
+        raise NotImplementedError("MeetingSimulator is not implemented yet.")   
+
+    def ConversationSimulator(self):
+        raise NotImplementedError("ConversationSimulator is not implemented yet.")
+    
+    # TODO: text is necessary for msasr and tsasr, but not for diar

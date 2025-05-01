@@ -270,6 +270,8 @@ def setup_model(cfg: DictConfig, map_location: torch.device) -> Tuple[ASRModel, 
             )
             asr_model._init_diar_model()
             asr_model.diarization_model.to(asr_model.device)
+            if 'diar_model_streaming_mode' in cfg:
+                asr_model.diarization_model.streaming_mode = cfg.diar_model_streaming_mode
         else:
             asr_model = imported_class.restore_from(
                 restore_path=cfg.model_path,map_location=map_location,
