@@ -135,7 +135,8 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
 
         if self.cfg.freeze_diar:
            self.diarization_model.eval()
-
+        #disable streaming mode
+        self.diarization_model.streaming_mode = False
     def forward_diar(
         self,
         input_signal=None,
