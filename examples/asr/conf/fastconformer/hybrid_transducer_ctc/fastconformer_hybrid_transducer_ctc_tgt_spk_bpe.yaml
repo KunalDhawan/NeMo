@@ -20,7 +20,7 @@ model:
   rttm_mix_prob: 0.5 # The sampling probability when mixing RTTMs
   shuffle_spk_mapping: false # Shuffle the speaker mapping in both transcript and RTTM/diar_preds
   binarize_diar_preds_threshold: null
-  add_separater_audio: false
+  add_separater_audio: true # add separater audio to the query audio
   separater_freq: 500
   separater_duration: 1
   separater_unvoice_ratio: 0.3
