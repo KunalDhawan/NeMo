@@ -119,7 +119,7 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
         """
 
         model_path = self.cfg.diar_model_path
-        # model_path = '/home/jinhanw/workdir/workdir_nemo_diarization/checkpoints/sortformer_rebase/im303a-ft7_epoch6-19_sortformer_rebase.nemo'
+        # model_path = '/home/jinhanw/workdir/workdir_nemo_diarization/checkpoints/sortformer_rebase/diar_sortformer_4spk-v1.nov20_2024.nemo'
 
         if model_path.endswith('.nemo'):
             pretrained_diar_model = SortformerEncLabelModel.restore_from(model_path, map_location="cpu")

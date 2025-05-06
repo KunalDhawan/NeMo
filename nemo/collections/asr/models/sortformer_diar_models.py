@@ -348,7 +348,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel):
             total_pred (torch.Tensor): tensor containing predicted speaker labels for the current chunk and all previous chunks
                 Dimension: (batch_size, pred_len, num_speakers)
         """
-
+        assert False, "Streaming mode shouldn't be used"
         MEM = None # memory to save the embeddings from start
         FIFO_QUEUE = None # memory to save the embedding from the latest chunks
         total_pred = None

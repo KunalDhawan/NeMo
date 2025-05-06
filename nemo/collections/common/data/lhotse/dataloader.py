@@ -37,7 +37,7 @@ from lhotse.dataset.sampling.base import SamplingConstraint, TimeConstraint, Tok
 from lhotse.dataset.sampling.dynamic_bucketing import FixedBucketBatchSizeConstraint
 from lhotse.lazy import LazyFlattener
 from lhotse.utils import fastcopy, fix_random_seed
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, ListConfig
 from nemo.collections.common.data.lhotse.cutset import mux
 
 from nemo.collections.common.data.lhotse.cutset import guess_parse_cutset, read_cutset_from_config
@@ -226,7 +226,7 @@ def get_lhotse_dataloader_from_config(
             with open(manifest_path, 'r') as f:
                 manifest_json = [json.loads(line) for line in f]
             weights.append(len(manifest_json))
-        elif isinstance(manifest_path, list):
+        elif isinstance(manifest_path, (list, ListConfig)):
             #multiple manifests
             for path in manifest_path:
                 with open(path, 'r') as f:

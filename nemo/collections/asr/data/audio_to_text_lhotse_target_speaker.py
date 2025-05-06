@@ -127,8 +127,7 @@ class LhotseSpeechToTextTgtSpkBpeDataset(torch.utils.data.Dataset):
                 self.num_speakers, 
                 self.num_sample_per_mel_frame, 
                 self.num_mel_frame_per_asr_frame, 
-                self.spk_tar_all_zero,
-                boundary_segments=True), 
+                self.spk_tar_all_zero), 
                 dtype=torch.float32), 0, 1) for c, q in zip(cuts,query_cuts)]
             
             # order matters: rir_augment and codec_augment (output monocut) should be applied before mix_noise (output mixedcut)
