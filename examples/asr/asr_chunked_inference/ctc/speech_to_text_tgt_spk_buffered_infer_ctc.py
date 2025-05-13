@@ -215,6 +215,7 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
             frame_len=chunk_len,
             total_buffer=cfg.total_buffer_in_secs,
             batch_size=cfg.batch_size,
+            dynamic_query=cfg.get('dynamic_query', False),
         )
     elif cfg.buffer_level == 'feature':
         frame_asr = FeatureFrameBatchASR_tgt_spk(

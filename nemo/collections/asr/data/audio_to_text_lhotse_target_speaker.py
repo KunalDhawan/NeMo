@@ -172,5 +172,12 @@ class LhotseSpeechToTextTgtSpkBpeDataset(torch.utils.data.Dataset):
         token_lens = torch.tensor([t.size(0) for t in tokens], dtype=torch.long)
         tokens = collate_vectors(tokens, padding_value=0)
         spk_targets = collate_matrices(spk_targets)
+        # import pickle; import numpy as np;
+        # with open('audio.pickle', 'wb') as f:
+        #     pickle.dump(audio, f)
+        # with open('spk_targets.pickle', 'wb') as f:
+        #     pickle.dump(spk_targets, f)
+        # import ipdb; ipdb.set_trace()
+
         return audio, audio_lens, tokens, token_lens, spk_targets, spk_mappings
     
