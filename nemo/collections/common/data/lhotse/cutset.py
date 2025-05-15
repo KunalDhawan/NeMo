@@ -595,6 +595,8 @@ def read_nemo_manifest(config) -> tuple[CutSet, bool]:
         )
     return cuts, is_tarred
 
+# @data_type_parser("channel_separated_audio_mixer")
+
 @data_type_parser("multi_speaker_simulator")
 def read_multi_speaker_simulator(config: DictConfig) -> tuple[CutSet, bool]:
         
