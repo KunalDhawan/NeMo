@@ -33,7 +33,8 @@ Use batch_size = 1 to have the longest inference window and the highest possible
 python $BASEPATH/neural_diarizer/e2e_diarize_speech.py \
     model_path=/path/to/diar_sortformer_4spk_v1.nemo \
     batch_size=1 \
-    dataset_manifest=/path/to/diarization_manifest.json
+    dataset_manifest=/path/to/diarization_manifest.json \
+    precision=bf16
 
 """
 import json
