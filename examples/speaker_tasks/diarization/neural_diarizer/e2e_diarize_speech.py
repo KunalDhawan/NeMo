@@ -109,6 +109,8 @@ class DiarizationConfig:
     # If `cuda` is a negative number, inference will be on CPU only.
     cuda: Optional[int] = None
     matmul_precision: str = "highest"  # Literal["highest", "high", "medium"]
+    precision: str = "bf16"  # Literal["fp32", "fp16", "bf16"] Precision for model inference
+
 
     # Optuna Config
     launch_pp_optim: bool = False  # If True, launch optimization process for postprocessing parameters
@@ -343,6 +345,25 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         diar_model = SortformerEncLabelModel.restore_from(restore_path=cfg.model_path, map_location=map_location)
     else:
         raise ValueError("cfg.model_path must end with.ckpt or.nemo!")
+    
+    # Set model precision according to config
+    if cfg.precision == "bf16":
+        if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
+            logging.warning("BFloat16 precision is not supported on this device. Falling back to FP32.")
+        else:
+            logging.info("Setting model to BFloat16 precision")
+            logging.info("Note: The preprocessor will still run in FP32 for accuracy, with only encoder and subsequent layers in BF16")
+            diar_model.set_precision_mode(torch.bfloat16)
+    elif cfg.precision == "fp16":
+        if not torch.cuda.is_available():
+            logging.warning("FP16 precision is not supported on CPU. Falling back to FP32.")
+        else:
+            logging.info("Setting model to FP16 precision")
+            logging.info("Note: The preprocessor will still run in FP32 for accuracy, with only encoder and subsequent layers in FP16")
+            diar_model.set_precision_mode(torch.float16)
+    else:  # Default fp32
+        logging.info("Using default FP32 precision")
+    
 
     diar_model._cfg.test_ds.session_len_sec = cfg.session_len_sec
     trainer = pl.Trainer(devices=device, accelerator=accelerator)

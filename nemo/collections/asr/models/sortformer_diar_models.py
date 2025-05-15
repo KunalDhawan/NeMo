@@ -299,6 +299,11 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         # Spec augment is not applied during evaluation/testing
         if self.spec_augmentation is not None and self.training:
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
+            
+        # Ensure the processed signal is in the appropriate precision
+        if hasattr(self, 'precision_mode') and processed_signal.dtype != self.precision_mode:
+            processed_signal = processed_signal.to(self.precision_mode)
+            
         emb_seq, emb_seq_length = self.encoder(
             audio_signal=processed_signal,
             length=processed_signal_length,
@@ -448,11 +453,16 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                                              The length of this tensor should match the original batch size.
             processed_signal_length (torch.Tensor): The lengths of the processed audio signals.
         """
-        input_signal = input_signal.cpu()
+        # Ensure input is in float32 for preprocessor
+        input_signal_fp32 = input_signal
+        if input_signal.dtype != torch.float32:
+            input_signal_fp32 = input_signal.to(torch.float32)
+            
+        input_signal_fp32 = input_signal_fp32.cpu()
         processed_signal_list, processed_signal_length_list = [], []
-        max_batch_sec = input_signal.shape[1] / self.preprocessor._cfg.sample_rate
-        org_batch_size = input_signal.shape[0]
-        div_batch_count = min(int(max_batch_sec * org_batch_size // self.max_batch_dur + 1), org_batch_size)
+        max_batch_sec = input_signal_fp32.shape[1]/self.preprocessor._cfg.sample_rate
+        org_batch_size = input_signal_fp32.shape[0]
+        div_batch_count = min(int(max_batch_sec * org_batch_size//self.max_batch_dur + 1), org_batch_size)
         div_size = math.ceil(org_batch_size / div_batch_count)
 
         for div_count in range(div_batch_count):
@@ -460,11 +470,11 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             end_idx = int((div_count + 1) * div_size)
             if start_idx >= org_batch_size:
                 break
-            input_signal_div = input_signal[start_idx:end_idx, :].to(self.device)
+            input_signal_div = input_signal_fp32[start_idx:end_idx, :].to(self.device)
             input_signal_length_div = input_signal_length[start_idx:end_idx]
             processed_signal_div, processed_signal_length_div = self.preprocessor(
-                input_signal=input_signal_div, length=input_signal_length_div
-            )
+                    input_signal=input_signal_div, length=input_signal_length_div
+                )
             processed_signal_div = processed_signal_div.detach().cpu()
             processed_signal_length_div = processed_signal_length_div.detach().cpu()
             processed_signal_list.append(processed_signal_div)
@@ -478,6 +488,11 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         )
         processed_signal = processed_signal.to(self.device)
         processed_signal_length = processed_signal_length.to(self.device)
+        
+        # Convert to desired precision if specified
+        if hasattr(self, 'precision_mode'):
+            processed_signal = processed_signal.to(self.precision_mode)
+            
         return processed_signal, processed_signal_length
 
     def process_signal(self, audio_signal, audio_signal_length):
@@ -505,21 +520,52 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         if not self.streaming_mode:
             audio_signal = (1 / (audio_signal.max() + self.eps)) * audio_signal
 
+        # Ensure input is float32 for preprocessor
+        audio_signal_fp32 = audio_signal
+        if audio_signal.dtype != torch.float32:
+            audio_signal_fp32 = audio_signal.to(torch.float32)
+
         batch_total_dur = audio_signal.shape[0] * audio_signal.shape[1] / self.preprocessor._cfg.sample_rate
         if self.max_batch_dur > 0 and self.max_batch_dur < batch_total_dur:
             processed_signal, processed_signal_length = self.oom_safe_feature_extraction(
-                input_signal=audio_signal, input_signal_length=audio_signal_length
+                input_signal=audio_signal_fp32, input_signal_length=audio_signal_length
             )
         else:
             processed_signal, processed_signal_length = self.preprocessor(
-                input_signal=audio_signal, length=audio_signal_length
+                input_signal=audio_signal_fp32, length=audio_signal_length
             )
+        
+        # Convert processed signal to desired precision if specified
+        if hasattr(self, 'precision_mode') and processed_signal.dtype != self.precision_mode:
+            processed_signal = processed_signal.to(self.precision_mode)
+
         # This cache clearning can significantly slow down the training speed.
         # Only perform `empty_cache()` when the input file is extremely large for streaming mode.
         if not self.training and self.streaming_mode:
-            del audio_signal, audio_signal_length
+            del audio_signal, audio_signal_length, audio_signal_fp32
             torch.cuda.empty_cache()
+        
         return processed_signal, processed_signal_length
+
+    def set_precision_mode(self, precision_mode=None):
+        """
+        Set the precision mode for the model.
+
+        Args:
+            precision_mode: torch.dtype or None. If None, use default precision (float32).
+        """
+        if precision_mode is not None:
+            self.precision_mode = precision_mode
+            # Convert model components to the specified precision
+            # But exclude the preprocessor which needs to run in fp32
+            self.encoder.to(precision_mode)
+            self.sortformer_modules.to(precision_mode)
+            self.transformer_encoder.to(precision_mode)
+            # Store original precision to revert when needed
+            self.original_precision = torch.float32
+        else:
+            if hasattr(self, 'precision_mode'):
+                delattr(self, 'precision_mode')
 
     def forward(
         self,
@@ -606,13 +652,23 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 from the chunk (=input buffer).
                 Shape: (batch_size,)
         """
+        # Ensure inputs are in the correct precision
+        if hasattr(self, 'precision_mode'):
+            if chunk.dtype != self.precision_mode:
+                chunk = chunk.to(self.precision_mode)
+            if spkcache.dtype != self.precision_mode:
+                spkcache = spkcache.to(self.precision_mode)
+            if fifo.dtype != self.precision_mode:
+                fifo = fifo.to(self.precision_mode)
+        
         # pre-encode the chunk
         chunk_pre_encode_embs, chunk_pre_encode_lengths = self.encoder.pre_encode(x=chunk, lengths=chunk_lengths)
         chunk_pre_encode_lengths = chunk_pre_encode_lengths.to(torch.int64)
 
         # concat the embeddings from speaker cache, FIFO queue and the chunk
         spkcache_fifo_chunk_pre_encode_embs, spkcache_fifo_chunk_pre_encode_lengths = self.concat_and_pad_script(
-            [spkcache, fifo, chunk_pre_encode_embs], [spkcache_lengths, fifo_lengths, chunk_pre_encode_lengths]
+            [spkcache, fifo, chunk_pre_encode_embs],
+            [spkcache_lengths, fifo_lengths, chunk_pre_encode_lengths]
         )
 
         # encode the concatenated embeddings
@@ -765,6 +821,15 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         chunk_pre_encode_embs, chunk_pre_encode_lengths = self.encoder.pre_encode(
             x=processed_signal, lengths=processed_signal_length
         )
+        
+        # Ensure consistency in precision
+        if hasattr(self, 'precision_mode'):
+            if chunk_pre_encode_embs.dtype != self.precision_mode:
+                chunk_pre_encode_embs = chunk_pre_encode_embs.to(self.precision_mode)
+            if hasattr(streaming_state, 'spkcache') and streaming_state.spkcache.dtype != self.precision_mode:
+                streaming_state.spkcache = streaming_state.spkcache.to(self.precision_mode)
+            if hasattr(streaming_state, 'fifo') and streaming_state.fifo.dtype != self.precision_mode:
+                streaming_state.fifo = streaming_state.fifo.to(self.precision_mode)
 
         if self.async_streaming:
             spkcache_fifo_chunk_pre_encode_embs, spkcache_fifo_chunk_pre_encode_lengths = concat_and_pad(
