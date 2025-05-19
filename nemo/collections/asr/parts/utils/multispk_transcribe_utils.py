@@ -793,37 +793,42 @@ class SpeakerTaggedASR:
         att_context_size,
         binary_diar_preds,
         n_mix,
-        vad
+        vad,
+        rttm=None
     ):
         
         if step_num > 0:
             left_offset = 8
             chunk_audio = chunk_audio[..., 1:]
             chunk_lengths -= 1
-        (
-            mem_last_time,
-            fifo_last_time,
-            mem_preds,
-            fifo_preds,
-            diar_pred_out_stream
-        ) = self.diar_model.forward_streaming_step(
-            processed_signal=chunk_audio.transpose(1, 2),
-            processed_signal_length=chunk_lengths,
-            mem_last_time=mem_last_time,
-            fifo_last_time=fifo_last_time,
-            previous_pred_out=diar_pred_out_stream,
-            left_offset=left_offset,
-            right_offset=right_offset,
-        )
+        if rttm is None:
+            (
+                mem_last_time,
+                fifo_last_time,
+                mem_preds,
+                fifo_preds,
+                diar_pred_out_stream
+            ) = self.diar_model.forward_streaming_step(
+                processed_signal=chunk_audio.transpose(1, 2),
+                processed_signal_length=chunk_lengths,
+                mem_last_time=mem_last_time,
+                fifo_last_time=fifo_last_time,
+                previous_pred_out=diar_pred_out_stream,
+                left_offset=left_offset,
+                right_offset=right_offset,
+            )
 
-        spk_targets = diar_pred_out_stream
+            spk_targets = diar_pred_out_stream
+        else:
+            spk_targets = rttm
 
         diar_max_len = att_context_size[-1] + 1
+
         if spk_targets.shape[1] > diar_max_len:
             spk_targets = spk_targets[:, -diar_max_len:]
 
-        if binary_diar_preds:
-            spk_targets = (spk_targets > 0.5).float()
+        # if binary_diar_preds:
+        #     spk_targets = (spk_targets > 0.5).float()
         
         (
             asr_pred_out_stream,
@@ -848,7 +853,8 @@ class SpeakerTaggedASR:
             return_transcription=True,
             spk_targets=spk_targets,
             n_mix=n_mix,
-            vad=vad
+            vad=vad,
+            binary_diar_preds=binary_diar_preds
         )
 
         transcribed_speaker_texts = [None] * n_mix

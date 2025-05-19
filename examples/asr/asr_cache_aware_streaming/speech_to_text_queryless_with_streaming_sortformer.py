@@ -43,6 +43,7 @@ print_sentences,
 get_color_palette,
 write_txt,
 )
+from nemo.collections.asr.data.audio_to_diar_label import get_frame_targets_from_rttm, extract_frame_info_from_rttm
 
 
 from typing import List, Optional
@@ -149,6 +150,7 @@ def perform_streaming(
     asr_model, 
     diar_model, 
     streaming_buffer, 
+    rttm=None,
     debug_mode=False):
     batch_size = len(streaming_buffer.streams_length)
     final_offline_tran = None
@@ -167,7 +169,7 @@ def perform_streaming(
     session_start_time = time.time()
     feat_frame_count = 0
     for step_num, (chunk_audio, chunk_lengths) in enumerate(streaming_buffer_iter):
-
+        
         logging.info(f"Step ID: {step_num}")
         loop_start_time = time.time()
         with torch.inference_mode():
@@ -202,9 +204,10 @@ def perform_streaming(
                         pad_and_drop_preencoded=False,
                         binary_diar_preds=cfg.binary_diar_preds,
                         n_mix=cfg.mix,
-                        vad=cfg.get("vad", False)
+                        vad=cfg.get("vad", False),
+                        rttm=rttm[:step_num*14+14].unsqueeze(0).to(asr_model.device) if rttm is not None else None
                     )
-        
+
         if debug_mode:
             logging.info(f"Streaming transcriptions: {extract_transcriptions(previous_hypotheses)}")
         
@@ -220,6 +223,8 @@ def perform_streaming(
     
     final_streaming_tran = extract_transcriptions(previous_hypotheses)
     # torch.save(diar_pred_out_stream, "diar_pred_out_stream.pt")
+    if rttm is not None:
+        diar_pred_out_stream = rttm
     
     return final_streaming_tran, final_offline_tran, diar_pred_out_stream
 
@@ -381,11 +386,20 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         samples = []
         all_refs_text = []
 
+
         with open(args.manifest_file, 'r') as f:
             for line in f:
                 item = json.loads(line)
-                item['duration'] = None
+                # item['duration'] = None
                 samples.append(item)
+                if cfg.spk_supervision == "rttm":
+                    with open(samples[-1]['rttm_filepath'], 'r') as f:
+                        rttm_lines = f.readlines()
+                    rttm_timestamps, sess_to_global_spkids = extract_frame_info_from_rttm(0, samples[-1]['duration'], rttm_lines)
+                    samples[-1]['rttm'] = get_frame_targets_from_rttm(rttm_timestamps, 0, samples[-1]['duration'], 3, 12.5, 4)
+                else:
+                    samples[-1]['rttm'] = None
+                samples[-1]['duration'] = None
 
         # Override batch size: The batch size should be equal to the number of samples in the manifest file
         # args.batch_size = 1
@@ -415,6 +429,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
                     asr_model=asr_model,
                     diar_model=diar_model,
                     streaming_buffer=streaming_buffer,
+                    rttm=sample['rttm'],
                 )
                 all_streaming_tran.extend(streaming_tran)
                 all_diar_pred_out_stream.append(diar_pred_out_stream)

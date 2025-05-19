@@ -376,7 +376,8 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
         return_log_probs: bool = False,
         spk_targets: torch.Tensor = None,
         n_mix = 1,
-        vad=False
+        vad=False,
+        binary_diar_preds=False
     ):
         """
         It simulates a forward step with caching for streaming purposes.
@@ -417,10 +418,13 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
             valid_speaker_ids = torch.where(valid_speakers)[1] # B x N
 
             # spk_targets: (B, T, N) -> (BN, T)
-            spk_targets = spk_targets.transpose(1, 2).reshape(-1, spk_targets.size(1)) > 0.5
+            if binary_diar_preds:
+                spk_targets = spk_targets.transpose(1, 2).reshape(-1, spk_targets.size(1)) > 0.5
+            else:
+                spk_targets = spk_targets.transpose(1, 2).reshape(-1, spk_targets.size(1))
             # 
             self.spk_targets = spk_targets[valid_speakers.reshape(-1)].float()
-
+        
             mi_processed_signal = []
             mi_processed_signal_length = []
             for i in range(processed_signal.size(0)):
@@ -480,6 +484,7 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
             # N: # speakers
             # spk_targets: (B, T, N) -> (BN, T)
             self.spk_targets = spk_targets[:, :, :n_mix].transpose(1, 2).reshape(-1, spk_targets.size(1))
+            # self.spk_targets = (self.spk_targets > 0.5).float()
 
             # processed_signal: (B, T, D) -> (BN, T, D)
             processed_signal = processed_signal.unsqueeze(1).repeat(1, n_mix, 1, 1).reshape(-1, processed_signal.size(1), processed_signal.size(2)) 
