@@ -67,6 +67,7 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
         self.num_sample_per_mel_frame = self.cfg.get('num_sample_per_mel_frame', 160)
         self.num_mel_frame_per_asr_frame = self.cfg.get('num_mel_frame_per_asr_frame', 8)
         self.fixed_spk_id = self.cfg.get('fixed_spk_id', None)
+        self.inference_mode = self.cfg.get('inference_mode', False)
 
     def __getitem__(self, cuts) -> Tuple[torch.Tensor, ...]:
 
@@ -79,6 +80,9 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
         
         tokens = []
         query_speaker_ids = []
+
+        if self.inference_mode:
+            return audio, audio_lens, None, None, None, None
 
         for cut in cuts:
             non_padding_cuts = []
@@ -98,7 +102,7 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
                         if isinstance(track.cut, MonoCut):
                             non_padding_cuts.append(track.cut)
                     text_per_speaker = [cut.custom['text'] for cut in non_padding_cuts]
-
+    
             if self.fixed_spk_id is None: # Randomly select a speaker during training
                 query_spk_id = random.choice(range(len(text_per_speaker)))
             else: # fix the speaker id for inference
@@ -107,7 +111,7 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
             text = text_per_speaker[query_spk_id]
             tokens.append(torch.as_tensor(self.tokenizer(text, cut.supervisions[0].language)))
             query_speaker_ids.append(query_spk_id)
-
+        
         token_lens = torch.tensor([t.size(0) for t in tokens], dtype=torch.long)
         tokens = collate_vectors(tokens, padding_value=0)
         query_speaker_ids = torch.tensor(query_speaker_ids, dtype=torch.long)

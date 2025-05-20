@@ -211,7 +211,6 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 "cache_last_time": NeuralType(('D', 'B', 'D', 'T'), ChannelType(), optional=True),
                 "cache_last_channel_len": NeuralType(tuple('B'), LengthsType(), optional=True),
                 "pre_encode_input": NeuralType(tuple(), LogitsType(), optional=True),  # Boolean-style input
-                "vad_mask": NeuralType(('B', 'T'), ChannelType(), optional=True),
             }
         )
 
@@ -520,7 +519,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
 
     @typecheck()
     def forward(
-        self, audio_signal, length, cache_last_channel=None, cache_last_time=None, cache_last_channel_len=None, pre_encode_input=False, vad_mask=None
+        self, audio_signal, length, cache_last_channel=None, cache_last_time=None, cache_last_channel_len=None, pre_encode_input=False
     ):
         if pre_encode_input:
             self.update_max_seq_length(seq_length=audio_signal.size(2)*self.subsampling_factor, device=audio_signal.device)
@@ -533,11 +532,10 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             cache_last_time=cache_last_time,
             cache_last_channel_len=cache_last_channel_len,
             pre_encode_input=pre_encode_input,
-            vad_mask=vad_mask
         )
 
     def forward_internal(
-        self, audio_signal, length, cache_last_channel=None, cache_last_time=None, cache_last_channel_len=None, pre_encode_input=False, vad_mask=None
+        self, audio_signal, length, cache_last_channel=None, cache_last_time=None, cache_last_channel_len=None, pre_encode_input=False
     ):
         if length is None:
             length = audio_signal.new_full(

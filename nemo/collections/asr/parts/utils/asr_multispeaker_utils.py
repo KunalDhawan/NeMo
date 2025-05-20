@@ -1414,12 +1414,13 @@ class MultiSpeakerSimulator():
 
         tracks = []
         offset = 0.0
-        for mono_cut in mono_cuts:
+        for speaker_id, mono_cut in zip(sampled_speaker_ids, mono_cuts):
             custom = {
                     'pnc': 'no',
                     'source_lang': 'en',
                     'target_lang': 'en',
-                    'task': 'asr'
+                    'task': 'asr',
+                    'speaker_id': speaker_id,
                 }
             mono_cut.custom.update(custom)
             tracks.append(MixTrack(cut=deepcopy(mono_cut), type=type(mono_cut), offset=offset))

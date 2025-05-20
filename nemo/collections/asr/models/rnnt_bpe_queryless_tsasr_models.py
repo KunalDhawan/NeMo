@@ -15,7 +15,7 @@
 import copy
 import os
 from typing import Dict, List, Optional, Union
-
+import itertools
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -37,6 +37,7 @@ from nemo.collections.asr.models.rnnt_bpe_models import EncDecRNNTBPEModel
 from nemo.collections.asr.models.sortformer_diar_models import SortformerEncLabelModel
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
 from nemo.collections.asr.modules.speaker_kernels import SpeakerMask, SpeakerConcat
+from nemo.collections.asr.parts.utils.asr_multispeaker_utils import get_pil_targets
 
 from nemo.core.classes.common import typecheck
 from nemo.utils import logging
@@ -46,6 +47,98 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
 
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
         super().__init__(cfg=cfg, trainer=trainer)
+
+        if self.cfg.get('diar_model_path', None):
+            self.num_speakers = cfg.model_defaults.get('num_speakers', 4)
+            speaker_inds = list(range(self.num_speakers))
+            self.speaker_permutations = torch.tensor(list(itertools.permutations(speaker_inds)))  # Get all permutations
+
+            # config for speaker kernel
+            self.spk_kernel_type = cfg.get('spk_kernel_type', None)
+            self.spk_kernel_layers = cfg.get('spk_kernel_layers', [])
+            self.spk_kernel_mask_original = cfg.get('spk_kernel_mask_original', True)
+            self.spk_kernel_residual = cfg.get('spk_kernel_residual', True)
+
+            self._init_diar_model(
+                model_path = self.cfg.diar_model_path,
+                num_speakers=self.cfg.model_defaults.get('num_speakers', 4),
+                freeze_diar=self.cfg.freeze_diar,
+                soft_decision=self.cfg.soft_decision,
+                gt_decision=self.cfg.gt_decision,
+                streaming_mode=self.cfg.get('streaming_mode', False),
+            )
+            self._init_spk_kernel()
+        
+    def _init_spk_kernel(self):
+        """Initialize speaker kernel modules and register them to encoder layers."""
+        if not isinstance(self.spk_kernel_layers, ListConfig):
+            if self.spk_kernel_type is not None:
+                raise ValueError(f"spk_kernel_layers must be a list, got {type(self.spk_kernel_layers)}")
+            return
+
+        # Initialize speaker kernels for each specified layer
+        hidden_size = self.cfg.model_defaults.enc_hidden
+        self.spk_kernels = torch.nn.ModuleDict()
+        
+        kernel_types = {
+            'mask': SpeakerMask,
+            'concat': SpeakerConcat,
+            'sinusoidal': None
+        }
+
+        # Create kernel for each layer index
+        kernel_class = kernel_types[self.spk_kernel_type]
+        for layer_idx in self.spk_kernel_layers:
+            if kernel_class is not None:
+                self.spk_kernels[str(layer_idx)] = kernel_class(hidden_size, hidden_size, mask_original=self.spk_kernel_mask_original, residual=self.spk_kernel_residual)
+
+        if self.spk_kernels:
+            logging.info(f"Initialized speaker kernels for layers: {list(self.spk_kernels.keys())}")
+            self._attach_spk_kernel_hooks()
+        else:
+            logging.info("No speaker kernels initialized")
+
+    def _attach_spk_kernel_hooks(self):
+        """
+        Attach speaker kernel hooks to encoder layers.
+        Following NeMo pattern of separating hook attachment logic.
+        """
+        # Only attach hooks if not already attached
+        if hasattr(self, 'encoder_hooks'):
+            return
+
+        self.encoder_hooks = []
+        for layer_idx, kernel in self.spk_kernels.items():
+            idx = int(layer_idx)
+            
+            if idx == 0:
+                hook = self.encoder.pre_encode.register_forward_hook(
+                    self._get_spk_kernel_hook(layer_idx)
+                )
+            else:
+                hook = self.encoder.layers[idx-1].register_forward_hook(
+                    self._get_spk_kernel_hook(layer_idx)
+                )
+            self.encoder_hooks.append(hook)
+
+    def _get_spk_kernel_hook(self, layer_idx: str):
+        """
+        Returns a hook function for applying speaker kernel transformation.
+        
+        Args:
+            layer_idx (str): Index of the layer to apply the kernel
+            
+        Returns:
+            callable: Hook function that applies speaker kernel
+        """
+        def hook_fn(module, input, output):
+            if isinstance(output, tuple):
+                x, *cache = output
+                x = self.spk_kernels[layer_idx](x, self.spk_targets)
+                return (x, *cache)
+            return self.spk_kernels[layer_idx](output, self.spk_targets)
+        
+        return hook_fn
 
     def _init_diar_model(self, 
                          model_path = None,
@@ -81,6 +174,7 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
         
         if freeze_diar:
             pretrained_diar_model.eval()
+            pretrained_diar_model.freeze()
 
         # Register diarization model 
         self.register_nemo_submodule(
@@ -111,8 +205,9 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
         else:
             # Get diarization predictions from model
             with torch.set_grad_enabled(not self.freeze_diar):
-                spk_targets = self.diarization_model(audio_signal=audio_signal, audio_signal_length=audio_signal_length)
-
+                pred_spk_targets = self.diarization_model(audio_signal=audio_signal, audio_signal_length=audio_signal_length)
+                spk_targets = get_pil_targets(pred_spk_targets.clone(), spk_targets.clone(), self.speaker_permutations)
+            
         if self.soft_decision:
             pass
         else:
@@ -179,7 +274,7 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
         if self.spec_augmentation is not None and self.training:
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
 
-        encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length, vad_mask=self.spk_targets)
+        encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
         return encoded, encoded_len
 
     def training_step(self, batch, batch_nb):
@@ -282,6 +377,8 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
         return_log_probs: bool = False,
         spk_targets: torch.Tensor = None,
         n_mix = 1,
+        vad=False,
+        binary_diar_preds=False
     ):
         """
         It simulates a forward step with caching for streaming purposes.
@@ -310,30 +407,105 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
             encoded_len: the length of the output log_probs + history chunk log_probs, only returned when return_log_probs=True
         """
         # Multi-instance inference
-        if len(spk_targets.size()) == 3:
+        # N: # speakers
+        # B x T x N
+        spk_targets = spk_targets[:, :, :n_mix] 
+        if vad:
+            # import ipdb; ipdb.set_trace()
+            max_probs = torch.max(spk_targets, dim=1).values # B x N
+            valid_speakers = max_probs > 0.5 # B x N
+            if valid_speakers.sum() == 0:
+                return previous_pred_out, previous_hypotheses, cache_last_channel, cache_last_time, cache_last_channel_len, previous_hypotheses
+            valid_speaker_ids = torch.where(valid_speakers)[1] # B x N
+
+            # spk_targets: (B, T, N) -> (BN, T)
+            if binary_diar_preds:
+                spk_targets = spk_targets.transpose(1, 2).reshape(-1, spk_targets.size(1)) > 0.5
+            else:
+                spk_targets = spk_targets.transpose(1, 2).reshape(-1, spk_targets.size(1))
+            # 
+            self.spk_targets = spk_targets[valid_speakers.reshape(-1)].float()
+        
+            mi_processed_signal = []
+            mi_processed_signal_length = []
+            for i in range(processed_signal.size(0)):
+                mi_processed_signal.append(processed_signal[[i]].repeat(valid_speakers[i].sum(), 1, 1))
+                mi_processed_signal_length.append(processed_signal_length[[i]].repeat(valid_speakers[i].sum()))
+            
+            processed_signal = torch.cat(mi_processed_signal, dim=0)
+            processed_signal_length = torch.cat(mi_processed_signal_length, dim=0)
+            
+            # processed_signal: (B, T, D) -> (BN, T, D)
+            # processed_signal = processed_signal.unsqueeze(1).repeat(1, n_mix, 1, 1).reshape(-1, processed_signal.size(1), processed_signal.size(2))
+            # processed_signal_length = processed_signal_length.unsqueeze(1).repeat(1, n_mix).reshape(-1)
+            
+            if cache_last_channel_len.shape[0] != n_mix:
+                cache_last_channel = cache_last_channel.unsqueeze(2).repeat(1, 1, n_mix, 1, 1).reshape(cache_last_channel.size(0), -1, cache_last_channel.size(2), cache_last_channel.size(3))
+                cache_last_time = cache_last_time.unsqueeze(2).repeat(1, 1, n_mix, 1, 1).reshape(cache_last_time.size(0), -1, cache_last_time.size(2), cache_last_time.size(3))
+                cache_last_channel_len = cache_last_channel_len.unsqueeze(1).repeat(1, n_mix).reshape(-1)
+            
+            cache_last_channel_spk = cache_last_channel[:, valid_speakers.reshape(-1)]
+            cache_last_time_spk = cache_last_time[:, valid_speakers.reshape(-1)]
+            cache_last_channel_len_spk = cache_last_channel_len[valid_speakers.reshape(-1)]
+            
+            previous_pred_out_spk = [previous_pred_out[i] for i in valid_speaker_ids]
+            previous_hypotheses_spk = [previous_hypotheses[i] for i in valid_speaker_ids]
+
+            (
+                asr_pred_out_stream_spk,
+                transcribed_texts_spk,
+                cache_last_channel_spk,
+                cache_last_time_spk,
+                cache_last_channel_len_spk,
+                previous_hypotheses_spk 
+            ) = super().conformer_stream_step(
+                processed_signal=processed_signal,
+                processed_signal_length=processed_signal_length,
+                cache_last_channel=cache_last_channel_spk,
+                cache_last_time=cache_last_time_spk,
+                cache_last_channel_len=cache_last_channel_len_spk,
+                keep_all_outputs=keep_all_outputs,
+                previous_hypotheses=previous_hypotheses_spk,
+                previous_pred_out=previous_pred_out_spk,
+                drop_extra_pre_encoded=drop_extra_pre_encoded,
+                return_transcription=return_transcription,
+                return_log_probs=return_log_probs
+            )
+
+            cache_last_channel[:, valid_speakers.reshape(-1)] = cache_last_channel_spk
+            cache_last_time[:, valid_speakers.reshape(-1)] = cache_last_time_spk
+            cache_last_channel_len[valid_speakers.reshape(-1)] = cache_last_channel_len_spk
+
+            for i, spk_idx in enumerate(valid_speaker_ids):
+                previous_hypotheses[spk_idx] = previous_hypotheses_spk[i]
+                previous_pred_out[spk_idx] = asr_pred_out_stream_spk[i]
+
+            return previous_pred_out, transcribed_texts_spk, cache_last_channel, cache_last_time, cache_last_channel_len, previous_hypotheses
+        else:
             # N: # speakers
             # spk_targets: (B, T, N) -> (BN, T)
             self.spk_targets = spk_targets[:, :, :n_mix].transpose(1, 2).reshape(-1, spk_targets.size(1))
+            # self.spk_targets = (self.spk_targets > 0.5).float()
 
             # processed_signal: (B, T, D) -> (BN, T, D)
-            processed_signal = processed_signal.unsqueeze(1).repeat(1, n_mix, 1, 1).reshape(-1, processed_signal.size(1), processed_signal.size(2))
+            processed_signal = processed_signal.unsqueeze(1).repeat(1, n_mix, 1, 1).reshape(-1, processed_signal.size(1), processed_signal.size(2)) 
             processed_signal_length = processed_signal_length.unsqueeze(1).repeat(1, n_mix).reshape(-1)
 
-        if cache_last_channel_len.shape[0] != processed_signal.shape[0]:
-            cache_last_channel = cache_last_channel.unsqueeze(2).repeat(1, 1, n_mix, 1, 1).reshape(cache_last_channel.size(0), -1, cache_last_channel.size(2), cache_last_channel.size(3))
-            cache_last_time = cache_last_time.unsqueeze(2).repeat(1, 1, n_mix, 1, 1).reshape(cache_last_time.size(0), -1, cache_last_time.size(2), cache_last_time.size(3))
-            cache_last_channel_len = cache_last_channel_len.unsqueeze(1).repeat(1, n_mix).reshape(-1)
+            if cache_last_channel_len.shape[0] != processed_signal.shape[0]:
+                cache_last_channel = cache_last_channel.unsqueeze(2).repeat(1, 1, n_mix, 1, 1).reshape(cache_last_channel.size(0), -1, cache_last_channel.size(2), cache_last_channel.size(3))
+                cache_last_time = cache_last_time.unsqueeze(2).repeat(1, 1, n_mix, 1, 1).reshape(cache_last_time.size(0), -1, cache_last_time.size(2), cache_last_time.size(3))
+                cache_last_channel_len = cache_last_channel_len.unsqueeze(1).repeat(1, n_mix).reshape(-1)
 
-        return super().conformer_stream_step(
-            processed_signal=processed_signal,
-            processed_signal_length=processed_signal_length,
-            cache_last_channel=cache_last_channel,
-            cache_last_time=cache_last_time,
-            cache_last_channel_len=cache_last_channel_len,
-            keep_all_outputs=keep_all_outputs,
-            previous_hypotheses=previous_hypotheses,
-            previous_pred_out=previous_pred_out,
-            drop_extra_pre_encoded=drop_extra_pre_encoded,
-            return_transcription=return_transcription,
-            return_log_probs=return_log_probs
-        )
+            return super().conformer_stream_step(
+                processed_signal=processed_signal,
+                processed_signal_length=processed_signal_length,
+                cache_last_channel=cache_last_channel,
+                cache_last_time=cache_last_time,
+                cache_last_channel_len=cache_last_channel_len,
+                keep_all_outputs=keep_all_outputs,
+                previous_hypotheses=previous_hypotheses,
+                previous_pred_out=previous_pred_out,
+                drop_extra_pre_encoded=drop_extra_pre_encoded,
+                return_transcription=return_transcription,
+                return_log_probs=return_log_probs
+            )
