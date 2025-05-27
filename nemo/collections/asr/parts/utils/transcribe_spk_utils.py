@@ -73,6 +73,7 @@ def get_buffered_pred_feat_tgt_spk_ctc(
             hyp = asr.transcribe(tokens_per_chunk, delay)
             hyps.append(hyp)
     else:
+        print(f'Diarization Streaming Mode: {asr.diar_model_streaming_mode} Loader Level: {asr.sortformer_loader_level} initial_final_buffer: {asr.initial_final_buffer}')
         with open(manifest, "r", encoding='utf_8') as mfst_f:
             for l in tqdm(mfst_f, desc="Sample:"):
                 asr.reset()
@@ -270,8 +271,6 @@ def setup_model(cfg: DictConfig, map_location: torch.device) -> Tuple[ASRModel, 
             )
             asr_model._init_diar_model()
             asr_model.diarization_model.to(asr_model.device)
-            if 'diar_model_streaming_mode' in cfg:
-                asr_model.diarization_model.streaming_mode = cfg.diar_model_streaming_mode
         else:
             asr_model = imported_class.restore_from(
                 restore_path=cfg.model_path,map_location=map_location,

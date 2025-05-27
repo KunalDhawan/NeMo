@@ -62,11 +62,17 @@ class FrameBatchASR_tgt_spk:
         batch_size=4,
         dynamic_query=False,
         pad_to_buffer_len=True,
-        activation_ratio=0.2,
+        activation_ratio=0.85,
         new_query_max_len=10,
-        new_query_min_len=4,
-        non_target_spk_offset_threshold=0.85,
-        target_spk_onset_threshold=0.3,
+        new_query_min_len=13, #4 for strategy 2, 13 for strategy 3 buffer 4, 38 for strategy 3 buffer 8
+        query_refresh_rate=1, # 1 for strategy 3 high throughput, 10 for strategy 3 low latency
+        query_change_once=True,#change query once and then not update query
+        non_target_spk_offset_threshold=0.3, #0.85
+        target_spk_onset_threshold=0.3, #0.3
+        start_replace_step=3, #wait for x steps before start replacing query, 3 for high throughput, 7 for low latency, overall 3s 
+        diar_model_streaming_mode=False,
+        sortformer_loader_level='emb',
+        initial_final_buffer=False,
 
     ):
         '''
@@ -101,7 +107,6 @@ class FrameBatchASR_tgt_spk:
         self.tokenizer = asr_model.tokenizer
         self.toks_unmerged = []
         self.frame_buffers = []
-        self.reset()
         cfg = copy.deepcopy(asr_model._cfg)
         self.cfg = cfg
         self.frame_len = frame_len
@@ -115,6 +120,7 @@ class FrameBatchASR_tgt_spk:
         self.raw_preprocessor = ASRModel.from_config_dict(cfg.preprocessor)
         self.raw_preprocessor.to(asr_model.device)
         self.preprocessor = self.raw_preprocessor
+        #dynamic query related variables
         self.all_diar_preds = None
         self.all_audio = None
         self.new_query_min_len = new_query_min_len
@@ -122,6 +128,15 @@ class FrameBatchASR_tgt_spk:
         self.new_query_max_len = new_query_max_len
         self.target_spk_onset_threshold = target_spk_onset_threshold
         self.non_target_spk_offset_threshold = non_target_spk_offset_threshold
+        self.query_refresh_rate = query_refresh_rate
+        self.query_change_once = query_change_once
+        self.start_replace_step = start_replace_step
+        self.diar_model_streaming_mode = diar_model_streaming_mode
+        self.sortformer_loader_level = sortformer_loader_level
+        #disable initial_final_buffer for sortformer offline mode
+        self.initial_final_buffer = initial_final_buffer if diar_model_streaming_mode else False
+        self.reset()
+
     def reset(self):
         """
         Reset frame_history and decoder's state
@@ -135,6 +150,10 @@ class FrameBatchASR_tgt_spk:
         self.toks_unmerged = []
         self.frame_buffers = []
         self.frame_bufferer.reset()
+        self.query_refresh_count = 0
+        self.query_refresh_rate = 1
+        if self.diar_model_streaming_mode:
+            self.asr_model._reset_streaming_state()
 
     def get_partial_samples(self, audio_file: str, offset: float, duration: float, target_sr: int = 16000, dtype: str = 'float32'):
         try:
@@ -156,6 +175,7 @@ class FrameBatchASR_tgt_spk:
         samples = self.get_partial_samples(audio_filepath, offset, duration)
         # pad on the right side
         samples = np.pad(samples, (0, int(delay * model_stride_in_secs * self.asr_model._cfg.sample_rate)))
+        self.pad_len = int(delay * model_stride_in_secs * self.asr_model._cfg.sample_rate)
         # query related variables
         separater_audio = get_separator_audio(separater_freq, self.asr_model._cfg.sample_rate, separater_duration, separater_unvoice_ratio)
         self.separater_audio = separater_audio
@@ -171,6 +191,19 @@ class FrameBatchASR_tgt_spk:
         #reset all_audio all_diar_preds
         self.all_audio = None
         self.all_diar_preds = None
+        self.selected_regions = set()
+        self.change_query_action = []
+                #estimate number of buffers
+        self.num_buffer = np.ceil((samples.shape[0] - self.frame_bufferer.feature_frame_len) / 16000 / self.frame_len) / self.batch_size
+        self.temp_buffer = 0
+        # self.num_tailing_silence = 
+        if self.diar_model_streaming_mode:
+            #cache contains query + separater --> query
+            self.asr_model.diarization_model.spkcache_len = self.query_pred_len
+            self.asr_model.diarization_model.spkcache_len_audio = int(self.asr_model.diarization_model.spkcache_len / 12.5 * 16000)
+            self.asr_model.diarization_model.spkcache_refresh_rate = self.query_pred_len
+        if self.initial_final_buffer:
+            self.num_buffer_w_leading_silence = np.ceil((self.frame_bufferer.feature_buffer_len - self.frame_bufferer.feature_frame_len)/self.frame_bufferer.feature_frame_len)
 
     def set_frame_reader(self, frame_reader):
         self.frame_bufferer.set_frame_reader(frame_reader)
@@ -189,7 +222,6 @@ class FrameBatchASR_tgt_spk:
     def _get_batch_preds(self, keep_logits=False):
         device = self.asr_model.device
         for batch in iter(self.data_loader):
-            
             feat_signal, feat_signal_len = batch
 
             # # padding silence after each buffer
@@ -202,11 +234,49 @@ class FrameBatchASR_tgt_spk:
             # padding_len = padding_len*16000
             # feat_signal_len += padding_len
 
+            if self.initial_final_buffer:
+                if self.temp_buffer == self.num_buffer:
+                    #final buffer
+                    final_buffer =True
+                else:
+                    final_buffer = False
+                if self.temp_buffer < self.num_buffer_w_leading_silence:
+                    initial_buffer = True
+                else:
+                    initial_buffer = False
+            else:
+                initial_buffer, final_buffer = False, False
+
+
+            if initial_buffer:
+                # import ipdb; ipdb.set_trace()
+                # LR_len = int((self.frame_bufferer.feature_buffer_len - self.frame_bufferer.feature_frame_len)/2)
+                # LR_len_hidden = get_hidden_length_from_sample_length(LR_len, 160, 8)
+                temp_pad_len = int(self.frame_bufferer.feature_buffer_len - self.frame_bufferer.feature_frame_len - self.temp_buffer * self.frame_bufferer.feature_frame_len)
+                feat_signal[0] = torch.nn.functional.pad(
+                    torch.cat([feat_signal[0][:int(self.frame_bufferer.frame_reader.query_audio_signal_len[0])], feat_signal[0][-int(self.frame_bufferer.feature_frame_len * (self.temp_buffer + 1)):]]), 
+                    (0, temp_pad_len)
+                )
+                feat_signal_len[0] = feat_signal_len[0] - temp_pad_len
+            if final_buffer:
+                feat_signal_len[-1] = feat_signal_len[-1] - self.pad_len
 
 
             feat_signal, feat_signal_len = feat_signal.to(device), feat_signal_len.to(device)
             # forward_outs = self.asr_model(processed_signal=feat_signal, processed_signal_length=feat_signal_len)
-            encoded, encoded_len, _, _ = self.asr_model.train_val_forward([feat_signal, feat_signal_len, None, None, None, None], 0)
+            if self.diar_model_streaming_mode:
+                encoded, encoded_len = self.asr_model.forward_sortformer_streaming(
+                    signal = feat_signal,
+                    signal_len = feat_signal_len,
+                    query_len = self.frame_bufferer.frame_reader.query_audio_signal_len[0],
+                    chunk_len = self.frame_bufferer.feature_frame_len,
+                    buffer_len = self.frame_bufferer.feature_buffer_len,
+                    initial_buffer = initial_buffer,
+                    temp_buffer_index = self.temp_buffer,
+                    sortformer_loader_level = self.sortformer_loader_level
+                )
+            else:
+                encoded, encoded_len, _, _ = self.asr_model.train_val_forward([feat_signal, feat_signal_len, None, None, None, None], 0)
             forward_outs = (encoded, encoded_len)
             if len(forward_outs) == 2:  # hybrid ctc rnnt model
                 encoded, encoded_len = forward_outs
@@ -217,6 +287,9 @@ class FrameBatchASR_tgt_spk:
             # #remove pred from query
             log_probs = log_probs[:,self.query_pred_len:,:]
             predictions = predictions[:,self.query_pred_len:]
+            if initial_buffer:
+                predictions = torch.nn.functional.pad(predictions[:,:get_hidden_length_from_sample_length(self.frame_bufferer.feature_frame_len * (self.temp_buffer + 1), 160, 8)], (get_hidden_length_from_sample_length(self.frame_bufferer.feature_frame_len * (self.num_buffer_w_leading_silence - self.temp_buffer), 160, 8), 0), mode='constant', value=self.blank_id)
+
 
             # hidden_padding_len = get_hidden_length_from_sample_length(padding_len, 160, 8)
             # log_probs = log_probs[:,self.query_pred_len-1:-hidden_padding_len+1,:]
@@ -224,33 +297,47 @@ class FrameBatchASR_tgt_spk:
 
             #dynamic query
             # import ipdb; ipdb.set_trace()
-            if self.dynamic_query:
-                if self.all_diar_preds is None:
+            if self.all_diar_preds is None:
 
-                    self.all_diar_preds = self.asr_model.diar_preds[:,self.query_pred_len:]
+                self.all_diar_preds = self.asr_model.diar_preds[:,self.query_pred_len-1:]
 
-                    self.all_audio = feat_signal[:,int(self.frame_bufferer.frame_reader.query_audio_signal_len[0]):]
-                else:
-                    self.all_diar_preds = F.pad(self.all_diar_preds, (0, 0, 0, get_hidden_length_from_sample_length(self.frame_bufferer.feature_frame_len, 160, 8), 0, 0))
-                    self.all_diar_preds[:, -get_hidden_length_from_sample_length(self.frame_bufferer.feature_buffer_len, 160, 8):,:] = self.asr_model.diar_preds[:,self.query_pred_len-1:,:]
-                    self.all_audio = F.pad(self.all_audio, (0, self.frame_bufferer.feature_frame_len, 0, 0))
-                    self.all_audio[:, -self.frame_bufferer.feature_buffer_len:] = feat_signal[:,int(self.frame_bufferer.frame_reader.query_audio_signal_len[0]):]
+                self.all_audio = feat_signal[:,int(self.frame_bufferer.frame_reader.query_audio_signal_len[0]):]
 
+            # else:
+                # import numpy as np
+                # self.all_diar_preds = F.pad(self.all_diar_preds, (0, 0, 0, int(np.ceil(self.frame_bufferer.feature_frame_len/16000 * 12.5)), 0, 0))
+                # self.all_diar_preds[:, -get_hidden_length_from_sample_length(self.frame_bufferer.feature_buffer_len, 160, 8)+2:,:] = self.asr_model.diar_preds[:, -get_hidden_length_from_sample_length(self.frame_bufferer.feature_buffer_len, 160, 8)+2:,:]
+                # self.all_audio = F.pad(self.all_audio, (0, self.frame_bufferer.feature_frame_len, 0, 0))
+                # self.all_audio[:, -self.frame_bufferer.feature_buffer_len:] = feat_signal[:,int(self.frame_bufferer.frame_reader.query_audio_signal_len[0]):]
                 #select new query from history
                 # Find subrange where first speaker is active and last 3 are inactive
+            if self.dynamic_query:
+                self.query_refresh_count += 1
                 diar_preds = self.all_diar_preds.squeeze(0) # Shape [len, 4]
                 first_spk_active = diar_preds[:, 0] > self.target_spk_onset_threshold # High threshold for first speaker
                 other_spks_inactive = torch.all(diar_preds[:, 1:] < self.non_target_spk_offset_threshold, dim=1) # Low threshold for other speakers
                 valid_frames = torch.logical_and(first_spk_active, other_spks_inactive)
 
-                strategy = 2
+                # Helper function to check if a region overlaps with previously selected ones
+                def add_region(start, end):
+                    self.selected_regions.add((start, end))
+                # Helper function to check if a region starts from previous region
+                def no_look_back(start):
+                    if not self.selected_regions:
+                        return True
+                    prev_start, prev_end = max(self.selected_regions) if self.selected_regions else (0, 0)
+                    return start >= prev_end
+
+                strategy = 3
                 search_direction = 'forward' # 'backward
+                # Keep track of previously selected regions to avoid duplicates
+
                 """
                 Strategy 1:
                     Search for valid from with min_length 3s, starting from the middle of all diar_preds and moving forward / backward, replace the old query with the new query
                 """
                 if strategy == 1:
-                    min_length = 38
+                    min_length = self.new_query_min_len
                     # Start from middle and search forward
                     start_idx = len(valid_frames) // 2
                     end_idx = start_idx + min_length - 1
@@ -258,15 +345,16 @@ class FrameBatchASR_tgt_spk:
                     # Search forward until we find a valid sequence or reach en
                     if search_direction == 'forward':
                         while end_idx < len(valid_frames): 
-                            if torch.sum(valid_frames[start_idx:end_idx+1]) / (end_idx - start_idx + 1) > 0.85:
+                            if torch.sum(valid_frames[start_idx:end_idx+1]) / (end_idx - start_idx + 1) > self.activation_ratio and no_look_back(start_idx):
                                 # and  torch.all(valid_frames[end_idx-6:end_idx+1])):
+                                add_region(start_idx, end_idx)
                                 break
                             start_idx += 1
                             end_idx = start_idx + min_length - 1
                         replace_query = (end_idx < len(valid_frames))
                     elif search_direction == 'backward':
                         while start_idx > 0:
-                            if torch.sum(valid_frames[start_idx:end_idx+1]) / (end_idx - start_idx + 1) > 0.85:
+                            if torch.sum(valid_frames[start_idx:end_idx+1]) / (end_idx - start_idx + 1) > self.activation_ratio:
                                 # and  torch.all(valid_frames[end_idx-6:end_idx+1])):
                                 break
                             start_idx -= 1
@@ -285,14 +373,11 @@ class FrameBatchASR_tgt_spk:
 
                         #replace old query with new query
                         new_query = np.concatenate([candidate_query.cpu().numpy(), self.separater_audio])
-                        self.frame_bufferer.frame_reader._query_samples = new_query
-                        self.frame_bufferer.frame_reader.query_audio_signal = torch.from_numpy(self.frame_bufferer.frame_reader._query_samples).unsqueeze_(0).to(device)
-                        self.frame_bufferer.frame_reader.query_audio_signal_len = torch.Tensor([self.frame_bufferer.frame_reader.query_audio_signal.shape[1]]).to(device)
-                        self.query_pred_len = get_hidden_length_from_sample_length(self.frame_bufferer.frame_reader.query_audio_signal_len, 160, 8)
+
                 elif strategy == 2:
                     """
                     Strategy 2:
-                        Search for valid from with min_length 0.5s, starting from the middle of all diar_preds and moving forward / backward, add new query to the start / end of old query and truncate to 5s
+                        Search for valid from with min_length min_length, starting from the middle of all diar_preds and moving forward / backward, add new query to the start / end of old query and truncate to 5s
                     """
                     min_length = self.new_query_min_len
                     # Start from middle and search forward
@@ -300,10 +385,12 @@ class FrameBatchASR_tgt_spk:
                     end_idx = start_idx + min_length - 1
 
                     # Search forward until we find a valid sequence or reach en
+
                     if search_direction == 'forward':
                         while end_idx < len(valid_frames): 
-                            if torch.sum(valid_frames[start_idx:end_idx+1]) / (end_idx - start_idx + 1) > self.activation_ratio:
+                            if torch.sum(valid_frames[start_idx:end_idx+1]) / (end_idx - start_idx + 1) > self.activation_ratio:# and no_look_back(start_idx):
                                 # and  torch.all(valid_frames[end_idx-6:end_idx+1])):
+                                add_region(start_idx, end_idx)
                                 break
                             start_idx += 1
                             end_idx = start_idx + min_length - 1
@@ -322,25 +409,95 @@ class FrameBatchASR_tgt_spk:
                         import numpy as np
                         # Get candidate new query audio
                         candidate_query = self.all_audio[0,int(shifted_start_idx/12.5*16000):int(shifted_end_idx/12.5*16000)]
-                        # print('Change of query!')
-                        # print('Start idx: ', start_idx)
-                        # print('End idx: ', end_idx)
+                        print('Change of query!')
+                        print('Start idx: ', start_idx)
+                        print('End idx: ', end_idx)
 
                         #replace old query with new query
                         # new_query = np.concatenate([candidate_query.cpu().numpy(), self.separater_audio])
                         #concatenate to the end of old query
                         new_query = np.concatenate([self.frame_bufferer.frame_reader._query_samples[:-len(self.separater_audio)], candidate_query.cpu().numpy(), self.separater_audio])
                         new_query = new_query[-int(self.new_query_max_len*16000):]
-
+                        self.change_query_action.append(0)
+                    else:
+                        self.change_query_action.append(0)
                         #concatenate to the start of old query
                         # new_query = np.concatenate([candidate_query.cpu().numpy(), self.frame_bufferer.frame_reader._query_samples[:-len(self.separater_audio)]])
                         # new_query = new_query[:int(5*16000)]
                         # new_query = np.concatenate([new_query, self.separater_audio])
-                        self.frame_bufferer.frame_reader._query_samples = new_query
-                        self.frame_bufferer.frame_reader.query_audio_signal = torch.from_numpy(self.frame_bufferer.frame_reader._query_samples).unsqueeze_(0).to(device)
-                        self.frame_bufferer.frame_reader.query_audio_signal_len = torch.Tensor([self.frame_bufferer.frame_reader.query_audio_signal.shape[1]]).to(device)
-                        self.query_pred_len = get_hidden_length_from_sample_length(self.frame_bufferer.frame_reader.query_audio_signal_len, 160, 8)
+                elif strategy == 3:
+                    """
+                    Strategy 3:
+                        Search for valid from with min_length to max_length, starting from the middle of all diar_preds and moving forward / backward, replace old query with the new query, if valid_sequence is short, repeat the valid_sequence to max_length
+                    """
+                    min_length = self.new_query_min_len
+                    max_length = 25
+                    # Start from middle and search forward
+                    start_idx = 0 #len(valid_frames) // 2
+                    end_idx = start_idx + min_length - 1
 
+                    # Search forward until we find a valid sequence or reach en
+                    if search_direction == 'forward':
+                        while end_idx < len(valid_frames): 
+                            if torch.sum(valid_frames[start_idx:end_idx+1]) / (end_idx - start_idx + 1) > self.activation_ratio:# and torch.all(valid_frames[end_idx-6:end_idx+1]):# and no_look_back(start_idx):
+                                # Try extending end_idx up to max_length while maintaining activation ratio
+                                anchored_end_index = end_idx
+                                temp_end_idx = end_idx
+                                while temp_end_idx < min(len(valid_frames), start_idx + max_length):
+                                    if torch.sum(valid_frames[anchored_end_index:temp_end_idx+1]) / (temp_end_idx - anchored_end_index + 1) > self.activation_ratio:
+                                        end_idx = temp_end_idx
+                                        temp_end_idx += 1
+                                    else:
+                                        break
+                                # and  torch.all(valid_frames[end_idx-6:end_idx+1])):
+                                # add_region(start_idx, end_idx)
+                                break
+                            start_idx += 1
+                            end_idx = start_idx + min_length - 1
+                        replace_query = (end_idx < len(valid_frames)) if len(self.change_query_action) >= self.start_replace_step else False
+                    elif search_direction == 'backward':
+                        while start_idx > 0:
+                            if torch.sum(valid_frames[start_idx:end_idx+1]) / (end_idx - start_idx + 1) > self.activation_ratio:
+                                # and  torch.all(valid_frames[end_idx-6:end_idx+1])):
+                                break
+                            start_idx -= 1
+                            end_idx = start_idx + min_length - 1
+                        replace_query = (start_idx > 0)
+                
+                    if replace_query:
+                        shifted_start_idx = start_idx # 6 frames after the valid sequence
+                        shifted_end_idx = end_idx # 6 frames before the valid sequence
+                        import numpy as np
+                        # Get candidate new query audio
+                        candidate_query = self.all_audio[0,int(shifted_start_idx/12.5*16000):int(shifted_end_idx/12.5*16000)]
+                        # If candidate query is shorter than 2s (32000 samples), repeat to make it 3s (48000 samples)
+                        if len(candidate_query) < 32000:
+                            repeats = int(np.ceil(48000 / len(candidate_query)))
+                            candidate_query = candidate_query.repeat(repeats)[:48000]
+                        self.change_query_action.append(1) if self.query_refresh_count >= self.query_refresh_rate else self.change_query_action.append(0)
+
+                        #replace old query with new query
+                        new_query = np.concatenate([candidate_query.cpu().numpy(), self.separater_audio])
+                    else:
+                        self.change_query_action.append(0)
+                    
+            #manipulate audio
+            # query_audio = feat_signal[0][-16000:].repeat(2)
+            # changed_feat_signal = torch.cat([query_audio.unsqueeze(0), feat_signal[0][64000:].unsqueeze(0)], dim=1)
+            # feat_signal = changed_feat_signal
+            # feat_signal_len = torch.Tensor([changed_feat_signal.shape[1]]).to(device)
+            
+                if replace_query and self.query_refresh_count >= self.query_refresh_rate:
+                    print('Change of query!')
+                    print('Start idx: ', start_idx)
+                    print('End idx: ', end_idx)
+                    self.frame_bufferer.frame_reader._query_samples = new_query
+                    self.frame_bufferer.frame_reader.query_audio_signal = torch.from_numpy(self.frame_bufferer.frame_reader._query_samples).unsqueeze_(0).to(device)
+                    self.frame_bufferer.frame_reader.query_audio_signal_len = torch.Tensor([self.frame_bufferer.frame_reader.query_audio_signal.shape[1]]).to(device)
+                    self.query_pred_len = get_hidden_length_from_sample_length(self.frame_bufferer.frame_reader.query_audio_signal_len, 160, 8)
+                    self.query_refresh_count = 0
+                    if self.query_change_once:
+                        self.query_refresh_rate = np.inf
 
 
 
@@ -350,6 +507,7 @@ class FrameBatchASR_tgt_spk:
                 self.all_preds.append(pred.cpu().numpy())
             
             save_intermediate_var = False
+
             if save_intermediate_var:
                 delay = 26
                 tokens_per_chunk = 2
@@ -362,7 +520,7 @@ class FrameBatchASR_tgt_spk:
                     # print(hypothesis)
                     buffer_preds.append(self.greedy_merge(decoded))
                     buffer_logits.append(decoded)
-                parent_dir = '/home/jinhanw/workdir/workdir_nemo_speaker_asr/dataloader/pipeline/decode_scripts/saved/temp/'
+                parent_dir = '/home/jinhanw/workdir/workdir_nemo_speaker_asr/dataloader/pipeline/decode_scripts/saved/temp'
                 os.makedirs(parent_dir, exist_ok=True)
                 import pickle; import numpy as np;
                 with open(os.path.join(parent_dir, 'buffer_preds.pickle'), 'wb') as f:
@@ -377,14 +535,18 @@ class FrameBatchASR_tgt_spk:
                     f.write(OmegaConf.to_yaml(self.asr_model.diarization_model._cfg))
                 with open(os.path.join(parent_dir, 'diar_preds.pickle'), 'wb') as f:
                     pickle.dump(self.asr_model.diar_preds, f)
+                # with open(os.path.join(parent_dir, 'total_diar_preds.pickle'), 'wb') as f:
+                    # pickle.dump(self.asr_model.total_preds, f)
+                with open(os.path.join(parent_dir, 'all_diar_preds.pickle'), 'wb') as f:
+                    pickle.dump(self.all_diar_preds, f)
+                with open(os.path.join(parent_dir, 'all_audio.pickle'), 'wb') as f:
+                    pickle.dump(self.all_audio, f)
                 if self.dynamic_query:
-                    with open(os.path.join(parent_dir, 'all_diar_preds.pickle'), 'wb') as f:
-                        pickle.dump(self.all_diar_preds, f)
-                    with open(os.path.join(parent_dir, 'all_audio.pickle'), 'wb') as f:
-                        pickle.dump(self.all_audio, f)
+
                     with open(os.path.join(parent_dir, 'new_query.pickle'), 'wb') as f:
                         pickle.dump(self.frame_bufferer.frame_reader.query_audio_signal, f)
-                import ipdb; ipdb.set_trace()
+                if self.temp_buffer % 1 == 0:
+                    import ipdb; ipdb.set_trace()
 
             
             if keep_logits:
@@ -395,14 +557,26 @@ class FrameBatchASR_tgt_spk:
                 del log_probs
             del encoded_len
             del predictions
+                        
+            self.temp_buffer += 1
+
 
     def transcribe(self, tokens_per_chunk: int, delay: int, keep_logits: bool = False):
         self.infer_logits(keep_logits)
         self.unmerged = []
 
-        for pred in self.all_preds:
+        for i, pred in enumerate(self.all_preds):
             decoded = pred.tolist()
-            self.unmerged += decoded[max(0,len(decoded) - 1 - delay) : len(decoded) - 1 - delay + tokens_per_chunk]
+
+            if len(self.change_query_action) == 0 or (i > 0 and self.change_query_action[i-1] == 0):
+                self.unmerged += decoded[max(0,len(decoded) - 1 - delay) : len(decoded) - 1 - delay + tokens_per_chunk]
+            else:
+                if (self.all_preds[i-1] == 1024).all():
+                    # there is a change of query action in previous buffer, and previous buffer is blank
+                    self.unmerged += decoded[: len(decoded) - 1 - delay + tokens_per_chunk]
+                else:
+                    # there is a change of query action in previous buffer, and previous buffer is not blank
+                    self.unmerged += decoded[max(0,len(decoded) - 1 - delay) : len(decoded) - 1 - delay + tokens_per_chunk]
         hypothesis = self.greedy_merge(self.unmerged)
         if not keep_logits:
             return hypothesis

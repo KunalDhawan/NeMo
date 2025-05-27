@@ -39,6 +39,9 @@ from nemo.core.classes.common import PretrainedModelInfo
 from nemo.utils import logging, model_utils
 from nemo.core.classes.mixins import AccessMixin
 from nemo.collections.asr.data.audio_to_text_dali import DALIOutputs
+import math
+from nemo.collections.asr.parts.utils.streaming_tgt_spk_utils import get_hidden_length_from_sample_length
+from tqdm import tqdm
 
 
 class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
@@ -135,7 +138,7 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
 
         if self.cfg.freeze_diar:
            self.diarization_model.eval()
-        #disable streaming mode
+        #disable streaming mode for now, activate using _reset_streaming_state if necessary
         self.diarization_model.streaming_mode = False
     def forward_diar(
         self,
@@ -144,7 +147,7 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
         is_raw_waveform_input=True,
     ):
         # preds, _preds, attn_score_stack, total_memory_list, encoder_states_list = self.diarization_model.forward(audio_signal=input_signal, audio_signal_length=input_signal_length, is_raw_waveform_input=is_raw_waveform_input)
-        preds = self.diarization_model.forward(audio_signal=input_signal, audio_signal_length=input_signal_length, is_raw_waveform_input=is_raw_waveform_input)
+        preds = self.diarization_model.forward(audio_signal=input_signal, audio_signal_length=input_signal_length)#, 
         self.diar_preds = preds
 
         # return preds, _preds, attn_score_stack, total_memory_list, encoder_states_list
@@ -647,4 +650,157 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
 
         encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
         
+        return encoded, encoded_len
+
+    def _reset_streaming_state(self):
+        self.diarization_model.streaming_mode = True
+        self.diarization_model.chunk_len = 376
+        self.diarization_model.fifo_len = 188
+        self.query_pred = None
+        self.total_preds = torch.zeros((1, 0, 4), device = self.diarization_model.device)
+        self.diarization_model.chunk_len_audio = int(self.diarization_model.chunk_len / 12.5 * 16000)
+        self.diarization_model.fifo_len_audio = int(self.diarization_model.fifo_len / 12.5 * 16000)
+        self.streaming_state = self.diarization_model.sortformer_modules.init_streaming_state(
+            batch_size = 1,
+            device = self.diarization_model.device,
+        )
+
+    def forward_sortformer_streaming(self, signal, signal_len, query_len, chunk_len, buffer_len, initial_buffer, temp_buffer_index, sortformer_loader_level):
+        # speaker targetes
+
+        if signal.shape[1] == 80:
+            is_raw_waveform_input=False
+        else:
+            is_raw_waveform_input=True
+
+        if self.query_pred is None:
+            diar_input_signal_len = signal_len
+            diar_input_signal = signal[:,:signal_len]
+        else:
+            if initial_buffer:
+                diar_input_signal = signal[:,signal_len - int(chunk_len): signal_len]
+                diar_input_signal_len = torch.tensor([int(chunk_len)], device = signal.device)
+            else:
+                    diar_input_signal = signal[:,-int(chunk_len):]
+                    diar_input_signal_len = torch.tensor([int(chunk_len)], device = signal.device)
+        if self.cfg.spk_supervision_strategy == 'diar':
+            with torch.set_grad_enabled(not self.cfg.freeze_diar):
+                # diar_preds = self.forward_diar(signal, signal_len, is_raw_waveform_input)
+                processed_signal, processed_signal_len = self.diarization_model.process_signal(
+                    audio_signal = diar_input_signal,
+                    audio_signal_length = diar_input_signal_len,
+                )
+                feat_len = processed_signal.shape[2]
+                num_chunks = math.ceil(
+                    feat_len / (self.diarization_model.chunk_len * self.diarization_model.sortformer_modules.subsampling_factor)
+                )
+                assert num_chunks == 1, "Only one chunk should be used for streaming mode"
+                
+                streaming_level = sortformer_loader_level
+
+                if streaming_level in ['emb', 'feat']:
+                    streaming_loader = self.diarization_model.sortformer_modules.streaming_feat_loader(
+                        feat_seq = processed_signal,
+                        feat_seq_length = processed_signal_len,
+                        feat_seq_offset = 0
+                    )
+                    for _, chunk_feat_seq_t, feat_lengths, left_offset, right_offset in streaming_loader:
+                        # import ipdb; ipdb.set_trace()
+                        self.streaming_state, self.total_preds = self.diarization_model.forward_streaming_step(
+                        processed_signal=chunk_feat_seq_t,
+                        processed_signal_length=feat_lengths,
+                        streaming_state=self.streaming_state,
+                        total_preds=self.total_preds,
+                        left_offset=left_offset,
+                        right_offset=right_offset,
+                        streaming_level = streaming_level,
+                        )
+                elif streaming_level == 'audio':
+                    print('Inference on audio level')
+                    self.streaming_state, self.total_preds = self.diarization_model.forward_streaming_step(
+                    processed_signal=diar_input_signal,
+                    processed_signal_length=diar_input_signal_len,
+                    streaming_state=self.streaming_state,
+                    total_preds=self.total_preds,
+                    left_offset=0,
+                    right_offset=0,
+                    streaming_level = streaming_level,
+                    )
+        else:
+            raise ValueError(f"Invalid RTTM strategy {self.cfg.spk_supervision_strategy} is not supported.")
+        if self.query_pred is None:
+            query_pred_len = get_hidden_length_from_sample_length(query_len, 160, 8)
+            self.query_pred = self.diarization_model.spkcache_fifo_chunk_preds[:,:query_pred_len]
+            re_aranged_diar_preds = self.diarization_model.spkcache_fifo_chunk_preds
+        else:
+            if initial_buffer:
+                re_aranged_diar_preds = torch.cat([self.query_pred, self.diarization_model.spkcache_fifo_chunk_preds[:,-get_hidden_length_from_sample_length(chunk_len * (temp_buffer_index + 1), 160, 8):]], dim = 1)
+            else:
+                re_aranged_diar_preds = torch.cat([self.query_pred, self.diarization_model.spkcache_fifo_chunk_preds[:,-get_hidden_length_from_sample_length(buffer_len):]], dim = 1)
+        
+        diar_preds = re_aranged_diar_preds
+        if self.binarize_diar_preds_threshold:
+            diar_preds = torch.where(diar_preds > self.binarize_diar_preds_threshold, torch.tensor(1), torch.tensor(0)).to(signal.device).float()
+        self.diar_preds = diar_preds
+
+        # if (isinstance(batch, DALIOutputs) and batch.has_processed_signal) or signal.shape[1] == 80:
+        #     encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
+        # else:
+        encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
+    
+        encoded = torch.transpose(encoded, 1, 2) # B * D * T -> B * T * D
+        if self.diar == True:        
+            # Speaker mapping shuffling to equalize the speaker label's distributions
+            if self.cfg.shuffle_spk_mapping:
+                diar_preds = apply_spk_mapping(diar_preds, spk_mappings)
+
+            if(diar_preds.shape[1]!=encoded.shape[1]):
+            # KD duct-tape solution for extending the speaker predictions 
+                asr_frame_count = encoded.shape[1]
+                diar_preds = self.fix_diar_output(diar_preds, asr_frame_count)
+
+            # Normalize the features
+            if self.norm == 'ln':
+                diar_preds = self.diar_norm(diar_preds)
+                encoded = self.asr_norm(encoded)
+            elif self.norm == 'l2':
+                diar_preds = torch.nn.functional.normalize(diar_preds, p=2, dim=-1)
+                encoded = torch.nn.functional.normalize(encoded, p=2, dim=-1)
+            
+            if diar_preds.shape[1] > encoded.shape[1]:
+                diar_preds = diar_preds[:, :encoded.shape[1], :]
+
+            if self.diar_kernel_type == 'sinusoidal':
+                speaker_infusion_asr = torch.matmul(diar_preds, self.diar_kernel.to(diar_preds.device))
+                if self.kernel_norm == 'l2':
+                    speaker_infusion_asr = torch.nn.functional.normalize(speaker_infusion_asr, p=2, dim=-1)
+                encoded = speaker_infusion_asr + encoded
+            elif self.diar_kernel_type == 'metacat':
+                concat_enc_states = encoded.unsqueeze(2) * diar_preds.unsqueeze(3)
+                concat_enc_states = concat_enc_states.flatten(2,3)
+                encoded = self.joint_proj(concat_enc_states)
+            elif self.diar_kernel_type == 'metacat_residule':
+                #only pick speaker 0
+                concat_enc_states = encoded.unsqueeze(2) * diar_preds[:,:,:1].unsqueeze(3)
+                concat_enc_states = concat_enc_states.flatten(2,3)
+                encoded = encoded + self.joint_proj(concat_enc_states)    
+            elif self.diar_kernel_type == 'metacat_residule_early':
+                #only pick speaker 0
+                concat_enc_states = encoded.unsqueeze(2) * diar_preds[:,:,:1].unsqueeze(3)
+                concat_enc_states = concat_enc_states.flatten(2,3)
+                encoded = self.joint_proj(encoded + concat_enc_states)
+            elif self.diar_kernel_type == 'metacat_residule_projection':
+                #only pick speaker 0 and add diar_preds
+                concat_enc_states = encoded.unsqueeze(2) * diar_preds[:,:,:1].unsqueeze(3)
+                concat_enc_states = concat_enc_states.flatten(2,3)
+                encoded = encoded + concat_enc_states
+                concat_enc_states = torch.cat([encoded, diar_preds], dim = -1)
+                encoded = self.joint_proj(concat_enc_states)
+            else: #projection
+                concat_enc_states = torch.cat([encoded, diar_preds], dim=-1)
+                encoded = self.joint_proj(concat_enc_states)
+        else:
+            encoded = encoded
+        
+        encoded = torch.transpose(encoded, 1, 2) # B * T * D -> B * D * T
         return encoded, encoded_len
