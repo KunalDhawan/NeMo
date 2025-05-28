@@ -1315,7 +1315,6 @@ def speaker_to_target(
                 seg.duration -= seg.end - cut.duration
             seg.start += offsets[i]
             segments_total.append(seg)
-    
     # apply arrival time sorting to the existing segments
     segments_total.sort(key = lambda rttm_sup: rttm_sup.start)
 
@@ -1343,7 +1342,6 @@ def speaker_to_target(
         mask = soft_mask
     else:
         mask = (soft_mask > soft_thres).float()
-
     return mask
 
 class MultiSpeakerSimulator():

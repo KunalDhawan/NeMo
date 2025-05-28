@@ -40,8 +40,8 @@ import json
 import logging
 import os
 import tempfile
-from dataclasses import dataclass, is_dataclass
 from tempfile import NamedTemporaryFile
+from dataclasses import dataclass, is_dataclass
 from typing import Dict, List, Optional, Union
 
 import lightning.pytorch as pl
@@ -50,6 +50,8 @@ import torch
 from omegaconf import OmegaConf
 from pytorch_lightning import seed_everything
 
+from nemo.collections.asr.parts.utils.transcribe_utils import read_and_maybe_sort_manifest
+from nemo.collections.common.parts.preprocessing.manifest import get_full_path
 from nemo.collections.asr.metrics.der import score_labels
 from nemo.collections.asr.models import SortformerEncLabelModel
 from nemo.collections.asr.parts.utils.speaker_utils import (
@@ -57,13 +59,12 @@ from nemo.collections.asr.parts.utils.speaker_utils import (
     get_uniqname_from_filepath,
     timestamps_to_pyannote_object,
 )
-from nemo.collections.asr.parts.utils.transcribe_utils import read_and_maybe_sort_manifest
 from nemo.collections.asr.parts.utils.vad_utils import (
     PostProcessingParams,
     load_postprocessing_from_yaml,
     predlist_to_timestamps,
+    ts_vad_post_processing,
 )
-from nemo.collections.common.parts.preprocessing.manifest import get_full_path
 from nemo.core.config import hydra_runner
 
 seed_everything(42)
@@ -89,7 +90,7 @@ class DiarizationConfig:
     num_workers: int = 0
     random_seed: Optional[int] = None  # seed number going to be used in seed_everything()
     bypass_postprocessing: bool = True  # If True, postprocessing will be bypassed
-    log: bool = False  # If True, log will be printed
+    log: bool = False # If True, log will be printed
 
     use_lhotse: bool = True
     batch_duration: int = 33000
@@ -99,12 +100,16 @@ class DiarizationConfig:
     ignore_overlap: bool = False  # If True, DER will be calculated only for non-overlapping segments
 
     # Streaming diarization configs
-    spkcache_len: int = 188
-    spkcache_refresh_rate: int = 144
-    fifo_len: int = 188
-    chunk_len: int = 6
-    chunk_left_context: int = 1
-    chunk_right_context: int = 7
+    streaming_mode: bool = True # If True, streaming diarization will be used. For long-form audio, set mem_len=step_len
+    mem_len: int = 100
+    mem_refresh_rate: int = 1
+    fifo_len: int = 100
+    step_len: int = 100
+    step_left_context: int = 100
+    step_right_context: int = 100
+    visualization: bool = False
+    streaming_eval: bool = False # If True, evaluation will be done in a streaming fashion
+    out_dir: Optional[str] = None # Path to a file to save DER values
 
     # If `cuda` is a negative number, inference will be on CPU only.
     cuda: Optional[int] = None
@@ -140,6 +145,41 @@ def optuna_suggest_params(postprocessing_cfg: PostProcessingParams, trial: optun
     postprocessing_cfg.min_duration_off = trial.suggest_float("min_duration_off", 0.0, 0.75, step=0.01)
     return postprocessing_cfg
 
+def optuna_suggest_window_params(cfg, trial: optuna.Trial) -> PostProcessingParams:
+    """
+    Suggests hyperparameters for postprocessing using Optuna.
+    See the following link for `trial` instance in Optuna framework.
+    https://optuna.readthedocs.io/en/stable/reference/generated/optuna.trial.Trial.html#optuna.trial.Trial
+
+    Args:
+        postprocessing_cfg (PostProcessingParams): The current postprocessing configuration.
+        trial (optuna.Trial): The Optuna trial object used to suggest hyperparameters.
+
+    Returns:
+        PostProcessingParams: The updated postprocessing configuration with suggested hyperparameters.
+    """
+    # diar_model.streaming_mode = cfg.streaming_mode
+    # diar_model.sortformer_modules.step_len = cfg.step_len
+    # diar_model.sortformer_modules.mem_len = cfg.mem_len
+    # diar_model.sortformer_modules.step_left_context = cfg.step_left_context
+    # diar_model.sortformer_modules.step_right_context = cfg.step_right_context
+    # diar_model.sortformer_modules.fifo_len = cfg.fifo_len
+    # diar_model.sortformer_modules.log = cfg.log
+    # diar_model.sortformer_modules.mem_refresh_rate = cfg.mem_refresh_rate
+    
+    # MEM_REFRESH_RATE=5 
+    # FIFO_LEN=72
+    # MEM_LEN=188
+    STEP_LEN=12
+    # STEP_LEFT_CONTEXT=1
+    # STEP_RIGHT_CONTEXT=1
+    cfg.mem_refresh_rate = trial.suggest_int("mem_refresh_rate", 1, 24, step=1)
+    cfg.fifo_len = trial.suggest_int("fifo_len", int(STEP_LEN*cfg.mem_refresh_rate), 384, step=4)
+    cfg.mem_len = trial.suggest_int("mem_len", 64, 384, step=16)
+    # postprocessing_cfg.pad_offset = trial.suggest_int("pad_offset", 0.0, 0.2, step=0.01)
+    # postprocessing_cfg.min_duration_on = trial.suggest_int("min_duration_on", 0.0, 0.75, step=0.01)
+    # postprocessing_cfg.min_duration_off = trial.suggest_int("min_duration_off", 0.0, 0.75, step=0.01)
+    return cfg
 
 def get_tensor_path(cfg: DiarizationConfig) -> str:
     """
@@ -162,11 +202,13 @@ def get_tensor_path(cfg: DiarizationConfig) -> str:
 
 
 def diarization_objective(
+    diar_model,
     trial: optuna.Trial,
-    postprocessing_cfg: PostProcessingParams,
+    cfg,
+    postprocessing_cfg,
     temp_out_dir: str,
     infer_audio_rttm_dict: Dict[str, Dict[str, str]],
-    diar_model_preds_total_list: List[torch.Tensor],
+    # diar_model_preds_total_list: List[torch.Tensor],
     collar: float = 0.25,
     ignore_overlap: bool = False,
 ) -> float:
@@ -193,17 +235,24 @@ def diarization_objective(
     Returns:
         float: The Diarization Error Rate (DER) for the given set of postprocessing parameters.
     """
-    with tempfile.TemporaryDirectory(dir=temp_out_dir, prefix="Diar_PostProcessing_") as _:
-        if trial is not None:
-            postprocessing_cfg = optuna_suggest_params(postprocessing_cfg, trial)
+    with tempfile.TemporaryDirectory(dir=temp_out_dir, prefix="Diar_PostProcessing_") as local_temp_out_dir:
+        # if trial is not None:
+        #     postprocessing_cfg = optuna_suggest_params(postprocessing_cfg, trial)
+        
+        cfg = optuna_suggest_window_params(cfg, trial)
+        diar_model.sortformer_modules.mem_len = cfg.mem_len
+        diar_model.sortformer_modules.fifo_len = cfg.fifo_len
+        diar_model.sortformer_modules.mem_refresh_rate = cfg.mem_refresh_rate
+        diar_model.test_batch()
+        diar_model_preds_total_list = diar_model.preds_total_list
         all_hyps, all_refs, all_uems = convert_pred_mat_to_segments(
             audio_rttm_map_dict=infer_audio_rttm_dict,
             postprocessing_cfg=postprocessing_cfg,
             batch_preds_list=diar_model_preds_total_list,
             unit_10ms_frame_count=8,
-            bypass_postprocessing=False,
+            bypass_postprocessing=True,
         )
-        metric, _, _ = score_labels(
+        metric, mapping_dict, itemized_errors = score_labels(
             AUDIO_RTTM_MAP=infer_audio_rttm_dict,
             all_reference=all_refs,
             all_hypothesis=all_hyps,
@@ -216,10 +265,11 @@ def diarization_objective(
 
 
 def run_optuna_hyperparam_search(
+    diar_model,
     cfg: DiarizationConfig,  # type: DiarizationConfig
     postprocessing_cfg: PostProcessingParams,
     infer_audio_rttm_dict: Dict[str, Dict[str, str]],
-    preds_list: List[torch.Tensor],
+    # preds_list: List[torch.Tensor],
     temp_out_dir: str,
 ):
     """
@@ -234,11 +284,13 @@ def run_optuna_hyperparam_search(
         temp_out_dir (str): temporary directory for storing intermediate outputs.
     """
     worker_function = lambda trial: diarization_objective(
+        diar_model=diar_model,
         trial=trial,
+        cfg=cfg,
         postprocessing_cfg=postprocessing_cfg,
         temp_out_dir=temp_out_dir,
         infer_audio_rttm_dict=infer_audio_rttm_dict,
-        diar_model_preds_total_list=preds_list,
+        # diar_model_preds_total_list=preds_list,
         collar=cfg.collar,
     )
     study = optuna.create_study(
@@ -256,7 +308,7 @@ def run_optuna_hyperparam_search(
 def convert_pred_mat_to_segments(
     audio_rttm_map_dict: Dict[str, Dict[str, str]],
     postprocessing_cfg,
-    batch_preds_list: List[torch.Tensor],
+    batch_preds_list,
     unit_10ms_frame_count: int = 8,
     bypass_postprocessing: bool = False,
     out_rttm_dir: str | None = None,
@@ -276,7 +328,7 @@ def convert_pred_mat_to_segments(
        all_reference (list): list of pyannote objects for each audio file.
        all_uems (list): list of pyannote objects for each audio file.
     """
-    all_hypothesis, all_reference, all_uems = [], [], []
+    batch_pred_ts_segs, all_hypothesis, all_reference, all_uems = [], [], [], []
     cfg_vad_params = OmegaConf.structured(postprocessing_cfg)
     total_speaker_timestamps = predlist_to_timestamps(
         batch_preds_list=batch_preds_list,
@@ -287,11 +339,10 @@ def convert_pred_mat_to_segments(
     )
     for sample_idx, (uniq_id, audio_rttm_values) in enumerate(audio_rttm_map_dict.items()):
         speaker_timestamps = total_speaker_timestamps[sample_idx]
-        if uniq_id is None:
-            if audio_rttm_values.get("uniq_id", None) is not None:
-                uniq_id = audio_rttm_values["uniq_id"]
-            else:
-                uniq_id = get_uniqname_from_filepath(audio_rttm_values["audio_filepath"])
+        if audio_rttm_values.get("uniq_id", None) is not None:
+            uniq_id = audio_rttm_values["uniq_id"]
+        else:
+            uniq_id = get_uniqname_from_filepath(audio_rttm_values["audio_filepath"])
         all_hypothesis, all_reference, all_uems = timestamps_to_pyannote_object(
             speaker_timestamps,
             uniq_id,
@@ -302,6 +353,64 @@ def convert_pred_mat_to_segments(
             out_rttm_dir,
         )
     return all_hypothesis, all_reference, all_uems
+
+
+def convert_pred_mat_to_segments_chunkwise(
+    audio_rttm_map_dict: Dict[str, Dict[str, str]],
+    postprocessing_cfg,
+    batch_preds_list: List[torch.Tensor],
+    unit_10ms_frame_count:int = 8,
+    bypass_postprocessing: bool = False,
+    chunk_size: int = 125
+    ):
+    """
+    Convert prediction matrix to time-stamp segments.
+
+    Args:
+        audio_rttm_map_dict (dict): dictionary of audio file path, offset, duration and RTTM filepath.
+        batch_preds_list (List[torch.Tensor]): list of prediction matrices containing sigmoid values for each speaker.
+            Dimension: [(1, frames, num_speakers), ..., (1, frames, num_speakers)]
+        unit_10ms_frame_count (int, optional): number of 10ms segments in a frame. Defaults to 8.
+        bypass_postprocessing (bool, optional): if True, postprocessing will be bypassed. Defaults to False.
+        chunk_size (int, optional): chunk size for processing. Defaults to 125. The chunk duration is 125*8*10ms / 1000 = 10 seconds.
+
+    Returns:
+       all_hypothesis (list): list of pyannote objects for each audio file.
+       all_reference (list): list of pyannote objects for each audio file.
+       all_uems (list): list of pyannote objects for each audio file.
+    """
+    cfg_vad_params = OmegaConf.structured(postprocessing_cfg)
+    pred_len = batch_preds_list[0].shape[1]
+    batch_pred_ts_segs, all_hypothesis, all_reference, all_uems = [], [], [], []
+    for cur_chunk_idx in range(0, pred_len, chunk_size):
+        offset, duration = cur_chunk_idx*unit_10ms_frame_count*0.01, chunk_size*unit_10ms_frame_count*0.01
+        for sample_idx, (uniq_id, audio_rttm_values) in enumerate(audio_rttm_map_dict.items()):
+            spk_ts = []
+
+            speaker_assign_mat = batch_preds_list[sample_idx].squeeze(dim=0)[cur_chunk_idx:cur_chunk_idx+chunk_size]
+            speaker_timestamps = [[] for _ in range(speaker_assign_mat.shape[-1])]
+            for spk_id in range(speaker_assign_mat.shape[-1]):
+                ts_mat = ts_vad_post_processing(speaker_assign_mat[:, spk_id],
+                                                cfg_vad_params=cfg_vad_params,
+                                                unit_10ms_frame_count=unit_10ms_frame_count,
+                                                bypass_postprocessing=bypass_postprocessing)
+                ts_mat = ts_mat + offset
+                ts_mat = torch.clamp(ts_mat, min=offset, max=(offset + duration))
+                ts_seg_list = ts_mat.tolist()
+                speaker_timestamps[spk_id].extend(ts_seg_list)
+                spk_ts.append(ts_seg_list)
+            audio_rttm_values['offset'] = offset
+            audio_rttm_values['duration'] = duration
+            all_hypothesis, all_reference, all_uems = timestamps_to_pyannote_object(speaker_timestamps,
+                                                                                    uniq_id,
+                                                                                    audio_rttm_values,
+                                                                                    all_hypothesis,
+                                                                                    all_reference,
+                                                                                    all_uems,
+                                                                                    out_rttm_dir=None
+                                                                                )
+            batch_pred_ts_segs.append(spk_ts)
+        yield all_hypothesis, all_reference, all_uems
 
 
 @hydra_runner(config_name="DiarizationConfig", schema=DiarizationConfig)
@@ -380,72 +489,36 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     diar_model.setup_test_data(test_data_config=diar_model._cfg.test_ds)
 
     # Steaming mode setup
-    diar_model.sortformer_modules.chunk_len = cfg.chunk_len
-    diar_model.sortformer_modules.spkcache_len = cfg.spkcache_len
-    diar_model.sortformer_modules.chunk_left_context = cfg.chunk_left_context
-    diar_model.sortformer_modules.chunk_right_context = cfg.chunk_right_context
+    diar_model.streaming_mode = cfg.streaming_mode
+    diar_model.sortformer_modules.step_len = cfg.step_len
+    diar_model.sortformer_modules.mem_len = cfg.mem_len
+    diar_model.sortformer_modules.step_left_context = cfg.step_left_context
+    diar_model.sortformer_modules.step_right_context = cfg.step_right_context
     diar_model.sortformer_modules.fifo_len = cfg.fifo_len
     diar_model.sortformer_modules.log = cfg.log
-    diar_model.sortformer_modules.spkcache_refresh_rate = cfg.spkcache_refresh_rate
+    diar_model.sortformer_modules.mem_refresh_rate = cfg.mem_refresh_rate
+    diar_model.sortformer_modules.visualization = cfg.visualization
 
     postprocessing_cfg = load_postprocessing_from_yaml(cfg.postprocessing_yaml)
     tensor_path, model_id, tensor_filename = get_tensor_path(cfg)
     cfg.optuna_study_name = f"__{model_id}_{tensor_filename}"
     cfg.optuna_storage: str = f"sqlite:///{cfg.optuna_temp_dir}/{cfg.optuna_study_name}.db"
     cfg.optuna_log_file: str = f"{cfg.optuna_temp_dir}/{cfg.optuna_study_name}.log"
-
-    if os.path.exists(tensor_path) and cfg.save_preds_tensors:
-        logging.info(
-            f"A saved prediction tensor has been found. Loading the saved prediction tensors from {tensor_path}..."
-        )
-        diar_model_preds_total_list = torch.load(tensor_path)
-    else:
-        logging.info("No saved prediction tensors found. Running inference on the dataset...")
-        diar_model.test_batch()
-        diar_model_preds_total_list = diar_model.preds_total_list
-        if cfg.save_preds_tensors:
-            torch.save(diar_model.preds_total_list, tensor_path)
-
+    
     if cfg.launch_pp_optim:
         # Launch a hyperparameter optimization process if launch_pp_optim is True
         run_optuna_hyperparam_search(
+            diar_model=diar_model,
             cfg=cfg,
             postprocessing_cfg=postprocessing_cfg,
             infer_audio_rttm_dict=infer_audio_rttm_dict,
-            preds_list=diar_model_preds_total_list,
             temp_out_dir=cfg.optuna_temp_dir,
         )
-
-    # Evaluation
-    if not cfg.no_der:
-        if cfg.out_rttm_dir is not None and not os.path.exists(cfg.out_rttm_dir):
-            os.mkdir(cfg.out_rttm_dir)
-
-        logging.info("Running offline diarization evaluation...")
-        all_hyps, all_refs, all_uems = convert_pred_mat_to_segments(
-            infer_audio_rttm_dict,
-            postprocessing_cfg=postprocessing_cfg,
-            batch_preds_list=diar_model_preds_total_list,
-            unit_10ms_frame_count=8,
-            bypass_postprocessing=cfg.bypass_postprocessing,
-            out_rttm_dir=cfg.out_rttm_dir,
-        )
-        logging.info(f"Evaluating the model on the {len(diar_model_preds_total_list)} audio segments...")
-        score_labels(
-            AUDIO_RTTM_MAP=infer_audio_rttm_dict,
-            all_reference=all_refs,
-            all_hypothesis=all_hyps,
-            all_uem=all_uems,
-            collar=cfg.collar,
-            ignore_overlap=cfg.ignore_overlap,
-        )
-        logging.info(f"PostProcessingParams: {postprocessing_cfg}")
 
     # clean-up
     if cfg.presort_manifest is not None:
         if remove_path_after_done is not None:
             os.unlink(remove_path_after_done)
-
 
 if __name__ == '__main__':
     main()
