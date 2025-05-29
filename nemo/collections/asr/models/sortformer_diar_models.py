@@ -820,40 +820,40 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                     lc=round(left_offset / self.encoder.subsampling_factor),
                     rc=math.ceil(right_offset / self.encoder.subsampling_factor),
                 )
-        elif streaming_level == 'feat':
-            #raw audio input, sync manner
-            spkcache_fifo_chunk_feat = self.sortformer_modules.concat_embs(
-                [streaming_state.spkcache_feat, streaming_state.fifo_feat, processed_signal], dim=1, device=self.device)
-            spkcache_fifo_chunk_feat_lengths = (
-                streaming_state.spkcache_feat.shape[1] +
-                streaming_state.fifo_feat.shape[1] +
-                processed_signal_length
-            )
-            spkcache_fifo_chunk_pre_encode_embs, spkcache_fifo_chunk_pre_encode_lengths = self.encoder.pre_encode(
-                x=spkcache_fifo_chunk_feat,
-                lengths=spkcache_fifo_chunk_feat_lengths)
-            spkcache_fifo_chunk_fc_encoder_embs, spkcache_fifo_chunk_fc_encoder_lengths = self.frontend_encoder(
-                processed_signal=spkcache_fifo_chunk_pre_encode_embs,
-                processed_signal_length=spkcache_fifo_chunk_pre_encode_lengths,
-                bypass_pre_encode=True
-            )
-            spkcache_fifo_chunk_preds = self.forward_infer(
-                emb_seq=spkcache_fifo_chunk_fc_encoder_embs,
-                emb_seq_length=spkcache_fifo_chunk_fc_encoder_lengths
-            )
-            streaming_state, _ = self.sortformer_modules.streaming_update_feat(
-                streaming_state=streaming_state,
-                chunk_feat=processed_signal,
-                preds=spkcache_fifo_chunk_preds,
-            )
-            total_preds = spkcache_fifo_chunk_preds
-            # with open('/home/jinhanw/workdir/workdir_nemo_speaker_asr/dataloader/pipeline/decode_scripts/saved/temp/spkcache_fifo_chunk_preds.pickle','wb') as f:
-            #     pickle.dump(spkcache_fifo_chunk_preds, f)
-            # print(streaming_state.spkcache_feat.shape)
-            # print(streaming_state.fifo_feat.shape)
-            spkcache_fifo_chunk_preds = self.sortformer_modules.apply_mask_to_preds(
-                spkcache_fifo_chunk_preds, spkcache_fifo_chunk_fc_encoder_lengths
-            )
+        # elif streaming_level == 'feat':
+        #     #raw audio input, sync manner
+        #     spkcache_fifo_chunk_feat = self.sortformer_modules.concat_embs(
+        #         [streaming_state.spkcache_feat, streaming_state.fifo_feat, processed_signal], dim=1, device=self.device)
+        #     spkcache_fifo_chunk_feat_lengths = (
+        #         streaming_state.spkcache_feat.shape[1] +
+        #         streaming_state.fifo_feat.shape[1] +
+        #         processed_signal_length
+        #     )
+        #     spkcache_fifo_chunk_pre_encode_embs, spkcache_fifo_chunk_pre_encode_lengths = self.encoder.pre_encode(
+        #         x=spkcache_fifo_chunk_feat,
+        #         lengths=spkcache_fifo_chunk_feat_lengths)
+        #     spkcache_fifo_chunk_fc_encoder_embs, spkcache_fifo_chunk_fc_encoder_lengths = self.frontend_encoder(
+        #         processed_signal=spkcache_fifo_chunk_pre_encode_embs,
+        #         processed_signal_length=spkcache_fifo_chunk_pre_encode_lengths,
+        #         bypass_pre_encode=True
+        #     )
+        #     spkcache_fifo_chunk_preds = self.forward_infer(
+        #         emb_seq=spkcache_fifo_chunk_fc_encoder_embs,
+        #         emb_seq_length=spkcache_fifo_chunk_fc_encoder_lengths
+        #     )
+        #     streaming_state, _ = self.sortformer_modules.streaming_update_feat(
+        #         streaming_state=streaming_state,
+        #         chunk_feat=processed_signal,
+        #         preds=spkcache_fifo_chunk_preds,
+        #     )
+        #     total_preds = spkcache_fifo_chunk_preds
+        #     # with open('/home/jinhanw/workdir/workdir_nemo_speaker_asr/dataloader/pipeline/decode_scripts/saved/temp/spkcache_fifo_chunk_preds.pickle','wb') as f:
+        #     #     pickle.dump(spkcache_fifo_chunk_preds, f)
+        #     # print(streaming_state.spkcache_feat.shape)
+        #     # print(streaming_state.fifo_feat.shape)
+        #     spkcache_fifo_chunk_preds = self.sortformer_modules.apply_mask_to_preds(
+        #         spkcache_fifo_chunk_preds, spkcache_fifo_chunk_fc_encoder_lengths
+        #     )
         elif streaming_level == 'audio':
             #raw audio input, sync manner
 
@@ -881,7 +881,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 emb_seq=spkcache_fifo_chunk_fc_encoder_embs,
                 emb_seq_length=spkcache_fifo_chunk_fc_encoder_lengths
             )
-            streaming_state, _ = self.sortformer_modules.streaming_update_audio(
+            streaming_state, chunk_preds = self.sortformer_modules.streaming_update_audio(
                 streaming_state=streaming_state,
                 chunk_audio=processed_signal,
                 preds=spkcache_fifo_chunk_preds,

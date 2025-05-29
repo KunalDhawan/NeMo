@@ -40,7 +40,7 @@ from nemo.utils import logging, model_utils
 from nemo.core.classes.mixins import AccessMixin
 from nemo.collections.asr.data.audio_to_text_dali import DALIOutputs
 import math
-from nemo.collections.asr.parts.utils.streaming_tgt_spk_utils import get_hidden_length_from_sample_length
+from nemo.collections.asr.parts.utils.asr_multispeaker_utils import get_hidden_length_from_sample_length
 from tqdm import tqdm
 
 
@@ -654,12 +654,12 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
 
     def _reset_streaming_state(self):
         self.diarization_model.streaming_mode = True
-        self.diarization_model.chunk_len = 376
-        self.diarization_model.fifo_len = 188
+        self.diarization_model.sortformer_modules.chunk_len = 376
+        self.diarization_model.sortformer_modules.fifo_len = 188
         self.query_pred = None
         self.total_preds = torch.zeros((1, 0, 4), device = self.diarization_model.device)
-        self.diarization_model.chunk_len_audio = int(self.diarization_model.chunk_len / 12.5 * 16000)
-        self.diarization_model.fifo_len_audio = int(self.diarization_model.fifo_len / 12.5 * 16000)
+        self.diarization_model.sortformer_modules.chunk_len_audio = int(self.diarization_model.sortformer_modules.chunk_len / 12.5 * 16000)
+        self.diarization_model.sortformer_modules.fifo_len_audio = int(self.diarization_model.sortformer_modules.fifo_len / 12.5 * 16000)
         self.streaming_state = self.diarization_model.sortformer_modules.init_streaming_state(
             batch_size = 1,
             device = self.diarization_model.device,
@@ -681,8 +681,8 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
                 diar_input_signal = signal[:,signal_len - int(chunk_len): signal_len]
                 diar_input_signal_len = torch.tensor([int(chunk_len)], device = signal.device)
             else:
-                    diar_input_signal = signal[:,-int(chunk_len):]
-                    diar_input_signal_len = torch.tensor([int(chunk_len)], device = signal.device)
+                diar_input_signal = signal[:,-int(chunk_len):]
+                diar_input_signal_len = torch.tensor([int(chunk_len)], device = signal.device)
         if self.cfg.spk_supervision_strategy == 'diar':
             with torch.set_grad_enabled(not self.cfg.freeze_diar):
                 # diar_preds = self.forward_diar(signal, signal_len, is_raw_waveform_input)
@@ -692,7 +692,7 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
                 )
                 feat_len = processed_signal.shape[2]
                 num_chunks = math.ceil(
-                    feat_len / (self.diarization_model.chunk_len * self.diarization_model.sortformer_modules.subsampling_factor)
+                    feat_len / (self.diarization_model.sortformer_modules.chunk_len * self.diarization_model.sortformer_modules.subsampling_factor)
                 )
                 assert num_chunks == 1, "Only one chunk should be used for streaming mode"
                 
@@ -716,7 +716,7 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
                         streaming_level = streaming_level,
                         )
                 elif streaming_level == 'audio':
-                    print('Inference on audio level')
+                    # print('Inference on audio level')
                     self.streaming_state, self.total_preds = self.diarization_model.forward_streaming_step(
                     processed_signal=diar_input_signal,
                     processed_signal_length=diar_input_signal_len,
@@ -736,7 +736,7 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
             if initial_buffer:
                 re_aranged_diar_preds = torch.cat([self.query_pred, self.diarization_model.spkcache_fifo_chunk_preds[:,-get_hidden_length_from_sample_length(chunk_len * (temp_buffer_index + 1), 160, 8):]], dim = 1)
             else:
-                re_aranged_diar_preds = torch.cat([self.query_pred, self.diarization_model.spkcache_fifo_chunk_preds[:,-get_hidden_length_from_sample_length(buffer_len):]], dim = 1)
+                re_aranged_diar_preds = torch.cat([self.query_pred, self.diarization_model.spkcache_fifo_chunk_preds[:,-get_hidden_length_from_sample_length(buffer_len)-1:-1]], dim = 1)
         
         diar_preds = re_aranged_diar_preds
         if self.binarize_diar_preds_threshold:

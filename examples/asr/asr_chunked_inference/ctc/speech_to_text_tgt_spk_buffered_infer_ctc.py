@@ -49,14 +49,17 @@ from omegaconf import OmegaConf
 from nemo.collections.asr.models import EncDecCTCModel, EncDecHybridRNNTCTCModel
 from nemo.collections.asr.parts.submodules.ctc_decoding import CTCDecodingConfig
 from nemo.collections.asr.parts.utils.eval_utils import cal_write_wer
-from nemo.collections.asr.parts.utils.streaming_tgt_spk_utils import FrameBatchASR_tgt_spk, FeatureFrameBatchASR_tgt_spk
+from nemo.collections.asr.parts.utils.streaming_tgt_spk_audio_buffer_ctc_batchview_sample_utils import FrameBatchASR_tgt_spk
+from nemo.collections.asr.parts.utils.streaming_tgt_spk_audio_buffer_ctc_batchview_dataset_utils import BatchedFrameASRCTC_tgt_spk
+from nemo.collections.asr.parts.utils.streaming_tgt_spk_feature_buffer_ctc_batchview_sample_utils import FeatureFrameBatchASR_tgt_spk
 from nemo.collections.asr.parts.utils.transcribe_utils import (
     compute_output_filename,
     write_transcription,
 )
 from nemo.collections.asr.parts.utils.transcribe_spk_utils import (
     setup_model,
-    get_buffered_pred_feat_tgt_spk_ctc,
+    get_buffered_pred_feat_tgt_spk_ctc_batchview_sample,
+    get_buffered_pred_feat_tgt_spk_ctc_batchview_dataset,
 )
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
@@ -209,37 +212,60 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
     mid_delay = math.ceil((chunk_len + (total_buffer - chunk_len) / 2) / model_stride_in_secs)
     logging.info(f"tokens_per_chunk is {tokens_per_chunk}, mid_delay is {mid_delay}")
 
-    if cfg.buffer_level == 'audio':
-        frame_asr = FrameBatchASR_tgt_spk(
-            asr_model=asr_model,
-            frame_len=chunk_len,
-            total_buffer=cfg.total_buffer_in_secs,
-            batch_size=cfg.batch_size,
-            dynamic_query=cfg.get('dynamic_query', False),
-            diar_model_streaming_mode=cfg.get('diar_model_streaming_mode', False),
-            sortformer_loader_level=cfg.get('sortformer_loader_level', 'emb'),
-            initial_final_buffer=cfg.get('initial_final_buffer', False),
-        )
-    elif cfg.buffer_level == 'feature':
-        frame_asr = FeatureFrameBatchASR_tgt_spk(
-            asr_model=asr_model,
-            frame_len=chunk_len,
-            total_buffer=cfg.total_buffer_in_secs,
-            batch_size=cfg.batch_size,
-        )
+    if cfg.batch_view == 'sample':
+        if cfg.buffer_level == 'audio':
+            frame_asr = FrameBatchASR_tgt_spk(
+                asr_model=asr_model,
+                frame_len=chunk_len,
+                total_buffer=cfg.total_buffer_in_secs,
+                batch_size=cfg.batch_size,
+                dynamic_query=cfg.get('dynamic_query', False),
+                diar_model_streaming_mode=cfg.get('diar_model_streaming_mode', False),
+                sortformer_loader_level=cfg.get('sortformer_loader_level', 'emb'),
+                initial_final_buffer=cfg.get('initial_final_buffer', False),
+            )
+        elif cfg.buffer_level == 'feature':
+            frame_asr = FeatureFrameBatchASR_tgt_spk(
+                asr_model=asr_model,
+                frame_len=chunk_len,
+                total_buffer=cfg.total_buffer_in_secs,
+                batch_size=cfg.batch_size,
+            )
 
-    with torch.amp.autocast(asr_model.device.type, enabled=cfg.amp):
-        hyps = get_buffered_pred_feat_tgt_spk_ctc(
-            frame_asr,
-            chunk_len,
-            tokens_per_chunk,
-            mid_delay,
-            model_cfg.preprocessor,
-            model_stride_in_secs,
-            asr_model.device,
-            manifest,
-            filepaths,
+        with torch.amp.autocast(asr_model.device.type, enabled=cfg.amp):
+            hyps = get_buffered_pred_feat_tgt_spk_ctc_batchview_sample(
+                frame_asr,
+                chunk_len,
+                tokens_per_chunk,
+                mid_delay,
+                model_cfg.preprocessor,
+                model_stride_in_secs,
+                asr_model.device,
+                manifest,
+                filepaths,
+            )
+    elif cfg.batch_view == 'dataset':
+        assert cfg.buffer_level == 'audio', "Dataset batch view only supports audio buffer level"
+        frame_asr = BatchedFrameASRCTC_tgt_spk(
+            asr_model=asr_model,
+            frame_len=chunk_len,
+            total_buffer=cfg.total_buffer_in_secs,
+            batch_size=cfg.batch_size,
         )
+        with torch.amp.autocast(asr_model.device.type, enabled=cfg.amp):
+            hyps = get_buffered_pred_feat_tgt_spk_ctc_batchview_dataset(
+                frame_asr,
+                chunk_len,
+                tokens_per_chunk,
+                mid_delay,
+                model_stride_in_secs,
+                cfg.batch_size,
+                manifest,
+                filepaths,
+            )
+    else:
+        raise ValueError(f"Invalid batch view: {cfg.batch_view}")
+
     output_filename, pred_text_attr_name = write_transcription(
         hyps, cfg, model_name, filepaths=filepaths, compute_langs=False, timestamps=False
     )

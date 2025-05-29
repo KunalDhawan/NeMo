@@ -22,12 +22,15 @@ from typing import List, Optional, Tuple, Union
 import torch
 from omegaconf import DictConfig
 from tqdm.auto import tqdm
+import tracemalloc
 
 import nemo.collections.asr as nemo_asr
 from nemo.collections.asr.metrics.wer import word_error_rate
 from nemo.collections.asr.models import ASRModel, EncDecHybridRNNTCTCModel, EncDecMultiTaskModel
 from nemo.collections.asr.parts.utils import manifest_utils, rnnt_utils
-from nemo.collections.asr.parts.utils.streaming_tgt_spk_utils import FrameBatchASR_tgt_spk, FeatureFrameBatchASR_tgt_spk
+from nemo.collections.asr.parts.utils.streaming_tgt_spk_audio_buffer_ctc_batchview_sample_utils import FrameBatchASR_tgt_spk
+from nemo.collections.asr.parts.utils.streaming_tgt_spk_feature_buffer_ctc_batchview_sample_utils import FeatureFrameBatchASR_tgt_spk
+from nemo.collections.asr.parts.utils.streaming_tgt_spk_audio_buffer_ctc_batchview_dataset_utils import BatchedFrameASRCTC_tgt_spk
 from nemo.collections.common.metrics.punct_er import OccurancePunctuationErrorRate
 from nemo.collections.common.parts.preprocessing.manifest import get_full_path
 from nemo.utils import logging, model_utils
@@ -38,7 +41,7 @@ from nemo.collections.asr.parts.utils.asr_multispeaker_utils import apply_spk_ma
 
 from nemo.collections.asr.parts.utils.transcribe_utils import wrap_transcription
 
-def get_buffered_pred_feat_tgt_spk_ctc(
+def get_buffered_pred_feat_tgt_spk_ctc_batchview_sample(
     asr: Union[FrameBatchASR_tgt_spk, FeatureFrameBatchASR_tgt_spk],
     frame_len: float,
     tokens_per_chunk: int,
@@ -108,6 +111,127 @@ def get_buffered_pred_feat_tgt_spk_ctc(
 
     wrapped_hyps = wrap_transcription(hyps)
     return wrapped_hyps
+
+def get_buffered_pred_feat_tgt_spk_ctc_batchview_dataset(
+    asr: BatchedFrameASRCTC_tgt_spk,
+    frame_len: int,
+    tokens_per_chunk: int,
+    delay: int,
+    model_stride_in_secs: int,
+    batch_size: int,
+    manifest: str = None,
+    filepaths: List[list] = None,
+    accelerator: Optional[str] = 'cpu',
+) -> List[rnnt_utils.Hypothesis]:
+    """
+    Moved from examples/asr/asr_chunked_inference/rnnt/speech_to_text_buffered_infer_rnnt.py
+    Write all information presented in input manifest to output manifest and removed WER calculation.
+    """
+    hyps = []
+    refs = []
+
+    if filepaths and manifest:
+        raise ValueError("Please select either filepaths or manifest")
+    if filepaths is None and manifest is None:
+        raise ValueError("Either filepaths or manifest shoud not be None")
+
+    if manifest:
+        filepaths = []
+        offsets = []
+        durations = []
+        query_audio_files = []
+        query_offsets = []
+        query_durations = []
+
+        #separater info
+        separater_freq = asr.asr_model.cfg.test_ds.separater_freq
+        separater_duration = asr.asr_model.cfg.test_ds.separater_duration
+        separater_unvoice_ratio = asr.asr_model.cfg.test_ds.separater_unvoice_ratio
+        with open(manifest, "r", encoding='utf_8') as mfst_f:
+            print("Parsing manifest files...")
+            for l in mfst_f:
+                row = json.loads(l.strip())
+                audio_file = get_full_path(audio_file=row['audio_filepath'], manifest_file=manifest)
+                offset = row['offset']
+                duration = row['duration']
+                #query info
+                query_audio_file = row['query_audio_filepath']
+                query_offset = row['query_offset']
+                query_duration = row['query_duration']
+                #save to list, each element corresponding to attribute of one sample
+                offsets.append(offset)
+                durations.append(duration)
+                query_audio_files.append(query_audio_file)
+                query_offsets.append(query_offset)
+                query_durations.append(query_duration)
+                
+                filepaths.append(audio_file)
+                if 'text' in row:
+                    refs.append(row['text'])
+        assert len(refs) == len(filepaths) == len(offsets) == len(durations) == len(query_audio_files) == len(query_offsets) == len(query_durations)
+    # tracemalloc.start()
+    # snapshot0 = tracemalloc.take_snapshot()
+    with torch.inference_mode():
+        with torch.amp.autocast('cpu' if accelerator == 'cpu' else 'cuda'):
+            batch = []
+            asr.sample_offset = 0
+            for idx in tqdm(range(len(filepaths)), desc='Sample:', total=len(filepaths)):
+                batch.append((filepaths[idx], offsets[idx], durations[idx], query_audio_files[idx], query_offsets[idx], query_durations[idx])
+                )
+                #batch = Tuple(audio_filepath, audio_offset, audio_duration, query_filepath, query_offset, query_duration) 
+            
+                if len(batch) == batch_size:
+                    batch_audio_files = [sample[0] for sample in batch]
+                    batch_offsets = [sample[1] for sample in batch]
+                    batch_durations = [sample[2] for sample in batch]
+                    batch_query_audio_files = [sample[3] for sample in batch]
+                    batch_query_offsets = [sample[4] for sample in batch]
+                    batch_query_durations= [sample[5] for sample in batch]
+
+                    asr.reset()
+                    asr.read_audio_file(batch_audio_files, batch_offsets, batch_durations, batch_query_audio_files, batch_query_offsets, batch_query_durations, separater_freq, separater_duration, separater_unvoice_ratio, delay, model_stride_in_secs)
+                    # asr.read_audio_file(batch_audio_files,delay,model_stride_in_secs)
+                    hyp_list = asr.transcribe(tokens_per_chunk, delay)
+                    hyps.extend(hyp_list)
+
+                    batch.clear()
+                    asr.sample_offset += batch_size
+                    # snapshot1 = tracemalloc.take_snapshot()
+                    # top_stats = snapshot1.compare_to(snapshot0, 'lineno')
+                    # snapshot0 = snapshot1
+                    # import ipdb; ipdb.set_trace()
+
+            if len(batch) > 0:
+                asr.batch_size = len(batch)
+                asr.frame_bufferer.batch_size = len(batch)
+                batch_audio_files = [sample[0] for sample in batch]
+                batch_offsets = [sample[1] for sample in batch]
+                batch_durations = [sample[2] for sample in batch]
+                batch_query_audio_files = [sample[3] for sample in batch]
+                batch_query_offsets = [sample[4] for sample in batch]
+                batch_query_durations= [sample[5] for sample in batch]
+
+                asr.reset()
+                asr.read_audio_file(batch_audio_files, batch_offsets, batch_durations, batch_query_audio_files, batch_query_offsets, batch_query_durations, separater_freq, separater_duration, separater_unvoice_ratio, delay, model_stride_in_secs)
+                hyp_list = asr.transcribe(tokens_per_chunk, delay)
+                hyps.extend(hyp_list)
+
+                batch.clear()
+                asr.sample_offset += len(batch)
+
+    if os.environ.get('DEBUG', '0') in ('1', 'y', 't'):
+        if len(refs) == 0:
+            print("ground-truth text does not present!")
+            for hyp in hyps:
+                print("hyp:", hyp)
+        else:
+            for hyp, ref in zip(hyps, refs):
+                print("hyp:", hyp)
+                print("ref:", ref)
+
+    wrapped_hyps = wrap_transcription(hyps)
+    return wrapped_hyps
+
 
 def get_buffered_pred_feat_tgt_spk_rnnt(
     asr: Union[FrameBatchASR_tgt_spk, FeatureFrameBatchASR_tgt_spk],
