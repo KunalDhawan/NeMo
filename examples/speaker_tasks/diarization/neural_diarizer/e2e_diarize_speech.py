@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -33,14 +33,16 @@ Use batch_size = 1 to have the longest inference window and the highest possible
 python $BASEPATH/neural_diarizer/e2e_diarize_speech.py \
     model_path=/path/to/diar_sortformer_4spk_v1.nemo \
     batch_size=1 \
-    dataset_manifest=/path/to/diarization_manifest.json \
-    precision=bf16
+    dataset_manifest=/path/to/diarization_manifest.json
 
 """
 import json
 import logging
 import os
 import tempfile
+import time
+import psutil
+import tracemalloc
 from dataclasses import dataclass, is_dataclass
 from tempfile import NamedTemporaryFile
 from typing import Dict, List, Optional, Union
@@ -100,6 +102,7 @@ class DiarizationConfig:
     ignore_overlap: bool = False  # If True, DER will be calculated only for non-overlapping segments
 
     # Streaming diarization configs
+    streaming_mode: bool = True  # If True, run the model in streaming mode
     spkcache_len: int = 188
     spkcache_refresh_rate: int = 144
     fifo_len: int = 188
@@ -112,7 +115,6 @@ class DiarizationConfig:
     matmul_precision: str = "highest"  # Literal["highest", "high", "medium"]
     precision: str = "bf16"  # Literal["fp32", "fp16", "bf16"] Precision for model inference
 
-
     # Optuna Config
     launch_pp_optim: bool = False  # If True, launch optimization process for postprocessing parameters
     optuna_study_name: str = "optim_postprocessing"
@@ -120,6 +122,10 @@ class DiarizationConfig:
     optuna_storage: str = f"sqlite:///{optuna_study_name}.db"
     optuna_log_file: str = f"{optuna_study_name}.log"
     optuna_n_trials: int = 100000
+
+    # CUDA Graphs Config
+    use_cuda_graphs: bool = False  # If True, use CUDA graphs for streaming inference acceleration (EXPERIMENTAL - may not work with all models)
+    cuda_graph_warmup_steps: int = 3  # Number of warmup steps for CUDA graphs
 
 
 def optuna_suggest_params(postprocessing_cfg: PostProcessingParams, trial: optuna.Trial) -> PostProcessingParams:
@@ -310,6 +316,16 @@ def convert_pred_mat_to_segments(
 @hydra_runner(config_name="DiarizationConfig", schema=DiarizationConfig)
 def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     """Main function for end-to-end speaker diarization inference."""
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    # Start tracking execution time and memory usage
+    start_time = time.time()
+    tracemalloc.start()
+    
     for key in cfg:
         cfg[key] = None if cfg[key] == 'None' else cfg[key]
 
@@ -346,7 +362,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         diar_model = SortformerEncLabelModel.restore_from(restore_path=cfg.model_path, map_location=map_location)
     else:
         raise ValueError("cfg.model_path must end with.ckpt or.nemo!")
-    
+
     # Set model precision according to config
     if cfg.precision == "bf16":
         if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
@@ -365,6 +381,46 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     else:  # Default fp32
         logging.info("Using default FP32 precision")
     
+    # Log memory usage after model loading
+    if torch.cuda.is_available():
+        gpu_id = cfg.cuda if cfg.cuda is not None else 0
+        gpu_memory = torch.cuda.memory_allocated(gpu_id) / (1024 ** 3)  # Convert bytes to GB
+        logging.info(f"GPU memory usage after model loading: {gpu_memory:.2f} GB")
+
+    # Setting streaming mode flag in model
+    logging.info(f"Setting streaming mode to: {cfg.streaming_mode}")
+    diar_model.streaming_mode = cfg.streaming_mode
+
+    # Configure streaming parameters if in streaming mode
+    if cfg.streaming_mode:
+        logging.info("Configuring streaming parameters...")
+        diar_model.sortformer_modules.chunk_len = cfg.chunk_len
+        diar_model.sortformer_modules.spkcache_len = cfg.spkcache_len
+        diar_model.sortformer_modules.chunk_left_context = cfg.chunk_left_context
+        diar_model.sortformer_modules.chunk_right_context = cfg.chunk_right_context
+        diar_model.sortformer_modules.fifo_len = cfg.fifo_len
+        diar_model.sortformer_modules.log = cfg.log
+        diar_model.sortformer_modules.spkcache_refresh_rate = cfg.spkcache_refresh_rate
+
+    # Configure CUDA graphs if enabled
+    if cfg.use_cuda_graphs:
+        if not torch.cuda.is_available():
+            logging.warning("CUDA graphs requested but CUDA is not available. Disabling CUDA graphs.")
+            cfg.use_cuda_graphs = False
+        elif not cfg.streaming_mode:
+            logging.warning("CUDA graphs are only supported in streaming mode. Disabling CUDA graphs.")
+            cfg.use_cuda_graphs = False
+        else:
+            logging.warning("CUDA graphs support is EXPERIMENTAL and may not work with all model configurations.")
+            logging.warning("The streaming diarization model uses dynamic operations that may not be compatible with CUDA graphs.")
+            logging.warning("If you encounter errors, please disable CUDA graphs by setting use_cuda_graphs=False")
+            logging.info("Enabling CUDA graphs for streaming inference acceleration...")
+            diar_model.use_cuda_graphs = cfg.use_cuda_graphs
+            diar_model.cuda_graph_warmup_steps = cfg.cuda_graph_warmup_steps
+            logging.info(f"CUDA graphs warmup steps: {cfg.cuda_graph_warmup_steps}")
+            logging.info(f"CUDA graphs will be initialized for batch_size={cfg.batch_size}")
+    else:
+        logging.info("CUDA graphs disabled")
 
     diar_model._cfg.test_ds.session_len_sec = cfg.session_len_sec
     trainer = pl.Trainer(devices=device, accelerator=accelerator)
@@ -401,20 +457,19 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     diar_model._cfg.test_ds.num_workers = cfg.num_workers
     diar_model.setup_test_data(test_data_config=diar_model._cfg.test_ds)
 
-    # Steaming mode setup
-    diar_model.sortformer_modules.chunk_len = cfg.chunk_len
-    diar_model.sortformer_modules.spkcache_len = cfg.spkcache_len
-    diar_model.sortformer_modules.chunk_left_context = cfg.chunk_left_context
-    diar_model.sortformer_modules.chunk_right_context = cfg.chunk_right_context
-    diar_model.sortformer_modules.fifo_len = cfg.fifo_len
-    diar_model.sortformer_modules.log = cfg.log
-    diar_model.sortformer_modules.spkcache_refresh_rate = cfg.spkcache_refresh_rate
-
     postprocessing_cfg = load_postprocessing_from_yaml(cfg.postprocessing_yaml)
     tensor_path, model_id, tensor_filename = get_tensor_path(cfg)
     cfg.optuna_study_name = f"__{model_id}_{tensor_filename}"
     cfg.optuna_storage: str = f"sqlite:///{cfg.optuna_temp_dir}/{cfg.optuna_study_name}.db"
     cfg.optuna_log_file: str = f"{cfg.optuna_temp_dir}/{cfg.optuna_study_name}.log"
+
+    # Log memory usage before inference
+    if torch.cuda.is_available():
+        gpu_id = cfg.cuda if cfg.cuda is not None else 0
+        gpu_memory = torch.cuda.memory_allocated(gpu_id) / (1024 ** 3)  # Convert bytes to GB
+        logging.info(f"GPU memory usage before inference: {gpu_memory:.2f} GB")
+    
+    inference_start_time = time.time()
 
     if os.path.exists(tensor_path) and cfg.save_preds_tensors:
         logging.info(
@@ -427,6 +482,16 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         diar_model_preds_total_list = diar_model.preds_total_list
         if cfg.save_preds_tensors:
             torch.save(diar_model.preds_total_list, tensor_path)
+    
+    inference_end_time = time.time()
+    inference_time = inference_end_time - inference_start_time
+    logging.info(f"Inference time: {inference_time:.2f} seconds")
+    
+    # Log memory usage after inference
+    if torch.cuda.is_available():
+        gpu_id = cfg.cuda if cfg.cuda is not None else 0
+        gpu_memory = torch.cuda.memory_allocated(gpu_id) / (1024 ** 3)  # Convert bytes to GB
+        logging.info(f"GPU memory usage after inference: {gpu_memory:.2f} GB")
 
     if cfg.launch_pp_optim:
         # Launch a hyperparameter optimization process if launch_pp_optim is True
@@ -467,6 +532,63 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     if cfg.presort_manifest is not None:
         if remove_path_after_done is not None:
             os.unlink(remove_path_after_done)
+
+    # Track execution time and memory usage
+    end_time = time.time()
+    execution_time = end_time - start_time
+    logging.info(f"Execution time: {execution_time:.2f} seconds")
+
+    memory_usage = psutil.Process().memory_info().rss / (1024 ** 3)  # Convert bytes to GB
+    logging.info(f"Memory usage: {memory_usage:.2f} GB")
+
+    tracemalloc.stop()
+    peak_memory_usage = tracemalloc.get_traced_memory()[1] / (1024 ** 3)  # Convert bytes to GB
+    logging.info(f"Peak memory usage: {peak_memory_usage:.2f} GB")
+    
+    # Track GPU memory usage if CUDA is available
+    if torch.cuda.is_available():
+        gpu_id = cfg.cuda if cfg.cuda is not None else 0
+        reserved_gpu_memory = torch.cuda.memory_reserved(gpu_id) / (1024 ** 3)  # Convert bytes to GB
+        allocated_gpu_memory = torch.cuda.memory_allocated(gpu_id) / (1024 ** 3)  # Convert bytes to GB
+        max_gpu_memory = torch.cuda.max_memory_allocated(gpu_id) / (1024 ** 3)  # Convert bytes to GB
+        logging.info(f"GPU {gpu_id} reserved memory: {reserved_gpu_memory:.2f} GB")
+        logging.info(f"GPU {gpu_id} allocated memory: {allocated_gpu_memory:.2f} GB")
+        logging.info(f"GPU {gpu_id} peak allocated memory: {max_gpu_memory:.2f} GB")
+    
+    # Print performance summary
+    logging.info("\n" + "="*50)
+    logging.info("PERFORMANCE SUMMARY")
+    logging.info("="*50)
+    logging.info(f"Precision mode: {cfg.precision}")
+    logging.info(f"Batch size: {cfg.batch_size}")
+    logging.info(f"CUDA graphs enabled: {cfg.use_cuda_graphs}")
+    if cfg.use_cuda_graphs and hasattr(diar_model, 'cuda_graph_initialized'):
+        logging.info(f"CUDA graphs initialized: {diar_model.cuda_graph_initialized}")
+        logging.info(f"CUDA graphs compatible: {diar_model.cuda_graph_compatible}")
+    logging.info(f"Total execution time: {execution_time:.2f} seconds")
+    logging.info(f"Inference time only: {inference_time:.2f} seconds")
+    
+    # Add model's detailed timing breakdown if available
+    if hasattr(diar_model, 'forward_pass_count') and diar_model.forward_pass_count > 0:
+        logging.info(f"Preprocessing time: {diar_model.total_preprocess_time:.2f} seconds")
+        logging.info(f"Model forward pass time: {diar_model.total_model_forward_time:.2f} seconds")
+        if hasattr(diar_model, 'streaming_mode') and diar_model.streaming_mode:
+            logging.info(f"Streaming time: {diar_model.total_streaming_time:.2f} seconds")
+        
+        avg_preprocess_time = diar_model.total_preprocess_time / diar_model.forward_pass_count
+        avg_model_forward_time = diar_model.total_model_forward_time / diar_model.forward_pass_count
+        
+        logging.info(f"Average preprocessing time per batch: {avg_preprocess_time:.4f} seconds")
+        logging.info(f"Average model forward pass time per batch: {avg_model_forward_time:.4f} seconds")
+        if hasattr(diar_model, 'streaming_mode') and diar_model.streaming_mode:
+            avg_streaming_time = diar_model.total_streaming_time / diar_model.forward_pass_count
+            logging.info(f"Average streaming time per batch: {avg_streaming_time:.4f} seconds")
+    
+    logging.info(f"CPU memory usage: {memory_usage:.2f} GB")
+    logging.info(f"CPU peak memory usage: {peak_memory_usage:.2f} GB")
+    if torch.cuda.is_available():
+        logging.info(f"GPU {gpu_id} peak allocated memory: {max_gpu_memory:.2f} GB")
+    logging.info("="*50)
 
 
 if __name__ == '__main__':

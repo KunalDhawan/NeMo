@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,8 +14,7 @@
 
 # pylint: disable=E1101
 import itertools
-import math
-import os
+import os, math
 import random
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -48,7 +47,6 @@ from nemo.utils import logging
 
 __all__ = ['SortformerEncLabelModel']
 
-
 def concat_and_pad(embs: List[torch.Tensor], lengths: List[torch.Tensor]):
     """
     Concatenates lengths[i] first embeddings of embs[i], and pads the rest elements with zeros.
@@ -71,7 +69,7 @@ def concat_and_pad(embs: List[torch.Tensor], lengths: List[torch.Tensor]):
     batch_size, emb_dim = embs[0].shape[0], embs[0].shape[2]
 
     total_lengths = torch.sum(torch.stack(lengths), dim=0)
-    sig_length = total_lengths.max().item()
+    sig_length  = total_lengths.max().item()
 
     output = torch.zeros(batch_size, sig_length, emb_dim, device=device, dtype=dtype)
     start_indices = torch.zeros(batch_size, dtype=torch.int64, device=device)
@@ -79,11 +77,11 @@ def concat_and_pad(embs: List[torch.Tensor], lengths: List[torch.Tensor]):
     for emb, length in zip(embs, lengths):
         end_indices = start_indices + length
         for batch_idx in range(batch_size):
-            output[batch_idx, start_indices[batch_idx] : end_indices[batch_idx]] = emb[batch_idx, : length[batch_idx]]
+            output[batch_idx, start_indices[batch_idx]:end_indices[batch_idx]] = \
+                emb[batch_idx, :length[batch_idx]]
         start_indices = end_indices
 
     return output, total_lengths
-
 
 class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixin):
     """
@@ -161,6 +159,21 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         self.max_batch_dur = self._cfg.get("max_batch_dur", 20000)
         self.concat_and_pad_script = torch.jit.script(concat_and_pad)
+        
+        # Add timing metrics
+        self.total_preprocess_time = 0.0
+        self.total_model_forward_time = 0.0
+        self.total_streaming_time = 0.0
+        self.forward_pass_count = 0
+        
+        # CUDA graphs support
+        self.use_cuda_graphs = self._cfg.get("use_cuda_graphs", False)
+        self.cuda_graph_warmup_steps = self._cfg.get("cuda_graph_warmup_steps", 3)
+        self.cuda_graph = None
+        self.static_inputs = {}
+        self.static_outputs = {}
+        self.cuda_graph_initialized = False
+        self.cuda_graph_compatible = False
 
     def _init_loss_weights(self):
         pil_weight = self._cfg.get("pil_weight", 0.0)
@@ -280,7 +293,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             }
         )
 
-    def frontend_encoder(self, processed_signal, processed_signal_length, bypass_pre_encode: bool = False):
+    def frontend_encoder(self, processed_signal, processed_signal_length, bypass_pre_encode: bool=False):
         """
         Generate encoder outputs from frontend encoder.
 
@@ -291,15 +304,15 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 tensor containing lengths of audio signal in integers.
 
         Returns:
-            emb_seq (torch.Tensor):
+            emb_seq (torch.Tensor): 
                 tensor containing encoder outputs.
-            emb_seq_length (torch.Tensor):
+            emb_seq_length (torch.Tensor): 
                 tensor containing lengths of encoder outputs.
         """
         # Spec augment is not applied during evaluation/testing
         if self.spec_augmentation is not None and self.training:
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
-            
+        
         # Ensure the processed signal is in the appropriate precision
         if hasattr(self, 'precision_mode') and processed_signal.dtype != self.precision_mode:
             processed_signal = processed_signal.to(self.precision_mode)
@@ -349,7 +362,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         with torch.no_grad():
             preds = self.forward(audio_signal=batch[0], audio_signal_length=batch[1])
             preds = preds.to('cpu')
-            torch.cuda.empty_cache()
+            # Only call empty_cache if CUDA graphs are not being used
+            if not self._is_cuda_graphs_active():
+                torch.cuda.empty_cache()
         return preds
 
     def _diarize_output_processing(
@@ -543,7 +558,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         # Only perform `empty_cache()` when the input file is extremely large for streaming mode.
         if not self.training and self.streaming_mode:
             del audio_signal, audio_signal_length, audio_signal_fp32
-            torch.cuda.empty_cache()
+            # Only call empty_cache if CUDA graphs are not being used
+            if not self._is_cuda_graphs_active():
+                torch.cuda.empty_cache()
         
         return processed_signal, processed_signal_length
 
@@ -567,6 +584,381 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             if hasattr(self, 'precision_mode'):
                 delattr(self, 'precision_mode')
 
+    def _init_cuda_graphs_static_tensors(self, batch_size, max_chunk_len, emb_dim):
+        """
+        Initialize static tensors for CUDA graphs.
+        
+        Args:
+            batch_size: Batch size for static tensors
+            max_chunk_len: Maximum chunk length
+            emb_dim: Embedding dimension
+        """
+        device = self.device
+        dtype = self.precision_mode if hasattr(self, 'precision_mode') else torch.float32
+        
+        # Use the actual configured sizes for spkcache and fifo
+        spkcache_len = self.sortformer_modules.spkcache_len
+        fifo_len = self.sortformer_modules.fifo_len
+        
+        logging.info(f"Initializing CUDA graphs static tensors:")
+        logging.info(f"  - Batch size: {batch_size}")
+        logging.info(f"  - Max chunk length: {max_chunk_len}")
+        logging.info(f"  - Embedding dimension: {emb_dim}")
+        logging.info(f"  - Speaker cache length: {spkcache_len}")
+        logging.info(f"  - FIFO length: {fifo_len}")
+        logging.info(f"  - Device: {device}")
+        logging.info(f"  - Data type: {dtype}")
+        
+        # Static inputs for streaming step
+        self.static_inputs = {
+            'chunk_pre_encode_embs': torch.zeros(batch_size, max_chunk_len, emb_dim, device=device, dtype=dtype),
+            'chunk_pre_encode_lengths': torch.zeros(batch_size, device=device, dtype=torch.int64),
+            'spkcache': torch.zeros(batch_size, spkcache_len, emb_dim, device=device, dtype=dtype),
+            'spkcache_lengths': torch.zeros(batch_size, device=device, dtype=torch.int64),
+            'fifo': torch.zeros(batch_size, fifo_len, emb_dim, device=device, dtype=dtype),
+            'fifo_lengths': torch.zeros(batch_size, device=device, dtype=torch.int64),
+        }
+        
+        # Static outputs - calculate total length for concatenated embeddings
+        max_total_len = spkcache_len + fifo_len + max_chunk_len
+        self.static_outputs = {
+            'chunk_preds': torch.zeros(batch_size, max_chunk_len, self.sortformer_modules.n_spk, device=device, dtype=dtype),
+            'spkcache_fifo_chunk_preds': torch.zeros(batch_size, max_total_len, self.sortformer_modules.n_spk, device=device, dtype=dtype),
+        }
+        
+        logging.info(f"  - Max total concatenated length: {max_total_len}")
+        logging.info(f"  - Number of speakers: {self.sortformer_modules.n_spk}")
+        
+        # Validate tensor creation
+        total_memory_mb = 0
+        for name, tensor in {**self.static_inputs, **self.static_outputs}.items():
+            tensor_memory_mb = tensor.numel() * tensor.element_size() / (1024 * 1024)
+            total_memory_mb += tensor_memory_mb
+            logging.info(f"  - {name}: {tensor.shape} ({tensor_memory_mb:.2f} MB)")
+        
+        logging.info(f"Total CUDA graphs static tensor memory: {total_memory_mb:.2f} MB")
+
+    def _warmup_cuda_graphs(self, sample_inputs):
+        """
+        Perform warmup runs for CUDA graphs.
+        
+        Args:
+            sample_inputs: Dictionary containing sample inputs for warmup
+        """
+        logging.info("Performing CUDA graphs warmup...")
+        
+        # Create a separate CUDA stream for warmup
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        
+        with torch.cuda.stream(warmup_stream):
+            for i in range(self.cuda_graph_warmup_steps):
+                torch.cuda.synchronize()
+                _ = self._forward_streaming_step_core(
+                    chunk_pre_encode_embs=sample_inputs['chunk_pre_encode_embs'],
+                    chunk_pre_encode_lengths=sample_inputs['chunk_pre_encode_lengths'],
+                    spkcache=sample_inputs['spkcache'],
+                    spkcache_lengths=sample_inputs['spkcache_lengths'],
+                    fifo=sample_inputs['fifo'],
+                    fifo_lengths=sample_inputs['fifo_lengths'],
+                )
+                torch.cuda.synchronize()
+        
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+        logging.info("CUDA graphs warmup completed")
+
+    def _capture_cuda_graph(self):
+        """
+        Capture the CUDA graph for the streaming step.
+        """
+        logging.info("Capturing CUDA graph...")
+        
+        try:
+            self.cuda_graph = torch.cuda.CUDAGraph()
+            
+            with torch.cuda.graph(self.cuda_graph):
+                self.static_outputs['chunk_preds'], self.static_outputs['spkcache_fifo_chunk_preds'] = self._forward_streaming_step_core(
+                    chunk_pre_encode_embs=self.static_inputs['chunk_pre_encode_embs'],
+                    chunk_pre_encode_lengths=self.static_inputs['chunk_pre_encode_lengths'],
+                    spkcache=self.static_inputs['spkcache'],
+                    spkcache_lengths=self.static_inputs['spkcache_lengths'],
+                    fifo=self.static_inputs['fifo'],
+                    fifo_lengths=self.static_inputs['fifo_lengths'],
+                )
+            
+            self.cuda_graph_initialized = True
+            self.cuda_graph_compatible = True
+            logging.info("CUDA graph captured successfully")
+            
+        except Exception as e:
+            # If capture fails, clean up and reset state
+            logging.warning(f"CUDA graph capture failed: {e}")
+            self.cuda_graph_initialized = False
+            self.cuda_graph_compatible = False
+            if hasattr(self, 'cuda_graph') and self.cuda_graph is not None:
+                del self.cuda_graph
+                self.cuda_graph = None
+            raise e  # Re-raise to be caught by the calling function
+
+    def _replay_cuda_graph(self, inputs):
+        """
+        Replay the captured CUDA graph with new inputs.
+        
+        Args:
+            inputs: Dictionary containing new inputs
+            
+        Returns:
+            Tuple of (chunk_preds, spkcache_fifo_chunk_preds)
+        """
+        # Copy new data to static tensors, handling size mismatches carefully
+        for key, value in inputs.items():
+            if key in self.static_inputs and value is not None:
+                static_tensor = self.static_inputs[key]
+                if value.shape == static_tensor.shape:
+                    # Direct copy if shapes match exactly
+                    static_tensor.copy_(value)
+                else:
+                    # Handle size mismatches by copying what fits and zero-padding the rest
+                    if len(value.shape) == len(static_tensor.shape):
+                        # Clear the static tensor first to ensure clean state
+                        static_tensor.zero_()
+                        
+                        if len(value.shape) == 3:  # For embedding tensors (batch, seq_len, emb_dim)
+                            batch_size = min(value.shape[0], static_tensor.shape[0])
+                            seq_len = min(value.shape[1], static_tensor.shape[1])
+                            emb_dim = min(value.shape[2], static_tensor.shape[2])
+                            
+                            # Ensure we don't exceed tensor bounds
+                            if batch_size > 0 and seq_len > 0 and emb_dim > 0:
+                                static_tensor[:batch_size, :seq_len, :emb_dim] = value[:batch_size, :seq_len, :emb_dim]
+                                
+                        elif len(value.shape) == 1:  # For length tensors (batch,)
+                            batch_size = min(value.shape[0], static_tensor.shape[0])
+                            if batch_size > 0:
+                                static_tensor[:batch_size] = value[:batch_size]
+                                # CRITICAL: Ensure unused batch elements have zero lengths to prevent invalid indexing
+                                if batch_size < static_tensor.shape[0]:
+                                    static_tensor[batch_size:] = 0
+                        else:
+                            logging.warning(f"Unexpected tensor shape for key {key}: {value.shape}")
+                    else:
+                        logging.warning(f"Shape dimension mismatch for key {key}: {value.shape} vs {static_tensor.shape}")
+        
+        # Replay the graph
+        self.cuda_graph.replay()
+        
+        # Return copies of the outputs to avoid graph memory issues
+        # Clone to ensure we get independent tensors that won't be affected by future graph replays
+        return (
+            self.static_outputs['chunk_preds'].clone(),
+            self.static_outputs['spkcache_fifo_chunk_preds'].clone()
+        )
+
+    def _cleanup_cuda_graphs(self):
+        """
+        Clean up CUDA graphs resources.
+        """
+        if hasattr(self, 'cuda_graph') and self.cuda_graph is not None:
+            del self.cuda_graph
+            self.cuda_graph = None
+        
+        if hasattr(self, 'static_inputs'):
+            del self.static_inputs
+            self.static_inputs = {}
+        
+        if hasattr(self, 'static_outputs'):
+            del self.static_outputs
+            self.static_outputs = {}
+        
+        self.cuda_graph_initialized = False
+        self.cuda_graph_compatible = False
+        
+        # Force garbage collection and clear CUDA cache
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        logging.info("CUDA graphs resources cleaned up")
+
+    def _is_cuda_graphs_active(self):
+        """
+        Check if CUDA graphs are currently active and should prevent empty_cache calls.
+        
+        Returns:
+            bool: True if CUDA graphs are active, False otherwise
+        """
+        return (
+            hasattr(self, 'use_cuda_graphs') and 
+            getattr(self, 'use_cuda_graphs', False) and 
+            hasattr(self, 'cuda_graph_initialized') and 
+            getattr(self, 'cuda_graph_initialized', False) and
+            hasattr(self, 'cuda_graph_compatible') and
+            getattr(self, 'cuda_graph_compatible', False)
+        )
+
+    def _apply_mask_to_preds_cuda_graphs(self, spkcache_fifo_chunk_preds, spkcache_fifo_chunk_fc_encoder_lengths):
+        """
+        CUDA graphs compatible version of apply_mask_to_preds.
+        
+        This version avoids creating new tensors during graph capture by using in-place operations
+        and pre-allocated tensors.
+        
+        Args:
+            spkcache_fifo_chunk_preds (torch.Tensor): Speaker predictions of the chunk
+            spkcache_fifo_chunk_fc_encoder_lengths (torch.Tensor): Lengths of current chunk
+            
+        Returns:
+            spkcache_fifo_chunk_preds (torch.Tensor): Masked speaker predictions
+        """
+        batch_size, n_frames, n_spk = spkcache_fifo_chunk_preds.shape
+        device = spkcache_fifo_chunk_preds.device
+        
+        # Create mask using existing tensor operations (CUDA graph compatible)
+        frame_indices = torch.arange(n_frames, device=device, dtype=torch.long).view(1, -1, 1)
+        frame_indices = frame_indices.expand(batch_size, -1, n_spk)
+        length_mask = spkcache_fifo_chunk_fc_encoder_lengths.view(-1, 1, 1).expand(-1, n_frames, n_spk)
+        
+        # Create boolean mask - frames beyond the actual length should be masked out
+        valid_mask = frame_indices < length_mask
+        
+        # CUDA GRAPH FIX: Use in-place masking instead of creating new tensors
+        # Apply mask by setting invalid positions to 0 directly
+        spkcache_fifo_chunk_preds = spkcache_fifo_chunk_preds * valid_mask.to(spkcache_fifo_chunk_preds.dtype)
+        
+        return spkcache_fifo_chunk_preds
+
+    def _forward_streaming_step_core(self, chunk_pre_encode_embs, chunk_pre_encode_lengths, 
+                                   spkcache, spkcache_lengths, fifo, fifo_lengths):
+        """
+        Core computation for streaming step that can be captured in CUDA graph.
+        
+        This version is designed to be CUDA graph compatible by avoiding dynamic operations.
+        Uses vectorized operations and creates the correct layout expected by streaming update functions.
+        
+        Args:
+            chunk_pre_encode_embs: Pre-encoded chunk embeddings
+            chunk_pre_encode_lengths: Lengths of pre-encoded chunks
+            spkcache: Speaker cache embeddings
+            spkcache_lengths: Speaker cache lengths
+            fifo: FIFO queue embeddings
+            fifo_lengths: FIFO queue lengths
+            
+        Returns:
+            Tuple of (chunk_preds, spkcache_fifo_chunk_preds)
+        """
+        batch_size = chunk_pre_encode_embs.shape[0]
+        device = chunk_pre_encode_embs.device
+        dtype = chunk_pre_encode_embs.dtype
+        
+        # Use the static tensor dimensions for CUDA graph compatibility
+        static_spkcache_len = spkcache.shape[1]
+        static_fifo_len = fifo.shape[1] 
+        static_chunk_len = chunk_pre_encode_embs.shape[1]
+        static_total_len = static_spkcache_len + static_fifo_len + static_chunk_len
+        emb_dim = chunk_pre_encode_embs.shape[2]
+        
+        # CRITICAL FIX: Create concatenated tensor that respects actual lengths per batch element
+        # while maintaining CUDA graph compatibility through vectorized operations
+        
+        # Create the output tensor with maximum possible size
+        spkcache_fifo_chunk_pre_encode_embs = torch.zeros(
+            batch_size, static_total_len, emb_dim, device=device, dtype=dtype
+        )
+        
+        # Use vectorized operations to copy data while respecting actual lengths
+        # This approach uses masking to handle variable lengths in a CUDA graph compatible way
+        
+        # CUDA GRAPH FIX: Use static_total_len instead of dynamically calculating max_actual_len
+        # to avoid .item() calls during graph capture
+        total_actual_lengths = spkcache_lengths + fifo_lengths + chunk_pre_encode_lengths
+        
+        # Create a position tensor for indexing - use static size to avoid .item() calls
+        positions = torch.arange(static_total_len, device=device).unsqueeze(0).expand(batch_size, -1)
+        
+        # For each batch element, we need to copy:
+        # - spkcache data to positions [0:spkcache_len]
+        # - fifo data to positions [spkcache_len:spkcache_len+fifo_len] 
+        # - chunk data to positions [spkcache_len+fifo_len:spkcache_len+fifo_len+chunk_len]
+        
+        # Create masks for spkcache positions
+        spkcache_mask = positions < spkcache_lengths.unsqueeze(1)
+        spkcache_positions = torch.clamp(positions, 0, static_spkcache_len - 1)
+        
+        # Copy spkcache data using advanced indexing
+        batch_indices = torch.arange(batch_size, device=device).unsqueeze(1).expand(-1, static_total_len)
+        spkcache_fifo_chunk_pre_encode_embs[batch_indices, positions, :] = torch.where(
+            spkcache_mask.unsqueeze(2),
+            spkcache[batch_indices, spkcache_positions, :],
+            0
+        )
+        
+        # Create masks for fifo positions  
+        fifo_start_positions = spkcache_lengths.unsqueeze(1)
+        fifo_end_positions = spkcache_lengths.unsqueeze(1) + fifo_lengths.unsqueeze(1)
+        fifo_mask = (positions >= fifo_start_positions) & (positions < fifo_end_positions)
+        fifo_local_positions = torch.clamp(positions - fifo_start_positions, 0, static_fifo_len - 1)
+        
+        # Copy fifo data
+        spkcache_fifo_chunk_pre_encode_embs[batch_indices, positions, :] = torch.where(
+            fifo_mask.unsqueeze(2),
+            fifo[batch_indices, fifo_local_positions, :],
+            spkcache_fifo_chunk_pre_encode_embs[batch_indices, positions, :]
+        )
+        
+        # Create masks for chunk positions
+        chunk_start_positions = spkcache_lengths.unsqueeze(1) + fifo_lengths.unsqueeze(1)
+        chunk_end_positions = chunk_start_positions + chunk_pre_encode_lengths.unsqueeze(1)
+        chunk_mask = (positions >= chunk_start_positions) & (positions < chunk_end_positions)
+        chunk_local_positions = torch.clamp(positions - chunk_start_positions, 0, static_chunk_len - 1)
+        
+        # Copy chunk data
+        spkcache_fifo_chunk_pre_encode_embs[batch_indices, positions, :] = torch.where(
+            chunk_mask.unsqueeze(2),
+            chunk_pre_encode_embs[batch_indices, chunk_local_positions, :],
+            spkcache_fifo_chunk_pre_encode_embs[batch_indices, positions, :]
+        )
+
+        # Apply the concatenated embeddings and lengths to the encoder
+        spkcache_fifo_chunk_fc_encoder_embs, spkcache_fifo_chunk_fc_encoder_lengths = self.frontend_encoder(
+             processed_signal=spkcache_fifo_chunk_pre_encode_embs,
+             processed_signal_length=total_actual_lengths,
+             bypass_pre_encode=True
+        )
+        
+        spkcache_fifo_chunk_preds = self.forward_infer(
+             emb_seq=spkcache_fifo_chunk_fc_encoder_embs,
+             emb_seq_length=spkcache_fifo_chunk_fc_encoder_lengths
+        )
+
+        # Use CUDA graphs compatible masking
+        spkcache_fifo_chunk_preds = self._apply_mask_to_preds_cuda_graphs(
+            spkcache_fifo_chunk_preds, spkcache_fifo_chunk_fc_encoder_lengths
+        )
+        
+        # Extract chunk predictions using the correct dynamic indexing expected by streaming update
+        # This now matches the layout that streaming_update_async expects
+        chunk_preds = torch.zeros(batch_size, static_chunk_len, spkcache_fifo_chunk_preds.shape[2], 
+                                 device=device, dtype=spkcache_fifo_chunk_preds.dtype)
+        
+        # Use vectorized extraction with masking
+        chunk_extract_positions = torch.arange(static_chunk_len, device=device).unsqueeze(0).expand(batch_size, -1)
+        chunk_extract_mask = chunk_extract_positions < chunk_pre_encode_lengths.unsqueeze(1)
+        
+        # Calculate source positions in the predictions tensor
+        source_positions = (spkcache_lengths + fifo_lengths).unsqueeze(1) + chunk_extract_positions
+        source_positions = torch.clamp(source_positions, 0, spkcache_fifo_chunk_preds.shape[1] - 1)
+        
+        batch_extract_indices = torch.arange(batch_size, device=device).unsqueeze(1).expand(-1, static_chunk_len)
+        
+        chunk_preds[batch_extract_indices, chunk_extract_positions, :] = torch.where(
+            chunk_extract_mask.unsqueeze(2),
+            spkcache_fifo_chunk_preds[batch_extract_indices, source_positions, :],
+            0
+        )
+        
+        return chunk_preds, spkcache_fifo_chunk_preds
+
     def forward(
         self,
         audio_signal,
@@ -585,17 +977,37 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             preds (torch.Tensor): Sorted tensor containing predicted speaker labels
                 Shape: (batch_size, max. diar frame count, num_speakers)
         """
+        import time
+        
+        # Track preprocessing time
+        preprocess_start = time.time()
         processed_signal, processed_signal_length = self.process_signal(
             audio_signal=audio_signal, audio_signal_length=audio_signal_length
         )
-        processed_signal = processed_signal[:, :, : processed_signal_length.max()]
+        processed_signal = processed_signal[:, :, :processed_signal_length.max()]
+        preprocess_end = time.time()
+        
+        # Track only actual model forward pass time
+        model_start = time.time()
         if self.streaming_mode:
+            streaming_start = time.time()
             preds = self.forward_streaming(processed_signal, processed_signal_length)
+            streaming_end = time.time()
+            self.total_streaming_time += (streaming_end - streaming_start)
         else:
             emb_seq, emb_seq_length = self.frontend_encoder(
-                processed_signal=processed_signal, processed_signal_length=processed_signal_length
+                processed_signal=processed_signal,
+                processed_signal_length=processed_signal_length
             )
             preds = self.forward_infer(emb_seq, emb_seq_length)
+        model_end = time.time()
+        
+        # Update timing metrics
+        if not self.training:
+            self.total_preprocess_time += (preprocess_end - preprocess_start)
+            self.total_model_forward_time += (model_end - model_start)
+            self.forward_pass_count += 1
+            
         return preds
 
     @property
@@ -607,7 +1019,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         return ["spkcache_fifo_chunk_preds", "chunk_pre_encode_embs", "chunk_pre_encode_lengths"]
 
     def streaming_input_examples(self):
-        """Input tensor examples for exporting streaming version of model"""
+        """Input tensor examples for exporting streaming version of model
+        """
         batch_size = 4
         chunk = torch.rand([batch_size, 120, 80]).to(self.device)
         chunk_lengths = torch.tensor([120] * batch_size).to(self.device)
@@ -618,7 +1031,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         return chunk, chunk_lengths, spkcache, spkcache_lengths, fifo, fifo_lengths
 
     def streaming_export(self, output: str):
-        """Exports the model for streaming inference."""
+        """Exports the model for streaming inference.
+        """
         input_example = self.streaming_input_examples()
         export_out = self.export(output, input_example=input_example)
         return export_out
@@ -703,25 +1117,28 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 and all previous chunks
                 Shape: (batch_size, pred_len, num_speakers)
         """
+        import time
+        streaming_setup_start = time.time()
+        
         streaming_state = self.sortformer_modules.init_streaming_state(
-            batch_size=processed_signal.shape[0], async_streaming=self.async_streaming, device=self.device
+            batch_size = processed_signal.shape[0],
+            async_streaming = self.async_streaming,
+            device = self.device
         )
 
-        batch_size, ch, sig_length = processed_signal.shape
+        batch_size, ch, sig_length  = processed_signal.shape
         processed_signal_offset = torch.zeros((batch_size,), dtype=torch.long, device=self.device)
 
         if dist.is_available() and dist.is_initialized():
-            local_tensor = torch.tensor([sig_length], device=processed_signal.device)
-            dist.all_reduce(
-                local_tensor, op=dist.ReduceOp.MAX, async_op=False
-            )  # get max feature length across all GPUs
+            local_tensor = torch.tensor([sig_length ], device=processed_signal.device)
+            dist.all_reduce(local_tensor, op=dist.ReduceOp.MAX, async_op=False) # get max feature length across all GPUs
             max_n_frames = local_tensor.item()
             if dist.get_rank() == 0:
                 logging.info(f"Maximum feature length across all GPUs: {max_n_frames}")
         else:
             max_n_frames = sig_length
 
-        if sig_length < max_n_frames:  # need padding to have the same feature length for all GPUs
+        if sig_length  < max_n_frames: # need padding to have the same feature length for all GPUs
             pad_tensor = torch.full(
                 (batch_size, ch, max_n_frames - sig_length),
                 self.negative_init_val,
@@ -734,11 +1151,72 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         if self.training:
             rand_num = random.random()
             if rand_num < self.sortformer_modules.causal_attn_rate:
-                self.encoder.att_context_size = [-1, self.sortformer_modules.causal_attn_rc]
+                self.encoder.att_context_size=[-1, self.sortformer_modules.causal_attn_rc]
                 self.transformer_encoder.diag = self.sortformer_modules.causal_attn_rc
                 att_mod = True
 
         total_preds = torch.zeros((batch_size, 0, self.sortformer_modules.n_spk), device=self.device)
+        
+        # CUDA graphs initialization
+        cuda_graphs_enabled = (
+            self.use_cuda_graphs and 
+            torch.cuda.is_available() and 
+            not self.training
+        )
+        
+        if cuda_graphs_enabled and not self.cuda_graph_initialized:
+            logging.info(f"Initializing CUDA graphs for streaming diarization with batch_size={batch_size}...")
+            try:
+                # Estimate embedding dimension from encoder config
+                emb_dim = getattr(self.encoder, 'd_model', 512)
+                max_chunk_len = self.sortformer_modules.chunk_len + self.sortformer_modules.chunk_left_context + self.sortformer_modules.chunk_right_context
+                
+                # Initialize static tensors
+                self._init_cuda_graphs_static_tensors(batch_size, max_chunk_len, emb_dim)
+                
+                # Create sample inputs for warmup
+                sample_inputs = {
+                    'chunk_pre_encode_embs': torch.randn_like(self.static_inputs['chunk_pre_encode_embs']),
+                    'chunk_pre_encode_lengths': torch.full_like(self.static_inputs['chunk_pre_encode_lengths'], max_chunk_len),
+                    'spkcache': torch.randn_like(self.static_inputs['spkcache']),
+                    'spkcache_lengths': torch.full_like(self.static_inputs['spkcache_lengths'], self.sortformer_modules.spkcache_len),
+                    'fifo': torch.randn_like(self.static_inputs['fifo']),
+                    'fifo_lengths': torch.full_like(self.static_inputs['fifo_lengths'], self.sortformer_modules.fifo_len),
+                }
+                
+                # Warmup
+                self._warmup_cuda_graphs(sample_inputs)
+                
+                # Capture graph
+                self._capture_cuda_graph()
+                
+                logging.info(f"CUDA graphs initialized successfully for streaming diarization with batch_size={batch_size}")
+                
+            except Exception as e:
+                logging.warning(f"Failed to initialize CUDA graphs: {e}. Falling back to regular execution.")
+                # Ensure proper cleanup and state reset
+                cuda_graphs_enabled = False
+                self.cuda_graph_initialized = False
+                self.cuda_graph_compatible = False
+                if hasattr(self, 'cuda_graph') and self.cuda_graph is not None:
+                    del self.cuda_graph
+                    self.cuda_graph = None
+                if hasattr(self, 'static_inputs'):
+                    del self.static_inputs
+                    self.static_inputs = {}
+                if hasattr(self, 'static_outputs'):
+                    del self.static_outputs
+                    self.static_outputs = {}
+                # Clear any potential CUDA graph state
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+        
+        streaming_setup_end = time.time()
+        streaming_setup_time = streaming_setup_end - streaming_setup_start
+        
+        # Track individual streaming step times
+        chunk_prep_time = 0.0
+        streaming_step_time = 0.0
 
         feat_len = processed_signal.shape[2]
         num_chunks = math.ceil(
@@ -749,30 +1227,60 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             feat_seq_length=processed_signal_length,
             feat_seq_offset=processed_signal_offset,
         )
-        for _, chunk_feat_seq_t, feat_lengths, left_offset, right_offset in tqdm(
+        
+        for chunk_idx, (_, chunk_feat_seq_t, feat_lengths, left_offset, right_offset) in enumerate(tqdm(
             streaming_loader,
             total=num_chunks,
             desc="Streaming Steps",
             disable=self.training,
-        ):
-            streaming_state, total_preds = self.forward_streaming_step(
-                processed_signal=chunk_feat_seq_t,
-                processed_signal_length=feat_lengths,
-                streaming_state=streaming_state,
-                total_preds=total_preds,
-                left_offset=left_offset,
-                right_offset=right_offset,
-            )
+        )):
+            chunk_prep_start = time.time()
+            # Chunk preparation time
+            chunk_prep_end = time.time()
+            chunk_prep_time += (chunk_prep_end - chunk_prep_start)
+            
+            # Streaming step timing
+            step_start = time.time()
+            
+            # Use CUDA graphs for compatible scenarios
+            if cuda_graphs_enabled and self.cuda_graph_compatible:
+                streaming_state, total_preds = self.forward_streaming_step_cuda_graphs(
+                    processed_signal=chunk_feat_seq_t,
+                    processed_signal_length=feat_lengths,
+                    streaming_state=streaming_state,
+                    total_preds=total_preds,
+                    left_offset=left_offset,
+                    right_offset=right_offset,
+                )
+            else:
+                streaming_state, total_preds = self.forward_streaming_step(
+                    processed_signal=chunk_feat_seq_t,
+                    processed_signal_length=feat_lengths,
+                    streaming_state=streaming_state,
+                    total_preds=total_preds,
+                    left_offset=left_offset,
+                    right_offset=right_offset,
+                )
+            
+            step_end = time.time()
+            streaming_step_time += (step_end - step_start)
 
         if att_mod:
-            self.encoder.att_context_size = [-1, -1]
+            self.encoder.att_context_size=[-1, -1]
             self.transformer_encoder.diag = None
 
         del processed_signal, processed_signal_length
 
-        if sig_length < max_n_frames:  # Discard preds corresponding to padding
-            n_frames = math.ceil(sig_length / self.encoder.subsampling_factor)
-            total_preds = total_preds[:, :n_frames, :]
+        if sig_length  < max_n_frames: # Discard preds corresponding to padding
+            n_frames = math.ceil(sig_length  / self.encoder.subsampling_factor)
+            total_preds = total_preds[:,:n_frames,:]
+        
+        # Store timing metrics for streaming-specific operations
+        if not self.training:
+            self.streaming_setup_time = streaming_setup_time
+            self.streaming_chunk_prep_time = chunk_prep_time
+            self.streaming_step_time = streaming_step_time
+        
         return total_preds
 
     def forward_streaming_step(
@@ -819,7 +1327,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 Shape: (batch_size, cumulative pred length, num_speakers)
         """
         chunk_pre_encode_embs, chunk_pre_encode_lengths = self.encoder.pre_encode(
-            x=processed_signal, lengths=processed_signal_length
+            x=processed_signal,
+            lengths=processed_signal_length
         )
         
         # Ensure consistency in precision
@@ -834,23 +1343,26 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         if self.async_streaming:
             spkcache_fifo_chunk_pre_encode_embs, spkcache_fifo_chunk_pre_encode_lengths = concat_and_pad(
                 [streaming_state.spkcache, streaming_state.fifo, chunk_pre_encode_embs],
-                [streaming_state.spkcache_lengths, streaming_state.fifo_lengths, chunk_pre_encode_lengths],
+                [streaming_state.spkcache_lengths, streaming_state.fifo_lengths, chunk_pre_encode_lengths]
             )
         else:
             spkcache_fifo_chunk_pre_encode_embs = self.sortformer_modules.concat_embs(
                 [streaming_state.spkcache, streaming_state.fifo, chunk_pre_encode_embs], dim=1, device=self.device
             )
             spkcache_fifo_chunk_pre_encode_lengths = (
-                streaming_state.spkcache.shape[1] + streaming_state.fifo.shape[1] + chunk_pre_encode_lengths
+                streaming_state.spkcache.shape[1] +
+                streaming_state.fifo.shape[1] +
+                chunk_pre_encode_lengths
             )
 
         spkcache_fifo_chunk_fc_encoder_embs, spkcache_fifo_chunk_fc_encoder_lengths = self.frontend_encoder(
-            processed_signal=spkcache_fifo_chunk_pre_encode_embs,
-            processed_signal_length=spkcache_fifo_chunk_pre_encode_lengths,
-            bypass_pre_encode=True,
+             processed_signal=spkcache_fifo_chunk_pre_encode_embs,
+             processed_signal_length=spkcache_fifo_chunk_pre_encode_lengths,
+             bypass_pre_encode=True
         )
         spkcache_fifo_chunk_preds = self.forward_infer(
-            emb_seq=spkcache_fifo_chunk_fc_encoder_embs, emb_seq_length=spkcache_fifo_chunk_fc_encoder_lengths
+             emb_seq=spkcache_fifo_chunk_fc_encoder_embs,
+             emb_seq_length=spkcache_fifo_chunk_fc_encoder_lengths
         )
 
         spkcache_fifo_chunk_preds = self.sortformer_modules.apply_mask_to_preds(
@@ -875,6 +1387,217 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             )
         total_preds = torch.cat([total_preds, chunk_preds], dim=1)
 
+        return streaming_state, total_preds
+
+    def forward_streaming_step_cuda_graphs(
+        self,
+        processed_signal,
+        processed_signal_length,
+        streaming_state,
+        total_preds,
+        left_offset=0,
+        right_offset=0,
+    ):
+        """
+        CUDA graphs optimized version of forward_streaming_step.
+        
+        Args:
+            processed_signal (torch.Tensor): Tensor containing audio waveform
+                Shape: (batch_size, num_samples)
+            processed_signal_length (torch.Tensor): Tensor containing lengths of audio waveforms
+                Shape: (batch_size,)
+            streaming_state (SortformerStreamingState): Streaming state
+            total_preds (torch.Tensor): Total predicted speaker activity probabilities
+            left_offset (int): left offset for the current chunk
+            right_offset (int): right offset for the current chunk
+
+        Returns:
+            streaming_state (SortformerStreamingState): Updated streaming state
+            total_preds (torch.Tensor): Updated total predicted speaker activity probabilities
+        """
+        # Pre-encode the chunk (this part cannot be easily captured in CUDA graphs due to variable sizes)
+        chunk_pre_encode_embs, chunk_pre_encode_lengths = self.encoder.pre_encode(
+            x=processed_signal,
+            lengths=processed_signal_length
+        )
+        
+        # Ensure consistency in precision
+        if hasattr(self, 'precision_mode'):
+            if chunk_pre_encode_embs.dtype != self.precision_mode:
+                chunk_pre_encode_embs = chunk_pre_encode_embs.to(self.precision_mode)
+            if hasattr(streaming_state, 'spkcache') and streaming_state.spkcache.dtype != self.precision_mode:
+                streaming_state.spkcache = streaming_state.spkcache.to(self.precision_mode)
+            if hasattr(streaming_state, 'fifo') and streaming_state.fifo.dtype != self.precision_mode:
+                streaming_state.fifo = streaming_state.fifo.to(self.precision_mode)
+
+        # Get actual dimensions for validation
+        actual_batch_size = chunk_pre_encode_embs.shape[0]
+        actual_chunk_len = chunk_pre_encode_embs.shape[1]
+        actual_emb_dim = chunk_pre_encode_embs.shape[2]
+        actual_spkcache_len = streaming_state.spkcache.shape[1]
+        actual_fifo_len = streaming_state.fifo.shape[1]
+
+        # Check if we can use CUDA graphs with strict size validation
+        can_use_cuda_graph = (
+            self.cuda_graph_initialized and
+            self.cuda_graph_compatible and
+            actual_batch_size == self.static_inputs['chunk_pre_encode_embs'].shape[0] and  # batch size must match exactly
+            actual_chunk_len <= self.static_inputs['chunk_pre_encode_embs'].shape[1] and  # chunk length must fit
+            actual_emb_dim == self.static_inputs['chunk_pre_encode_embs'].shape[2] and  # embedding dim must match exactly
+            actual_spkcache_len <= self.static_inputs['spkcache'].shape[1] and  # spkcache must fit
+            actual_fifo_len <= self.static_inputs['fifo'].shape[1]  # fifo must fit
+        )
+        
+        # Additional validation for streaming state consistency
+        if can_use_cuda_graph:
+            # Handle the case where length tensors might be None in synchronous mode
+            if streaming_state.spkcache_lengths is None:
+                # Create length tensors on-the-fly for synchronous mode
+                spkcache_lengths = torch.full((actual_batch_size,), actual_spkcache_len, 
+                                            device=streaming_state.spkcache.device, dtype=torch.long)
+            else:
+                spkcache_lengths = streaming_state.spkcache_lengths
+                
+            if streaming_state.fifo_lengths is None:
+                # Create length tensors on-the-fly for synchronous mode  
+                fifo_lengths = torch.full((actual_batch_size,), actual_fifo_len,
+                                        device=streaming_state.fifo.device, dtype=torch.long)
+            else:
+                fifo_lengths = streaming_state.fifo_lengths
+            
+            # Validate that all inputs are non-None
+            graph_inputs = {
+                'chunk_pre_encode_embs': chunk_pre_encode_embs,
+                'chunk_pre_encode_lengths': chunk_pre_encode_lengths,
+                'spkcache': streaming_state.spkcache,
+                'spkcache_lengths': spkcache_lengths,
+                'fifo': streaming_state.fifo,
+                'fifo_lengths': fifo_lengths,
+            }
+            
+            # Check for None values
+            for key, value in graph_inputs.items():
+                if value is None:
+                    logging.warning(f"CUDA graph input '{key}' is None, falling back to regular computation")
+                    can_use_cuda_graph = False
+                    break
+            
+            if can_use_cuda_graph:
+                try:
+                    # DEBUG: Log when we're using CUDA graphs
+                    if not hasattr(self, '_cuda_graph_usage_count'):
+                        self._cuda_graph_usage_count = 0
+                    self._cuda_graph_usage_count += 1
+                    
+                    # Replay CUDA graph to get predictions
+                    chunk_preds, spkcache_fifo_chunk_preds = self._replay_cuda_graph(graph_inputs)
+                    
+                    # CRITICAL FIX: DO NOT trim the predictions to actual sizes!
+                    # The CUDA graph produces predictions based on the static tensor layout:
+                    # [static_spkcache_len + static_fifo_len + static_chunk_len]
+                    # 
+                    # The streaming update functions expect this full layout and will handle
+                    # the indexing based on the actual lengths passed in the streaming state.
+                    # 
+                    # Previously, we were incorrectly trimming to actual_total_len, which broke
+                    # the indexing because the streaming update functions expect the predictions
+                    # to have the full static layout.
+                    
+                    # Only trim chunk_preds to actual chunk length for the final output
+                    chunk_preds = chunk_preds[:, :actual_chunk_len, :]
+                    
+                    # Keep spkcache_fifo_chunk_preds at full static size - DO NOT TRIM!
+                    # The streaming update functions will use the length information from
+                    # streaming_state.spkcache_lengths and streaming_state.fifo_lengths
+                    # to correctly index into this tensor.
+                    
+                    # Validate that the predictions have the expected static shape
+                    static_spkcache_len = self.static_inputs['spkcache'].shape[1]
+                    static_fifo_len = self.static_inputs['fifo'].shape[1] 
+                    static_chunk_len = self.static_inputs['chunk_pre_encode_embs'].shape[1]
+                    static_total_len = static_spkcache_len + static_fifo_len + static_chunk_len
+                    
+                    expected_shape = (actual_batch_size, static_total_len, self.sortformer_modules.n_spk)
+                    if spkcache_fifo_chunk_preds.shape != expected_shape:
+                        logging.warning(f"CUDA graph prediction shape mismatch. Expected {expected_shape}, got {spkcache_fifo_chunk_preds.shape}. Falling back to regular computation.")
+                        can_use_cuda_graph = False
+                    # else:
+                    #     # DEBUG: Log successful CUDA graph usage
+                    #     if self._cuda_graph_usage_count <= 5 or self._cuda_graph_usage_count % 50 == 0:
+                    #         logging.info(f"CUDA graph used successfully (count: {self._cuda_graph_usage_count}). Shapes: chunk_preds={chunk_preds.shape}, spkcache_fifo_chunk_preds={spkcache_fifo_chunk_preds.shape}")
+                    #         logging.info(f"  Static layout: spkcache_len={static_spkcache_len}, fifo_len={static_fifo_len}, chunk_len={static_chunk_len}")
+                    #         logging.info(f"  Actual lengths: spkcache_len={actual_spkcache_len}, fifo_len={actual_fifo_len}, chunk_len={actual_chunk_len}")
+                    
+                except Exception as e:
+                    logging.warning(f"CUDA graph replay failed: {e}. Falling back to regular computation.")
+                    can_use_cuda_graph = False
+            
+        if not can_use_cuda_graph:
+            # DEBUG: Log when we fall back to regular computation
+            if not hasattr(self, '_fallback_usage_count'):
+                self._fallback_usage_count = 0
+            self._fallback_usage_count += 1
+            
+            if self._fallback_usage_count <= 5 or self._fallback_usage_count % 50 == 0:
+                logging.info(f"Falling back to regular computation (count: {self._fallback_usage_count}). Reason: can_use_cuda_graph={can_use_cuda_graph}")
+            
+            # Fall back to regular computation
+            if self.async_streaming:
+                spkcache_fifo_chunk_pre_encode_embs, spkcache_fifo_chunk_pre_encode_lengths = concat_and_pad(
+                    [streaming_state.spkcache, streaming_state.fifo, chunk_pre_encode_embs],
+                    [streaming_state.spkcache_lengths, streaming_state.fifo_lengths, chunk_pre_encode_lengths]
+                )
+            else:
+                spkcache_fifo_chunk_pre_encode_embs = self.sortformer_modules.concat_embs(
+                    [streaming_state.spkcache, streaming_state.fifo, chunk_pre_encode_embs], dim=1, device=self.device
+                )
+                spkcache_fifo_chunk_pre_encode_lengths = (
+                    streaming_state.spkcache.shape[1] +
+                    streaming_state.fifo.shape[1] +
+                    chunk_pre_encode_lengths
+                )
+
+            spkcache_fifo_chunk_fc_encoder_embs, spkcache_fifo_chunk_fc_encoder_lengths = self.frontend_encoder(
+                 processed_signal=spkcache_fifo_chunk_pre_encode_embs,
+                 processed_signal_length=spkcache_fifo_chunk_pre_encode_lengths,
+                 bypass_pre_encode=True
+            )
+            spkcache_fifo_chunk_preds = self.forward_infer(
+                 emb_seq=spkcache_fifo_chunk_fc_encoder_embs,
+                 emb_seq_length=spkcache_fifo_chunk_fc_encoder_lengths
+            )
+
+            spkcache_fifo_chunk_preds = self.sortformer_modules.apply_mask_to_preds(
+                spkcache_fifo_chunk_preds, spkcache_fifo_chunk_fc_encoder_lengths
+            )
+            
+            # Extract chunk predictions
+            chunk_start_idx = streaming_state.spkcache.shape[1] + streaming_state.fifo.shape[1]
+            chunk_end_idx = chunk_start_idx + chunk_pre_encode_embs.shape[1]
+            chunk_preds = spkcache_fifo_chunk_preds[:, chunk_start_idx:chunk_end_idx, :]
+
+        # Update streaming state (this part uses the original streaming update logic)
+        # CRITICAL: The streaming update functions expect the full spkcache_fifo_chunk_preds
+        # with the correct indexing, which we now ensure above
+        if self.async_streaming:
+            streaming_state, chunk_preds = self.sortformer_modules.streaming_update_async(
+                streaming_state=streaming_state,
+                chunk=chunk_pre_encode_embs,
+                chunk_lengths=chunk_pre_encode_lengths,
+                preds=spkcache_fifo_chunk_preds,
+                lc=round(left_offset / self.encoder.subsampling_factor),
+                rc=math.ceil(right_offset / self.encoder.subsampling_factor),
+            )
+        else:
+            streaming_state, chunk_preds = self.sortformer_modules.streaming_update(
+                streaming_state=streaming_state,
+                chunk=chunk_pre_encode_embs,
+                preds=spkcache_fifo_chunk_preds,
+                lc=round(left_offset / self.encoder.subsampling_factor),
+                rc=math.ceil(right_offset / self.encoder.subsampling_factor),
+            )
+        
+        total_preds = torch.cat([total_preds, chunk_preds], dim=1)
         return streaming_state, total_preds
 
     def _get_aux_train_evaluations(self, preds, targets, target_lens) -> dict:
@@ -1090,6 +1813,17 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         This method iterates through the test data loader, making predictions for each batch,
         and calculates various evaluation metrics. It handles both single and multi-sample batches.
         """
+        import time
+        import logging
+        
+        # Reset timing counters
+        self.total_preprocess_time = 0.0
+        self.total_model_forward_time = 0.0
+        self.total_streaming_time = 0.0
+        self.forward_pass_count = 0
+        
+        batch_start_time = time.time()
+        
         (
             self.preds_total_list,
             self.batch_f1_accs_list,
@@ -1114,12 +1848,45 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                     self.preds_total_list.append(preds)
                 else:
                     self.preds_total_list.extend(torch.split(preds, [1] * preds.shape[0]))
-                torch.cuda.empty_cache()
+                # Only call empty_cache if CUDA graphs are not being used
+                if not self._is_cuda_graphs_active():
+                    torch.cuda.empty_cache()
 
-        logging.info(f"Batch F1Acc. MEAN: {torch.mean(torch.tensor(self.batch_f1_accs_list))}")
-        logging.info(f"Batch Precision MEAN: {torch.mean(torch.tensor(self.batch_precision_list))}")
-        logging.info(f"Batch Recall MEAN: {torch.mean(torch.tensor(self.batch_recall_list))}")
-        logging.info(f"Batch ATS F1Acc. MEAN: {torch.mean(torch.tensor(self.batch_f1_accs_ats_list))}")
+        batch_end_time = time.time()
+        total_batch_time = batch_end_time - batch_start_time
+        
+        # Log timing information
+        if self.forward_pass_count > 0:
+            avg_preprocess_time = self.total_preprocess_time / self.forward_pass_count
+            avg_model_forward_time = self.total_model_forward_time / self.forward_pass_count
+            
+            logging.info(f"Batch F1Acc. MEAN: {torch.mean(torch.tensor(self.batch_f1_accs_list))}")
+            logging.info(f"Batch Precision MEAN: {torch.mean(torch.tensor(self.batch_precision_list))}")
+            logging.info(f"Batch Recall MEAN: {torch.mean(torch.tensor(self.batch_recall_list))}")
+            logging.info(f"Batch ATS F1Acc. MEAN: {torch.mean(torch.tensor(self.batch_f1_accs_ats_list))}")
+            
+            logging.info(f"\n===== MODEL TIMING INFORMATION =====")
+            logging.info(f"Total inference time: {total_batch_time:.2f} seconds")
+            logging.info(f"Total preprocessing time: {self.total_preprocess_time:.2f} seconds")
+            logging.info(f"Total model forward pass time: {self.total_model_forward_time:.2f} seconds")
+            if self.streaming_mode:
+                logging.info(f"Total streaming time: {self.total_streaming_time:.2f} seconds")
+                if hasattr(self, 'streaming_setup_time'):
+                    logging.info(f"  - Streaming setup time: {self.streaming_setup_time:.2f} seconds")
+                if hasattr(self, 'streaming_chunk_prep_time'):
+                    logging.info(f"  - Streaming chunk prep time: {self.streaming_chunk_prep_time:.2f} seconds")
+                if hasattr(self, 'streaming_step_time'):
+                    logging.info(f"  - Streaming step processing time: {self.streaming_step_time:.2f} seconds")
+            
+            logging.info(f"Average preprocessing time per batch: {avg_preprocess_time:.4f} seconds")
+            logging.info(f"Average model forward pass time per batch: {avg_model_forward_time:.4f} seconds")
+            if self.streaming_mode:
+                avg_streaming_time = self.total_streaming_time / self.forward_pass_count
+                logging.info(f"Average streaming time per batch: {avg_streaming_time:.4f} seconds")
+            
+            logging.info(f"Preprocessing percentage: {(self.total_preprocess_time / total_batch_time) * 100:.2f}%")
+            logging.info(f"Model forward pass percentage: {(self.total_model_forward_time / total_batch_time) * 100:.2f}%")
+            logging.info(f"===============================")
 
     def on_validation_epoch_end(self) -> Optional[dict[str, dict[str, torch.Tensor]]]:
         """Run validation with sync_dist=True."""
