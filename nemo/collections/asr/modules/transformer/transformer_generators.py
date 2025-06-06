@@ -163,7 +163,6 @@ class GreedySequenceGenerator:
             next_tokens = self.pad * pad_profile + next_tokens * (1 - pad_profile)
             pad_profile = torch.max(pad_profile, (next_tokens == self.eos).long())
             tgt = torch.cat((tgt, next_tokens), dim=-1)
-
             # abort generation if all sequences end with <eos>
             if pad_profile.sum() == batch_size:
                 break
@@ -334,7 +333,7 @@ class BeamSearchSequenceGenerator(GreedySequenceGenerator):
 
         tgt_len = tgt.size(-1)
         for i in range(tgt_len, max_generation_length + tgt_len):
-
+            # print(f"Step {i+1}-th, max length {max_generation_length+tgt_len}")
             # mask all finished hypotheses to exclude them from beam
             pad_mask = pad_profile.repeat(1, self.beam_size)
 
@@ -378,12 +377,12 @@ class BeamSearchSequenceGenerator(GreedySequenceGenerator):
                     .gather(1, mems_ids)
                     .view(-1, p_len - 1, hidden_size)
                 )
+                # import ipdb; ipdb.set_trace()
 
             # update prefixes_len and pad_profile
             not_eos_pad = prefixes.ne(self.eos) & prefixes.ne(self.pad)
             prefixes_len = 1 + not_eos_pad.sum(dim=1, keepdim=True).to(scores.dtype)
             pad_profile = (~not_eos_pad[:, -1:]).long()
-
             # if all hypotheses end with <eos> or <pad>, interrupt search
             if pad_profile.sum() == batch_size * self.beam_size:
                 break

@@ -191,7 +191,6 @@ class TransformerDecoderNM(DecoderModule, Exportable):
             embedding_dropout=embedding_dropout,
             learn_positional_encodings=learn_positional_encodings,
         )
-
         self._decoder = TransformerDecoder(
             hidden_size=self.hidden_size,
             num_layers=num_layers,
@@ -205,7 +204,7 @@ class TransformerDecoderNM(DecoderModule, Exportable):
             pre_ln_final_layer_norm=pre_ln_final_layer_norm,
         )
 
-    @typecheck()
+    # @typecheck()
     def forward(
         self, input_ids, decoder_mask, encoder_embeddings, encoder_mask, decoder_mems=None,
     ):

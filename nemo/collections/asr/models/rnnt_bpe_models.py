@@ -492,6 +492,7 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
         logging.info(f"Changed decoding strategy to \n{OmegaConf.to_yaml(self.cfg.decoding)}")
 
     def _setup_dataloader_from_config(self, config: Optional[Dict]):
+        import ipdb; ipdb.set_trace()
         if config.get("use_lhotse"):
             return get_lhotse_dataloader_from_config(
                 config,
@@ -541,7 +542,6 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
             config['batch_size'] = None
             config['drop_last'] = False
             shuffle = False
-
         return torch.utils.data.DataLoader(
             dataset=dataset,
             batch_size=config['batch_size'],

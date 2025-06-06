@@ -457,13 +457,15 @@ class MultiHeadAttention(nn.Module):
             whole layer, but before layer normalization
     """
 
-    def __init__(self, hidden_size, num_attention_heads, attn_score_dropout=0.0, attn_layer_dropout=0.0):
+    def __init__(self, hidden_size, num_attention_heads, attn_score_dropout=0.0, attn_layer_dropout=0.0, is_decoder=False):
         super().__init__()
         if hidden_size % num_attention_heads != 0:
             raise ValueError(
                 "The hidden size (%d) is not a multiple of the number "
                 "of attention heads (%d)" % (hidden_size, num_attention_heads)
             )
+        self.is_decoder = is_decoder
+        self.attention_saved_list = []
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
         self.attn_head_size = int(hidden_size / num_attention_heads)
@@ -509,6 +511,9 @@ class MultiHeadAttention(nn.Module):
         # output projection
         output_states = self.out_projection(context)
         output_states = self.layer_dropout(output_states)
+        if self.is_decoder:
+            # self.attention_saved_list.append(attention_probs[:, -1, :].unsqueeze_(0))
+            self.attention_saved_list.append(attention_scores)
         return output_states
 
 

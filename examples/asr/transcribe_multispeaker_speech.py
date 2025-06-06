@@ -109,7 +109,6 @@ python transcribe_speech.py \
 
 @dataclass
 class ModelChangeConfig:
-
     # Sub-config for changes specific to the Conformer Encoder
     conformer: ConformerChangeConfig = ConformerChangeConfig()
 
@@ -118,8 +117,6 @@ class ModelChangeConfig:
 class TranscriptionConfig:
     # Required configs
     model_path: Optional[str] = None  # Path to a .nemo file
-    asr_model_path: Optional[str] = model_path  # Path to a .nemo file
-    diar_pred_model_path: Optional[str] = None  # Path to a diarization model
     pretrained_name: Optional[str] = None  # Name of a pretrained model
     audio_dir: Optional[str] = None  # Path to a directory which contains audio files
     dataset_manifest: Optional[str] = None  # Path to dataset's JSON manifest
@@ -250,16 +247,11 @@ def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig, List[Hypothesis
 
     logging.info(f"Inference will be done on device: {map_location}")
 
-    # cfg.asr_model_path = cfg.model_path
     asr_model, model_name = setup_model(cfg, map_location)
 
     trainer = pl.Trainer(devices=device, accelerator=accelerator)
     asr_model.set_trainer(trainer)
     asr_model = asr_model.eval()
-
-    
-    if cfg.get('diar_pred_model_path', None) is not None:
-        asr_model.setup_diar_pred_model(cfg.diar_pred_model_path, map_location)
 
     # we will adjust this flag if the model does not support it
     compute_timestamps = cfg.compute_timestamps
@@ -445,7 +437,7 @@ def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig, List[Hypothesis
         compute_timestamps=compute_timestamps,
     )
     logging.info(f"Finished writing predictions to {output_filename}!")
-
+    
     # clean-up
     if cfg.presort_manifest is not None:
         if remove_path_after_done is not None:

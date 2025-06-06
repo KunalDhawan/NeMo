@@ -17,6 +17,7 @@ import os
 from typing import Optional
 
 import numpy as np
+import re
 import torch
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
@@ -28,6 +29,7 @@ from nemo.collections.asr.parts.preprocessing.features import normalize_batch
 from nemo.collections.asr.parts.utils.audio_utils import get_samples
 from nemo.core.classes import IterableDataset
 from nemo.core.neural_types import LengthsType, MelSpectrogramType, NeuralType
+from nemo.collections.asr.parts.preprocessing.segment import AudioSegment
 
 # Minimum number of tokens required to assign a LCS merge step, otherwise ignore and
 # select all i-1 and ith buffer tokens to merge.
@@ -503,7 +505,111 @@ class AudioFeatureIterator(IterableDataset):
         self.count += 1
         return frame
 
+class AudioSampleIterator(IterableDataset):
+    def __init__(self, samples, frame_len, preprocessor, device, pad_to_frame_len=True, sample_per_frame=160, mel_frame_per_asr_frame=8):
+    # def __init__(self, samples, device, pad_to_frame_len=True):
+        self.num_sample_per_mel_frame = sample_per_frame
+        self.num_mel_frame_per_asr_frame: int = mel_frame_per_asr_frame
+        self._samples = samples
+        self._frame_len = frame_len
+        self._sample_frame_len = int(frame_len * self.num_mel_frame_per_asr_frame * self.num_sample_per_mel_frame)
+        self._start_frame = 0
+        self._start_samfr = 0
+        self.output = True
+        self.count = 0
+        self.pad_to_frame_len = pad_to_frame_len
+        timestep_duration = preprocessor._cfg['window_stride']
+        self._feature_frame_len = frame_len / timestep_duration
+        audio_signal = torch.from_numpy(self._samples).unsqueeze_(0).to(device)
+        audio_signal_len = torch.Tensor([self._samples.shape[0]]).to(device)
+        self._features, self._features_len = preprocessor(input_signal=audio_signal, length=audio_signal_len,)
+        self._audio_signal, self._audio_signal_len = audio_signal, audio_signal_len
+        self._features = self._features.squeeze()
+        
 
+    def get_hidden_length_from_sample_length(
+        self,
+        num_samples: int, 
+        num_sample_per_mel_frame: int = 160, 
+        num_mel_frame_per_asr_frame: int = 8
+    ) -> int:
+        """ 
+        Calculate the hidden length from the given number of samples.
+        This function is needed for speaker diarization with ASR model trainings.
+
+        This function computes the number of frames required for a given number of audio samples,
+        considering the number of samples per mel frame and the number of mel frames per ASR frame.
+
+        Parameters:
+            num_samples (int): The total number of audio samples.
+            num_sample_per_mel_frame (int, optional): The number of samples per mel frame. Default is 160.
+            num_mel_frame_per_asr_frame (int, optional): The number of mel frames per ASR frame. Default is 8.
+
+        Returns:
+            hidden_length (int): The calculated hidden length in terms of the number of frames.
+        """
+        mel_frame_count = math.ceil((num_samples + 1) / num_sample_per_mel_frame)
+        hidden_length = math.ceil(mel_frame_count / num_mel_frame_per_asr_frame)
+        return int(hidden_length)
+    
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        """ 
+        self._feature_frame_len : The length of a feature frame in terms of "mel frames"
+        self._start : The start index of the current feature frame in terms of "mel frames"
+        self._start_samfr : The start index of the current sample frame in terms of "samples"
+        """
+        if not self.output:
+            raise StopIteration
+        last = int(self._start_frame + self._feature_frame_len)
+        last_samfr = int((self._start_frame + self._feature_frame_len)*self.num_sample_per_mel_frame)
+        if last <= self._features_len[0]:
+            # feat frame
+            # frame = self._features[:, self._start_frame : last].cpu()
+            # self._start_frame = last
+            # sample frame
+            sample_frame = self._audio_signal[:, self._start_samfr: last_samfr].cpu()
+            self._start_samfr = last_samfr
+            self._start_frame = last
+        else:
+            if not self.pad_to_frame_len:
+                # frame = self._features[:, self._start_frame : self._features_len[0]].cpu()
+                sample_frame = self._audio_signal[:, self._start_samfr: int(self._audio_signal_len[0])].cpu()
+            else:
+                # frame = np.zeros([self._features.shape[0], int(self._feature_frame_len)], dtype='float32')
+                # segment = self._features[:, self._start_frame : self._features_len[0]].cpu()
+                # frame[:, : segment.shape[1]] = segment
+                
+                sample_frame = np.zeros([self._audio_signal.shape[0], int(self._audio_signal_len[0])], dtype='float32')
+                segment_samfr = self._audio_signal[:, self._start_samfr : int(self._audio_signal_len[0])].cpu()
+                sample_frame[:, : segment_samfr.shape[1]] = segment_samfr
+                
+            self.output = False
+        self.count += 1
+        sample_frame = sample_frame.squeeze()
+        return sample_frame
+
+    def next_place_holder(self):
+        if not self.output:
+            raise StopIteration
+        last = int(self._start_frame + self._feature_frame_len)
+        if last <= self._features_len[0]:
+            frame = self._features[:, self._start_frame : last].cpu()
+            self._start_frame = last
+        else:
+            if not self.pad_to_frame_len:
+                frame = self._features[:, self._start_frame : self._features_len[0]].cpu()
+            else:
+                frame = np.zeros([self._features.shape[0], int(self._feature_frame_len)], dtype='float32')
+                segment = self._features[:, self._start_frame : self._features_len[0]].cpu()
+                frame[:, : segment.shape[1]] = segment
+            self.output = False
+        self.count += 1
+        return frame
+    
+    
 def speech_collate_fn(batch):
     """collate batch of audio sig, audio len, tokens, tokens len
     Args:
@@ -534,6 +640,40 @@ def speech_collate_fn(batch):
         audio_signal, audio_lengths = None, None
 
     return audio_signal, audio_lengths
+
+
+# simple data layer to pass buffered frames of audio samples
+class AudioSampleBuffersDataLayer(IterableDataset):
+    @property
+    def output_types(self):
+        return {
+            "processed_signal": NeuralType(('B', 'T'), MelSpectrogramType()),
+            "processed_length": NeuralType(tuple('B'), LengthsType()),
+        }
+
+    def __init__(self):
+        super().__init__()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._buf_count == len(self.signal):
+            raise StopIteration
+        self._buf_count += 1
+        
+        return (
+            torch.as_tensor(self.signal[self._buf_count - 1], dtype=torch.float32),
+            torch.as_tensor(self.signal[self._buf_count - 1].shape[0], dtype=torch.int64),
+        )
+
+    def set_signal(self, signals):
+        self.signal = signals
+        self.signal_shape = self.signal[0].shape
+        self._buf_count = 0
+
+    def __len__(self):
+        return 1
 
 
 # simple data layer to pass buffered frames of audio samples
@@ -690,6 +830,141 @@ class FeatureFrameBufferer:
         return []
 
 
+class SampleFrameBufferer:
+    """
+    Class to append each feature frame to a buffer and return
+    an array of buffers.
+    """
+
+    def __init__(self, asr_model, frame_len=1.6, batch_size=4, total_buffer=4.0, samples_per_feat_frame=160, pad_to_buffer_len=True):
+        '''
+        Args:
+          frame_len: frame's duration, seconds
+          frame_overlap: duration of overlaps before and after current frame, seconds
+          offset: number of symbols to drop for smooth streaming
+        '''
+        if hasattr(asr_model.preprocessor, 'log') and asr_model.preprocessor.log:
+            self.ZERO_LEVEL_SPEC_DB_VAL = -16.635  # Log-Melspectrogram value for zero signal
+        else:
+            self.ZERO_LEVEL_SPEC_DB_VAL = 0.0
+        self.asr_model = asr_model
+        self.sr = asr_model._cfg.sample_rate
+        self.frame_len = frame_len
+        timestep_duration = asr_model._cfg.preprocessor.window_stride
+        self.n_frame_len = int(frame_len / timestep_duration)
+        
+        self.samples_per_feat_frame = samples_per_feat_frame
+        self.n_sample_len = self.n_frame_len * self.samples_per_feat_frame
+
+        # total_buffer_len = int(total_buffer / timestep_duration)
+        # self.n_feat = asr_model._cfg.preprocessor.features
+        # self.buffer = np.ones([self.n_feat, total_buffer_len], dtype=np.float32) * self.ZERO_LEVEL_SPEC_DB_VAL
+        total_sample_len = int(total_buffer / timestep_duration) * self.samples_per_feat_frame 
+        self.buffer = np.zeros([total_sample_len], dtype=np.float32) 
+        self.cumul_buffer = np.zeros([0], dtype=np.float32) 
+        self.cumul_buffer_sample_len = 0
+        self.total_sample_len = total_sample_len
+        self.pad_to_buffer_len = pad_to_buffer_len
+        self.batch_size = batch_size
+
+        self.signal_end = False
+        self.frame_reader = None
+        # self.feature_buffer_len = total_buffer_len
+        # self.feature_buffer = (
+        #     np.ones([self.n_feat, self.feature_buffer_len], dtype=np.float32) * self.ZERO_LEVEL_SPEC_DB_VAL
+        # )
+        # self.frame_buffers = []
+        
+        self.feature_buffer_len = total_sample_len
+        self.sample_buffer_len = total_sample_len
+        self.feature_buffer = np.zeros([self.sample_buffer_len], dtype=np.float32) 
+        self.frame_buffers = []
+        self.buffered_features_size = 0
+        self.reset()
+        self.buffered_len = 0
+
+    def reset(self):
+        '''
+        Reset frame_history and decoder's state
+        '''
+        # self.buffer = np.ones(shape=self.buffer.shape, dtype=np.float32) * self.ZERO_LEVEL_SPEC_DB_VAL
+        self.buffer = np.zeros(shape=self.buffer.shape, dtype=np.float32) 
+        self.prev_char = ''
+        self.unmerged = []
+        self.frame_buffers = []
+        self.buffered_len = 0
+        # self.feature_buffer = (
+        #     np.ones([self.n_feat, self.feature_buffer_len], dtype=np.float32) * self.ZERO_LEVEL_SPEC_DB_VAL
+        # )
+        self.feature_buffer = np.zeros([self.sample_buffer_len], dtype=np.float32) 
+
+    def get_batch_frames(self):
+        if self.signal_end:
+            return []
+        batch_frames = []
+        for frame in self.frame_reader:
+            batch_frames.append(np.copy(frame))
+            if len(batch_frames) == self.batch_size:
+                return batch_frames
+        self.signal_end = True
+
+        return batch_frames
+
+    def get_sample_buffers(self, frames):
+        # Build buffers for each frame
+        self.frame_buffers = []
+        for frame in frames:
+            # curr_frame_len = frame.shape[1]
+            curr_frame_len = frame.shape[0]
+            self.buffered_len += curr_frame_len
+            # if curr_frame_len < self.sample_buffer_len and not self.pad_to_buffer_len:
+            #     self.frame_buffers.append(np.copy(frame))
+            #     continue
+            # self.buffer[:, :-curr_frame_len] = self.buffer[:, curr_frame_len:]
+            # self.buffer[:, -self.n_frame_len :] = frame
+            self.buffer[:-curr_frame_len] = self.buffer[curr_frame_len:]
+            if curr_frame_len < self.n_sample_len:
+                self.buffer[-self.n_sample_len : -self.n_sample_len + curr_frame_len] = frame
+            else: 
+                self.buffer[-self.n_sample_len :] = frame
+            # self.cumul_buffer = np.concatenate((self.cumul_buffer, frame))
+            # self.cumul_buffer_sample_len = self.cumul_buffer.shape[0]
+            self.frame_buffers.append(np.copy(self.buffer))
+            # import ipdb; ipdb.set_trace()
+        return self.frame_buffers
+
+    def set_frame_reader(self, frame_reader):
+        self.frame_reader = frame_reader
+        self.signal_end = False
+
+    def _update_feature_buffer(self, feat_frame):
+        curr_frame_len = feat_frame.shape[1]
+        if curr_frame_len < self.sample_buffer_len and not self.pad_to_buffer_len:
+            self.feature_buffer = np.copy(feat_frame)  # assume that only the last frame is less than the buffer length
+        else:
+            self.feature_buffer[:-feat_frame.shape[1]] = self.feature_buffer[feat_frame.shape[1] :]
+            self.feature_buffer[-feat_frame.shape[1] :] = feat_frame
+        self.buffered_features_size += feat_frame.shape[1]
+
+    def normalize_frame_buffers(self, frame_buffers, norm_consts):
+        CONSTANT = 1e-5
+        for i, frame_buffer in enumerate(frame_buffers):
+            frame_buffers[i] = (frame_buffer - norm_consts[i][0]) / (norm_consts[i][1] + CONSTANT)
+
+    def get_samples_batch(self):
+        batch_frames = self.get_batch_frames()
+
+        while len(batch_frames) > 0:
+
+            frame_buffers = self.get_sample_buffers(batch_frames)
+            # norm_consts = self.get_norm_consts_per_frame(batch_frames)
+            if len(frame_buffers) == 0:
+                continue
+            # self.normalize_frame_buffers(frame_buffers, norm_consts)
+            return frame_buffers
+        return []
+
+
 # class for streaming frame-based ASR
 # 1) use reset() method to reset FrameASR's state
 # 2) call transcribe(frame) to do ASR on
@@ -774,7 +1049,8 @@ class FrameBatchASR:
 
     @torch.no_grad()
     def infer_logits(self, keep_logits=False):
-        frame_buffers = self.frame_bufferer.get_buffers_batch()
+        # frame_buffers = self.frame_bufferer.get_buffers_batch()
+        frame_buffers = self.sample_bufferer.get_buffers_batch()
 
         while len(frame_buffers) > 0:
             self.frame_buffers += frame_buffers[:]
@@ -1638,6 +1914,291 @@ class FrameBatchMultiTaskAED(FrameBatchASR):
 
         print("keep_logits=True is not supported for MultiTaskAEDFrameBatchInfer. Returning empty logits.")
         return hypothesis, []
+
+
+class FrameBatchMultiTaskMultiStreamSpkAED(FrameBatchASR):
+    def __init__(self, asr_model, frame_len=4, total_buffer=4, step_len_in_secs=0.5, batch_size=1, use_offline_diar=True):
+        super().__init__(asr_model, frame_len, total_buffer, batch_size, pad_to_buffer_len=False)
+        """
+        Batch size is 1 to simulate streaming scenarios. 
+        * We will be extending this to batch_size > 1 in the future.
+        """
+        self.seg_count = 0
+        self.min_seg_count = int(total_buffer / frame_len)
+        self.use_offline_diar = use_offline_diar
+        self.step_len_in_secs = step_len_in_secs  # seconds
+        self.batch_size = 1
+        self.diar_extra_frames = 2 # Extra frames added by diarizer.
+        self.data_layer = AudioSampleBuffersDataLayer()
+        self.data_loader = DataLoader(self.data_layer, batch_size=self.batch_size, collate_fn=speech_collate_fn)
+        self.pad_to_buffer_len = False
+        self.cumul_buffer = np.zeros((self.batch_size, 0), dtype=np.float32) 
+        self.cumul_buffer_sample_len = 0
+        self.sample_bufferer = SampleFrameBufferer(
+            asr_model=asr_model,
+            frame_len=frame_len,
+            batch_size=self.batch_size,
+            total_buffer=total_buffer,
+            pad_to_buffer_len=self.pad_to_buffer_len,
+        )
+        self.device = self.asr_model.device
+
+    def reset(self):
+        """
+        Reset frame_history and decoder's state
+        """
+        self.seg_count = 0
+        self.prev_char = ''
+        self.output_trans = ''
+        self.unmerged = []
+        self.data_layer = AudioSampleBuffersDataLayer()
+        self.data_loader = DataLoader(self.data_layer, batch_size=self.batch_size, collate_fn=speech_collate_fn)
+        self.all_logits = []
+        self.all_preds = []
+        self.toks_unmerged = []
+        self.frame_buffers = []
+        self.frame_bufferer.reset() 
+        
+    def get_input_tokens(self, sample: dict):
+        if self.asr_model.prompt_format == "canary":
+            missing_keys = [k for k in ("source_lang", "target_lang", "taskname", "pnc") if k not in sample]
+            if missing_keys:
+                raise RuntimeError(
+                    f"We found sample that is missing the following keys: {missing_keys}"
+                    f"Please ensure that every utterance in the input manifests contains these keys. Sample: {sample}"
+                )
+            tokens = canary_prompt(
+                tokenizer=self.asr_model.tokenizer,
+                text=None,
+                language=None,
+                source_language=sample['source_lang'],
+                target_language=sample['target_lang'],
+                taskname=sample['taskname'],
+                pnc=sample['pnc'],
+            )
+        else:
+            raise ValueError(f"Unknown prompt format: {self.asr_model.prompt_format}")
+        return torch.tensor(tokens, dtype=torch.long, device=self.asr_model.device).unsqueeze(0)  # [1, T]
+    
+    def find_first_nonzero(self, mat, max_cap_val=-1):
+        # non zero values mask
+        non_zero_mask = mat != 0
+        # operations on the mask to find first nonzero values in the rows
+        mask_max_values, mask_max_indices = torch.max(non_zero_mask, dim=1)
+        # if the max-mask is zero, there is no nonzero value in the row
+        mask_max_indices[mask_max_values == 0] = max_cap_val
+        return mask_max_indices
+
+    def sort_probs_and_labels(self, labels, discrete=True, thres=0.5, return_inds=False, accum_frames=1):
+        num_spks = labels[0].shape[1]
+        max_cap_val = labels.shape[1] + 1
+        labels_discrete = labels.clone()
+        if not discrete:
+            labels_discrete[labels_discrete < thres] = 0
+            labels_discrete[labels_discrete >= thres] = 1
+        mones = torch.ones(labels.shape[1],labels.shape[1]).triu().to(labels.device)
+        labels_accum = torch.matmul(labels_discrete.permute(0,2,1),mones).permute(0,2,1)
+        labels_accum[labels_accum < accum_frames] = 0
+        label_fz = self.find_first_nonzero(labels_accum, max_cap_val)
+        label_fz_mask = torch.zeros_like(label_fz)
+        label_fz_mask[label_fz == max_cap_val] = 1
+        label_fz[label_fz == -1] = max_cap_val
+        # This order-keeper sequence is needed to get the right argsort result to get inverse-permutation orders. 
+        ord_keeper = torch.arange(0, num_spks).repeat(labels.shape[0], 1).to(labels.device) * label_fz_mask
+        ord_label_fz = label_fz + ord_keeper 
+        sorted_inds = torch.sort(ord_label_fz)[1]
+        inverse_perm_inds = torch.argsort(sorted_inds, axis=1)
+        sorted_labels = labels.transpose(0,1)[:, torch.arange(labels.shape[0]).unsqueeze(1), sorted_inds].transpose(0, 1)
+        if return_inds:
+            return sorted_labels, sorted_inds, inverse_perm_inds
+        else:
+            return sorted_labels
+
+    def _align_spk_mapping(self, predictions: list, spk_mappings, pattern= r'<\|spltoken\d+\|>'):
+        """_summary_
+
+        Args:
+            predictions (list): a list of predicted texts in string format.
+            spk_mappings (_type_): Batch integer array representing speaker mapping (B, D = number_of_speakers)
+            pattern (regexp, optional): Pattern in regex to capture the speaker token. Defaults to r'<\|spltoken\d+\|>'.
+
+        Returns:
+            out_predictions (list): a list of predicted texts in string format with speaker mapping applied.
+        """
+        out_predictions = []
+        str_pattern = pattern.replace("\\", '')
+        left_str, right_str = str_pattern.split('d+')[0], str_pattern.split('d+')[1]
+        for idx, cut_text in enumerate(predictions):
+            word_list = []
+            for word in copy.copy(cut_text).split(): 
+                if len(re.findall(pattern, word)) > 0:
+                    # <CAVEAT!> omtimes a model outputs `<speaker_token>word` without a space after it.
+                    left_removed = word.replace(left_str,'')
+                    spk_token_int = int(left_removed.split(right_str)[0])
+                    new_spk = spk_mappings[idx][spk_token_int]
+                    word_list.append(f'{left_str}{new_spk}{right_str}')
+                else:
+                    word_list.append(word)
+            out_predictions.append(' '.join(word_list))
+        return out_predictions
+
+    def merge_consecutive_tokens(self, text, pattern= r'<\|spltoken\d+\|>'):
+        tokens = text.split()
+        merged_tokens = []
+        str_pattern = pattern.replace("\\", '')
+        left_str, right_str = str_pattern.split('d+')[0], str_pattern.split('d+')[1]
+
+        # Initialize a variable to track the last added token
+        last_token = None
+
+        for token in tokens:
+            # Check if current token is a special token and if it's the same as the last token
+            if len(re.findall(pattern, token)) > 0:
+                if token == last_token:
+                    continue  # Skip adding the token if it's a duplicate special token
+                else:
+                    if len(re.findall(pattern, token)) > 0:
+                        spk_token_int = int(token.replace(left_str,'').replace(right_str, ''))
+                        new_token = f"<|spltoken{spk_token_int}|>"
+                    else:
+                        new_token = token
+                    merged_tokens.append(new_token)
+                    last_token = token  # Update the last token to the current one
+            else:
+                merged_tokens.append(token)
+                # last_token = token  # Update the last token to the current one
+        merged_text = ' '.join(merged_tokens)
+        return merged_text
+
+    def read_audio_file(self, audio_filepath: str, delay, model_stride_in_secs, meta_data):
+        self.input_tokens = self.get_input_tokens(meta_data)
+        offset, duration = meta_data.get('offset', None), meta_data.get('duration', None)
+        if offset is not None and duration is not None:
+            audio_segment = AudioSegment.from_file(audio_file=audio_filepath, 
+                                                   offset=offset, 
+                                                   duration=duration, 
+                                                   orig_sr=self.sample_bufferer.sr)
+            samples = audio_segment.samples
+        else:
+            samples = get_samples(audio_filepath)
+        samples = np.pad(samples, (0, int(delay * model_stride_in_secs * self.asr_model._cfg.sample_rate)))
+        frame_reader = AudioSampleIterator(
+            samples, self.frame_len, self.raw_preprocessor, self.asr_model.device, pad_to_frame_len=False
+        )
+        self.sample_bufferer.set_frame_reader(frame_reader)
+    def get_last_spk_token(self, text_split, pattern_left="<|spltoken"):
+        last_spk_token = ''
+        for token in text_split:
+            if pattern_left in token:
+                last_spk_token = token
+                break
+        return last_spk_token
+        
+     
+    def _add_to_total_transcript(self, incoming_text, update_freq=1, min_seg_count=15, matching_words=5, pattern_left="<|spltoken"):
+        if len(self.output_trans) == 0 or self.seg_count <= min_seg_count:
+            self.output_trans = incoming_text
+        elif self.seg_count % update_freq == 0 and len(incoming_text.split()) > 1:
+            old_text = self.output_trans
+            old_text_split = old_text.split()
+            # non_matching_len = int(len(old_text_split) / min_seg_count)
+            # matching_words = min(max(0, len(incoming_text.split()[1:]) - non_matching_len), len(old_text_split))
+            if len(old_text_split) > matching_words:
+                keep_words = old_text_split[:-matching_words]
+                old_overlap_words = old_text_split[-matching_words:]
+            else:
+                keep_words = '' 
+                old_overlap_words = old_text_split
+            old_last_spk_token = self.get_last_spk_token(keep_words)
+            old_overlap_str = " ".join(old_overlap_words)
+            new_last_spk_token = self.get_last_spk_token(incoming_text.split()[:-matching_words])
+            new_text = ' '.join(incoming_text.split()[-matching_words:])
+            result_idx, _ = longest_common_subsequence_merge(X=old_overlap_str, Y=new_text)
+            print(f"keep_words: {' '.join(keep_words)}")
+            print(f"old_overlap_str: {old_overlap_str}")
+            print(f"new_text: {new_text}")
+            print(f"MATCHED:", old_overlap_str[ : result_idx[0]] + new_text[result_idx[1]:])
+            self.output_trans = " ".join(keep_words) + f" {old_last_spk_token} " + old_overlap_str[ : result_idx[0]] + new_text[result_idx[1]:]
+            self.output_trans =  self.merge_consecutive_tokens(self.output_trans)
+            # import ipdb; ipdb.set_trace()
+            
+        print_output_trans = self.output_trans.replace(f"{pattern_left}", f"\n{pattern_left}")
+        return print_output_trans 
+    
+    def _set_step_variables(self, audio_signal, audio_signal_len):
+        self.seg_count += 1
+        self.start_cumul_buffer_len = self.cumul_buffer.shape[1]
+        self.cumul_buffer = np.concatenate((self.cumul_buffer, audio_signal), axis=1)
+        self.cumul_buffer_sample_len = self.cumul_buffer.shape[1]
+        self.end_sec = self.seg_count * self.frame_len 
+        audio_signal, audio_signal_len = audio_signal.to(self.device), audio_signal_len.to(self.device)
+        tokens = self.input_tokens.to(self.device).repeat(audio_signal.size(0), 1)
+        tokens_len = torch.tensor([tokens.size(1)] * tokens.size(0), device=self.device).long()
+        batch_input = (audio_signal, audio_signal_len, None, None, tokens, tokens_len)
+        return batch_input
+
+    def _decode_multispeaker(self, batch, pattern_left="<|spltoken"):
+        audio_signal, audio_signal_len = batch
+        batch_input = self._set_step_variables(audio_signal, audio_signal_len)
+        if self.use_offline_diar:
+            _audio_signal = torch.tensor(self.cumul_buffer).to(self.device)
+            _audio_signal_len = torch.tensor(self.cumul_buffer_sample_len).repeat(self.batch_size).to(self.device)
+            diar_preds_cumul = self.asr_model.forward_diar(input_signal=_audio_signal,
+                                                        input_signal_length=_audio_signal_len,
+                                                        has_processed_signal=False)
+            # Take the last buffer frame for in-context diarization
+            diar_preds_last = copy.copy(diar_preds_cumul[:, -(self.sample_bufferer.n_frame_len + self.diar_extra_frames): ,:])
+            diar_preds_ext, sorted_inds, inverse_perm_inds = self.sort_probs_and_labels(diar_preds_last, return_inds=True)
+        else:
+            raise NotImplementedError("Online diarization is not implemented yet.")
+        print(f"Sorted inds: {sorted_inds}, inverse_perm_inds: {inverse_perm_inds}")
+        predictions = self.asr_model.predict_step(batch_input, diar_preds_ext=diar_preds_ext, has_processed_signal=False)
+        permed_predictions = self._align_spk_mapping(predictions, spk_mappings=inverse_perm_inds)
+        self.all_preds.extend(permed_predictions)
+        # print(f"\n Transcribed [{self.seg_count}]: {permed_predictions[0]}")
+        token_merged_trans = self.merge_consecutive_tokens(text=permed_predictions[0])
+        # token_merged_trans = token_merged_trans.replace(f"{pattern_left}", f"\n{pattern_left}")
+        total_transcript = self._add_to_total_transcript(incoming_text=token_merged_trans, 
+                                                         update_freq=1, 
+                                                         min_seg_count=self.min_seg_count)
+        print(f"\n 0.0s ~ {self.end_sec:.2f}s")
+        print(f"TransMerged {self.seg_count}]: [[[ {token_merged_trans} ]]]")
+        # print(f"TransMerged {self.seg_count}]:\n{token_merged_trans}")
+        print(f"TransTotal [{self.seg_count}]: \n{total_transcript}")
+        del permed_predictions, predictions, diar_preds_cumul
+
+    @torch.no_grad()
+    def _get_single_file_pred(self, keep_logits=False):
+        for batch in iter(self.data_loader):
+            self._decode_multispeaker(batch)
+    
+    @torch.no_grad()
+    def infer_logits(self, keep_logits=False):
+        # frame_buffers = self.frame_bufferer.get_buffers_batch()
+        sample_buffers = self.sample_bufferer.get_samples_batch()
+        sample_buffer_count = 0
+        while len(sample_buffers) > 0:
+            sample_buffer_count += 1
+            self.frame_buffers += sample_buffers[:]
+            self.data_layer.set_signal(sample_buffers[:])
+            self._get_single_file_pred(keep_logits)
+            sample_buffers = self.sample_bufferer.get_samples_batch()
+
+    def transcribe(
+        self, tokens_per_chunk: Optional[int] = None, delay: Optional[int] = None, keep_logits: bool = False
+    ):
+        """
+        unsued params are for keeping the same signature as the parent class
+        """
+        self.infer_logits(keep_logits)
+
+        hypothesis = " ".join(self.all_preds)
+        if not keep_logits:
+            return hypothesis
+
+        print("keep_logits=True is not supported for MultiTaskAEDFrameBatchInfer. Returning empty logits.")
+        return hypothesis, []
+
 
 
 class FrameBatchChunkedRNNT(FrameBatchASR):

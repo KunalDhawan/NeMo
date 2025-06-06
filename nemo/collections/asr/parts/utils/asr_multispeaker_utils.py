@@ -193,7 +193,7 @@ def speaker_to_target(
         mask = soft_mask
     else:
         mask = (soft_mask > soft_thres).float()
-
+    import ipdb; ipdb.set_trace()
     return mask
 
 def get_mask_from_segments(segments: list, a_cut, speaker_to_idx_map: torch.Tensor, num_speakers: int =4, feat_per_sec: int=100, ignore_num_spk_mismatch: bool = False):

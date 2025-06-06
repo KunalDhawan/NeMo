@@ -40,6 +40,20 @@ from nemo.collections.asr.parts.utils.transcribe_utils import (
     transcribe_partial_audio,
     write_transcription,
 )
+
+from nemo.collections.asr.parts.utils.asr_timestamp import (
+min_max_token_wise_normalization,
+get_target_inds,
+get_attn_frames,
+get_word_alignment,
+backtrack,
+dynamic_programming_max_sum_path,
+run_dp_for_alignment,
+save_plot_imgs,
+save_attn_imgs,
+write_ctm,
+)
+
 from nemo.collections.common.parts.preprocessing.manifest import get_full_path
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
@@ -199,7 +213,8 @@ class TranscriptionConfig:
     allow_partial_transcribe: bool = False
     extract_nbest: bool = False  # Extract n-best hypotheses from the model
 
-
+    is_multispeaker: bool = False 
+    
 @hydra_runner(config_name="TranscriptionConfig", schema=TranscriptionConfig)
 def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig, List[Hypothesis]]:
     logging.info(f'Hydra config: {OmegaConf.to_yaml(cfg)}')
@@ -414,6 +429,15 @@ def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig, List[Hypothesis
                 override_cfg.text_field = cfg.gt_text_attr_name
                 override_cfg.lang_field = cfg.gt_lang_attr_name
                 transcriptions = asr_model.transcribe(audio=filepaths, override_config=override_cfg,)
+                attn_layer_dict = asr_model.transf_decoder._decoder.last_layer_attention_saved_list
+                num_layers = len(attn_layer_dict)
+                # attn_block = torch.vstack(attn_list[1:])
+                tensor_attn_dict = {}
+                for i, attn_list in attn_layer_dict.items():
+                    if i == 0:
+                        pre_tokens_len = attn_list[0].shape[2]
+                    attn_block = torch.stack(attn_list[1:], 3)
+                    tensor_attn_dict[i] = attn_block
 
     if cfg.dataset_manifest is not None:
         logging.info(f"Finished transcribing from manifest file: {cfg.dataset_manifest}")
@@ -434,6 +458,11 @@ def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig, List[Hypothesis
 
     if cfg.return_transcriptions:
         return transcriptions
+    
+    word_alignments = save_attn_imgs(cfg, asr_model, transcriptions, num_layers, tensor_attn_dict, pre_tokens_len)
+    ctm_filepath = cfg.output_filename.replace(".json", ".ctm")
+    # import ipdb; ipdb.set_trace()
+    write_ctm(filepaths, ctm_filepath, cfg, word_alignments)
 
     # write audio transcriptions
     output_filename, pred_text_attr_name = write_transcription(

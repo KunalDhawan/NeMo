@@ -523,6 +523,8 @@ class _AudioTextDataset(Dataset):
         return self.manifest_processor.collection[sample_id]
 
     def __getitem__(self, index):
+        print(f"=====================> Index is {index}")
+        index = index[0]
         sample = self.manifest_processor.collection[index]
         offset = sample.offset
 

@@ -54,15 +54,47 @@ from omegaconf import OmegaConf
 
 from nemo.collections.asr.parts.submodules.multitask_decoding import MultiTaskDecodingConfig
 from nemo.collections.asr.parts.utils.eval_utils import cal_write_wer
-from nemo.collections.asr.parts.utils.streaming_utils import FrameBatchMultiTaskAED
+from nemo.collections.asr.parts.utils.streaming_utils import FrameBatchMultiTaskMultiStreamSpkAED
 from nemo.collections.asr.parts.utils.transcribe_utils import (
     compute_output_filename,
     get_buffered_pred_feat_multitaskAED,
+    get_buffered_pred_sample_streaming_multitaskAED,
     setup_model,
     write_transcription,
 )
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
+import re
+
+
+def merge_consecutive_tokens(text, pattern= r'<\|spltoken\d+\|>',  pattern_left="<|spltoken"):
+    tokens = text.split()
+    merged_tokens = []
+    str_pattern = pattern.replace("\\", '')
+    left_str, right_str = str_pattern.split('d+')[0], str_pattern.split('d+')[1]
+
+    # Initialize a variable to track the last added token
+    last_token = None
+
+    for token in tokens:
+        # Check if current token is a special token and if it's the same as the last token
+        if len(re.findall(pattern, token)) > 0:
+            if token == last_token:
+                continue  # Skip adding the token if it's a duplicate special token
+            else:
+                if len(re.findall(pattern, token)) > 0:
+                    spk_token_int = int(token.replace(left_str,'').replace(right_str, ''))
+                    new_token = f"<|spltoken{spk_token_int}|>"
+                else:
+                    new_token = token
+                merged_tokens.append(new_token)
+                last_token = token  # Update the last token to the current one
+        else:
+            merged_tokens.append(token)
+            # last_token = token  # Update the last token to the current one
+    merged_text = ' '.join(merged_tokens)
+    merged_text = merged_text.replace(f"{pattern_left}", f"\n{pattern_left}")
+    return merged_text
 
 
 @dataclass
@@ -88,7 +120,8 @@ class TranscriptionConfig:
     compute_langs: bool = False
 
     # Chunked configs
-    chunk_len_in_secs: float = 40.0  # Chunk length in seconds
+    chunk_len_in_secs: float = 5.0  # Chunk length in seconds
+    step_len_in_secs: float = 0.5
     model_stride: int = 8  # Model downsampling factor, 8 for Citrinet and FasConformer models and 4 for Conformer models.
 
     # Decoding strategy for MultitaskAED models
@@ -201,40 +234,40 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
     feature_stride = model_cfg.preprocessor['window_stride']
     model_stride_in_secs = feature_stride * cfg.model_stride
 
-    frame_asr = FrameBatchMultiTaskAED(
+    frame_asr = FrameBatchMultiTaskMultiStreamSpkAED(
         asr_model=asr_model,
-        frame_len=cfg.chunk_len_in_secs,
+        frame_len=cfg.step_len_in_secs,
         total_buffer=cfg.chunk_len_in_secs,
         batch_size=cfg.batch_size,
+        step_len_in_secs=cfg.step_len_in_secs,
     )
-
     amp_dtype = torch.float16 if cfg.amp_dtype == "float16" else torch.bfloat16
-
+    print("Sleeping for 4 seconds to load the model"); import time; time.sleep(4.0)
     with autocast(dtype=amp_dtype):
         with torch.no_grad():
-            hyps = get_buffered_pred_feat_multitaskAED(
+            hyps = get_buffered_pred_sample_streaming_multitaskAED(
                 frame_asr, model_cfg.preprocessor, model_stride_in_secs, asr_model.device, manifest, filepaths,
             )
 
-    output_filename, pred_text_attr_name = write_transcription(
-        hyps, cfg, model_name, filepaths=filepaths, compute_langs=False, compute_timestamps=False
-    )
-    logging.info(f"Finished writing predictions to {output_filename}!")
+    # output_filename, pred_text_attr_name = write_transcription(
+    #     hyps, cfg, model_name, filepaths=filepaths, compute_langs=False, compute_timestamps=False
+    # )
+    # logging.info(f"Finished writing predictions to {output_filename}!")
 
-    if cfg.calculate_wer:
-        output_manifest_w_wer, total_res, _ = cal_write_wer(
-            pred_manifest=output_filename,
-            pred_text_attr_name=pred_text_attr_name,
-            clean_groundtruth_text=cfg.clean_groundtruth_text,
-            langid=cfg.langid,
-            use_cer=cfg.use_cer,
-            output_filename=None,
-        )
-        if output_manifest_w_wer:
-            logging.info(f"Writing prediction and error rate of each sample to {output_manifest_w_wer}!")
-            logging.info(f"{total_res}")
+    # if cfg.calculate_wer:
+    #     output_manifest_w_wer, total_res, _ = cal_write_wer(
+    #         pred_manifest=output_filename,
+    #         pred_text_attr_name=pred_text_attr_name,
+    #         clean_groundtruth_text=cfg.clean_groundtruth_text,
+    #         langid=cfg.langid,
+    #         use_cer=cfg.use_cer,
+    #         output_filename=None,
+    #     )
+    #     if output_manifest_w_wer:
+    #         logging.info(f"Writing prediction and error rate of each sample to {output_manifest_w_wer}!")
+    #         logging.info(f"{total_res}")
 
-    return cfg
+    # return cfg
 
 
 if __name__ == '__main__':

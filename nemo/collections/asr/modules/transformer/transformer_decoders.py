@@ -52,16 +52,18 @@ class TransformerDecoderBlock(nn.Module):
     ):
         super().__init__()
         self.pre_ln = pre_ln
+        self.num_attention_heads = num_attention_heads
         self.layer_norm_1 = nn.LayerNorm(hidden_size, eps=1e-5)
         self.first_sub_layer = MultiHeadAttention(
-            hidden_size, num_attention_heads, attn_score_dropout, attn_layer_dropout
+            hidden_size, num_attention_heads, attn_score_dropout, attn_layer_dropout, is_decoder=True,
         )
         self.layer_norm_2 = nn.LayerNorm(hidden_size, eps=1e-5)
         self.second_sub_layer = MultiHeadAttention(
-            hidden_size, num_attention_heads, attn_score_dropout, attn_layer_dropout
+            hidden_size, num_attention_heads, attn_score_dropout, attn_layer_dropout, is_decoder=True,
         )
         self.layer_norm_3 = nn.LayerNorm(hidden_size, eps=1e-5)
         self.third_sub_layer = PositionWiseFF(hidden_size, inner_size, ffn_dropout, hidden_act)
+        self.step_count =0
 
     def forward_preln(self, decoder_query, decoder_mask, decoder_keys, encoder_states, encoder_mask):
         """
@@ -84,6 +86,9 @@ class TransformerDecoderBlock(nn.Module):
         output_states = self.third_sub_layer(enc_dec_attn_output)
         output_states += residual
 
+        # if self.step_count >= 295:
+        #     import ipdb; ipdb.set_trace()
+        
         return output_states
 
     def forward_postln(self, decoder_query, decoder_mask, decoder_keys, encoder_states, encoder_mask):
@@ -143,6 +148,8 @@ class TransformerDecoder(nn.Module):
         )
         self.layers = nn.ModuleList([copy.deepcopy(layer) for _ in range(num_layers)])
         self.diagonal = 0
+        self.step_count = 0
+        self.last_layer_attention_saved_list = {i : [] for i in range(num_layers)}
 
     def _get_memory_states(self, decoder_states, decoder_mems_list=None, i=0):
         if decoder_mems_list is not None:
@@ -177,6 +184,7 @@ class TransformerDecoder(nn.Module):
                 or the last layer only
             return_mems_as_list: bool, when True, mems returned are as a list; otherwise mems are Tensor
         """
+        self.step_count += 1
         decoder_attn_mask = form_attention_mask(decoder_mask, diagonal=self.diagonal)
         encoder_attn_mask = form_attention_mask(encoder_mask)
         memory_states = self._get_memory_states(decoder_states, decoder_mems_list, 0)
@@ -187,14 +195,18 @@ class TransformerDecoder(nn.Module):
                 cached_mems_list = memory_states.unsqueeze(0)
 
         for i, layer in enumerate(self.layers):
+            layer.step_count = self.step_count
             decoder_states = layer(decoder_states, decoder_attn_mask, memory_states, encoder_states, encoder_attn_mask)
             memory_states = self._get_memory_states(decoder_states, decoder_mems_list, i + 1)
+            self.last_layer_attention_saved_list[i].append(layer.second_sub_layer.attention_saved_list[-1])
             if return_mems:
                 if return_mems_as_list:
                     cached_mems_list.append(memory_states)
                 else:
                     cached_mems_list = torch.cat((cached_mems_list, memory_states.unsqueeze(0)), dim=0)
-
+        # print(f"step_count: {self.step_count}")
+        # print(f"forward_preln : decoder_states.shape: {decoder_states.shape}")
+        # print(f"forward_preln : encoder_attn_mask.shape: {encoder_attn_mask.shape}")
         if self.final_layer_norm is not None:
             decoder_states = self.final_layer_norm(decoder_states)
             memory_states = self._get_memory_states(decoder_states, decoder_mems_list, i + 2)
@@ -203,7 +215,8 @@ class TransformerDecoder(nn.Module):
                     cached_mems_list.append(memory_states)
                 else:
                     cached_mems_list = torch.cat((cached_mems_list, memory_states.unsqueeze(0)), dim=0)
-
+        
+        # self.last_layer_attention_saved_list = layer.second_sub_layer.attention_saved_list
         if return_mems:
             return cached_mems_list
         else:

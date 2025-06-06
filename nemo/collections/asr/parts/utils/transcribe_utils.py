@@ -231,6 +231,64 @@ def get_buffered_pred_feat_multitaskAED(
     return wrapped_hyps
 
 
+def get_buffered_pred_sample_streaming_multitaskAED(
+    asr: FrameBatchMultiTaskAED,
+    preprocessor_cfg: DictConfig,
+    model_stride_in_secs: int,
+    device: Union[List[int], int],
+    manifest: str = None,
+    filepaths: List[list] = None,
+    delay: float = 0.0,
+) -> List[rnnt_utils.Hypothesis]:
+    # Create a preprocessor to convert audio samples into raw features,
+    # Normalization will be done per buffer in frame_bufferer
+    # Do not normalize whatever the model's preprocessor setting is
+    preprocessor_cfg.normalize = "None"
+    preprocessor = EncDecMultiTaskModel.from_config_dict(preprocessor_cfg)
+    preprocessor.to(device)
+    hyps = []
+    refs = []
+
+    if filepaths and manifest:
+        raise ValueError("Please select either filepaths or manifest")
+    if filepaths is None and manifest is None:
+        raise ValueError("Either filepaths or manifest shoud not be None")
+
+    if filepaths:
+        logging.info(
+            "Deteced audio files as input, default to English ASR with Punctuation and Capitalization output. Please use manifest input for other options."
+        )
+        for audio_file in tqdm(filepaths, desc="Transcribing:", total=len(filepaths), ncols=80):
+            meta = {
+                'audio_filepath': audio_file,
+                'duration': 100000,
+                'source_lang': 'en',
+                'taskname': 'asr',
+                'target_lang': 'en',
+                'pnc': 'yes',
+                'answer': 'nothing',
+            }
+            asr.reset()
+            asr.read_audio_file(audio_file, delay, model_stride_in_secs, meta_data=meta)
+            hyp = asr.transcribe()
+            hyps.append(hyp)
+    else:
+        with open(manifest, "r", encoding='utf_8') as fin:
+            lines = list(fin.readlines())
+            for line in tqdm(lines, desc="Transcribing:", total=len(lines), ncols=80):
+                asr.reset()
+                sample = json.loads(line.strip())
+                if 'text' in sample:
+                    refs.append(sample['text'])
+                audio_file = get_full_path(audio_file=sample['audio_filepath'], manifest_file=manifest)
+                # do not support partial audio
+                asr.read_audio_file(audio_file, delay, model_stride_in_secs, meta_data=sample)
+                hyp = asr.transcribe()
+                hyps.append(hyp)
+
+    wrapped_hyps = wrap_transcription(hyps)
+    return wrapped_hyps
+
 def wrap_transcription(hyps: List[str]) -> List[rnnt_utils.Hypothesis]:
     """ Wrap transcription to the expected format in func write_transcription """
     wrapped_hyps = []
@@ -247,10 +305,10 @@ def setup_model(cfg: DictConfig, map_location: torch.device) -> Tuple[ASRModel, 
         model_cfg = ASRModel.restore_from(restore_path=cfg.model_path, return_config=True)
         classpath = model_cfg.target  # original class path
         imported_class = model_utils.import_class_by_path(classpath)  # type: ASRModel
-        logging.info(f"Restoring model : {imported_class.__name__}")
+        # logging.info(f"Restoring model : {imported_class.__name__}")
         asr_model = imported_class.restore_from(
-            restore_path=cfg.model_path, map_location=map_location,
-        )  # type: ASRModel
+                restore_path=cfg.model_path, map_location=map_location,
+            )  # type: ASRModel
         model_name = os.path.splitext(os.path.basename(cfg.model_path))[0]
     else:
         # restore model by name
@@ -513,7 +571,7 @@ def transcribe_partial_audio(
         }
         if augmentor:
             config['augmentor'] = augmentor
-
+        import ipdb; ipdb.set_trace()
         temporary_datalayer = asr_model._setup_transcribe_dataloader(config)
         for test_batch in tqdm(temporary_datalayer, desc="Transcribing"):
             outputs = asr_model.forward(
@@ -524,7 +582,7 @@ def transcribe_partial_audio(
             if isinstance(asr_model, EncDecHybridRNNTCTCModel) and decoder_type == "ctc":
                 logits = asr_model.ctc_decoder(encoder_output=logits)
 
-            logits = logits.cpu()
+            # logits = logits.cpu()
 
             if logprobs:
                 logits = logits.numpy()

@@ -1117,13 +1117,14 @@ class MultiSpeakerSimulator(object):
                 ctm_filepath=os.path.join(basepath, filename + '.ctm'),
             )
             self.annotator.annote_lists['json'].append(new_json_entry)
-
+            
             new_ctm_entries = self.annotator.create_new_ctm_entry(
                 words=self._words,
                 alignments=self._alignments,
                 session_name=filename,
                 speaker_id=speaker_ids[speaker_turn],
-                start=int(start / self._params.data_simulator.sr),
+                # start=int(start / self._params.data_simulator.sr),
+                start=float(start / self._params.data_simulator.sr),
             )
 
             self.annotator.annote_lists['ctm'].extend(new_ctm_entries)
@@ -1172,7 +1173,7 @@ class MultiSpeakerSimulator(object):
         if torch.is_tensor(array):
             array = array.cpu().numpy()
         sf.write(os.path.join(basepath, filename + '.wav'), array, self._params.data_simulator.sr)
-
+        
         self.annotator.write_annotation_files(
             basepath=basepath, filename=filename, meta_data=self._get_session_meta_data(array=array, snr=snr),
         )
