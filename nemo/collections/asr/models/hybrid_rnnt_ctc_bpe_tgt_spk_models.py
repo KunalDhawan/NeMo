@@ -41,6 +41,7 @@ from nemo.core.classes.mixins import AccessMixin
 from nemo.collections.asr.data.audio_to_text_dali import DALIOutputs
 import math
 from nemo.collections.asr.parts.utils.asr_multispeaker_utils import get_hidden_length_from_sample_length
+from lhotse.dataset.collation import collate_vectors, collate_matrices
 from tqdm import tqdm
 
 
@@ -652,37 +653,73 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
         
         return encoded, encoded_len
 
-    def _reset_streaming_state(self):
+    def _reset_streaming_state(self, batch_size, async_streaming):
+        #async streaming is for batchview dataset configuration
+        #otherwise use sync streaming with batch_size = 1--> mandatory for batchview sample (history matters)
         self.diarization_model.streaming_mode = True
         self.diarization_model.sortformer_modules.chunk_len = 376
-        self.diarization_model.sortformer_modules.fifo_len = 188
+        self.diarization_model.sortformer_modules.fifo_len = 376
         self.query_pred = None
-        self.total_preds = torch.zeros((1, 0, 4), device = self.diarization_model.device)
+        self.total_preds = torch.zeros((batch_size, 0, 4), device = self.diarization_model.device)
         self.diarization_model.sortformer_modules.chunk_len_audio = int(self.diarization_model.sortformer_modules.chunk_len / 12.5 * 16000)
         self.diarization_model.sortformer_modules.fifo_len_audio = int(self.diarization_model.sortformer_modules.fifo_len / 12.5 * 16000)
         self.streaming_state = self.diarization_model.sortformer_modules.init_streaming_state(
-            batch_size = 1,
+            batch_size = batch_size,
             device = self.diarization_model.device,
+            async_streaming = async_streaming
         )
+        self.streaming_state.query_pred_len = torch.zeros((batch_size), device = self.diarization_model.device, dtype = torch.int32)
+        self.streaming_state.query_len_audio = torch.zeros((batch_size), device = self.diarization_model.device, dtype = torch.int32)
+        self.diarization_model.async_streaming = async_streaming
+        self.batch_index = list(np.arange(batch_size)) #record global batch index for each sample
+        
 
-    def forward_sortformer_streaming(self, signal, signal_len, query_len, chunk_len, buffer_len, initial_buffer, temp_buffer_index, sortformer_loader_level):
-        # speaker targetes
+    def forward_sortformer_streaming(self, signal, signal_len, query_len, chunk_len, buffer_len, initial_buffer=False, temp_buffer_index=0, sortformer_loader_level='emb', new_batch_keys=None, left_context=0, tokens_per_chunk=0):
+
+        if new_batch_keys is not None and len(new_batch_keys) != self.streaming_state.spkcache.shape[0]:
+            curr_batch_key = []
+            for i, global_index in enumerate(self.batch_index):
+                if global_index in new_batch_keys:
+                    curr_batch_key.append(i)
+            # Update streaming state tensors to only include valid rows
+            # emb level
+            self.streaming_state.spkcache = self.streaming_state.spkcache[curr_batch_key]
+            self.streaming_state.spkcache_lengths = self.streaming_state.spkcache_lengths[curr_batch_key] 
+            self.streaming_state.fifo = self.streaming_state.fifo[curr_batch_key]
+            self.streaming_state.fifo_lengths = self.streaming_state.fifo_lengths[curr_batch_key]
+            self.streaming_state.query_pred_len = self.streaming_state.query_pred_len[curr_batch_key]
+            # audio level
+            self.streaming_state.spkcache_audio = self.streaming_state.spkcache_audio[curr_batch_key]
+            self.streaming_state.spkcache_audio_lengths = self.streaming_state.spkcache_audio_lengths[curr_batch_key]
+            self.streaming_state.fifo_audio = self.streaming_state.fifo_audio[curr_batch_key]
+            self.streaming_state.fifo_audio_lengths = self.streaming_state.fifo_audio_lengths[curr_batch_key]
+            self.streaming_state.query_len_audio = self.streaming_state.query_len_audio[curr_batch_key]
+
+            new_query_pred = []
+            new_query_pred = [self.query_pred[i] for i in curr_batch_key]
+            self.query_pred = new_query_pred
+            self.batch_index = new_batch_keys
+            
+            
 
         if signal.shape[1] == 80:
             is_raw_waveform_input=False
         else:
             is_raw_waveform_input=True
-
         if self.query_pred is None:
             diar_input_signal_len = signal_len
-            diar_input_signal = signal[:,:signal_len]
+            # diar_input_signal = signal[:,:signal_len]
+            diar_input_signal = signal
         else:
-            if initial_buffer:
-                diar_input_signal = signal[:,signal_len - int(chunk_len): signal_len]
-                diar_input_signal_len = torch.tensor([int(chunk_len)], device = signal.device)
-            else:
-                diar_input_signal = signal[:,-int(chunk_len):]
-                diar_input_signal_len = torch.tensor([int(chunk_len)], device = signal.device)
+            chunk_len += left_context
+            # import ipdb; ipdb.set_trace()
+            diar_input_signal = torch.empty((signal.size(0), chunk_len), 
+                dtype=signal.dtype,
+                device=signal.device)
+            for i in range(signal.size(0)):
+                diar_input_signal[i,:] = signal[i,signal_len[i] - int(chunk_len):signal_len[i]]
+            # diar_input_signal = signal[:,-int(chunk_len):]
+            diar_input_signal_len = torch.tensor([int(chunk_len)], device = signal.device).expand(signal.size(0))
         if self.cfg.spk_supervision_strategy == 'diar':
             with torch.set_grad_enabled(not self.cfg.freeze_diar):
                 # diar_preds = self.forward_diar(signal, signal_len, is_raw_waveform_input)
@@ -695,9 +732,7 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
                     feat_len / (self.diarization_model.sortformer_modules.chunk_len * self.diarization_model.sortformer_modules.subsampling_factor)
                 )
                 assert num_chunks == 1, "Only one chunk should be used for streaming mode"
-                
                 streaming_level = sortformer_loader_level
-
                 if streaming_level in ['emb', 'feat']:
                     streaming_loader = self.diarization_model.sortformer_modules.streaming_feat_loader(
                         feat_seq = processed_signal,
@@ -714,6 +749,8 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
                         left_offset=left_offset,
                         right_offset=right_offset,
                         streaming_level = streaming_level,
+                        left_context = left_context,
+                        tokens_per_chunk = tokens_per_chunk
                         )
                 elif streaming_level == 'audio':
                     # print('Inference on audio level')
@@ -729,15 +766,25 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
         else:
             raise ValueError(f"Invalid RTTM strategy {self.cfg.spk_supervision_strategy} is not supported.")
         if self.query_pred is None:
-            query_pred_len = get_hidden_length_from_sample_length(query_len, 160, 8)
-            self.query_pred = self.diarization_model.spkcache_fifo_chunk_preds[:,:query_pred_len]
+            self.query_pred = []
+            for i in range(signal.size(0)):
+                query_pred_len = get_hidden_length_from_sample_length(query_len[i], 160, 8)
+
+                # set all the non-query speaker predictions in query session to 0
+                self.diarization_model.spkcache_fifo_chunk_preds[i, :query_pred_len, 1:] = 0
+                
+                self.query_pred.append(self.diarization_model.spkcache_fifo_chunk_preds[i, :query_pred_len])
             re_aranged_diar_preds = self.diarization_model.spkcache_fifo_chunk_preds
         else:
             if initial_buffer:
                 re_aranged_diar_preds = torch.cat([self.query_pred, self.diarization_model.spkcache_fifo_chunk_preds[:,-get_hidden_length_from_sample_length(chunk_len * (temp_buffer_index + 1), 160, 8):]], dim = 1)
             else:
-                re_aranged_diar_preds = torch.cat([self.query_pred, self.diarization_model.spkcache_fifo_chunk_preds[:,-get_hidden_length_from_sample_length(buffer_len)-1:-1]], dim = 1)
-        
+                re_aranged_diar_preds = []
+                for i in range(signal.size(0)):
+                    # as the last frame is predicted to be all silence somehow, shift backward by 1 frame while rearange diarization prediction
+                    re_aranged_diar_preds.append(torch.cat([self.query_pred[i], self.diarization_model.spkcache_fifo_chunk_preds[i, self.diarization_model.spkcache_fifo_chunk_preds_lengths[i] - get_hidden_length_from_sample_length(buffer_len)-1:self.diarization_model.spkcache_fifo_chunk_preds_lengths[i]-1]], dim = 0))
+                re_aranged_diar_preds = collate_matrices(re_aranged_diar_preds)
+
         diar_preds = re_aranged_diar_preds
         if self.binarize_diar_preds_threshold:
             diar_preds = torch.where(diar_preds > self.binarize_diar_preds_threshold, torch.tensor(1), torch.tensor(0)).to(signal.device).float()

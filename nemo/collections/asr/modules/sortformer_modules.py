@@ -72,8 +72,8 @@ class SortformerModules(NeuralModule, Exportable):
         fc_d_model: int = 512,
         tf_d_model: int = 192,
         subsampling_factor: int = 8,
-        spkcache_len: int = 50, # 188
-        fifo_len: int = 188, # 0
+        spkcache_len: int = 188, # 188
+        fifo_len: int = 188, # 188
         chunk_len: int = 152, # 376
         spkcache_refresh_rate: int = 50, # 0
         chunk_left_context: int = 1,
@@ -275,6 +275,10 @@ class SortformerModules(NeuralModule, Exportable):
             streaming_state.spkcache_lengths = torch.zeros((batch_size,), dtype=torch.long, device = device)
             streaming_state.fifo = torch.zeros((batch_size, self.fifo_len, self.fc_d_model), device = device)
             streaming_state.fifo_lengths = torch.zeros((batch_size,), dtype=torch.long, device = device)
+            streaming_state.spkcache_audio = torch.zeros((batch_size, self.spkcache_len_audio), device = device)
+            streaming_state.fifo_audio = torch.zeros((batch_size, self.fifo_len_audio), device = device)
+            streaming_state.spkcache_audio_lengths = torch.zeros((batch_size,), dtype=torch.long, device = device)
+            streaming_state.fifo_audio_lengths = torch.zeros((batch_size,), dtype=torch.long, device = device)
         else:
             streaming_state.spkcache = torch.zeros((batch_size, 0, self.fc_d_model), device = device)
             streaming_state.fifo = torch.zeros((batch_size, 0, self.fc_d_model), device = device)
@@ -303,6 +307,94 @@ class SortformerModules(NeuralModule, Exportable):
         preds_mask = preds_mask.expand(-1, n_frames, n_spk)
         spkcache_fifo_chunk_preds = torch.where(preds_mask, spkcache_fifo_chunk_preds, torch.tensor(0.0))
         return spkcache_fifo_chunk_preds
+
+    def streaming_update_async_audio(
+        self,
+        streaming_state,
+        chunk_audio,
+        chunk_audio_lengths,
+        preds,
+        lc: int = 0,
+        rc: int = 0
+    ):
+        """
+        Update the speaker cache and FIFO queue with the chunk of embeddings and speaker predictions.
+        Asynchronous version, which means speaker cache, FIFO and chunk may have different lengths within a batch.
+        Should be used for real streaming applications.
+
+        Args:
+            streaming_state (SortformerStreamingState): Previous streaming state including speaker cache and FIFO
+            chunk (torch.Tensor): chunk of embeddings to be predicted
+                Shape: (batch_size, lc+chunk_len+rc, emb_dim)
+            chunk_lengths (torch.Tensor): Lengths of current chunk
+                Shape: (batch_size,)
+            preds (torch.Tensor): Speaker predictions of the [spkcache + fifo + chunk] embeddings
+                Shape: (batch_size, spkcache_len + fifo_len + lc+chunk_len+rc, num_spks)
+            lc and rc (int): The left & right offset of the chunk,
+                only the chunk[:, lc:chunk_len+lc] is used for update of speaker cache and FIFO queue
+
+        Returns:
+            streaming_state (SortformerStreamingState): Current streaming state including speaker cache and FIFO
+            chunk_preds (torch.Tensor): Speaker predictions of the chunk embeddings
+                Shape: (batch_size, chunk_len, num_spks)
+        """
+
+        batch_size, _ = chunk_audio.shape
+        n_spk = preds.shape[2]
+        max_spkcache_len_audio, max_fifo_len_audio, max_chunk_len_audio = streaming_state.spkcache_audio.shape[
+            1], streaming_state.fifo_audio.shape[1], chunk_audio.shape[1] - lc - rc
+        
+        # max_spkcache_len = int(max_spkcache_len_audio / 16000 * 12.5)
+        # max_fifo_len = int(max_fifo_len_audio / 16000 * 12.5)
+        # max_chunk_len = int(max_chunk_len_audio / 16000 * 12.5)
+        
+        # chunk_preds = torch.zeros((batch_size, max_chunk_len, n_spk), device=preds.device)
+        # chunk_lengths = (chunk_lengths - lc).clamp(min=0, max=max_chunk_len)
+        updated_fifo_audio = torch.zeros((batch_size, max_fifo_len_audio + max_chunk_len_audio), device=preds.device)
+
+        updated_spkcache_audio = torch.zeros((batch_size, max_spkcache_len_audio), device=preds.device)
+
+        for batch_index in range(batch_size):
+            # spkcache_len = streaming_state.spkcache_lengths[batch_index].item()
+            # fifo_len = streaming_state.fifo_lengths[batch_index].item()
+            # chunk_len = chunk_lengths[batch_index].item()
+            spkcache_len_audio = streaming_state.spkcache_audio_lengths[batch_index].item()
+            fifo_len_audio = streaming_state.fifo_audio_lengths[batch_index].item()
+            chunk_len_audio = chunk_audio_lengths[batch_index].item()
+
+            # chunk_preds[batch_index, :chunk_len, :] = preds[
+            #     batch_index,
+            #     spkcache_len + fifo_len + lc:spkcache_len + fifo_len + lc + chunk_len
+            # ]
+
+            updated_fifo_audio[batch_index, :fifo_len_audio] = streaming_state.fifo_audio[batch_index, :fifo_len_audio]
+
+
+            # append chunk to fifo
+            streaming_state.fifo_audio_lengths[batch_index] += chunk_len_audio
+            updated_fifo_audio[batch_index, fifo_len_audio:fifo_len_audio + chunk_len_audio] = chunk_audio[batch_index, lc:lc + chunk_len_audio]
+
+            if fifo_len_audio + chunk_len_audio > max_fifo_len_audio:
+                if spkcache_len_audio == 0:
+                    #update memroy only once to be query + separater
+                    pop_out_len_audio = streaming_state.query_len_audio[batch_index]
+                    updated_spkcache_audio[batch_index, :pop_out_len_audio] = updated_fifo_audio[batch_index, :pop_out_len_audio]
+                    streaming_state.spkcache_audio[batch_index, :pop_out_len_audio] = updated_spkcache_audio[batch_index, :pop_out_len_audio]
+                    streaming_state.spkcache_audio_lengths[batch_index] = pop_out_len_audio
+                else:
+                    pop_out_len_audio = fifo_len_audio + chunk_len_audio - max_fifo_len_audio
+                # pop_out_len = int(pop_out_len_audio / 16000 * 12.5)
+                
+                streaming_state.fifo_audio_lengths[batch_index] -= pop_out_len_audio
+                new_fifo_len_audio = streaming_state.fifo_audio_lengths[batch_index].item()
+                updated_fifo_audio[batch_index, :new_fifo_len_audio] = updated_fifo_audio[
+                    batch_index, pop_out_len_audio:pop_out_len_audio + new_fifo_len_audio
+                ].clone()
+                updated_fifo_audio[batch_index, new_fifo_len_audio:] = 0
+
+        streaming_state.fifo_audio = updated_fifo_audio[:, :max_fifo_len_audio]
+
+        return streaming_state, None
 
     def streaming_update_async(
         self,
@@ -340,57 +432,50 @@ class SortformerModules(NeuralModule, Exportable):
         max_spkcache_len, max_fifo_len, max_chunk_len = streaming_state.spkcache.shape[
             1], streaming_state.fifo.shape[1], chunk.shape[1] - lc - rc
 
-        if self.fifo_len == 0:
-            max_pop_out_len = max_chunk_len
-        elif self.spkcache_refresh_rate == 0:
-            max_pop_out_len = self.fifo_len
-        else:
-            max_pop_out_len = min(max(self.spkcache_refresh_rate, max_chunk_len), self.fifo_len)
-
-        streaming_state.fifo_preds = torch.zeros((batch_size, max_fifo_len, n_spk), device=preds.device)
+        # if self.fifo_len == 0:
+        #     max_pop_out_len = max_chunk_len
+        # elif self.spkcache_refresh_rate == 0:
+        #     max_pop_out_len = self.fifo_len
+        # else:
+        #     max_pop_out_len = min(max(self.spkcache_refresh_rate, max_chunk_len), self.fifo_len)
+        # streaming_state.fifo_preds = torch.zeros((batch_size, max_fifo_len, n_spk), device=preds.device)
         chunk_preds = torch.zeros((batch_size, max_chunk_len, n_spk), device=preds.device)
         chunk_lengths = (chunk_lengths - lc).clamp(min=0, max=max_chunk_len)
         updated_fifo = torch.zeros((batch_size, max_fifo_len + max_chunk_len, emb_dim), device=preds.device)
-        updated_fifo_preds = torch.zeros((batch_size, max_fifo_len + max_chunk_len, n_spk), device=preds.device)
-        updated_spkcache = torch.zeros((batch_size, max_spkcache_len + max_pop_out_len, emb_dim), device=preds.device)
-        updated_spkcache_preds = torch.full(
-            (batch_size, max_spkcache_len + max_pop_out_len, n_spk), 0.0, device=preds.device)
-
+        # updated_fifo_preds = torch.zeros((batch_size, max_fifo_len + max_chunk_len, n_spk), device=preds.device)
+        updated_spkcache = torch.zeros((batch_size, max_spkcache_len, emb_dim), device=preds.device)
+        # updated_spkcache_preds = torch.full(
+        #     (batch_size, max_spkcache_len + max_pop_out_len, n_spk), 0.0, device=preds.device)
         for batch_index in range(batch_size):
             spkcache_len = streaming_state.spkcache_lengths[batch_index].item()
             fifo_len = streaming_state.fifo_lengths[batch_index].item()
             chunk_len = chunk_lengths[batch_index].item()
-            streaming_state.fifo_preds[batch_index, :fifo_len,
-                                       :] = preds[batch_index, spkcache_len:spkcache_len + fifo_len, :]
+            # streaming_state.fifo_preds[batch_index, :fifo_len,
+            #                            :] = preds[batch_index, spkcache_len:spkcache_len + fifo_len, :]
             chunk_preds[batch_index, :chunk_len, :] = preds[
                 batch_index,
                 spkcache_len + fifo_len + lc:spkcache_len + fifo_len + lc + chunk_len
             ]
-            updated_spkcache[batch_index, :spkcache_len, :] = streaming_state.spkcache[batch_index, :spkcache_len, :]
-            updated_spkcache_preds[batch_index, :spkcache_len,
-                                   :] = streaming_state.spkcache_preds[batch_index, :spkcache_len, :]
+            # updated_spkcache[batch_index, :spkcache_len, :] = streaming_state.spkcache[batch_index, :spkcache_len, :]
+            # updated_spkcache_preds[batch_index, :spkcache_len,
+            #                        :] = streaming_state.spkcache_preds[batch_index, :spkcache_len, :]
             updated_fifo[batch_index, :fifo_len, :] = streaming_state.fifo[batch_index, :fifo_len, :]
-            updated_fifo_preds[batch_index, :fifo_len, :] = streaming_state.fifo_preds[batch_index, :fifo_len, :]
+            # updated_fifo_preds[batch_index, :fifo_len, :] = streaming_state.fifo_preds[batch_index, :fifo_len, :]
 
             # append chunk to fifo
             streaming_state.fifo_lengths[batch_index] += chunk_len
             updated_fifo[batch_index, fifo_len:fifo_len + chunk_len, :] = chunk[batch_index, lc:lc + chunk_len, :]
-            updated_fifo_preds[batch_index, fifo_len:fifo_len + chunk_len, :] = chunk_preds[batch_index, :chunk_len, :]
+            # updated_fifo_preds[batch_index, fifo_len:fifo_len + chunk_len, :] = chunk_preds[batch_index, :chunk_len, :]
             if fifo_len + chunk_len > max_fifo_len:
-                # move pop_out_len first frames of FIFO queue to speaker cache
-                pop_out_len = min(max_pop_out_len, fifo_len + chunk_len)
-                streaming_state.spkcache_lengths[batch_index] += pop_out_len
-                updated_spkcache[batch_index, spkcache_len:spkcache_len +
-                                 pop_out_len, :] = updated_fifo[batch_index, :pop_out_len, :]
-                if updated_spkcache_preds[batch_index, 0, 0] >= 0:
-                    # speaker cache already compressed at least once
-                    updated_spkcache_preds[batch_index, spkcache_len:spkcache_len +
-                                           pop_out_len, :] = updated_fifo_preds[batch_index, :pop_out_len, :]
-                elif spkcache_len + pop_out_len > self.spkcache_len:
-                    # will compress speaker cache for the first time
-                    updated_spkcache_preds[batch_index, :spkcache_len, :] = preds[batch_index, :spkcache_len, :]
-                    updated_spkcache_preds[batch_index, spkcache_len:spkcache_len +
-                                           pop_out_len, :] = updated_fifo_preds[batch_index, :pop_out_len, :]
+                if spkcache_len == 0:
+                    #update memroy only once to be query + separater
+                    pop_out_len = streaming_state.query_pred_len[batch_index]
+                    updated_spkcache[batch_index, :pop_out_len, :] = updated_fifo[batch_index, :pop_out_len, :]
+                    streaming_state.spkcache[batch_index, :pop_out_len, :] = updated_spkcache[batch_index, :pop_out_len, :]
+                    streaming_state.spkcache_lengths[batch_index] = pop_out_len
+                else:
+                    pop_out_len = fifo_len + chunk_len - max_fifo_len
+                
                 streaming_state.fifo_lengths[batch_index] -= pop_out_len
                 new_fifo_len = streaming_state.fifo_lengths[batch_index].item()
                 updated_fifo[batch_index, :new_fifo_len, :] = updated_fifo[
@@ -400,21 +485,21 @@ class SortformerModules(NeuralModule, Exportable):
 
         streaming_state.fifo = updated_fifo[:, :max_fifo_len, :]
 
-        # update speaker cache
-        need_compress = (streaming_state.spkcache_lengths > self.spkcache_len)
-        streaming_state.spkcache = updated_spkcache[:, :self.spkcache_len:, :]
-        streaming_state.spkcache_preds = updated_spkcache_preds[:, :self.spkcache_len:, :]
+        # # update speaker cache
+        # need_compress = (streaming_state.spkcache_lengths > self.spkcache_len)
+        # streaming_state.spkcache = updated_spkcache[:, :self.spkcache_len:, :]
+        # streaming_state.spkcache_preds = updated_spkcache_preds[:, :self.spkcache_len:, :]
 
-        idx = torch.where(need_compress)[0]
-        if len(idx) > 0:
-            streaming_state.spkcache[idx], streaming_state.spkcache_preds[idx], _ = self._compress_spkcache(
-                emb_seq=updated_spkcache[idx],
-                preds=updated_spkcache_preds[idx],
-                permute_spk=False
-            )
-            streaming_state.spkcache_lengths[idx] = streaming_state.spkcache_lengths[
-                idx
-            ].clamp(max=self.spkcache_len)
+        # idx = torch.where(need_compress)[0]
+        # if len(idx) > 0:
+        #     streaming_state.spkcache[idx], streaming_state.spkcache_preds[idx], _ = self._compress_spkcache(
+        #         emb_seq=updated_spkcache[idx],
+        #         preds=updated_spkcache_preds[idx],
+        #         permute_spk=False
+        #     )
+        #     streaming_state.spkcache_lengths[idx] = streaming_state.spkcache_lengths[
+        #         idx
+        #     ].clamp(max=self.spkcache_len)
 
         if self.log:
             logging.info(
@@ -460,8 +545,6 @@ class SortformerModules(NeuralModule, Exportable):
             streaming_state.fifo_preds = streaming_state.fifo_preds[:, pop_out_len:]
         # print(streaming_state.spkcache_audio.shape)
         # print(streaming_state.fifo_audio.shape)
-
-
         return streaming_state, chunk_preds
 
     # def streaming_update_feat(
@@ -545,7 +628,6 @@ class SortformerModules(NeuralModule, Exportable):
         """
 
         batch_size, _, emb_dim = chunk.shape
-
         spkcache_len, fifo_len, chunk_len = streaming_state.spkcache.shape[
             1], streaming_state.fifo.shape[1], chunk.shape[1] - lc - rc
         if streaming_state.spk_perm is not None:

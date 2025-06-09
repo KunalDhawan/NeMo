@@ -36,7 +36,10 @@ class BatchedFrameASRCTC_tgt_spk():
             asr_model,
             frame_len=1.6,
             total_buffer=4.0,
-            batch_size=4
+            batch_size=4,
+            diar_model_streaming_mode=False,
+            sortformer_loader_level = 'emb',
+            sortformer_left_context_in_sec = 0.0,
     ):
         self.frame_bufferer = BatchedAudioBufferer_tgt_spk(
             asr_model = asr_model,
@@ -75,6 +78,9 @@ class BatchedFrameASRCTC_tgt_spk():
         self.raw_preprocessor = ASRModel.from_config_dict(cfg.preprocessor)
         self.raw_preprocessor.to(asr_model.device)
         self.preprocessor = self.raw_preprocessor
+        self.diar_model_streaming_mode = diar_model_streaming_mode
+        self.sortformer_loader_level = sortformer_loader_level
+        self.sortformer_left_context_in_sec = sortformer_left_context_in_sec
         self.reset()
 
     def reset(self):
@@ -86,7 +92,10 @@ class BatchedFrameASRCTC_tgt_spk():
         ]
         self.frame_bufferer.reset()
         self.query_pred_len = [0 for _ in range(self.batch_size)]
-    
+        if self.diar_model_streaming_mode:
+            self.asr_model._reset_streaming_state(batch_size = self.batch_size, async_streaming = True)
+            self.left_context = int(self.sortformer_left_context_in_sec * self.asr_model._cfg.sample_rate)
+
     def get_partial_samples(self, audio_file: str, offset: float, duration: float, target_sr: int = 16000, dtype: str = 'float32'):
         try:
             with sf.SoundFile(audio_file, 'r') as f:
@@ -102,6 +111,7 @@ class BatchedFrameASRCTC_tgt_spk():
         return samples
 
     def read_audio_file(self, audio_filepaths: list, offsets, durations, query_audio_files, query_offsets, query_durations, separater_freq, separater_duration, separater_unvoice_ratio,delay, model_stride_in_secs):
+        max_query_len = -1
         for idx in range(self.batch_size):
             samples = self.get_partial_samples(audio_filepaths[idx], offsets[idx], durations[idx])
             samples = np.pad(samples, (0, int(delay * model_stride_in_secs * self.asr_model._cfg.sample_rate)))
@@ -110,10 +120,17 @@ class BatchedFrameASRCTC_tgt_spk():
             separater_audio = get_separator_audio(separater_freq, self.asr_model._cfg.sample_rate, separater_duration, separater_unvoice_ratio)
             separater_audio = separater_audio.astype(np.float32)
             query_samples = np.concatenate([query_samples, separater_audio])
+            if len(query_samples) > max_query_len:
+                max_query_len = len(query_samples)
             frame_reader = AudioIterator_tgt_spk(samples, query_samples, self.
             frame_len, self.asr_model.device)
             self.query_pred_len[idx] = get_hidden_length_from_sample_length(len(query_samples), 160, 8)
             self.set_frame_reader(frame_reader, idx)
+            if self.diar_model_streaming_mode:
+                self.asr_model.streaming_state.query_pred_len[idx] = int(self.query_pred_len[idx])
+                self.asr_model.streaming_state.query_len_audio[idx] = len(query_samples)    
+        self.frame_bufferer.query_buffer_placeholder = np.zeros((self.batch_size, max_query_len + self.frame_bufferer.feature_buffer_len))
+
             
 
     def set_frame_reader(self, frame_reader, idx):
@@ -154,14 +171,29 @@ class BatchedFrameASRCTC_tgt_spk():
         
         if len(feat_signals) == 0:
             return
-        
 
-        # feat_signal = torch.cat(feat_signals, 0)
         feat_signal = collate_vectors(feat_signals, padding_value = 0)
         feat_signal_len = torch.cat(feat_signal_lens, 0)
 
-        del feat_signals, feat_signal_lens
-        encoded, encoded_len, _, _ = self.asr_model.train_val_forward([feat_signal, feat_signal_len, None, None, None, None], 0)
+        del feat_signals, feat_signal_lens        
+
+        if self.diar_model_streaming_mode:
+        # feat_signal = torch.cat(feat_signals, 0)
+
+            encoded, encoded_len = self.asr_model.forward_sortformer_streaming(
+                signal = feat_signal, 
+                signal_len = feat_signal_len, 
+                query_len = torch.tensor([x.query_audio_signal_len[0] for x in self.frame_bufferer.all_frame_reader]),
+                chunk_len = self.frame_bufferer.feature_frame_len,
+                buffer_len = self.frame_bufferer.feature_buffer_len,
+                new_batch_keys = new_batch_keys,
+                sortformer_loader_level = self.sortformer_loader_level,
+                left_context = self.left_context,
+                tokens_per_chunk = self.tokens_per_chunk
+                )
+        else:
+
+            encoded, encoded_len, _, _ = self.asr_model.train_val_forward([feat_signal, feat_signal_len, None, None, None, None], 0)
 
         log_probs = self.asr_model.ctc_decoder(encoder_output = encoded)
         predictions = log_probs.argmax(dim = -1, keepdim = False)
@@ -181,6 +213,40 @@ class BatchedFrameASRCTC_tgt_spk():
 
         del encoded, encoded_len
 
+        save_intermediate_var = False
+
+        if save_intermediate_var:
+            buffer_logits = []
+            buffer_preds = []
+            for i, pred in enumerate(self.all_preds):
+                decoded = pred[-1].tolist()
+                # print(hypothesis)
+                buffer_preds.append(self.greedy_merge(decoded))
+                buffer_logits.append(decoded)
+            parent_dir = '/home/jinhanw/workdir/workdir_nemo_speaker_asr/dataloader/pipeline/decode_scripts/saved/temp_batchview_dataset'
+            os.makedirs(parent_dir, exist_ok=True)
+            import pickle; import numpy as np;
+            with open(os.path.join(parent_dir, 'buffer_preds.pickle'), 'wb') as f:
+                pickle.dump(buffer_preds, f)
+            with open(os.path.join(parent_dir, 'buffer_logits.pickle'), 'wb') as f:
+                pickle.dump(buffer_logits, f)
+            with open(os.path.join(parent_dir, 'feat_signal.pickle'), 'wb') as f:
+                pickle.dump(feat_signal, f)
+            with open(os.path.join(parent_dir, 'feat_signal_len.pickle'), 'wb') as f:
+                pickle.dump(feat_signal_len, f)
+            with open(os.path.join(parent_dir,'diar_model.cfg'), 'w') as f:
+                f.write(OmegaConf.to_yaml(self.asr_model.diarization_model._cfg))
+            with open(os.path.join(parent_dir, 'diar_preds.pickle'), 'wb') as f:
+                pickle.dump(self.asr_model.diar_preds, f)
+            if self.diar_model_streaming_mode:  
+                with open(os.path.join(parent_dir, 'spkcache_fifo_chunk_preds.pickle'), 'wb') as f:
+                    pickle.dump(self.asr_model.diarization_model.spkcache_fifo_chunk_preds, f)
+                    print('\n')
+                # if self.sortformer_loader_level == 'audio':
+                    # with open(os.path.join(parent_dir, 'spkcache_fifo_chunk_preds_audio.pickle'), 'wb') as f:
+                        # pickle.dump(self.asr_model.diarization_model.spkcache_fifo_chunk_preds_audio, f)
+            import ipdb; ipdb.set_trace()
+
     def transcribe(
             self, 
             tokens_per_chunk: int, 
@@ -189,6 +255,8 @@ class BatchedFrameASRCTC_tgt_spk():
         """
         Performs "middle token" alignment prediction using the buffered audio chunk.
         """
+        self.tokens_per_chunk = tokens_per_chunk
+        self.delay = delay
         self.infer_logits()
 
         self.unmerged = [[] for _ in range(self.batch_size)]
@@ -308,7 +376,11 @@ class BatchedAudioBufferer_tgt_spk():
             #batch_frames is a list of [query_features, frame]
             frame_buffers = self.get_frame_buffers([x[1] for x in batch_frames])
             for i, frame_buffer in enumerate(frame_buffers):
-                frame_buffers[i] = np.concatenate([batch_frames[i][0], frame_buffer[0,:]], axis = 0)
+                self.query_buffer_placeholder[i, :batch_frames[i][0].shape[0]] = batch_frames[i][0]
+                self.query_buffer_placeholder[i, batch_frames[i][0].shape[0]:batch_frames[i][0].shape[0] + frame_buffer.shape[1]] = frame_buffer[0,:]
+                query_buffer_len = batch_frames[i][0].shape[0] + frame_buffer.shape[1]
+                # frame_buffers[i] = np.concatenate([batch_frames[i][0], frame_buffer[0,:]], axis = 0)
+                frame_buffers[i] = self.query_buffer_placeholder[i,:query_buffer_len]
             del batch_frames
             return frame_buffers
         return []

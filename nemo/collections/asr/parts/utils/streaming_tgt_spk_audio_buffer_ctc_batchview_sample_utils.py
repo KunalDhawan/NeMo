@@ -73,6 +73,7 @@ class FrameBatchASR_tgt_spk:
         diar_model_streaming_mode=False,
         sortformer_loader_level='emb',
         initial_final_buffer=False,
+        sortformer_left_context_in_sec=0.0,
 
     ):
         '''
@@ -133,8 +134,9 @@ class FrameBatchASR_tgt_spk:
         self.start_replace_step = start_replace_step
         self.diar_model_streaming_mode = diar_model_streaming_mode
         self.sortformer_loader_level = sortformer_loader_level
+        self.sortformer_left_context_in_sec = sortformer_left_context_in_sec
         #disable initial_final_buffer for sortformer offline mode
-        self.initial_final_buffer = initial_final_buffer if diar_model_streaming_mode else False
+        self.initial_final_buffer = initial_final_buffer
         self.reset()
 
     def reset(self):
@@ -153,7 +155,9 @@ class FrameBatchASR_tgt_spk:
         self.query_refresh_count = 0
         self.query_refresh_rate = 1
         if self.diar_model_streaming_mode:
-            self.asr_model._reset_streaming_state()
+            assert self.batch_size == 1, "batch_size must be 1 for diar_model_streaming_mode when using batchview sample"
+            self.asr_model._reset_streaming_state(batch_size = self.batch_size, async_streaming = False)
+            self.left_context = int(self.sortformer_left_context_in_sec * self.asr_model._cfg.sample_rate)
 
     def get_partial_samples(self, audio_file: str, offset: float, duration: float, target_sr: int = 16000, dtype: str = 'float32'):
         try:
@@ -268,12 +272,14 @@ class FrameBatchASR_tgt_spk:
                 encoded, encoded_len = self.asr_model.forward_sortformer_streaming(
                     signal = feat_signal,
                     signal_len = feat_signal_len,
-                    query_len = self.frame_bufferer.frame_reader.query_audio_signal_len[0],
+                    query_len = [self.frame_bufferer.frame_reader.query_audio_signal_len[0]],
                     chunk_len = self.frame_bufferer.feature_frame_len,
                     buffer_len = self.frame_bufferer.feature_buffer_len,
                     initial_buffer = initial_buffer,
                     temp_buffer_index = self.temp_buffer,
-                    sortformer_loader_level = self.sortformer_loader_level
+                    sortformer_loader_level = self.sortformer_loader_level,
+                    left_context = self.left_context,
+                    tokens_per_chunk = self.tokens_per_chunk,
                 )
             else:
                 encoded, encoded_len, _, _ = self.asr_model.train_val_forward([feat_signal, feat_signal_len, None, None, None, None], 0)
@@ -547,8 +553,12 @@ class FrameBatchASR_tgt_spk:
                     with open(os.path.join(parent_dir, 'spkcache_fifo_chunk_preds.pickle'), 'wb') as f:
                         pickle.dump(self.asr_model.diarization_model.spkcache_fifo_chunk_preds, f)
                         print('\n')
-                    print(self.asr_model.streaming_state.fifo.shape)
-                    print(self.asr_model.streaming_state.spkcache.shape)
+                    if self.sortformer_loader_level == 'emb':
+                        print(self.asr_model.streaming_state.fifo.shape)
+                        print(self.asr_model.streaming_state.spkcache.shape)
+                    elif self.sortformer_loader_level == 'audio':
+                        print(self.asr_model.streaming_state.fifo_audio.shape)
+                        print(self.asr_model.streaming_state.spkcache_audio.shape)
                 if self.dynamic_query:
 
                     with open(os.path.join(parent_dir, 'new_query.pickle'), 'wb') as f:
@@ -570,6 +580,8 @@ class FrameBatchASR_tgt_spk:
 
 
     def transcribe(self, tokens_per_chunk: int, delay: int, keep_logits: bool = False):
+        self.tokens_per_chunk = tokens_per_chunk
+        self.delay = delay
         self.infer_logits(keep_logits)
         self.unmerged = []
 

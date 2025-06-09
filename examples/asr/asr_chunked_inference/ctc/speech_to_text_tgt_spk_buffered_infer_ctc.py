@@ -223,6 +223,7 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
                 diar_model_streaming_mode=cfg.get('diar_model_streaming_mode', False),
                 sortformer_loader_level=cfg.get('sortformer_loader_level', 'emb'),
                 initial_final_buffer=cfg.get('initial_final_buffer', False),
+                sortformer_left_context_in_sec=cfg.get('sortformer_left_context_in_sec', 0.0),
             )
         elif cfg.buffer_level == 'feature':
             frame_asr = FeatureFrameBatchASR_tgt_spk(
@@ -251,6 +252,9 @@ def main(cfg: TranscriptionConfig) -> TranscriptionConfig:
             frame_len=chunk_len,
             total_buffer=cfg.total_buffer_in_secs,
             batch_size=cfg.batch_size,
+            diar_model_streaming_mode=cfg.get('diar_model_streaming_mode', False),
+            sortformer_loader_level=cfg.get('sortformer_loader_level', 'emb'),
+            sortformer_left_context_in_sec=cfg.get('sortformer_left_context_in_sec', 0.0),
         )
         with torch.amp.autocast(asr_model.device.type, enabled=cfg.amp):
             hyps = get_buffered_pred_feat_tgt_spk_ctc_batchview_dataset(

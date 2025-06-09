@@ -732,6 +732,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         left_offset=0,
         right_offset=0,
         streaming_level='emb',
+        left_context=0,
+        tokens_per_chunk=0,
     ):
         """
         One-step forward pass for diarization inference in streaming mode.
@@ -771,12 +773,28 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             chunk_pre_encode_embs, chunk_pre_encode_lengths = self.encoder.pre_encode(
                 x=processed_signal,
                 lengths=processed_signal_length)
+            # import ipdb; ipdb.set_trace()
             if self.async_streaming:
+                # if torch.all(streaming_state.fifo_lengths == 0) or left_context == 0:
+                if torch.all(streaming_state.fifo_lengths == 0):
+                # if True:
+                    pass
+                    #first buffer, don't need other operation
+                    # or left context is 0, don't need other operation
+                else:
+                    chunk_pre_encode_lengths[:] = tokens_per_chunk
+                    chunk_pre_encode_embs = chunk_pre_encode_embs[:, -tokens_per_chunk-1:-1]
                 spkcache_fifo_chunk_pre_encode_embs, spkcache_fifo_chunk_pre_encode_lengths = concat_and_pad(
                     [streaming_state.spkcache, streaming_state.fifo, chunk_pre_encode_embs],
                     [streaming_state.spkcache_lengths, streaming_state.fifo_lengths, chunk_pre_encode_lengths]
                 )
+
             else:
+                # if streaming_state.fifo is None or left_context == 0:
+                if streaming_state.fifo.shape[1] == 0:
+                    pass
+                else:
+                    chunk_pre_encode_embs = chunk_pre_encode_embs[:, -tokens_per_chunk-1:-1]
                 spkcache_fifo_chunk_pre_encode_embs = self.sortformer_modules.concat_embs(
                     [streaming_state.spkcache, streaming_state.fifo, chunk_pre_encode_embs], dim=1, device=self.device
                 )
@@ -785,7 +803,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                     streaming_state.fifo.shape[1] +
                     chunk_pre_encode_lengths
                 )
-
+            # import ipdb; ipdb.set_trace()
             spkcache_fifo_chunk_fc_encoder_embs, spkcache_fifo_chunk_fc_encoder_lengths = self.frontend_encoder(
                 processed_signal=spkcache_fifo_chunk_pre_encode_embs,
                 processed_signal_length=spkcache_fifo_chunk_pre_encode_lengths,
@@ -856,14 +874,23 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         #     )
         elif streaming_level == 'audio':
             #raw audio input, sync manner
+            if self.async_streaming:
 
-            spkcache_fifo_chunk_audio = self.sortformer_modules.concat_embs(
-                [streaming_state.spkcache_audio, streaming_state.fifo_audio, processed_signal], dim=1, device=self.device)
-            spkcache_fifo_chunk_audio_lengths = (
-                streaming_state.spkcache_audio.shape[1] +
-                streaming_state.fifo_audio.shape[1] +
-                processed_signal_length
-            )
+                spkcache_fifo_chunk_audio, spkcache_fifo_chunk_audio_lengths = concat_and_pad(
+                    [streaming_state.spkcache_audio.unsqueeze(2), streaming_state.fifo_audio.unsqueeze(2), processed_signal.unsqueeze(2)],
+                    [streaming_state.spkcache_audio_lengths, streaming_state.fifo_audio_lengths, processed_signal_length]
+                )
+                spkcache_fifo_chunk_audio = spkcache_fifo_chunk_audio.squeeze(2)
+                self.spkcache_fifo_chunk_audio = spkcache_fifo_chunk_audio
+            else:
+                
+                spkcache_fifo_chunk_audio = self.sortformer_modules.concat_embs(
+                    [streaming_state.spkcache_audio, streaming_state.fifo_audio, processed_signal], dim=1, device=self.device)
+                spkcache_fifo_chunk_audio_lengths = (
+                    streaming_state.spkcache_audio.shape[1] +
+                    streaming_state.fifo_audio.shape[1] +
+                    processed_signal_length
+                )
             spkcache_fifo_chunk_feat, spkcache_fifo_chunk_feat_lengths = self.process_signal(
                 audio_signal=spkcache_fifo_chunk_audio,
                 audio_signal_length=spkcache_fifo_chunk_audio_lengths
@@ -872,6 +899,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             spkcache_fifo_chunk_pre_encode_embs, spkcache_fifo_chunk_pre_encode_lengths = self.encoder.pre_encode(
                 x=spkcache_fifo_chunk_feat,
                 lengths=spkcache_fifo_chunk_feat_lengths)
+            import ipdb; ipdb.set_trace()
             spkcache_fifo_chunk_fc_encoder_embs, spkcache_fifo_chunk_fc_encoder_lengths = self.frontend_encoder(
                 processed_signal=spkcache_fifo_chunk_pre_encode_embs,
                 processed_signal_length=spkcache_fifo_chunk_pre_encode_lengths,
@@ -881,7 +909,17 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 emb_seq=spkcache_fifo_chunk_fc_encoder_embs,
                 emb_seq_length=spkcache_fifo_chunk_fc_encoder_lengths
             )
-            streaming_state, chunk_preds = self.sortformer_modules.streaming_update_audio(
+            if self.async_streaming:
+                streaming_state, chunk_preds = self.sortformer_modules.streaming_update_async_audio(
+                    streaming_state=streaming_state,
+                    chunk_audio=processed_signal,
+                    chunk_audio_lengths=processed_signal_length,
+                    preds=spkcache_fifo_chunk_preds,
+                    lc=round(left_offset / self.encoder.subsampling_factor),
+                    rc=math.ceil(right_offset / self.encoder.subsampling_factor),
+                )
+            else:
+                streaming_state, chunk_preds = self.sortformer_modules.streaming_update_audio(
                 streaming_state=streaming_state,
                 chunk_audio=processed_signal,
                 preds=spkcache_fifo_chunk_preds,
@@ -895,8 +933,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             spkcache_fifo_chunk_preds = self.sortformer_modules.apply_mask_to_preds(
                 spkcache_fifo_chunk_preds, spkcache_fifo_chunk_fc_encoder_lengths
             )
-        total_preds = torch.cat([total_preds, chunk_preds], dim=1)
+        # total_preds = torch.cat([total_preds, chunk_preds], dim=1)
         self.spkcache_fifo_chunk_preds = spkcache_fifo_chunk_preds
+        self.spkcache_fifo_chunk_preds_lengths = spkcache_fifo_chunk_fc_encoder_lengths
         return streaming_state, total_preds
 
     def _get_aux_train_evaluations(self, preds, targets, target_lens) -> dict:

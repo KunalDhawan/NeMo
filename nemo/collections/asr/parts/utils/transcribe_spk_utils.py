@@ -76,7 +76,7 @@ def get_buffered_pred_feat_tgt_spk_ctc_batchview_sample(
             hyp = asr.transcribe(tokens_per_chunk, delay)
             hyps.append(hyp)
     else:
-        print(f'Diarization Streaming Mode: {asr.diar_model_streaming_mode} Loader Level: {asr.sortformer_loader_level} initial_final_buffer: {asr.initial_final_buffer}')
+        print(f'Batchview: sample Diarization Streaming Mode: {asr.diar_model_streaming_mode} Loader Level: {asr.sortformer_loader_level} initial_final_buffer: {asr.initial_final_buffer}')
         with open(manifest, "r", encoding='utf_8') as mfst_f:
             for l in tqdm(mfst_f, desc="Sample:"):
                 asr.reset()
@@ -147,6 +147,7 @@ def get_buffered_pred_feat_tgt_spk_ctc_batchview_dataset(
         separater_freq = asr.asr_model.cfg.test_ds.separater_freq
         separater_duration = asr.asr_model.cfg.test_ds.separater_duration
         separater_unvoice_ratio = asr.asr_model.cfg.test_ds.separater_unvoice_ratio
+        print(f'Batchview: dataset Diarization Streaming Mode: {asr.diar_model_streaming_mode} Loader Level: {asr.sortformer_loader_level}')
         with open(manifest, "r", encoding='utf_8') as mfst_f:
             print("Parsing manifest files...")
             for l in mfst_f:

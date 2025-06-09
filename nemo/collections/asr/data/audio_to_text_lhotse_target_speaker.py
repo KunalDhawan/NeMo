@@ -119,16 +119,16 @@ class LhotseSpeechToTextTgtSpkBpeDataset(torch.utils.data.Dataset):
             audio, audio_lens, cuts = self.load_audio(cuts)
         else:
             query_cuts = CutSet.from_cuts(get_query_cut(c) for c in cuts)
-            # spk_targets = [torch.transpose(torch.zeros(self.num_speakers, get_hidden_length_from_sample_length(cut.num_samples, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame)), 0, 1) for cut in cuts]
-            spk_targets = [torch.transpose(torch.as_tensor(speaker_to_target_w_query(
-                c, q, 
-                self.add_separater_audio,
-                self.separater_duration,
-                self.num_speakers, 
-                self.num_sample_per_mel_frame, 
-                self.num_mel_frame_per_asr_frame, 
-                self.spk_tar_all_zero), 
-                dtype=torch.float32), 0, 1) for c, q in zip(cuts,query_cuts)]
+            spk_targets = [torch.transpose(torch.zeros(self.num_speakers, get_hidden_length_from_sample_length(cut.num_samples, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame)), 0, 1) for cut in cuts]
+            # spk_targets = [torch.transpose(torch.as_tensor(speaker_to_target_w_query(
+            #     c, q, 
+            #     self.add_separater_audio,
+            #     self.separater_duration,
+            #     self.num_speakers, 
+            #     self.num_sample_per_mel_frame, 
+            #     self.num_mel_frame_per_asr_frame, 
+            #     self.spk_tar_all_zero), 
+            #     dtype=torch.float32), 0, 1) for c, q in zip(cuts,query_cuts)]
             
             # order matters: rir_augment and codec_augment (output monocut) should be applied before mix_noise (output mixedcut)
             if self.query_rir_augment:
