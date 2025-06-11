@@ -587,6 +587,7 @@ def get_split_points_in_alignments(
     splits = []
     for i in range(len(words)):
         if words[i] == "" and i != 0 and i != len(words) - 1:
+        # if words[i] == "<sil>" and i != 0 and i != len(words) - 1:
             silence_length = alignments[i] - alignments[i - 1]
             if silence_length > 2 * split_buffer:  # split utterance on silence
                 new_end = alignments[i - 1] + split_buffer
@@ -678,7 +679,7 @@ class DataAnnotator(object):
             self.annote_lists[file_type] = []
 
     def create_new_rttm_entry(
-        self, words: List[str], alignments: List[float], start: int, end: int, speaker_id: int
+        self, words: List[str], alignments: List[float], start: int, end: int, speaker_id: int, add_split_buffer: bool = False
     ) -> List[str]:
 
         """
@@ -703,12 +704,21 @@ class DataAnnotator(object):
                 if (
                     silence_length > 2 * self._params.data_simulator.session_params.split_buffer
                 ):  # split utterance on silence
-                    new_end = start + alignments[i - 1] + self._params.data_simulator.session_params.split_buffer
+                    new_end = start + alignments[i - 1]
+                    silence_duration = alignments[i] - alignments[i - 1]
+                    
+                    # new_end = start + alignments[i - 1] + self._params.data_simulator.session_params.split_buffer
+
+                    # import ipdb; ipdb.set_trace()
+                    # if add_split_buffer:  # add split buffer if specified in config
+                    #     new_end += self._params.data_simulator.session_params.split_buffer
                     t_stt = round(float(new_start), self._params.data_simulator.outputs.output_precision)
                     t_end = round(float(new_end), self._params.data_simulator.outputs.output_precision)
                     rttm_list.append(f"{t_stt} {t_end} {speaker_id}")
-                    new_start = start + alignments[i] - self._params.data_simulator.session_params.split_buffer
-
+                    new_start = start + alignments[i] 
+                    # new_start = start + alignments[i] - self._params.data_simulator.session_params.split_buffer
+        # if "mister" in words and "swift" in words:
+        #     import ipdb; ipdb.set_trace()
         t_stt = round(float(new_start), self._params.data_simulator.outputs.output_precision)
         t_end = round(float(end), self._params.data_simulator.outputs.output_precision)
         rttm_list.append(f"{t_stt} {t_end} {speaker_id}")
@@ -753,6 +763,52 @@ class DataAnnotator(object):
             "uem_filepath": None,
         }
         return meta
+    
+    def create_ctm_entry_from_segment_list(
+        self, source_segment_list, session_name: str, speaker_id: int, start: int
+    ) -> List[str]:
+        """
+        Create new CTM entry (to write to output ctm file)
+
+        Args:
+            words (list): List of words in the current audio file.
+            alignments (list): List of alignments (timestamps) for the current audio file.
+            session_name (str): Current session name.
+            speaker_id (int): LibriSpeech speaker ID for the current entry.
+            start (int): Current start of the audio file being inserted.
+        
+        Returns:
+            arr (list): List of ctm entries
+        """
+        arr = []
+        start = float(round(start, self._params.data_simulator.outputs.output_precision))
+
+        for seg_dict in source_segment_list:
+            words = seg_dict["words"]
+            alignments = seg_dict["alignments"]
+            start_offset = seg_dict["mixed_cut_offset"]
+            alignment_offset = alignments[0]
+            for i in range(len(words)):
+                word = words[i]
+                if (
+                    word != ""
+                ):  # note that using the current alignments the first word is always empty, so there is no error from indexing the array with i-1
+                    # prev_align = 0 if i == 0 else alignments[i - 1]
+                    # align1 = round(float(prev_align + start), self._params.data_simulator.outputs.output_precision)
+                    align1 = round(float(start_offset + alignments[i] - alignment_offset), self._params.data_simulator.outputs.output_precision)
+                    align2 = round(float(start_offset + alignments[i+1] - alignment_offset - align1), self._params.data_simulator.outputs.output_precision)
+                    text = get_ctm_line(
+                        source=session_name,
+                        channel=1,
+                        start_time=align1,
+                        duration=align2,
+                        token=word,
+                        conf=None,
+                        type_of_token='lex',
+                        speaker=speaker_id,
+                    )
+                    arr.append((align1, text))
+        return arr
 
     def create_new_ctm_entry(
         self, words: List[str], alignments: List[float], session_name: str, speaker_id: int, start: int
@@ -772,6 +828,7 @@ class DataAnnotator(object):
         """
         arr = []
         start = float(round(start, self._params.data_simulator.outputs.output_precision))
+
         for i in range(len(words)):
             word = words[i]
             if (
@@ -779,7 +836,12 @@ class DataAnnotator(object):
             ):  # note that using the current alignments the first word is always empty, so there is no error from indexing the array with i-1
                 prev_align = 0 if i == 0 else alignments[i - 1]
                 align1 = round(float(prev_align + start), self._params.data_simulator.outputs.output_precision)
-                align2 = round(float(alignments[i] - prev_align), self._params.data_simulator.outputs.output_precision)
+                # align1 = round(float(start), self._params.data_simulator.outputs.output_precision)
+                try:
+                    align2 = round(float(alignments[i] - prev_align), self._params.data_simulator.outputs.output_precision)
+                    # align2 = round(float(alignments[i+1] - start), self._params.data_simulator.outputs.output_precision)
+                except:
+                    import ipdb; ipdb.set_trace()
                 text = get_ctm_line(
                     source=session_name,
                     channel=1,
@@ -835,6 +897,20 @@ class DataAnnotator(object):
         write_text(os.path.join(basepath, filename + '.txt'), self.annote_lists['ctm'])
         write_manifest(os.path.join(basepath, filename + '.meta'), [meta_data])
 
+    def write_annotation_rttm_and_ctm(self, basepath: str, filename: str):
+        """
+        Write all annotation files: RTTM, JSON, CTM, TXT, and META.
+
+        Args:
+            basepath (str): Basepath for output files.
+            filename (str): Base filename for all output files.
+            meta_data (dict): Metadata for the current session.
+            rttm_list (list): List of RTTM entries.
+            json_list (list): List of JSON entries.
+            ctm_list (list): List of CTM entries.
+        """
+        labels_to_rttmfile(self.annote_lists['rttm'], os.path.join(basepath, filename), self._params.data_simulator.outputs.output_dir)
+        write_ctm(os.path.join(basepath, filename + '.ctm'), self.annote_lists['ctm'])
 
 class SpeechSampler(object):
     """

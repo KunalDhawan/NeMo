@@ -37,7 +37,7 @@ from nemo.collections.common.data.lhotse.text_adapters import (
     NeMoSFTJsonlAdapter,
 )
 from nemo.collections.common.parts.preprocessing.manifest import get_full_path
-from nemo.collections.asr.parts.utils.asr_multispeaker_utils import MultiSpeakerSimulator
+from nemo.collections.asr.parts.utils.asr_multispeaker_utils import MultiSpeakerMixtureGenerator
 
 
 def read_cutset_from_config(config: DictConfig | dict) -> Tuple[CutSet, bool]:
@@ -597,13 +597,14 @@ def read_nemo_manifest(config) -> tuple[CutSet, bool]:
 
 @data_type_parser("multi_speaker_simulator")
 def read_multi_speaker_simulator(config: DictConfig) -> tuple[CutSet, bool]:
-        
     multi_speaker_cuts = CutSet(
-        MultiSpeakerSimulator(
+        MultiSpeakerMixtureGenerator(
             manifest_filepath=config.manifest_filepath,
             num_speakers=config.num_speakers,
             simulator_type=config.simulator_type,
             min_delay=config.get("min_delay", 0.5),
+            outputs=config.get("outputs", None),
+            session_config=config.get("session_config", None),
         )
     )
 

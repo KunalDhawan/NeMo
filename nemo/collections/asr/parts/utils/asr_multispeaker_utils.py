@@ -31,9 +31,132 @@ from lhotse.cut import Cut, CutSet, MixedCut, MonoCut, MixTrack
 from lhotse import SupervisionSet, SupervisionSegment, dill_enabled, AudioSource, Recording
 from lhotse.utils import uuid4, compute_num_samples, ifnone
 from lhotse.lazy import LazyIteratorChain, LazyJsonlIterator
-
+from nemo.collections.asr.data.data_simulation import MultiSpeakerSimulator
 
 from typing import Optional, Union, List, Tuple, Dict, Any
+
+from omegaconf import OmegaConf
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+import soundfile as sf
+import os
+@dataclass
+class SessionConfig:
+    num_speakers: int = 2
+    num_sessions: int = 10
+    session_length: int = 15
+
+@dataclass
+class SessionParams:
+    max_audio_read_sec: float = 20.0
+    sentence_length_params: List[float] = field(default_factory=lambda: [0.4, 0.05])
+    dominance_var: float = 0.11
+    min_dominance: float = 0.05
+    turn_prob: float = 0.875
+    min_turn_prob: float = 0.5
+    mean_silence: float = 0.15
+    mean_silence_var: float = 0.01
+    per_silence_var: int = 900
+    per_silence_min: float = 0.0
+    per_silence_max: float = -1.0
+    mean_overlap: float = 0.1
+    mean_overlap_var: float = 0.01
+    per_overlap_var: int = 900
+    per_overlap_min: float = 0.0
+    per_overlap_max: float = -1.0
+    start_window: bool = True
+    window_type: str = "hamming"
+    window_size: float = 0.02
+    start_buffer: float = 0.0
+    split_buffer: float = 0.01
+    release_buffer: float = 0.0
+    normalize: bool = True
+    normalization_type: str = "equal"
+    normalization_var: float = 0.1
+    min_volume: float = 0.75
+    max_volume: float = 1.25
+    end_buffer: float = 0.5
+    random_offset: bool = False
+
+@dataclass
+class OutputConfig:
+    output_dir: str = ""
+    output_filename: str = "multispeaker_session"
+    overwrite_output: bool = True
+    output_precision: int = 3
+
+@dataclass
+class BackgroundNoise:
+    add_bg: bool = False
+    background_manifest: Optional[str] = None
+    num_noise_files: int = 10
+    snr: int = 60
+    snr_min: Optional[float] = None
+    snr_max: Optional[float] = None
+
+@dataclass
+class SegmentAugmentor:
+    add_seg_aug: bool = False
+    gain_prob: float = 0.5
+    min_gain_dbfs: float = -10.0
+    max_gain_dbfs: float = 10.0
+
+@dataclass
+class SessionAugmentor:
+    add_sess_aug: bool = False
+    white_noise_prob: float = 1.0
+    min_white_noise_level: int = -90
+    max_white_noise_level: int = -46
+
+@dataclass
+class SpeakerEnforcement:
+    enforce_num_speakers: bool = True
+    enforce_time: List[float] = field(default_factory=lambda: [0.25, 0.75])
+
+@dataclass
+class SegmentManifest:
+    window: float = 0.5
+    shift: float = 0.25
+    step_count: int = 50
+    deci: int = 3
+
+@dataclass
+class RIRGeneration:
+    use_rir: bool = False
+    toolkit: str = "pyroomacoustics"
+    room_sz: List[List[int]] = field(default_factory=lambda: [[2, 3], [2, 3], [2, 3]])
+    pos_src: List[List[List[float]]] = field(default_factory=lambda: [[[0.5, 1.5]] * 3] * 4)
+    noise_src_pos: List[float] = field(default_factory=lambda: [1.5, 1.5, 2])
+    num_channels: int = 2
+    pos_rcv: List[List[List[float]]] = field(default_factory=lambda: [[[0.5, 1.5]] * 3] * 2)
+    orV_rcv: Optional[List[List[float]]] = None
+    mic_pattern: str = "omni"
+    abs_weights: List[float] = field(default_factory=lambda: [0.9] * 6)
+    T60: float = 0.1
+    att_diff: float = 15.0
+    att_max: float = 60.0
+
+@dataclass
+class DataSimConfig:
+    """Configuration for data simulation."""
+    manifest_filepath: str = ""
+    sr: int = 16000
+    random_seed: int = 42
+    multiprocessing_chunksize: int = 10000
+    session_config: SessionConfig = field(default_factory=SessionConfig)
+    session_params: SessionParams = field(default_factory=SessionParams)
+    outputs: OutputConfig = field(default_factory=OutputConfig)
+    background_noise: BackgroundNoise = field(default_factory=BackgroundNoise)
+    segment_augmentor: SegmentAugmentor = field(default_factory=SegmentAugmentor)
+    session_augmentor: SessionAugmentor = field(default_factory=SessionAugmentor)
+    speaker_enforcement: SpeakerEnforcement = field(default_factory=SpeakerEnforcement)
+    segment_manifest: SegmentManifest = field(default_factory=SegmentManifest)
+    rir_generation: RIRGeneration = field(default_factory=RIRGeneration)
+
+@dataclass
+class MultiSpeakerSimulatorConfig:
+    data_simulator: DataSimConfig = field(default_factory=DataSimConfig)
 
 
 def find_first_nonzero(mat: torch.Tensor, max_cap_val=-1, thres: float = 0.5) -> torch.Tensor:
@@ -1246,6 +1369,21 @@ class LibriSpeechMixGenerator():
         
         return CutSet.from_cuts(cut_set)
 
+import numpy as np
+import matplotlib.pyplot as plt
+
+def save_numpy_array_as_png(np_array_source: np.ndarray, output_filepath: str):
+    """
+    Save a NumPy array as a PNG image.
+
+    Args:
+        np_array_source (np.ndarray): The image data (2D or 3D).
+        output_filepath (str): File path where the image will be saved (e.g., "image.png").
+    """
+    expanded_array = np.repeat(np_array_source, 100, axis=1)
+    plt.imsave(output_filepath, expanded_array, cmap='gray' if np_array_source.ndim == 2 else None)
+
+
 def speaker_to_target(
     a_cut,
     num_speakers: int = 4, 
@@ -1256,6 +1394,7 @@ def speaker_to_target(
     soft_label: bool = False,
     ignore_num_spk_mismatch: bool = True,
     soft_thres: float = 0.5,
+    is_audio_mix_sim: bool = False,
     ):
     '''
     Get rttm samples corresponding to one cut, generate speaker mask numpy.ndarray with shape (num_speaker, hidden_length)
@@ -1290,10 +1429,11 @@ def speaker_to_target(
         if hasattr(cut, 'rttm_filepath') and cut.rttm_filepath is not None:
             rttms = SupervisionSet.from_rttm(cut.rttm_filepath)
         elif hasattr(cut, 'speaker_id') and cut.speaker_id is not None:
+
             rttms = SupervisionSet.from_segments([SupervisionSegment(
                 id=uuid4(),
                 recording_id=cut.recording_id,
-                start=0,
+                start=cut.start,
                 duration=cut.duration,
                 channel=1,
                 speaker=cut.speaker_id,
@@ -1301,11 +1441,11 @@ def speaker_to_target(
             )])
         else:
             raise ValueError(f"Cut {cut.id} does not have rttm_filepath or speaker_id")
-
+        
         if boundary_segments: # segments with seg_start < total_end and seg_end > total_start are included
             segments_iterator = find_segments_from_rttm(recording_id=cut.recording_id, rttms=rttms, start_after=cut.start, end_before=cut.end, tolerance=0.0)
         else: # segments with seg_start > total_start and seg_end < total_end are included
-            segments_iterator = rttms.find(recording_id=cut.recording_id, start_after=cut.start, end_before=cut.end, adjust_offset=True)
+            segments_iterator = rttms.find(recording_id=cut.recording_id, start_after=cut.start, end_before=cut.end, adjust_offset=True) #, tolerance=0.0)
 
         for seg in segments_iterator:
             if seg.start < 0:
@@ -1346,7 +1486,7 @@ def speaker_to_target(
 
     return mask
 
-class MultiSpeakerSimulator():
+class MultiSpeakerMixtureGenerator():
     """
     This class is used to simulate multi-speaker audio data,
     which can be used for multi-speaker ASR and speaker diarization training.
@@ -1357,6 +1497,8 @@ class MultiSpeakerSimulator():
         num_speakers, 
         simulator_type,
         min_delay=0.5,
+        outputs=None,
+        session_config=None,
     ):
         """
         Args:
@@ -1375,17 +1517,22 @@ class MultiSpeakerSimulator():
             min_delay (float): The minimum delay between speakers
                 to avoid the same starting time for multiple speakers.
         """
-    
+        self.manifest_filepath = manifest_filepath 
         self.manifests = LazyJsonlIterator(manifest_filepath)
         self.min_delay = min_delay
         self.num_speakers = num_speakers
         self.simulator_type = simulator_type
+        self.outputs = outputs
+        self.session_config = session_config
 
         self.spk2manifests = groupby(lambda x: x["speaker_id"], self.manifests)
         self.speaker_ids = list(self.spk2manifests.keys())
-
+        print("======  simulator_type", simulator_type)
+    
         if simulator_type == 'lsmix':    
             self.simulator = self.LibriSpeechMixSimulator
+        elif simulator_type == 'audiomix': 
+            self.simulator = self.AudioMixtureSimulator
         elif simulator_type == 'meeting':
             self.simulator = self.MeetingSimulator
         elif simulator_type == 'conversation':
@@ -1396,6 +1543,69 @@ class MultiSpeakerSimulator():
     
     def __next__(self):
         return self.simulator()
+
+
+    def AudioMixtureSimulator(self):
+        """
+        NeMo MultiSpeaker Speech Simulator
+        """
+        cfg = OmegaConf.structured(MultiSpeakerSimulatorConfig())
+        cfg.data_simulator.manifest_filepath = self.manifest_filepath
+        cfg.data_simulator.outputs.output_dir = self.outputs.output_dir
+        cfg.data_simulator.outputs.output_filename = self.outputs.output_filename
+        cfg.data_simulator.session_config.num_sessions = self.session_config.num_sessions
+        cfg.data_simulator.session_config.num_speakers = self.session_config.num_speakers
+        cfg.data_simulator.session_config.session_length = self.session_config.session_length
+        simulator = MultiSpeakerSimulator(cfg=cfg)
+        # set_start_method('spawn', force=True)
+        # simulator.generate_sessions()
+        # mixed_cut 
+        manifest_json_list, uniq_id, mix_array = simulator.generate_single_session()
+
+        mono_cuts = []
+        # for speaker_id in sampled_speaker_ids:
+        #     manifest = random.choice(self.spk2manifests[speaker_id])
+        for manifest in manifest_json_list:
+            mono_cuts.append(self.json_to_cut(manifest))
+
+        tracks = []
+        for cut_idx, mono_cut in enumerate(mono_cuts):
+            custom = {
+                    'pnc': 'no',
+                    'source_lang': 'en',
+                    'target_lang': 'en',
+                    'task': 'asr'
+                }
+            mono_cut.custom.update(custom)
+            # temp_cut = deepcopy(mono_cut) # MixTrack(cut=deepcopy(mono_cut), type=type(mono_cut), offset=mono_cut.custom['mixed_cut_offset'])
+            # temp_cut.duration = manifest_json_list[cut_idx]['duration']
+            # tracks.append(MixTrack(cut=deepcopy(temp_cut), type=type(mono_cut), offset=mono_cut.custom['mixed_cut_offset']))
+            tracks.append(MixTrack(cut=deepcopy(mono_cut), type=type(mono_cut), offset=mono_cut.custom['mixed_cut_offset']))
+    
+        # mixed_cut = MixedCut(id='lsmix_' + '_'.join([track.cut.id for track in tracks]) + '_' + str(uuid4()), tracks=tracks)
+        mixed_cut = MixedCut(id=uniq_id, tracks=tracks)
+        bs_true = speaker_to_target(mixed_cut, boundary_segments=True, is_audio_mix_sim=True)
+        bs_false = speaker_to_target(mixed_cut, boundary_segments=False, is_audio_mix_sim=True)
+        save_numpy_array_as_png(bs_true, "/home/taejinp/Downloads/lhotse_sup_boundary/bs_true.png")
+        save_numpy_array_as_png(bs_false, "/home/taejinp/Downloads/lhotse_sup_boundary/bs_false.png")
+        basepath = "/home/taejinp/Downloads/lhotse_sup_boundary"
+        loaded_audio = mixed_cut.load_audio().squeeze(0)
+        mix_array = mix_array.cpu().numpy()
+        # Normalize the audio array
+        array = mix_array / (np.max(np.abs(mix_array)) + 1e-8)  # Avoid division by zero
+
+        package_path = f"{basepath}/{uniq_id}_test_sttw_va5-2_{self.session_config.num_speakers}spk"
+        os.makedirs(package_path, exist_ok=True)
+        sf.write(os.path.join(package_path, uniq_id + '.wav'), array, simulator._params.data_simulator.sr)
+        sf.write(os.path.join(package_path, uniq_id + '_lhotse.wav'), loaded_audio, simulator._params.data_simulator.sr)
+
+        simulator.annotator.write_annotation_rttm_and_ctm(
+            basepath=package_path,
+            filename=uniq_id,
+        )
+        import ipdb; ipdb.set_trace()
+        return mixed_cut
+
 
     def LibriSpeechMixSimulator(self):
         """
@@ -1442,6 +1652,8 @@ class MultiSpeakerSimulator():
         audio_path = json_dict["audio_filepath"]
         duration = json_dict["duration"]
         offset = json_dict.get("offset", None)
+        if duration == 0.0:
+            import ipdb; ipdb.set_trace()
         cut = self._create_cut(
             audio_path=audio_path, offset=offset, duration=duration, sampling_rate=json_dict.get("sampling_rate", None)
         )
@@ -1458,6 +1670,7 @@ class MultiSpeakerSimulator():
             )
         )
         cut.custom = json_dict
+        cut.duration = duration
 
         return cut
 

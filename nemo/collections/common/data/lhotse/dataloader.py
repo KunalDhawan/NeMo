@@ -238,7 +238,6 @@ def get_lhotse_dataloader_from_config(
 
     # Providing default value because we haven't filled the config defaults yet.
     maybe_set_cuda_expandable_segments(enabled=config.get("cuda_expandable_segments", True))
-
     if config.get("multi_config", False):
         return get_lhotse_dataloader_from_multi_config(
             top_level_config=config,
@@ -444,7 +443,7 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
     # 1. Load a manifest as a Lhotse CutSet.
     cuts, use_iterable_dataset = read_cutset_from_config(config)
     use_iterable_dataset = determine_use_iterable_dataset(use_iterable_dataset, config)
-
+    
     # Apply channel selector
     if config.channel_selector is not None:
         logging.info('Using channel selector %s.', config.channel_selector)
