@@ -43,6 +43,7 @@ print_sentences,
 get_color_palette,
 write_txt,
 )
+from nemo.collections.asr.data.audio_to_diar_label import get_frame_targets_from_rttm, extract_frame_info_from_rttm
 
 
 from typing import List, Optional
@@ -149,6 +150,7 @@ def perform_streaming(
     asr_model, 
     diar_model, 
     streaming_buffer, 
+    rttm=None,
     debug_mode=False):
     batch_size = len(streaming_buffer.streams_length)
     final_offline_tran = None
@@ -157,9 +159,9 @@ def perform_streaming(
         batch_size=batch_size
     )
 
-    previous_hypotheses = None
+    previous_hypotheses = [Hypothesis(score=0, y_sequence=[]) for i in range(cfg.mix)]
     streaming_buffer_iter = iter(streaming_buffer)
-    asr_pred_out_stream, diar_pred_out_stream  = None, None
+    asr_pred_out_stream, diar_pred_out_stream  = [torch.tensor([]) for i in range(cfg.mix)], None
     mem_last_time, fifo_last_time = None, None
     left_offset, right_offset = 0, 0
 
@@ -167,7 +169,7 @@ def perform_streaming(
     session_start_time = time.time()
     feat_frame_count = 0
     for step_num, (chunk_audio, chunk_lengths) in enumerate(streaming_buffer_iter):
-
+        
         logging.info(f"Step ID: {step_num}")
         loop_start_time = time.time()
         with torch.inference_mode():
@@ -198,13 +200,16 @@ def perform_streaming(
                         fifo_last_time=fifo_last_time,
                         left_offset=left_offset,
                         right_offset=right_offset,
+                        att_context_size=cfg.att_context_size,
                         pad_and_drop_preencoded=False,
                         binary_diar_preds=cfg.binary_diar_preds,
                         n_mix=cfg.mix,
+                        vad=cfg.get("vad", False),
+                        rttm=rttm[:step_num*14+14].unsqueeze(0).to(asr_model.device) if rttm is not None else None
                     )
-        
+
         if debug_mode:
-            logging.info(f"Streaming transcriptions: {extract_transcriptions(transcribed_texts)}")
+            logging.info(f"Streaming transcriptions: {extract_transcriptions(previous_hypotheses)}")
         
         loop_end_time = time.time()
         feat_frame_count += (chunk_audio.shape[-1] - cfg.discarded_frames)
@@ -216,9 +221,12 @@ def perform_streaming(
             time.sleep(max(0, (chunk_audio.shape[-1] - cfg.discarded_frames)*cfg.feat_len_sec - 
                            (loop_end_time - loop_start_time) - time_diff * cfg.finetune_realtime_ratio))
     
-    final_streaming_tran = extract_transcriptions(transcribed_texts)
+    final_streaming_tran = extract_transcriptions(previous_hypotheses)
+    # torch.save(diar_pred_out_stream, "diar_pred_out_stream.pt")
+    if rttm is not None:
+        diar_pred_out_stream = rttm
     
-    return final_streaming_tran, final_offline_tran
+    return final_streaming_tran, final_offline_tran, diar_pred_out_stream
 
 
 @hydra_runner(config_name="DiarizationConfig", schema=DiarizationConfig)
@@ -367,7 +375,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         processed_signal, processed_signal_length, stream_id = streaming_buffer.append_audio_file(
             args.audio_file, stream_id=-1
         )
-        streaming_tran, offline_tran = perform_streaming(
+        streaming_tran, offline_tran, diar_pred_out_stream = perform_streaming(
             cfg=cfg,
             asr_model=asr_model,
             diar_model=diar_model,
@@ -378,11 +386,20 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         samples = []
         all_refs_text = []
 
+
         with open(args.manifest_file, 'r') as f:
             for line in f:
                 item = json.loads(line)
-                item['duration'] = None
+                # item['duration'] = None
                 samples.append(item)
+                if cfg.spk_supervision == "rttm":
+                    with open(samples[-1]['rttm_filepath'], 'r') as f:
+                        rttm_lines = f.readlines()
+                    rttm_timestamps, sess_to_global_spkids = extract_frame_info_from_rttm(0, samples[-1]['duration'], rttm_lines)
+                    samples[-1]['rttm'] = get_frame_targets_from_rttm(rttm_timestamps, 0, samples[-1]['duration'], 3, 12.5, 4)
+                else:
+                    samples[-1]['rttm'] = None
+                samples[-1]['duration'] = None
 
         # Override batch size: The batch size should be equal to the number of samples in the manifest file
         # args.batch_size = 1
@@ -390,6 +407,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
 
         start_time = time.time()
         all_streaming_tran = []
+        all_diar_pred_out_stream = []
         streaming_buffer = CacheAwareStreamingAudioBuffer(
             model=asr_model,
             online_normalization=online_normalization,
@@ -406,21 +424,26 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
 
             if (sample_idx + 1) % args.batch_size == 0 or sample_idx == len(samples) - 1:
                 logging.info(f"Starting to stream samples {sample_idx - len(streaming_buffer) + 1} to {sample_idx}...")
-                streaming_tran, offline_tran = perform_streaming(
+                streaming_tran, offline_tran, diar_pred_out_stream = perform_streaming(
                     cfg=cfg,
                     asr_model=asr_model,
                     diar_model=diar_model,
                     streaming_buffer=streaming_buffer,
+                    rttm=sample['rttm'],
                 )
                 all_streaming_tran.extend(streaming_tran)
+                all_diar_pred_out_stream.append(diar_pred_out_stream)
                 streaming_buffer.reset_buffer()
-                
-        if args.output_path is not None:
+        
 
+        if args.output_path is not None:
+            torch.save(all_diar_pred_out_stream, args.output_path.replace('.json', '_diar_pred_out_stream.pt'))
             hyp_json = args.output_path
             records = []
             
             for i, hyp in enumerate(all_streaming_tran):
+                if hyp == "" or hyp is None:
+                    continue
                 idx = i // args.mix
                 mod = i % args.mix
                 audio_filepath = samples[idx]["audio_filepath"]

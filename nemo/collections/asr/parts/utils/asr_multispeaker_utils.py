@@ -1455,7 +1455,6 @@ def speaker_to_target(
                 seg.duration -= seg.end - cut.duration
             seg.start += offsets[i]
             segments_total.append(seg)
-    
     # apply arrival time sorting to the existing segments
     segments_total.sort(key = lambda rttm_sup: rttm_sup.start)
 
@@ -1483,7 +1482,6 @@ def speaker_to_target(
         mask = soft_mask
     else:
         mask = (soft_mask > soft_thres).float()
-
     return mask
 
 class MultiSpeakerMixtureGenerator():
@@ -1624,12 +1622,13 @@ class MultiSpeakerMixtureGenerator():
 
         tracks = []
         offset = 0.0
-        for mono_cut in mono_cuts:
+        for speaker_id, mono_cut in zip(sampled_speaker_ids, mono_cuts):
             custom = {
                     'pnc': 'no',
                     'source_lang': 'en',
                     'target_lang': 'en',
-                    'task': 'asr'
+                    'task': 'asr',
+                    'speaker_id': speaker_id,
                 }
             mono_cut.custom.update(custom)
             tracks.append(MixTrack(cut=deepcopy(mono_cut), type=type(mono_cut), offset=offset))
