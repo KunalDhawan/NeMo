@@ -32,7 +32,7 @@ from lhotse import SupervisionSet, SupervisionSegment, dill_enabled, AudioSource
 from lhotse.utils import uuid4, compute_num_samples, ifnone
 from lhotse.lazy import LazyIteratorChain, LazyJsonlIterator
 from nemo.collections.asr.data.data_simulation import MultiSpeakerSimulator
-
+from nemo.collections.asr.parts.utils.data_simulation_utils import read_rir_manifest
 from typing import Optional, Union, List, Tuple, Dict, Any
 
 from omegaconf import OmegaConf
@@ -43,8 +43,8 @@ import soundfile as sf
 import os
 @dataclass
 class SessionConfig:
-    num_speakers: int = 2
-    num_sessions: int = 10
+    num_speakers: int = 1
+    num_sessions: int = 1
     session_length: int = 15
 
 @dataclass
@@ -77,7 +77,7 @@ class SessionParams:
     min_volume: float = 0.75
     max_volume: float = 1.25
     end_buffer: float = 0.5
-    random_offset: bool = False
+    random_offset: bool = True
 
 @dataclass
 class OutputConfig:
@@ -88,8 +88,9 @@ class OutputConfig:
 
 @dataclass
 class BackgroundNoise:
-    add_bg: bool = False
+    add_bg: bool = True
     background_manifest: Optional[str] = None
+    rir_manifest: Optional[str] = None
     num_noise_files: int = 10
     snr: int = 60
     snr_min: Optional[float] = None
@@ -1491,8 +1492,9 @@ class MultiSpeakerMixtureGenerator():
     """
     def __init__(
         self, 
-        manifest_filepath, 
-        num_speakers, 
+        manifest_filepath,
+        rir_manifest,
+        background_manifest,
         simulator_type,
         min_delay=0.5,
         outputs=None,
@@ -1517,11 +1519,14 @@ class MultiSpeakerMixtureGenerator():
         """
         self.manifest_filepath = manifest_filepath 
         self.manifests = LazyJsonlIterator(manifest_filepath)
+        self.background_manifest = background_manifest
+        self.rir_manifest = read_rir_manifest(rir_manifest=rir_manifest)
+
         self.min_delay = min_delay
-        self.num_speakers = num_speakers
         self.simulator_type = simulator_type
         self.outputs = outputs
         self.session_config = session_config
+        self.max_speakers = 8
 
         self.spk2manifests = groupby(lambda x: x["speaker_id"], self.manifests)
         self.speaker_ids = list(self.spk2manifests.keys())
@@ -1542,6 +1547,15 @@ class MultiSpeakerMixtureGenerator():
     def __next__(self):
         return self.simulator()
 
+    def _get_custom_dict(self, speaker_id=None):
+        custom = {
+            'pnc': 'no',
+            'source_lang': 'en',
+            'target_lang': 'en',
+            'task': 'asr',
+            'speaker_id': speaker_id,
+        }
+        return custom
 
     def AudioMixtureSimulator(self):
         """
@@ -1554,47 +1568,72 @@ class MultiSpeakerMixtureGenerator():
         cfg.data_simulator.session_config.num_sessions = self.session_config.num_sessions
         cfg.data_simulator.session_config.num_speakers = self.session_config.num_speakers
         cfg.data_simulator.session_config.session_length = self.session_config.session_length
+        cfg.data_simulator.background_noise.background_manifest = self.background_manifest
+        
+        # cfg.data_simulator.background_noise.rir_manifest = self.rir_manifest
         simulator = MultiSpeakerSimulator(cfg=cfg)
         # set_start_method('spawn', force=True)
         # simulator.generate_sessions()
         # mixed_cut 
         manifest_json_list, uniq_id, mix_array = simulator.generate_single_session()
+        noise_json_list = simulator.annotator.annote_lists['noise']
 
+        # load RIR
+        reverb_rir =  Recording.from_file(self.rir_manifest[0]['audio_filepath'])
+
+        # Speech Cuts added
         mono_cuts = []
-        # for speaker_id in sampled_speaker_ids:
-        #     manifest = random.choice(self.spk2manifests[speaker_id])
         for manifest in manifest_json_list:
             mono_cuts.append(self.json_to_cut(manifest))
 
-        tracks = []
+        speaker_tracks = {}
         for cut_idx, mono_cut in enumerate(mono_cuts):
-            custom = {
-                    'pnc': 'no',
-                    'source_lang': 'en',
-                    'target_lang': 'en',
-                    'task': 'asr'
-                }
-            mono_cut.custom.update(custom)
-            # temp_cut = deepcopy(mono_cut) # MixTrack(cut=deepcopy(mono_cut), type=type(mono_cut), offset=mono_cut.custom['mixed_cut_offset'])
-            # temp_cut.duration = manifest_json_list[cut_idx]['duration']
-            # tracks.append(MixTrack(cut=deepcopy(temp_cut), type=type(mono_cut), offset=mono_cut.custom['mixed_cut_offset']))
-            tracks.append(MixTrack(cut=deepcopy(mono_cut), type=type(mono_cut), offset=mono_cut.custom['mixed_cut_offset']))
-    
-        # mixed_cut = MixedCut(id='lsmix_' + '_'.join([track.cut.id for track in tracks]) + '_' + str(uuid4()), tracks=tracks)
-        mixed_cut = MixedCut(id=uniq_id, tracks=tracks)
-        bs_true = speaker_to_target(mixed_cut, boundary_segments=True, is_audio_mix_sim=True)
-        bs_false = speaker_to_target(mixed_cut, boundary_segments=False, is_audio_mix_sim=True)
-        save_numpy_array_as_png(bs_true, "/home/taejinp/Downloads/lhotse_sup_boundary/bs_true.png")
-        save_numpy_array_as_png(bs_false, "/home/taejinp/Downloads/lhotse_sup_boundary/bs_false.png")
+            speaker_id=mono_cut.custom['speaker_id']
+            mono_cut.custom.update(self._get_custom_dict(speaker_id=speaker_id))
+            if speaker_id == '251':
+                mono_cut = mono_cut.reverb_rir(reverb_rir)
+            mix_track = MixTrack(cut=deepcopy(mono_cut), 
+                                 type=type(mono_cut), 
+                                 offset=mono_cut.custom['mixed_cut_offset']
+                                )
+            if speaker_id not in speaker_tracks:
+                speaker_tracks[speaker_id] = [mix_track]
+            else:
+                speaker_tracks[speaker_id].append(mix_track)
+
+        # Noise Cuts added
+        noise_cuts = []
+        for noise_manifest in noise_json_list:
+            noise_cuts.append(self.json_to_cut(noise_manifest))
+        
+        noise_tracks = []
+        for noise_cut in noise_cuts:
+            noise_cut.custom.update(self._get_custom_dict())
+            noise_tracks.append(MixTrack(cut=deepcopy(noise_cut), type=type(noise_cut), offset=noise_cut.custom['mixed_cut_offset']))
+
+        # Merge all speaker tracks into a list 
+        all_spk_tracks = []
+        for spk_id, tracks in speaker_tracks.items():
+            all_spk_tracks.extend(tracks)
+
+        # mixed_cut = MixedCut(id=uniq_id, tracks=tracks)
+        mixed_noisy_cut = MixedCut(id=uniq_id, tracks=all_spk_tracks + noise_tracks)
+
+
+        # bs_true = speaker_to_target(mixed_cut, boundary_segments=True, is_audio_mix_sim=True)
+        # bs_false = speaker_to_target(mixed_cut, boundary_segments=False, is_audio_mix_sim=True)
+        # save_numpy_array_as_png(bs_true, "/home/taejinp/Downloads/lhotse_sup_boundary/bs_true.png")
+        # save_numpy_array_as_png(bs_false, "/home/taejinp/Downloads/lhotse_sup_boundary/bs_false.png")
         basepath = "/home/taejinp/Downloads/lhotse_sup_boundary"
-        loaded_audio = mixed_cut.load_audio().squeeze(0)
+        # loaded_audio = mixed_cut.load_audio().squeeze(0)
+        loaded_audio = mixed_noisy_cut.load_audio().squeeze(0)
         mix_array = mix_array.cpu().numpy()
         # Normalize the audio array
         array = mix_array / (np.max(np.abs(mix_array)) + 1e-8)  # Avoid division by zero
 
-        package_path = f"{basepath}/{uniq_id}_test_sttw_va5-2_{self.session_config.num_speakers}spk"
+        package_path = f"{basepath}/{uniq_id}_test_an_rir_v6_ro{str(simulator._params.data_simulator.session_params.random_offset)}_{self.session_config.num_speakers}spk"
         os.makedirs(package_path, exist_ok=True)
-        sf.write(os.path.join(package_path, uniq_id + '.wav'), array, simulator._params.data_simulator.sr)
+        # sf.write(os.path.join(package_path, uniq_id + '.wav'), array, simulator._params.data_simulator.sr)
         sf.write(os.path.join(package_path, uniq_id + '_lhotse.wav'), loaded_audio, simulator._params.data_simulator.sr)
 
         simulator.annotator.write_annotation_rttm_and_ctm(
@@ -1651,10 +1690,8 @@ class MultiSpeakerMixtureGenerator():
         audio_path = json_dict["audio_filepath"]
         duration = json_dict["duration"]
         offset = json_dict.get("offset", None)
-        if duration == 0.0:
-            import ipdb; ipdb.set_trace()
         cut = self._create_cut(
-            audio_path=audio_path, offset=offset, duration=duration, sampling_rate=json_dict.get("sampling_rate", None)
+            audio_path=audio_path, offset=offset, duration=duration, sampling_rate=json_dict.get("sampling_rate", None),
         )
         # Note that start=0 and not start=offset because supervision's start if relative to the
         # start of the cut; and cut.start is already set to offset
@@ -1666,11 +1703,11 @@ class MultiSpeakerMixtureGenerator():
                 duration=cut.duration,
                 text=json_dict.get("text"),
                 language=json_dict.get("language", "en"),
+                speaker=json_dict.get("speaker_id"),
             )
         )
         cut.custom = json_dict
         cut.duration = duration
-
         return cut
 
     def _create_cut(
@@ -1679,10 +1716,13 @@ class MultiSpeakerMixtureGenerator():
         offset: float,
         duration: float,
         sampling_rate: int | None = None,
+        channel: int = 0,
     ) -> Cut:
         
         recording = self._create_recording(audio_path, duration, sampling_rate)
         cut = recording.to_cut()
+        if isinstance(cut.channel, list) and len(cut.channel) > 1:
+            cut.channel = [channel]
         if offset is not None:
             cut = cut.truncate(offset=offset, duration=duration, preserve_id=True)
             cut.id = f"{cut.id}-{round(offset * 1e2):06d}-{round(duration * 1e2):06d}"

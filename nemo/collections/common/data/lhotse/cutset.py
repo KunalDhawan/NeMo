@@ -600,11 +600,12 @@ def read_multi_speaker_simulator(config: DictConfig) -> tuple[CutSet, bool]:
     multi_speaker_cuts = CutSet(
         MultiSpeakerMixtureGenerator(
             manifest_filepath=config.manifest_filepath,
-            num_speakers=config.num_speakers,
             simulator_type=config.simulator_type,
             min_delay=config.get("min_delay", 0.5),
             outputs=config.get("outputs", None),
             session_config=config.get("session_config", None),
+            background_manifest=config.get("background_manifest", None),
+            rir_manifest=config.get("rir_manifest", None),
         )
     )
 

@@ -318,6 +318,7 @@ def get_background_noise(
     background_noise_snr: float,
     seed: int,
     device: torch.device,
+    sr: float = 16000,
 ):
     """
     Augment with background noise (inserting ambient background noise up to the desired SNR for the full clip).
@@ -343,9 +344,11 @@ def get_background_noise(
         power_array=power_array, snr_min=snr_min, snr_max=snr_max, background_noise_snr=background_noise_snr
     )
     running_len_samples = 0
+    noise_segment_list = []
 
+    last_mixed_cut_offset = 0
+    file_id = np.random.randint(len(noise_samples))
     while running_len_samples < len_array:  # build background audio stream (the same length as the full file)
-        file_id = np.random.randint(len(noise_samples))
         audio_file, sr, audio_manifest = read_audio_from_buffer(
             audio_manifest=noise_samples[file_id],
             buffer_dict=audio_read_buffer_dict,
@@ -353,6 +356,16 @@ def get_background_noise(
             device=device,
             read_subset=False,
         )
+        # noise_segment_list.append(
+        noise_manifest_dict = copy.deepcopy(audio_manifest)
+        noise_manifest_dict['duration'] = float(min(len(audio_file), len_array - running_len_samples-1) / sr)
+        noise_manifest_dict['offset'] = 0 
+        noise_manifest_dict['volume'] = 1.0
+        noise_manifest_dict['mixed_cut_offset'] = last_mixed_cut_offset 
+        last_mixed_cut_offset += noise_manifest_dict['duration']
+
+        noise_segment_list.append(noise_manifest_dict)
+
         if running_len_samples + len(audio_file) < len_array:
             end_audio_file = running_len_samples + len(audio_file)
         else:
@@ -368,7 +381,7 @@ def get_background_noise(
         bg_array[running_len_samples:end_audio_file] = scaled_audio_file
         running_len_samples = end_audio_file
 
-    return bg_array, desired_snr
+    return bg_array, desired_snr, noise_segment_list
 
 
 def get_random_offset_index(
@@ -490,6 +503,25 @@ def read_noise_manifest(add_bg: bool, background_manifest: str):
                 f"Noise manifest file is {background_manifest}. Please provide a valid noise manifest file/list if add_bg=True."
             )
     return noise_manifest
+
+
+def read_rir_manifest(rir_manifest: str):
+    """
+    Read the rir manifest file and sample the rir manifest.
+    """
+    # if isinstance(rir_manifest, str):
+    #     rir_manifest_list = [rir_manifest]
+    # elif isinstance(rir_manifest, list):
+    #     rir_manifest_list = rir_manifest
+    rir_manifest_list = [rir_manifest]
+    rir_loaded_list = []
+    for manifest_file in rir_manifest_list:
+        # try:
+        if os.path.exists(manifest_file):
+            rir_loaded_list.extend(read_manifest(manifest_file))
+        # except:
+        #     import ipdb; ipdb.set_trace()
+    return rir_loaded_list
 
 
 def get_speaker_samples(speaker_ids: List[str], speaker_samples: dict) -> Dict[str, list]:
@@ -660,7 +692,7 @@ class DataAnnotator(object):
         Initialize file writing arguments
         """
         self._file_base_str = "synthetic"
-        self._file_types = ["wav", "rttm", "json", "ctm", "txt", "meta"]
+        self._file_types = ["wav", "rttm", "json", "noise", "ctm", "txt", "meta"]
         self._annotation_types = ["rttm", "json", "ctm"]
 
     def _init_filelist_lists(self):
@@ -717,8 +749,7 @@ class DataAnnotator(object):
                     rttm_list.append(f"{t_stt} {t_end} {speaker_id}")
                     new_start = start + alignments[i] 
                     # new_start = start + alignments[i] - self._params.data_simulator.session_params.split_buffer
-        # if "mister" in words and "swift" in words:
-        #     import ipdb; ipdb.set_trace()
+
         t_stt = round(float(new_start), self._params.data_simulator.outputs.output_precision)
         t_end = round(float(end), self._params.data_simulator.outputs.output_precision)
         rttm_list.append(f"{t_stt} {t_end} {speaker_id}")
@@ -811,7 +842,7 @@ class DataAnnotator(object):
         return arr
 
     def create_new_ctm_entry(
-        self, words: List[str], alignments: List[float], session_name: str, speaker_id: int, start: int
+        self, words: List[str], alignments: List[float], session_name: str, speaker_id: int, start: int, 
     ) -> List[str]:
         """
         Create new CTM entry (to write to output ctm file)
@@ -826,7 +857,7 @@ class DataAnnotator(object):
         Returns:
             arr (list): List of ctm entries
         """
-        arr = []
+        arr, word_and_ts_list = [], []
         start = float(round(start, self._params.data_simulator.outputs.output_precision))
 
         for i in range(len(words)):
@@ -837,11 +868,9 @@ class DataAnnotator(object):
                 prev_align = 0 if i == 0 else alignments[i - 1]
                 align1 = round(float(prev_align + start), self._params.data_simulator.outputs.output_precision)
                 # align1 = round(float(start), self._params.data_simulator.outputs.output_precision)
-                try:
-                    align2 = round(float(alignments[i] - prev_align), self._params.data_simulator.outputs.output_precision)
-                    # align2 = round(float(alignments[i+1] - start), self._params.data_simulator.outputs.output_precision)
-                except:
-                    import ipdb; ipdb.set_trace()
+                align2 = round(float(alignments[i] - prev_align), self._params.data_simulator.outputs.output_precision)
+                # align2 = round(float(alignments[i+1] - start), self._params.data_simulator.outputs.output_precision)
+                end_time = round(align1 + align2, self._params.data_simulator.outputs.output_precision)
                 text = get_ctm_line(
                     source=session_name,
                     channel=1,
@@ -851,9 +880,13 @@ class DataAnnotator(object):
                     conf=None,
                     type_of_token='lex',
                     speaker=speaker_id,
+                    output_precision=self._params.data_simulator.outputs.output_precision,
                 )
+                # if word == "it" and align1 == 3.169:
+                #     import ipdb; ipdb.set_trace()
+                word_and_ts_list.append((word, align1, end_time))
                 arr.append((align1, text))
-        return arr
+        return arr, word_and_ts_list
 
     def add_to_filename_lists(self, basepath: str, filename: str):
         """

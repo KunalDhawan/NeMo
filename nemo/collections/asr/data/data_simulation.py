@@ -43,6 +43,7 @@ from nemo.collections.asr.parts.utils.data_simulation_utils import (
     perturb_audio,
     read_audio_from_buffer,
     read_noise_manifest,
+    read_rir_manifest,
 )
 from nemo.collections.asr.parts.utils.manifest_utils import read_manifest
 from nemo.collections.asr.parts.utils.speaker_utils import get_overlap_range, is_overlap, merge_float_intervals
@@ -574,7 +575,6 @@ class MultiSpeakerSimulator(object):
         window_amount = int(self._params.data_simulator.session_params.window_size * self._params.data_simulator.sr)
         if first_alignment < window_amount:
             window_amount = first_alignment 
-            start_cutoff = 0
 
         return window_amount
 
@@ -593,22 +593,37 @@ class MultiSpeakerSimulator(object):
             window_amount (int): Window length
         """
         window_amount = int(self._params.data_simulator.session_params.window_size * self._params.data_simulator.sr)
-        release_buffer = int(
-            self._params.data_simulator.session_params.release_buffer * self._params.data_simulator.sr
-        )
-
-        if current_sample_cursor + release_buffer > remaining_dur_samples:
+        if current_sample_cursor  > remaining_dur_samples:
             release_buffer = remaining_dur_samples - current_sample_cursor
             window_amount = 0
-        elif current_sample_cursor + window_amount + release_buffer > remaining_dur_samples:
-            window_amount = remaining_dur_samples - current_sample_cursor - release_buffer
+        elif current_sample_cursor + window_amount > remaining_dur_samples:
+            window_amount = remaining_dur_samples - current_sample_cursor
 
-        if remaining_len_audio_file < release_buffer:
-            release_buffer = remaining_len_audio_file
+        if remaining_len_audio_file < 0:
             window_amount = 0
-        elif remaining_len_audio_file < release_buffer + window_amount:
-            window_amount = remaining_len_audio_file - release_buffer
-        return release_buffer, window_amount
+        elif remaining_len_audio_file < window_amount:
+            window_amount = remaining_len_audio_file
+        
+        release_buffer = 0
+        return release_buffer, window_amount 
+
+
+        # release_buffer = int(
+        #     self._params.data_simulator.session_params.release_buffer * self._params.data_simulator.sr
+        # )
+
+        # if current_sample_cursor + release_buffer > remaining_dur_samples:
+        #     release_buffer = remaining_dur_samples - current_sample_cursor
+        #     window_amount = 0
+        # elif current_sample_cursor + window_amount + release_buffer > remaining_dur_samples:
+        #     window_amount = remaining_dur_samples - current_sample_cursor - release_buffer
+
+        # if remaining_len_audio_file < release_buffer:
+        #     release_buffer = remaining_len_audio_file
+        #     window_amount = 0
+        # elif remaining_len_audio_file < release_buffer + window_amount:
+        #     window_amount = remaining_len_audio_file - release_buffer
+        # return release_buffer, window_amount
 
     def _check_missing_speakers(self, num_missing: int = 0):
         """
@@ -635,6 +650,7 @@ class MultiSpeakerSimulator(object):
         max_word_count_in_sentence: int,
         max_samples_in_sentence: int,
         random_offset: bool = False,
+        is_last_word: bool = False,
     ) -> Tuple[int, torch.Tensor]:
         """
         Add audio file to current sentence (up to the desired number of words).
@@ -647,6 +663,8 @@ class MultiSpeakerSimulator(object):
             sentence_word_count (int): Running count for number of words in sentence
             max_word_count_in_sentence (int): Maximum count for number of words in sentence
             max_samples_in_sentence (int): Maximum length for sentence in terms of samples
+            is_last_word (bool): To break the infinite loop in _build_sentence, when remaining duration is
+                                 not enough to add the last word, set is_last_word to True to make an exception.
 
         Returns:
             sentence_word_count+current_word_count (int): Running word count
@@ -684,17 +702,20 @@ class MultiSpeakerSimulator(object):
         # Ensure the desired number of words are added and the length of the output session isn't exceeded
         sentence_samples = len(self._sentence)
 
-        remaining_dur_samples = max_samples_in_sentence - sentence_samples
+        remaining_dur_samples = max(max_samples_in_sentence - sentence_samples, int(0.5 * self._params.data_simulator.sr))
         remaining_duration = max_word_count_in_sentence - sentence_word_count
         prev_dur_samples, dur_samples, curr_dur_samples = 0, 0, 0
         current_word_count = 0
         word_idx = offset_idx
-        word_idx_range = (offset_idx, offset_idx)
+        word_idx_range = (offset_idx, offset_idx-1)
         # start_cutoff = int(audio_manifest['alignments'][offset_idx] * self._params.data_simulator.sr)
         # start_cutoff = int(audio_manifest['offset'] * self._params.data_simulator.sr)
         # start_cutoff = 0 
         silence_count = 0
         added_samples_stt_end = [0, 0]
+        new_added_alignments = []
+
+        # print(f"In _add_file, current_word_count {current_word_count} < remaining_duration {remaining_duration} and dur_samples {dur_samples} < remaining_dur_samples {remaining_dur_samples} and word_idx {word_idx} < len(audio_manifest['words']) {len(audio_manifest['words'])}")
         while (
             current_word_count < remaining_duration
             and dur_samples < remaining_dur_samples
@@ -715,16 +736,18 @@ class MultiSpeakerSimulator(object):
             # dur_samples = int(end_point_sec * self._params.data_simulator.sr)
 
             # check the length of the generated sentence in terms of sample count (int).
-            if curr_dur_samples + dur_samples > remaining_dur_samples:
+            if (not is_last_word) and curr_dur_samples + dur_samples > remaining_dur_samples:
+                print(f"In _add_file, BREAKING !! curr_dur_samples {curr_dur_samples} + dur_samples {dur_samples} > remaining_dur_samples {remaining_dur_samples}")
                 # if the upcoming loop will exceed the remaining sample count, break out of the loop.
                 break
 
             word = audio_manifest['words'][word_idx]
             
-            print(f"random offset {random_offset} word_idx {word_idx} word {word} start_cutoff-sec: {(start_cutoff/16000):.2f}, dur_samples-sec: {dur_samples/16000:.2f}, curr_dur_samples: {curr_dur_samples} audio_manifest['alignments'][word_idx+1]-{end_point_sec:.2f}")
+            # print(f"random offset {random_offset} word_idx {word_idx} word {word} start_cutoff-sec: {(start_cutoff/16000):.2f}, dur_samples-sec: {dur_samples/16000:.2f}, curr_dur_samples: {curr_dur_samples} audio_manifest['alignments'][word_idx+1]-{end_point_sec:.2f}")
 
             # if silence_count > 0:
             if silence_count > 0 or word == "":
+                print(f"In _add_file, BREAKING !! silence_count {silence_count} or word == ''")
                 break
 
             self._words.append(word)
@@ -740,7 +763,10 @@ class MultiSpeakerSimulator(object):
             #     + previous_alignment
             # )
             if len(self._alignments) == 0:
+                # if word_idx == 0:
                 prev_alignment = 0.0
+                # elif word_idx >= 1:
+                #     prev_alignment = audio_manifest['alignments'][word_idx-1]
             else:
                 accumulated_sent_sec = float(sentence_samples * 1.0 / self._params.data_simulator.sr)
                 prev_alignment = max(self._alignments[-1], accumulated_sent_sec)
@@ -749,10 +775,22 @@ class MultiSpeakerSimulator(object):
             #     # if len(self._alignments) == 0:
             #     #     import ipdb; ipdb.set_trace()
             #     import ipdb; ipdb.set_trace()
+
+            # if word == "so":
+            #     import ipdb; ipdb.set_trace()
             self._alignments.append(
                 prev_alignment + word_duration
             )
-            
+
+
+            # new_added_alignments.append(prev_alignment + word_duration)
+            # import ipdb; ipdb.set_trace()
+            if len(new_added_alignments) == 0:
+                new_add_prev_alignment = 0
+            else:
+                new_add_prev_alignment = new_added_alignments[-1]
+
+            new_added_alignments.append(new_add_prev_alignment + word_duration)
             
             # end_timestamp = float(sentence_samples * 1.0 / self._params.data_simulator.sr) - float(start_cutoff * 1.0 / self._params.data_simulator.sr) + audio_manifest['alignments'][word_idx+1]
 
@@ -774,8 +812,6 @@ class MultiSpeakerSimulator(object):
             curr_dur_samples += dur_samples
         
         # if "the" in audio_manifest['words'] and "terran" in audio_manifest['words'] and "public" in audio_manifest['words']:
-        # if "i" in audio_manifest['words'] and "know" in audio_manifest['words']:
-        #     import ipdb; ipdb.set_trace()
         
         # if len(self._alignments) < len(self._text.split()) + 1:
         #     self._alignments.append(end_timestamp)
@@ -790,81 +826,64 @@ class MultiSpeakerSimulator(object):
         # if word == "":
         #     import ipdb; ipdb.set_trace()
         
-        print(f"self._sentence is assigned with shape: {self._sentence.shape}")
+        # print(f"self._sentence is assigned with shape: {self._sentence.shape}")
         # add audio clip up to the final alignment
-        if self._params.data_simulator.session_params.window_type is not None:  # cut off the start of the sentence
-            if start_window_amount > 0:  # include window
-                window = self._get_window(start_window_amount, start=True)
-                self._sentence = self._sentence.to(self._device)
+
+        # if prev_dur_samples > 0:
+        # if True:
+            # import ipdb; ipdb.set_trace()
+        if word_idx_range[0] <= word_idx_range[1]:
+            if self._params.data_simulator.session_params.window_type is not None:  # cut off the start of the sentence
+                if start_window_amount > 0:  # include window
+                    window = self._get_window(start_window_amount, start=True)
+                    self._sentence = self._sentence.to(self._device)
+                    self._sentence = torch.cat(
+                        (
+                            self._sentence,
+                            torch.multiply(audio_file[start_cutoff : start_cutoff + start_window_amount], window),
+                        ),
+                        0,
+                    )
                 self._sentence = torch.cat(
                     (
                         self._sentence,
-                        torch.multiply(audio_file[start_cutoff : start_cutoff + start_window_amount], window),
-                    ),
-                    0,
-                )
-            self._sentence = torch.cat(
-                (
-                    self._sentence,
-                    audio_file[start_cutoff + start_window_amount : start_cutoff + prev_dur_samples],
-                ),
-                0,
-            ).to(self._device)
-
-        else:
-            self._sentence = torch.cat(
-                (self._sentence, audio_file[start_cutoff : start_cutoff + prev_dur_samples]), 0
-            ).to(self._device)
-
-        print(f"After addiing start window amount {start_window_amount} self._sentence is assigned with shape: {self._sentence.shape}")
-        # windowing at the end of the sentence
-        if (
-            word_idx < len(audio_manifest['words'])
-        ) and self._params.data_simulator.session_params.window_type is not None:
-            release_buffer, end_window_amount = self._get_end_buffer_and_window(
-                prev_dur_samples,
-                remaining_dur_samples,
-                len(audio_file[start_cutoff + prev_dur_samples:]),
-            )
-            print(f"Before adding release buffer: {len(self._sentence)/16000:.2f} seconds")
-            if release_buffer > 0:
-                self._sentence = torch.cat(
-                    (
-                        self._sentence,
-                        audio_file[start_cutoff + prev_dur_samples : start_cutoff + prev_dur_samples + release_buffer],
+                        audio_file[start_cutoff + start_window_amount : start_cutoff + prev_dur_samples],
                     ),
                     0,
                 ).to(self._device)
-            print(f"after adding release buffer: {len(self._sentence)/16000:.2f} seconds release_buffer: {release_buffer/16000:.2f} prev_dur_samples {prev_dur_samples/16000:.2f}")
-            if end_window_amount > 0 and len(self._alignments) > 0:  # include window
-            # if False:
-                window = self._get_window(end_window_amount, start=False)
-                sig_start = start_cutoff + prev_dur_samples + release_buffer
-                sig_end = start_cutoff + prev_dur_samples + release_buffer + end_window_amount
-                windowed_audio_file = torch.multiply(audio_file[sig_start:sig_end], window)
-                self._sentence = torch.cat((self._sentence, windowed_audio_file), 0).to(self._device)
-                self._alignments[-1] = float(len(self._sentence) * 1.0 / self._params.data_simulator.sr)
-                # self._sentence = torch.cat((self._sentence, audio_file[sig_start:sig_end]), 0).to(self._device)
 
-            # if end_window_amount > 0:
-            #     if len(self._sentence) >= end_window_amount:  # include window
-            #         window = self._get_window(end_window_amount, start=False)
-            #         sig_start = start_cutoff + prev_dur_samples + release_buffer - end_window_amount
-            #         sig_end = start_cutoff + prev_dur_samples + release_buffer
-            #         # sig_start = start_cutoff + prev_dur_samples 
-            #         # sig_end = start_cutoff + prev_dur_samples + release_buffer
-            #         windowed_audio_file = torch.multiply(audio_file[sig_start:sig_end], window)
-            #         added_samples_stt_end[1] += release_buffer 
-            #         self._sentence = torch.cat((self._sentence[:-end_window_amount], windowed_audio_file), 0).to(self._device)
-            #         print(f" Applied end_window_amount {end_window_amount} loc: sig_start {sig_start/16000:.2f} sig_end {sig_end/16000:.2f} \
-            #                  len(windowed_audio_file): {len(windowed_audio_file)/16000:.2f} seconds") 
-            #     else:
-            #         logging.warning(f"Sentence length {len(self._sentence)} is less than window length {end_window_amount}")
-            # print(f"after adding windowed audio in EWA > 0: length of self._sentence in sec {len(self._sentence)/16000:.2f} seconds end_window_amount: {end_window_amount/16000:.2f}")
+            else:
+                self._sentence = torch.cat(
+                    (self._sentence, audio_file[start_cutoff : start_cutoff + prev_dur_samples]), 0
+                ).to(self._device)
+
+            if (
+                word_idx_range[1] < len(audio_manifest['words'])
+            ) and self._params.data_simulator.session_params.window_type is not None:
+                release_buffer, end_window_amount = self._get_end_buffer_and_window(
+                    prev_dur_samples,
+                    remaining_dur_samples,
+                    len(audio_file[start_cutoff + prev_dur_samples:]),
+                )
+                if is_last_word:
+                    end_window_amount = int(self._params.data_simulator.session_params.window_size * self._params.data_simulator.sr)
+
+                # if "that" in audio_manifest['words'] and "sorrow" in audio_manifest['words'] and word == "be":
+                #     import ipdb; ipdb.set_trace()
+                if end_window_amount > 0 and len(self._alignments) > 0:  # include window
+                    window = self._get_window(end_window_amount, start=False)
+                    sig_start = start_cutoff + prev_dur_samples
+                    sig_end = start_cutoff + prev_dur_samples + end_window_amount
+                    windowed_audio_file = torch.multiply(audio_file[sig_start:sig_end], window)
+                    self._sentence = torch.cat((self._sentence, windowed_audio_file), 0).to(self._device)
+                    self._alignments[-1] = float(len(self._sentence) * 1.0 / self._params.data_simulator.sr)
+                    new_added_alignments[-1] = new_added_alignments[-1] + float(end_window_amount * 1.0 / self._params.data_simulator.sr)
+
+        if "snap" in audio_manifest['words'] and "to" in audio_manifest['words'] and "seek" in audio_manifest['words'] and word == "seek":
+            import ipdb; ipdb.set_trace()
         del audio_file
-        # import ipdb; ipdb.set_trace()
         start_cutoff_sec = float(start_cutoff / self._params.data_simulator.sr)
-        return sentence_word_count + current_word_count, len(self._sentence), word_idx_range, added_samples_stt_end, start_cutoff_sec
+        return sentence_word_count + current_word_count, len(self._sentence), word_idx_range, start_cutoff_sec, new_added_alignments
 
     def _build_sentence(
         self,
@@ -901,12 +920,18 @@ class MultiSpeakerSimulator(object):
 
         # build sentence
         while sentence_word_count < sl and sentence_samples < max_samples_in_sentence:
-            loaded_audio_manifest = load_speaker_sample(
+            # if sentence_word_count >= sl or sentence_samples >= max_samples_in_sentence:
+            #     break
+        # while sentence_samples < max_samples_in_sentence:
+            print(f"====[  LoopCheck ]===== sentence_word_count {sentence_word_count} < sl: {sl} and sentence_samples: {sentence_samples} < max_samples_in_sentence: {max_samples_in_sentence} \
+                  - deficit: {max_samples_in_sentence - sentence_samples}")
+            _loaded_audio_manifest = load_speaker_sample(
                 speaker_wav_align_map=speaker_wav_align_map,
                 speaker_ids=speaker_ids,
                 speaker_turn=speaker_turn,
                 min_alignment_count=self._min_alignment_count,
             )
+            loaded_audio_manifest = deepcopy(_loaded_audio_manifest)
 
             offset_index = get_random_offset_index(
                 audio_manifest=loaded_audio_manifest,
@@ -932,36 +957,47 @@ class MultiSpeakerSimulator(object):
                 if self._params.data_simulator.segment_augmentor.add_seg_aug:
                     audio_file = perturb_audio(audio_file, sr, self.segment_augmentor, device=self._device)
 
-                sentence_word_count, sentence_samples, word_idx_range, added_samples, start_cutoff_sec = self._add_file(
+                is_last_word = (sentence_word_count == sl - 1)
+                sentence_word_count, sentence_samples, word_idx_range, start_cutoff_sec, new_added_alignments = self._add_file(
                     audio_manifest, 
                     audio_file, 
                     sentence_word_count, 
                     sl, 
                     max_samples_in_sentence, 
-                    random_offset=self._params.data_simulator.session_params.random_offset
+                    random_offset=self._params.data_simulator.session_params.random_offset,
+                    is_last_word=is_last_word,
                 )
-                if word_idx_range[0] == word_idx_range[1]:
-                    # There is no more words to add, so break the loop
-                    break
-                else:
-                    source_audio_manifest = deepcopy(loaded_audio_manifest)
-                    source_audio_manifest['words'] = loaded_audio_manifest['words'][word_idx_range[0]:word_idx_range[1]+1]
+                # if word_idx_range[0] == word_idx_range[1]:
+                #     # There is no more words to add, so break the loop
+                #     break
+                # else:
+                if word_idx_range[0] <= word_idx_range[1]:
+                    # if audio_manifest['words'][1] == "so":
+                    #     import ipdb; ipdb.set_trace()
+                    source_audio_manifest = deepcopy(audio_manifest)
+                    source_audio_manifest['words'] = audio_manifest['words'][word_idx_range[0]:word_idx_range[1]+1]
                     source_audio_manifest['text'] = " ".join(source_audio_manifest['words'][word_idx_range[0]:word_idx_range[1]+1])
-                    source_audio_manifest['alignments'] = loaded_audio_manifest['alignments'][word_idx_range[0]:word_idx_range[1]+1]
+                    # source_audio_manifest['alignments'] = audio_manifest['alignments'][word_idx_range[0]:word_idx_range[1]+1]
+                    source_audio_manifest['alignments'] = new_added_alignments
                     source_audio_manifest['start_cutoff'] = start_cutoff_sec
                     # source_audio_manifest['duration'] = max(0, loaded_audio_manifest['alignments'][word_idx_range[1]] - loaded_audio_manifest['alignments'][word_idx_range[0]])
-                #     # source_audio_manifest['duration'] = max(0, loaded_audio_manifest['alignments'][word_idx_range[1]] - loaded_audio_manifest['alignments'][word_idx_range[0]])
-                #     # if len(source_audio_manifest['text']) == 0:
+                    source_audio_manifest['duration'] = audio_manifest['duration']
+                    if 'offset' in audio_manifest:
+                        source_audio_manifest['offset'] = audio_manifest['offset']
+                    else:
+                        source_audio_manifest['offset'] = 0
+                    # source_audio_manifest['duration'] = max(0, loaded_audio_manifest['alignments'][word_idx_range[1]] - loaded_audio_manifest['alignments'][word_idx_range[0]])
+                    # if len(source_audio_manifest['text']) == 0:
                     source_segment_list.append(source_audio_manifest)
-                #     # for idx, _source_audio_manifest in enumerate(source_segment_list):
-                #     #     if "telephone" in _source_audio_manifest["words"] and "line" in _source_audio_manifest['words']:
-                #     #         import ipdb; ipdb.set_trace()
+                # for idx, _source_audio_manifest in enumerate(source_segment_list):
+                #     if "telephone" in _source_audio_manifest["words"] and "line" in _source_audio_manifest['words']:
+                #         import ipdb; ipdb.set_trace()
 
         # if len(source_segment_list) == 0:
         #     return []
         # if "long" in loaded_audio_manifest["words"] and "stained" in loaded_audio_manifest['words']:
         # if "long" in source_audio_manifest["words"] and "stained" in source_audio_manifest['words']:
-        print(f"[_build_sentence][After _add_file loop] _sentence length in second : {len(self._sentence) / self._params.data_simulator.sr:.2f} sec")
+        # print(f"[_build_sentence][After _add_file loop] _sentence length in second : {len(self._sentence) / self._params.data_simulator.sr:.2f} sec")
 
         # per-speaker normalization (accounting for active speaker time)
         # if not self._meta_data_mode and self._params.data_simulator.session_params.normalize and torch.max(torch.abs(self._sentence)) > 0:
@@ -1130,7 +1166,7 @@ class MultiSpeakerSimulator(object):
         end = start + length
         if end > len(array):  # only occurs in enforce mode
             logging.info(f"end time {end} exceeds array length {len(array)}")
-            print(f"end time {end} array length {len(array)} start-{start} length-{length}")
+            # print(f"end time {end} array length {len(array)} start-{start} length-{length}")
             array = torch.nn.functional.pad(array, (0, end - len(array)))
             is_speech = torch.nn.functional.pad(is_speech, (0, end - len(is_speech)))
         array[start:end] += self._sentence
@@ -1235,8 +1271,6 @@ class MultiSpeakerSimulator(object):
                 array=array,
                 is_speech=is_speech,
             )
-            if "pyre" in self._words:
-                import ipdb; ipdb.set_trace()
             # Step 6: Build entries for output files
             new_rttm_entries = self.annotator.create_new_rttm_entry(
                 words=self._words,
@@ -1380,7 +1414,7 @@ class MultiSpeakerSimulator(object):
         self.sampler.get_session_overlap_mean()
 
         while running_len_samples < session_len_samples or enforce:
-            print(f"----- L1360 ===========> Running len sample sec: {running_len_samples / self._params.data_simulator.sr:.2f} session len samples sec : {session_len_samples / self._params.data_simulator.sr:.2f}")
+            # print(f"----- L1360 ===========> Running len sample sec: {running_len_samples / self._params.data_simulator.sr:.2f} session len samples sec : {session_len_samples / self._params.data_simulator.sr:.2f}")
             
             
             # Step 1: Prepare parameters for sentence generation
@@ -1422,13 +1456,7 @@ class MultiSpeakerSimulator(object):
             )
             # if len(source_segment_list) == 13:
             #     import ipdb; ipdb.set_trace()
- 
-            mixed_cut_offset = start/self._params.data_simulator.sr
-            # for idx in range(len(source_segment_list)):
-            for source_segment_dict in source_segment_list:
-                source_segment_dict['mixed_cut_offset'] = mixed_cut_offset
-                mixed_cut_offset += source_segment_list[idx]['duration']
-            
+  
             # step 5: add sentence to array
             array, is_speech, end = self._add_sentence_to_array(
                 start=start,
@@ -1445,9 +1473,7 @@ class MultiSpeakerSimulator(object):
                 end=end / self._params.data_simulator.sr,
                 speaker_id=speaker_ids[speaker_turn],
             )
-            # for kdx, source_seg_dict in enumerate(source_segment_list):
-            #     if "down" in source_seg_dict['words'] or "below" in source_seg_dict['words']:
-            #         import ipdb; ipdb.set_trace()
+
             # print(f"[_generate_only_session_metainfo] new_rttm_entries: {new_rttm_entries}")
             # print(f"[_generate_only_session_metainfo] RTTM duration {(float(new_rttm_entries[0].split()[1]) - float(new_rttm_entries[0].split()[0])):.2f} sec")
             # sum_dur = 0
@@ -1455,6 +1481,18 @@ class MultiSpeakerSimulator(object):
             #     sum_dur += source_segment['duration']
             #     print(f"[_generate_only_session_metainfo] List of Alignment : {[ round(x, 2) for x in source_segment['alignments']]}")
             # print(f"[_generate_only_session_metainfo] Alignment Duration: {sum_dur:.2f} sec sum of {len(source_segment_list)} sources")
+            
+            mixed_cut_offset = start/self._params.data_simulator.sr
+            # for idx in range(len(source_segment_list)):
+            for idx, source_segment_dict in enumerate(source_segment_list):
+                source_segment_dict['mixed_cut_offset'] = mixed_cut_offset
+                dur = source_segment_dict['alignments'][-1] 
+                # + self._params.data_simulator.session_params.window_size
+                source_segment_dict['duration'] = dur
+                source_segment_dict['offset'] = source_segment_dict['start_cutoff'] + source_segment_dict['offset']
+                mixed_cut_offset += dur
+
+
             self.annotator.annote_lists['rttm'].extend(new_rttm_entries)
             # segment_json_entry = self.annotator.create_new_json_entry(
             #     text=self._text,
@@ -1465,13 +1503,8 @@ class MultiSpeakerSimulator(object):
             #     rttm_filepath=os.path.join(basepath, filename + '.rttm'),
             #     ctm_filepath=os.path.join(basepath, filename + '.ctm'),
             # )
-            for source_segment_dict in source_segment_list:
-                print(f" Source Segment List lines: {len(source_segment_list)}")
             
-            self.annotator.annote_lists['json'].extend(source_segment_list)
-            # self.annotator.annote_lists['json'].append(source_segment_dict)
-            
-            new_ctm_entries = self.annotator.create_new_ctm_entry(
+            new_ctm_entries, word_and_ts_list = self.annotator.create_new_ctm_entry(
                 words=self._words,
                 alignments=self._alignments,
                 session_name=filename,
@@ -1479,6 +1512,28 @@ class MultiSpeakerSimulator(object):
                 start=float(start / self._params.data_simulator.sr),
             )
 
+            total_word_count = 0
+            for kdx, source_seg_dict in enumerate(source_segment_list):
+            # for source_seg_dict in source_segment_list:
+                seg_word_count = len(source_seg_dict['words'])
+                stt_index = total_word_count
+                end_index = stt_index + seg_word_count
+                stt_time = word_and_ts_list[stt_index][1]
+                end_time = word_and_ts_list[end_index - 1][2]
+                dur_time = end_time - stt_time
+                if abs(dur_time - source_seg_dict['duration']) > 0.01:
+                    print(f" Source Segment List lines: {source_seg_dict['words']}")
+                    print(f" Mismatch in duration: dur_time - {dur_time} != sourc seg dict {source_seg_dict['duration']}")
+                    raise ValueError(f" Error, Mismatch in duration: dur_time - {dur_time} != sourc seg dict {source_seg_dict['duration']}")
+                    # import ipdb; ipdb.set_trace()
+
+                # if len(new_ctm_entries) > 56:
+                #     import ipdb; ipdb.set_trace()
+                total_word_count += seg_word_count
+
+            # if total_word_count != len(new_ctm_entries):
+            # if total_word_count > 59:
+            #     import ipdb; ipdb.set_trace()
             # new_ctm_entries = self.annotator.create_new_ctm_entry(
             # new_ctm_entries = self.annotator.create_ctm_entry_from_segment_list(
             #     source_segment_list=source_segment_list,
@@ -1487,6 +1542,32 @@ class MultiSpeakerSimulator(object):
             #     start=float(start / self._params.data_simulator.sr),
             # )
             self.annotator.annote_lists['ctm'].extend(new_ctm_entries)
+            
+            
+            # if len(new_ctm_entries) != len(new_rttm_entries):
+            if True:
+                print(f" =======[ LOOK! ]========> len(source_segment_list) != len(new_rttm_entries) {len(source_segment_list)} != {len(new_rttm_entries)}")
+                rttm_end_time = float(new_rttm_entries[-1].split()[1])
+                for stt_time, ctm_string in new_ctm_entries:
+                    # segment_end = source_segment_dict['mixed_cut_offset'] + source_segment_dict['segment_duration']
+                    start, dur = float(ctm_string.split()[2]), float(ctm_string.split()[3])
+                    segment_end = start + dur
+                if abs(segment_end - rttm_end_time) > 0.01:
+                    print(f" RTTM start, end time: {new_rttm_entries[-1]}")
+                    print(f" CTM line string: {ctm_string}")
+                    print(f" CTM Segment end time {segment_end} does not match RTTM end time {rttm_end_time}")
+                    raise ValueError(f" Error, RTTM start, end time: {new_rttm_entries[-1]}")
+                    # import ipdb; ipdb.set_trace()
+                # if len(new_ctm_entries) > 6:
+                #     import ipdb; ipdb.set_trace()
+
+            # for source_segment_dict in source_segment_list:
+            #     print(f" Source Segment List lines: {len(source_segment_list)}")
+            
+
+
+            self.annotator.annote_lists['json'].extend(source_segment_list)
+            # self.annotator.annote_lists['json'].append(source_segment_dict)
 
             running_len_samples = np.maximum(running_len_samples, end)
             (
@@ -1499,6 +1580,29 @@ class MultiSpeakerSimulator(object):
             self._furthest_sample[speaker_turn] = running_len_samples
             prev_speaker = speaker_turn
             prev_len_samples = length
+
+        # Step 7-2: Additive background noise from noise manifest files
+        if self._params.data_simulator.background_noise.add_bg:
+            if len(self._noise_samples) > 0:
+                avg_power_array = torch.mean(array[is_speech == 1] ** 2)
+                bg, snr, noise_segment_list = get_background_noise(
+                    len_array=len(array),
+                    power_array=avg_power_array,
+                    noise_samples=self._noise_samples,
+                    audio_read_buffer_dict=self._audio_read_buffer_dict,
+                    snr_min=self._params.data_simulator.background_noise.snr_min,
+                    snr_max=self._params.data_simulator.background_noise.snr_max,
+                    background_noise_snr=self._params.data_simulator.background_noise.snr,
+                    seed=(random_seed + idx),
+                    device=self._device,
+                    sr=self._params.data_simulator.sr,
+                )
+                array += bg
+                self.annotator.annote_lists['noise'].extend(noise_segment_list)
+            else:
+                raise ValueError('No background noise samples found in self._noise_samples.')
+        else:
+            snr = "N/A"
 
         # Step 8: Clean up memory
         # del array
