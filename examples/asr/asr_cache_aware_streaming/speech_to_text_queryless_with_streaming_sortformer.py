@@ -162,7 +162,11 @@ def perform_streaming(
     previous_hypotheses = [Hypothesis(score=0, y_sequence=[]) for i in range(cfg.mix)]
     streaming_buffer_iter = iter(streaming_buffer)
     asr_pred_out_stream, diar_pred_out_stream  = [torch.tensor([]) for i in range(cfg.mix)], None
-    mem_last_time, fifo_last_time = None, None
+    streaming_state = diar_model.sortformer_modules.init_streaming_state(
+            batch_size = cfg.batch_size,
+            async_streaming = True,
+            device = diar_model.device
+        )
     left_offset, right_offset = 0, 0
 
     multispk_asr_streamer = SpeakerTaggedASR(cfg, asr_model, diar_model)
@@ -183,8 +187,7 @@ def perform_streaming(
                     cache_last_time,
                     cache_last_channel_len,
                     previous_hypotheses,
-                    mem_last_time,
-                    fifo_last_time,
+                    streaming_state,
                     diar_pred_out_stream) = multispk_asr_streamer.perform_queryless_streaming_stt_spk(
                         step_num=step_num,
                         chunk_audio=chunk_audio,
@@ -196,8 +199,7 @@ def perform_streaming(
                         previous_hypotheses=previous_hypotheses,
                         asr_pred_out_stream=asr_pred_out_stream,
                         diar_pred_out_stream=diar_pred_out_stream,
-                        mem_last_time=mem_last_time,
-                        fifo_last_time=fifo_last_time,
+                        streaming_state=streaming_state,
                         left_offset=left_offset,
                         right_offset=right_offset,
                         att_context_size=cfg.att_context_size,
@@ -304,11 +306,11 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
 
     if args.asr_model.endswith('.nemo'):
         logging.info(f"Using local ASR model from {args.asr_model}")
-        model_cfg = nemo_asr.models.ASRModel.restore_from(restore_path=cfg.asr_model, return_config=True)
-        model_cfg.diar_model_path = cfg.diar_model_path
+        model_cfg = nemo_asr.models.EncDecRNNTBPEQLTSASRModel.restore_from(restore_path=cfg.asr_model, return_config=True)
+        # model_cfg.diar_model_path = cfg.diar_model_path
         model_cfg.spk_supervision = cfg.spk_supervision
         model_cfg.binary_diar_preds = cfg.binary_diar_preds
-        asr_model = nemo_asr.models.ASRModel.restore_from(restore_path=cfg.asr_model, override_config_path=model_cfg)
+        asr_model = nemo_asr.models.EncDecRNNTBPEQLTSASRModel.restore_from(restore_path=cfg.asr_model, override_config_path=model_cfg)
     else:
         logging.info(f"Using NGC cloud ASR model {args.asr_model}")
         asr_model = nemo_asr.models.ASRModel.from_pretrained(model_name=args.asr_model)
@@ -400,6 +402,8 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
                 else:
                     samples[-1]['rttm'] = None
                 samples[-1]['duration'] = None
+                if 'offset' not in item:
+                    samples[-1]['offset'] = 0
 
         # Override batch size: The batch size should be equal to the number of samples in the manifest file
         # args.batch_size = 1
@@ -414,7 +418,6 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
             pad_and_drop_preencoded=args.pad_and_drop_preencoded,
         )
         for sample_idx, sample in enumerate(samples):
-            
             processed_signal, processed_signal_length, stream_id = streaming_buffer.append_audio_file(
                 sample['audio_filepath'], offset=sample['offset'], duration=sample['duration'], stream_id=-1
             )
