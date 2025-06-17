@@ -185,6 +185,9 @@ class FrameBatchASR_tgt_spk:
         self.separater_audio = separater_audio
         if query_duration > 0:
             query_samples = self.get_partial_samples(query_audio_file, query_offset, query_duration)
+            ref_samples = self.get_partial_samples('/home/jinhanw/Dataset/riva/segments/speakers/maynd4qi1kQ_speaker_1.wav', 0, 3)
+            silence_separater = get_separator_audio(0, self.asr_model._cfg.sample_rate, 1, 0.5)
+            # query_samples = np.concatenate([query_samples, separater_audio, ref_samples, silence_separater])
             query_samples = np.concatenate([query_samples, separater_audio])
         else:
             query_samples = separater_audio
@@ -203,7 +206,7 @@ class FrameBatchASR_tgt_spk:
         # self.num_tailing_silence = 
         if self.diar_model_streaming_mode:
             #cache contains query + separater --> query
-            self.asr_model.diarization_model.sortformer_modules.spkcache_len = self.query_pred_len
+            self.asr_model.diarization_model.sortformer_modules.spkcache_len = self.query_pred_len # * 4
             self.asr_model.diarization_model.sortformer_modules.spkcache_len_audio = int(self.asr_model.diarization_model.sortformer_modules.spkcache_len / 12.5 * 16000)
             self.asr_model.diarization_model.sortformer_modules.spkcache_refresh_rate = self.query_pred_len
         if self.initial_final_buffer:
@@ -241,7 +244,7 @@ class FrameBatchASR_tgt_spk:
             if self.initial_final_buffer:
                 if self.temp_buffer == self.num_buffer:
                     #final buffer
-                    final_buffer =True
+                    final_buffer =False
                 else:
                     final_buffer = False
                 if self.temp_buffer < self.num_buffer_w_leading_silence:
@@ -252,18 +255,26 @@ class FrameBatchASR_tgt_spk:
                 initial_buffer, final_buffer = False, False
 
 
+
             if initial_buffer:
                 orig_feat_len = feat_signal_len[0].clone()
                 valid_feat_len = int(self.frame_bufferer.feature_frame_len * (self.temp_buffer + 1))
                 # temp_pad_len = int(self.frame_bufferer.feature_buffer_len - self.frame_bufferer.feature_frame_len - self.temp_buffer * self.frame_bufferer.feature_frame_len)
                 temp_pad_len = int(orig_feat_len - valid_feat_len - self.frame_bufferer.frame_reader.query_audio_signal_len[0])
-                feat_signal[0] = torch.nn.functional.pad(
-                    torch.cat([feat_signal[0][:int(self.frame_bufferer.frame_reader.query_audio_signal_len[0])], feat_signal[0][-valid_feat_len:]]), 
-                    (0, temp_pad_len)
-                )
-                feat_signal_len[0] = feat_signal_len[0] - temp_pad_len
+                # feat_signal[0] = torch.nn.functional.pad(
+                #     torch.cat([feat_signal[0][:int(self.frame_bufferer.frame_reader.query_audio_signal_len[0])], feat_signal[0][-valid_feat_len:]]), 
+                #     (0, temp_pad_len)
+                # )
+                # feat_signal_len[0] = feat_signal_len[0] - temp_pad_len
+                until_silence = int(orig_feat_len - valid_feat_len) - 16000
+                pure_query = self.frame_bufferer.frame_reader.query_audio_signal[:,:-16000]
+                reps = (until_silence + pure_query.shape[1] - 1) // pure_query.shape[1]
+                new_query_audio = torch.tile(pure_query, (1, reps))[:,:until_silence]
+                feat_signal[0] = torch.cat([new_query_audio[0], self.frame_bufferer.frame_reader.query_audio_signal[0,-16000:], feat_signal[0, -valid_feat_len:].to(device)])
+
             if final_buffer:
                 feat_signal_len[-1] = feat_signal_len[-1] - self.pad_len
+
 
 
             feat_signal, feat_signal_len = feat_signal.to(device), feat_signal_len.to(device)
@@ -554,11 +565,11 @@ class FrameBatchASR_tgt_spk:
                         pickle.dump(self.asr_model.diarization_model.spkcache_fifo_chunk_preds, f)
                         print('\n')
                     if self.sortformer_loader_level == 'emb':
-                        print(self.asr_model.streaming_state.fifo.shape)
-                        print(self.asr_model.streaming_state.spkcache.shape)
+                        print('spkcache shape: ', self.asr_model.streaming_state.spkcache.shape)
+                        print('fifo shape: ', self.asr_model.streaming_state.fifo.shape)
                     elif self.sortformer_loader_level == 'audio':
-                        print(self.asr_model.streaming_state.fifo_audio.shape)
-                        print(self.asr_model.streaming_state.spkcache_audio.shape)
+                        print('fifo_audio shape: ', self.asr_model.streaming_state.fifo_audio.shape)
+                        print('spkcache_audio shape: ', self.asr_model.streaming_state.spkcache_audio.shape)
                 if self.dynamic_query:
 
                     with open(os.path.join(parent_dir, 'new_query.pickle'), 'wb') as f:

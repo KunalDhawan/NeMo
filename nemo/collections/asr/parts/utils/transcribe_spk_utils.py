@@ -414,7 +414,10 @@ def setup_model(cfg: DictConfig, map_location: torch.device) -> Tuple[ASRModel, 
             self_attention_model=cfg.model_change.conformer.get("self_attention_model", None),
             att_context_size=cfg.model_change.conformer.get("att_context_size", None),
         )
-
+    if cfg.get('use_titanet_on_diar_model', False):
+        asr_model._init_titanet_model(cfg.get("titanet_same_speaker_threshold", 0.6))
+    else:
+        asr_model.use_titanet_on_diar_model = False
     return asr_model, model_name
 
 

@@ -43,7 +43,9 @@ import math
 from nemo.collections.asr.parts.utils.asr_multispeaker_utils import get_hidden_length_from_sample_length
 from lhotse.dataset.collation import collate_vectors, collate_matrices
 from tqdm import tqdm
-
+from nemo.collections.asr.models.label_models import EncDecSpeakerLabelModel
+from nemo.collections.asr.parts.utils.speaker_utils import embedding_normalize
+import pickle as pkl
 
 class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
     """Base class for encoder decoder RNNT-based models with auxiliary CTC decoder/loss and subword tokenization."""
@@ -117,6 +119,92 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
         else:
             self.diar = False
 
+    def _init_titanet_model(self, same_speaker_threshold:float=0.6):
+        """
+        Initialize the titanet model.
+        """
+        self.use_titanet_on_diar_model = True
+        self.speaker_model = EncDecSpeakerLabelModel.from_pretrained(model_name='titanet_large')
+        self.speaker_model.eval()
+        self.speaker_model.to(self.device)
+        self.same_speaker_threshold = same_speaker_threshold
+        with open('/home/jinhanw/Dataset/SpeakerRecognition/voxceleb1/voxceleb1_mean_emb.pkl', 'rb') as f:
+            self.all_embs_mean = pkl.load(f)
+
+    def titanet_process(self, diar_preds, signal, normalize = True):
+        # currently only support 3 sec query audio
+        #if there is only one predicted speaker after query, using titanet for a 2nd pass re-scoring
+        after_query_pred = diar_preds[:,38:,:]
+        # Convert predictions to binary activations using 0.5 threshold
+        binary_preds = (after_query_pred > 0.5).float()
+        
+        # For each timestep, count number of active speakers
+        active_spk_per_frame = torch.sum(binary_preds, dim=-1)  # B x len
+        
+        # For frames with any active speaker, check if only 1 speaker
+        has_active = (active_spk_per_frame > 0)  # B x len
+        single_spk = (active_spk_per_frame == 1)  # B x len
+
+        # For frames with single speaker, get which speaker is active for each batch
+        batch_size = binary_preds.shape[0]
+        same_spk = torch.zeros(batch_size, dtype=torch.bool, device=binary_preds.device)
+        
+        for b in range(batch_size):
+            # Get frames with single speaker for this batch
+            batch_single_spk = single_spk[b]  # len
+            if not torch.any(batch_single_spk):
+                continue
+                
+            # Get active speaker indices for single speaker frames
+            batch_single_frames = binary_preds[b, batch_single_spk]  # N x num_speakers
+            batch_active_idx = torch.argmax(batch_single_frames, dim=1)  # N
+            
+            # Check if all single speaker frames have same active speaker
+            if len(batch_active_idx) > 0:
+                same_spk[b] = torch.all(batch_active_idx == batch_active_idx[0])
+        
+        # Update need_titanet to require both conditions
+        need_titanet = torch.logical_and(
+            torch.sum(single_spk.float(), dim=1) / torch.sum(has_active.float(), dim=1) > 0.8,  # Original condition
+            same_spk  # New condition requiring same speaker
+        )  # B
+        
+        # For each sequence, check if ALL active frames have exactly 1 speaker
+        # all_single_spk = torch.logical_or(~has_active, single_spk)  # B x len
+        # need_titanet = torch.sum(single_spk.float(), dim=1) / torch.sum(has_active.float(), dim=1) > 0.8  # B
+        # For batches that need titanet verification
+        for batch_idx in torch.where(need_titanet)[0]:
+            # Get query region (first 3s)
+            query_signal = signal[batch_idx,:48000].unsqueeze(0) # 3s * 16kHz = 48000 samples
+            
+            # Get region after query where there is active speech
+            active_frames = torch.where(has_active[batch_idx])[0]
+            if len(active_frames) > 1:
+                start_sample = int(active_frames[0]  / 12.5 * 16000) # Convert frame index to sample index
+                end_sample = int(active_frames[-1] / 12.5 * 16000) # Add frame_length=160 for last frame
+                target_signal = signal[batch_idx, 48000 + start_sample:48000 + end_sample].unsqueeze(0)
+                _, query_emb = self.speaker_model(query_signal, torch.tensor([48000]).to(self.device))
+                _, target_emb = self.speaker_model(target_signal, torch.tensor([end_sample - start_sample]).to(self.device))
+                all_embs = torch.cat([query_emb, target_emb], dim=0)
+                all_embs = np.asarray(all_embs.detach().cpu())
+                if normalize:
+                    all_embs = all_embs - self.all_embs_mean
+                    all_embs = all_embs / np.expand_dims(np.linalg.norm(all_embs, ord=2, axis=-1), axis=1)
+                X = all_embs[0]
+                Y = all_embs[1]
+                score = np.dot(X, Y) / ((np.dot(X, X) * np.dot(Y, Y)) ** 0.5)
+                score = (score + 1) / 2
+                # print(score)
+                # import ipdb; ipdb.set_trace()
+                # Get embeddings using titanet
+                # Update diar_preds based on similarity score
+                if score > self.same_speaker_threshold:
+                    diar_preds[batch_idx,38 + active_frames[0]:38 + active_frames[-1],0] = 1
+                else:
+                    diar_preds[batch_idx,38 + active_frames[0]:38 + active_frames[-1],0] = 0
+        return diar_preds
+
+
     def _init_diar_model(self):
         """
         Initialize the speaker model.
@@ -141,6 +229,7 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
            self.diarization_model.eval()
         #disable streaming mode for now, activate using _reset_streaming_state if necessary
         self.diarization_model.streaming_mode = False
+    
     def forward_diar(
         self,
         input_signal=None,
@@ -257,7 +346,8 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
                 diar_preds = self._get_probablistic_mix(diar_preds=diar_preds, spk_targets=spk_targets, rttm_mix_prob=float(self.cfg.rttm_mix_prob))
             else:
                 raise ValueError(f"Invalid RTTM strategy {self.cfg.spk_supervision_strategy} is not supported.")
-
+        if self.use_titanet_on_diar_model:
+            diar_preds = self.titanet_process(diar_preds, signal)
         if (isinstance(batch, DALIOutputs) and batch.has_processed_signal) or signal.shape[1] == 80:
             encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
         else:
@@ -658,7 +748,7 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
         #otherwise use sync streaming with batch_size = 1--> mandatory for batchview sample (history matters)
         self.diarization_model.streaming_mode = True
         self.diarization_model.sortformer_modules.chunk_len = 376
-        self.diarization_model.sortformer_modules.fifo_len = 376
+        self.diarization_model.sortformer_modules.fifo_len = 188
         self.query_pred = None
         self.total_preds = torch.zeros((batch_size, 0, 4), device = self.diarization_model.device)
         self.diarization_model.sortformer_modules.chunk_len_audio = int(self.diarization_model.sortformer_modules.chunk_len / 12.5 * 16000)
@@ -765,6 +855,7 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
                     )
         else:
             raise ValueError(f"Invalid RTTM strategy {self.cfg.spk_supervision_strategy} is not supported.")
+        
         if self.query_pred is None:
             self.query_pred = []
             for i in range(signal.size(0)):
@@ -777,7 +868,8 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
             re_aranged_diar_preds = self.diarization_model.spkcache_fifo_chunk_preds
         else:
             if initial_buffer:
-                re_aranged_diar_preds = torch.cat([self.query_pred, self.diarization_model.spkcache_fifo_chunk_preds[:,-get_hidden_length_from_sample_length(chunk_len * (temp_buffer_index + 1), 160, 8):]], dim = 1)
+                # re_aranged_diar_preds = torch.cat([self.query_pred, self.diarization_model.spkcache_fifo_chunk_preds[:,-get_hidden_length_from_sample_length(chunk_len * (temp_buffer_index + 1), 160, 8):]], dim = 1)
+                pass
             else:
                 re_aranged_diar_preds = []
                 for i in range(signal.size(0)):
@@ -788,6 +880,8 @@ class EncDecHybridRNNTCTCTgtSpkBPEModel(EncDecHybridRNNTCTCBPEModel):
         diar_preds = re_aranged_diar_preds
         if self.binarize_diar_preds_threshold:
             diar_preds = torch.where(diar_preds > self.binarize_diar_preds_threshold, torch.tensor(1), torch.tensor(0)).to(signal.device).float()
+        if self.use_titanet_on_diar_model:
+            diar_preds = self.titanet_process(diar_preds, signal)
         self.diar_preds = diar_preds
 
         # if (isinstance(batch, DALIOutputs) and batch.has_processed_signal) or signal.shape[1] == 80:
