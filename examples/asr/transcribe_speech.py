@@ -237,31 +237,36 @@ def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig, List[Hypothesis
     torch.set_float32_matmul_precision(cfg.matmul_precision)
     if cfg.cuda is None:
         if torch.cuda.is_available():
-            device = [0]  # use 0th CUDA device
+            devices = -1  # Use all available GPUs
             accelerator = 'gpu'
-            map_location = torch.device('cuda:0')
+            map_location = torch.device('cpu')  # Load to CPU, let Trainer handle distribution
         elif cfg.allow_mps and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             logging.warning(
                 "MPS device (Apple Silicon M-series GPU) support is experimental."
                 " Env variable `PYTORCH_ENABLE_MPS_FALLBACK=1` should be set in most cases to avoid failures."
             )
-            device = [0]
+            devices = [0]
             accelerator = 'mps'
             map_location = torch.device('mps')
         else:
-            device = 1
+            devices = 1
             accelerator = 'cpu'
             map_location = torch.device('cpu')
     else:
-        device = [cfg.cuda]
-        accelerator = 'gpu'
-        map_location = torch.device(f'cuda:{cfg.cuda}')
+        if cfg.cuda < 0:
+            devices = 1
+            accelerator = 'cpu'
+            map_location = torch.device('cpu')
+        else:
+            devices = [cfg.cuda]
+            accelerator = 'gpu'
+            map_location = torch.device(f'cuda:{cfg.cuda}')
 
-    logging.info(f"Inference will be done on device: {map_location}")
+    logging.info(f"Inference will be done on device(s): {devices} with accelerator: {accelerator}")
 
     asr_model, model_name = setup_model(cfg, map_location)
 
-    trainer = pl.Trainer(devices=device, accelerator=accelerator)
+    trainer = pl.Trainer(devices=devices, accelerator=accelerator)
     asr_model.set_trainer(trainer)
     asr_model = asr_model.eval()
 
@@ -410,7 +415,7 @@ def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig, List[Hypothesis
         logging.info(f"Finished transcribing {len(filepaths)} files !")
     logging.info(f"Writing transcriptions into file: {cfg.output_filename}")
 
-    # if transcriptions form a tuple of (best_hypotheses, all_hypotheses)
+    # if transcripts form a tuple of (best_hypotheses, all_hypotheses)
     if type(transcriptions) == tuple and len(transcriptions) == 2:
         if cfg.extract_nbest:
             # extract all hypotheses if exists

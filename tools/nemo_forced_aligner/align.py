@@ -325,13 +325,14 @@ def main(cfg: AlignmentConfig):
             cfg.simulate_cache_aware_streaming,
             cfg.use_buffered_chunked_streaming,
             buffered_chunk_params,
+            cfg.manifest_filepath
         )
 
         alignments_batch = viterbi_decoding(log_probs_batch, y_batch, T_batch, U_batch, viterbi_device)
 
         for utt_obj, alignment_utt in zip(utt_obj_batch, alignments_batch):
 
-            utt_obj = add_t_start_end_to_utt_obj(utt_obj, alignment_utt, output_timestep_duration)
+            utt_obj = add_t_start_end_to_utt_obj(utt_obj, alignment_utt, output_timestep_duration, offset=2.52)
 
             if "ctm" in cfg.save_output_file_formats:
                 utt_obj = make_ctm_files(utt_obj, cfg.output_dir, cfg.ctm_file_config,)

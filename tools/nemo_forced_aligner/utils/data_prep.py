@@ -585,7 +585,7 @@ def get_utt_obj(
         raise RuntimeError("Cannot get tokens of this model.")
 
 
-def add_t_start_end_to_utt_obj(utt_obj, alignment_utt, output_timestep_duration):
+def add_t_start_end_to_utt_obj(utt_obj, alignment_utt, output_timestep_duration, offset=0):
     """
     Function to add t_start and t_end (representing time in seconds) to the Utterance object utt_obj.
     Args:
@@ -626,48 +626,48 @@ def add_t_start_end_to_utt_obj(utt_obj, alignment_utt, output_timestep_duration)
     for segment_or_token in utt_obj.segments_and_tokens:
         if type(segment_or_token) is Segment:
             segment = segment_or_token
-            segment.t_start = num_to_first_alignment_appearance[segment.s_start] * output_timestep_duration
-            segment.t_end = (num_to_last_alignment_appearance[segment.s_end] + 1) * output_timestep_duration
+            segment.t_start = num_to_first_alignment_appearance[segment.s_start] * output_timestep_duration + offset 
+            segment.t_end = (num_to_last_alignment_appearance[segment.s_end] + 1) * output_timestep_duration + offset
 
             for word_or_token in segment.words_and_tokens:
                 if type(word_or_token) is Word:
                     word = word_or_token
-                    word.t_start = num_to_first_alignment_appearance[word.s_start] * output_timestep_duration
-                    word.t_end = (num_to_last_alignment_appearance[word.s_end] + 1) * output_timestep_duration
+                    word.t_start = num_to_first_alignment_appearance[word.s_start] * output_timestep_duration + offset
+                    word.t_end = (num_to_last_alignment_appearance[word.s_end] + 1) * output_timestep_duration + offset
 
                     for token in word.tokens:
                         if token.s_start in num_to_first_alignment_appearance:
-                            token.t_start = num_to_first_alignment_appearance[token.s_start] * output_timestep_duration
+                            token.t_start = num_to_first_alignment_appearance[token.s_start] * output_timestep_duration + offset
                         else:
                             token.t_start = -1
 
                         if token.s_end in num_to_last_alignment_appearance:
                             token.t_end = (
                                 num_to_last_alignment_appearance[token.s_end] + 1
-                            ) * output_timestep_duration
+                            ) * output_timestep_duration + offset
                         else:
                             token.t_end = -1
                 else:
                     token = word_or_token
                     if token.s_start in num_to_first_alignment_appearance:
-                        token.t_start = num_to_first_alignment_appearance[token.s_start] * output_timestep_duration
+                        token.t_start = num_to_first_alignment_appearance[token.s_start] * output_timestep_duration + offset
                     else:
                         token.t_start = -1
 
                     if token.s_end in num_to_last_alignment_appearance:
-                        token.t_end = (num_to_last_alignment_appearance[token.s_end] + 1) * output_timestep_duration
+                        token.t_end = (num_to_last_alignment_appearance[token.s_end] + 1) * output_timestep_duration + offset
                     else:
                         token.t_end = -1
 
         else:
             token = segment_or_token
             if token.s_start in num_to_first_alignment_appearance:
-                token.t_start = num_to_first_alignment_appearance[token.s_start] * output_timestep_duration
+                token.t_start = num_to_first_alignment_appearance[token.s_start] * output_timestep_duration + offset
             else:
                 token.t_start = -1
 
             if token.s_end in num_to_last_alignment_appearance:
-                token.t_end = (num_to_last_alignment_appearance[token.s_end] + 1) * output_timestep_duration
+                token.t_end = (num_to_last_alignment_appearance[token.s_end] + 1) * output_timestep_duration + offset
             else:
                 token.t_end = -1
 
@@ -684,6 +684,7 @@ def get_batch_variables(
     simulate_cache_aware_streaming=False,
     use_buffered_chunked_streaming=False,
     buffered_chunk_params={},
+    manifest_filepath=None,
 ):
     """
     Returns:
@@ -706,7 +707,7 @@ def get_batch_variables(
     if not use_buffered_chunked_streaming:
         if not simulate_cache_aware_streaming:
             with torch.no_grad():
-                hypotheses = model.transcribe(audio_filepaths_batch, return_hypotheses=True, batch_size=B)
+                hypotheses = model.transcribe(manifest_filepath, return_hypotheses=True, batch_size=B)
         else:
             with torch.no_grad():
                 hypotheses = model.transcribe_simulate_cache_aware_streaming(
@@ -753,7 +754,7 @@ def get_batch_variables(
             audio_filepaths_batch[i_line],
             _get_utt_id(audio_filepaths_batch[i_line], audio_filepath_parts_in_utt_id),
         )
-
+        import ipdb; ipdb.set_trace()
         # update utt_obj.pred_text or utt_obj.text
         if align_using_pred_text:
             utt_obj.pred_text = pred_text_batch[i_line]
@@ -815,9 +816,10 @@ def get_batch_variables(
                 "Don't have attribute 'sample_rate' in 'model.cfg.preprocessor' => cannot calculate start "
                 " and end time of segments => stopping process"
             )
-
+        manifest = json.load(open(manifest_filepath))
         with sf.SoundFile(audio_filepaths_batch[0]) as f:
             audio_dur = f.frames / f.samplerate
+            audio_dur = manifest['duration']
         n_input_frames = audio_dur / model.cfg.preprocessor.window_stride
         model_downsample_factor = round(n_input_frames / int(T_batch[0]))
 
