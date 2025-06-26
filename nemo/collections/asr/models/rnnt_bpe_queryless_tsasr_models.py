@@ -63,9 +63,9 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
                 model_path = self.cfg.diar_model_path,
                 num_speakers=self.cfg.model_defaults.get('num_speakers', 4),
                 freeze_diar=self.cfg.freeze_diar,
-                # soft_decision=self.cfg.soft_decision,
-                # gt_decision=self.cfg.gt_decision,
-                # streaming_mode=self.cfg.get('streaming_mode', False),
+                soft_decision=self.cfg.soft_decision,
+                gt_decision=self.cfg.gt_decision,
+                streaming_mode=self.cfg.get('streaming_mode', False),
             )
             self._init_spk_kernel()
         
