@@ -282,6 +282,7 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
 
         spk_targets = self.forward_diar(audio_signal=signal, audio_signal_length=signal_len, spk_targets=spk_targets)
         # Extract speaker-specific targets based on speaker IDs
+
         self.spk_targets = torch.stack([spk_targets[i, :, spk_ids[i]] for i in range(len(spk_ids))])
 
         batch = (signal, signal_len, transcript, transcript_len)

@@ -89,7 +89,10 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
             
             if isinstance(cut, MonoCut):
                 non_padding_cuts.append(cut)
-                text_per_speaker = self.split_text(cut.custom['text'])
+                if '<|spltoken0|>' in cut.custom['text']:
+                    text_per_speaker = self.split_text(cut.custom['text'])
+                else:
+                    text_per_speaker = [cut.custom['text']]
             elif isinstance(cut, MixedCut):
                 if len(cut.tracks) == 2 and isinstance(cut.tracks[1].cut, PaddingCut):
                     non_padding_cuts.append(cut)

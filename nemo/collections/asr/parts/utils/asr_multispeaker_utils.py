@@ -18,6 +18,7 @@ import random
 import logging
 from copy import deepcopy
 from cytoolz import groupby
+import time
 from collections import defaultdict
 
 import numpy as np
@@ -458,7 +459,7 @@ class ConcatenationMeetingSimulator():
 
     def __init__(
         self,
-        intra_session_concat_prob: float|List[float] = [0, 1.0, 0.5, 0.2],
+        intra_session_concat_prob: Union[float, List[float]] = [0, 1.0, 0.5, 0.2],
         data_type: str = "msasr",
         min_duration: float = 30.0,
         max_duration: float = 40.0,
@@ -503,7 +504,6 @@ class ConcatenationMeetingSimulator():
         Read the manifest file and return a CutSet object. 
         Each line in the manifest file should be a JSON object representing a segment.
         """
-
         self.id2cut = {}
         self.sess2cut_ids = defaultdict(list)
         self.sess2spks = defaultdict(set)
@@ -819,7 +819,7 @@ class MixMeetingSimulator():
 
     def __init__(
         self,
-        intra_session_mix_prob: float|List[float] = [0, 0, 0, 0],
+        intra_session_mix_prob: Union[float, List[float]] = [0, 0, 0, 0],
         data_type: str = "msasr",
         min_duration: float = 80.0,
         max_duration: float = 100.0,
@@ -1318,7 +1318,7 @@ class LibriSpeechMixGenerator():
 
     def generate(self, cuts):
         cut_set = []
-        for cut in tqdm(cuts):
+        for cut in tqdm(cuts, desc="Generating LibriSpeechMix", total=len(cuts), disable=True):
             offsets = cut.delays
             durations = cut.durations
             wavs = cut.wavs
@@ -1382,8 +1382,8 @@ def save_numpy_array_as_png(np_array_source: np.ndarray, output_filepath: str):
         output_filepath (str): File path where the image will be saved (e.g., "image.png").
     """
     expanded_array = np.repeat(np_array_source, 100, axis=1)
-    plt.imsave(output_filepath, expanded_array, cmap='gray' if np_array_source.ndim == 2 else None)
-
+    expanded_array = expanded_array.T  # Transpose the array
+    plt.imsave(output_filepath, expanded_array)
 
 def speaker_to_target(
     a_cut,
@@ -1498,7 +1498,8 @@ class MultiSpeakerMixtureGenerator():
         simulator_type,
         min_delay=0.5,
         outputs=None,
-        session_config=None,
+        random_seed=42,
+        session_config=None, 
     ):
         """
         Args:
@@ -1517,10 +1518,26 @@ class MultiSpeakerMixtureGenerator():
             min_delay (float): The minimum delay between speakers
                 to avoid the same starting time for multiple speakers.
         """
+        # cfg = OmegaConf.structured(MultiSpeakerSimulatorConfig())
+        # cfg.data_simulator.manifest_filepath = manifest_filepath
+        # # cfg.data_simulator.outputs.output_dir = self.outputs.output_dir
+        # # cfg.data_simulator.outputs.output_filename = self.outputs.output_filename
+        # cfg.data_simulator.session_config.num_sessions = session_config.num_sessions
+        # cfg.data_simulator.session_config.session_length = session_config.session_length
+        # cfg.data_simulator.background_noise.background_manifest = background_manifest
+        # cfg.data_simulator.background_noise.rir_manifest = rir_manifest
+
+        self.random_seed = random_seed
+        random.seed(self.random_seed)
+        np.random.seed(self.random_seed)
+        torch.manual_seed(self.random_seed)
+        torch.cuda.manual_seed(self.random_seed)
+        torch.cuda.manual_seed_all(self.random_seed)
+
         self.manifest_filepath = manifest_filepath 
         self.manifests = LazyJsonlIterator(manifest_filepath)
         self.background_manifest = background_manifest
-        self.rir_manifest = read_rir_manifest(rir_manifest=rir_manifest)
+        self.rir_manifest_list= read_rir_manifest(rir_manifest=rir_manifest)
 
         self.min_delay = min_delay
         self.simulator_type = simulator_type
@@ -1541,10 +1558,14 @@ class MultiSpeakerMixtureGenerator():
         elif simulator_type == 'conversation':
             self.simulator = self.ConversationSimulator
 
+        self.count = 0
+
     def __iter__(self):
         return self
     
     def __next__(self):
+        self.count += 1
+        print(f"====[  MixedCut Generated]===== {self.count}")
         return self.simulator()
 
     def _get_custom_dict(self, speaker_id=None):
@@ -1563,43 +1584,56 @@ class MultiSpeakerMixtureGenerator():
         """
         cfg = OmegaConf.structured(MultiSpeakerSimulatorConfig())
         cfg.data_simulator.manifest_filepath = self.manifest_filepath
-        cfg.data_simulator.outputs.output_dir = self.outputs.output_dir
-        cfg.data_simulator.outputs.output_filename = self.outputs.output_filename
+        # cfg.data_simulator.outputs.output_dir = self.outputs.output_dir
+        # cfg.data_simulator.outputs.output_filename = self.outputs.output_filename
         cfg.data_simulator.session_config.num_sessions = self.session_config.num_sessions
         cfg.data_simulator.session_config.num_speakers = self.session_config.num_speakers
         cfg.data_simulator.session_config.session_length = self.session_config.session_length
         cfg.data_simulator.background_noise.background_manifest = self.background_manifest
-        
-        # cfg.data_simulator.background_noise.rir_manifest = self.rir_manifest
         simulator = MultiSpeakerSimulator(cfg=cfg)
         # set_start_method('spawn', force=True)
         # simulator.generate_sessions()
         # mixed_cut 
-        manifest_json_list, uniq_id, mix_array = simulator.generate_single_session()
+        manifest_json_list, uniq_id, mix_array, speaker_ids = simulator.generate_single_session()
+        spk_mapping = {spk_id: spk_idx for spk_idx, spk_id in enumerate(speaker_ids)}
+        uniq_id = f"audiomix_{self.count}_nspk{len(spk_mapping.keys())}"
         noise_json_list = simulator.annotator.annote_lists['noise']
 
         # load RIR
-        reverb_rir =  Recording.from_file(self.rir_manifest[0]['audio_filepath'])
+        num_speakers = self.session_config.num_speakers
+        selected_rir_paths = random.sample(self.rir_manifest_list, num_speakers)
+        reverb_rirs = [Recording.from_file(rir_path['audio_filepath']) for rir_path in selected_rir_paths]
+
+        start_time_1 = time.time()
 
         # Speech Cuts added
         mono_cuts = []
         for manifest in manifest_json_list:
-            mono_cuts.append(self.json_to_cut(manifest))
+            mono_cuts.append(self.json_to_cut(json_dict=manifest, 
+                                              speaker_index=spk_mapping[manifest['speaker_id']]))
 
-        speaker_tracks = {}
-        for cut_idx, mono_cut in enumerate(mono_cuts):
+        speaker_tracks, speaker_rir_mapping = {}, {}
+        for mono_cut in mono_cuts:
             speaker_id=mono_cut.custom['speaker_id']
+            if speaker_id not in speaker_rir_mapping:
+                speaker_rir_mapping[speaker_id] = reverb_rirs[len(speaker_rir_mapping.keys())]
+
+            speaker_rir_recording = speaker_rir_mapping[speaker_id]
             mono_cut.custom.update(self._get_custom_dict(speaker_id=speaker_id))
-            if speaker_id == '251':
-                mono_cut = mono_cut.reverb_rir(reverb_rir)
-            mix_track = MixTrack(cut=deepcopy(mono_cut), 
-                                 type=type(mono_cut), 
-                                 offset=mono_cut.custom['mixed_cut_offset']
+            rir_mono_cut = mono_cut.reverb_rir(speaker_rir_recording).perturb_volume(0.9)
+            cln_mono_cut = mono_cut.perturb_volume(0.1)
+            cln_mix_track = MixTrack(cut=deepcopy(cln_mono_cut), 
+                                 type=type(cln_mono_cut), 
+                                 offset=cln_mono_cut.custom['mixed_cut_offset']
+                                )
+            rir_mix_track = MixTrack(cut=deepcopy(rir_mono_cut), 
+                                 type=type(rir_mono_cut), 
+                                 offset=rir_mono_cut.custom['mixed_cut_offset']
                                 )
             if speaker_id not in speaker_tracks:
-                speaker_tracks[speaker_id] = [mix_track]
+                speaker_tracks[speaker_id] = [cln_mix_track, rir_mix_track]
             else:
-                speaker_tracks[speaker_id].append(mix_track)
+                speaker_tracks[speaker_id].extend([cln_mix_track, rir_mix_track])
 
         # Noise Cuts added
         noise_cuts = []
@@ -1609,6 +1643,7 @@ class MultiSpeakerMixtureGenerator():
         noise_tracks = []
         for noise_cut in noise_cuts:
             noise_cut.custom.update(self._get_custom_dict())
+            noise_cut = noise_cut.perturb_volume(1.0)
             noise_tracks.append(MixTrack(cut=deepcopy(noise_cut), type=type(noise_cut), offset=noise_cut.custom['mixed_cut_offset']))
 
         # Merge all speaker tracks into a list 
@@ -1616,31 +1651,43 @@ class MultiSpeakerMixtureGenerator():
         for spk_id, tracks in speaker_tracks.items():
             all_spk_tracks.extend(tracks)
 
-        # mixed_cut = MixedCut(id=uniq_id, tracks=tracks)
+        end_time_1 = time.time()
+        elapsed_time_1 = end_time_1 - start_time_1
+        print(f"Speaker tracks creation took {elapsed_time_1:.4f} seconds")
+
+        start_time = time.time()
+        mixed_cut = MixedCut(id=uniq_id, tracks=all_spk_tracks) 
+        # + noise_tracks)
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        print(f"MixedCut creation took {elapsed_time:.4f} seconds")
         mixed_noisy_cut = MixedCut(id=uniq_id, tracks=all_spk_tracks + noise_tracks)
 
 
+        # uniq_folder_name = f"{uniq_id}_test_an_rir_v6_ro{str(simulator._params.data_simulator.session_params.random_offset)}_{self.session_config.num_speakers}spk"
         # bs_true = speaker_to_target(mixed_cut, boundary_segments=True, is_audio_mix_sim=True)
         # bs_false = speaker_to_target(mixed_cut, boundary_segments=False, is_audio_mix_sim=True)
-        # save_numpy_array_as_png(bs_true, "/home/taejinp/Downloads/lhotse_sup_boundary/bs_true.png")
-        # save_numpy_array_as_png(bs_false, "/home/taejinp/Downloads/lhotse_sup_boundary/bs_false.png")
-        basepath = "/home/taejinp/Downloads/lhotse_sup_boundary"
-        # loaded_audio = mixed_cut.load_audio().squeeze(0)
-        loaded_audio = mixed_noisy_cut.load_audio().squeeze(0)
-        mix_array = mix_array.cpu().numpy()
-        # Normalize the audio array
-        array = mix_array / (np.max(np.abs(mix_array)) + 1e-8)  # Avoid division by zero
+        # save_numpy_array_as_png(bs_true, f"/home/taejinp/Downloads/lhotse_sup_boundary/{uniq_folder_name}/bs_true.png")
+        # save_numpy_array_as_png(bs_false, f"/home/taejinp/Downloads/lhotse_sup_boundary/{uniq_folder_name}/bs_false.png")
+        # basepath = "/home/taejinp/Downloads/lhotse_sup_boundary"
+        # ### loaded_audio = mixed_cut.load_audio().squeeze(0)
+        # loaded_audio = mixed_noisy_cut.load_audio().squeeze(0)
+        # mix_array = mix_array.cpu().numpy()
+        # ### Normalize the audio array
+        # array = mix_array / (np.max(np.abs(mix_array)) + 1e-8)  # Avoid division by zero
 
-        package_path = f"{basepath}/{uniq_id}_test_an_rir_v6_ro{str(simulator._params.data_simulator.session_params.random_offset)}_{self.session_config.num_speakers}spk"
-        os.makedirs(package_path, exist_ok=True)
+        # package_path = f"{basepath}/{uniq_folder_name}"
+        # os.makedirs(package_path, exist_ok=True)
         # sf.write(os.path.join(package_path, uniq_id + '.wav'), array, simulator._params.data_simulator.sr)
-        sf.write(os.path.join(package_path, uniq_id + '_lhotse.wav'), loaded_audio, simulator._params.data_simulator.sr)
+        # sf.write(os.path.join(package_path, uniq_id + '_lhotse.wav'), loaded_audio, simulator._params.data_simulator.sr)
 
-        simulator.annotator.write_annotation_rttm_and_ctm(
-            basepath=package_path,
-            filename=uniq_id,
-        )
-        import ipdb; ipdb.set_trace()
+        # package_path = None
+        # simulator.annotator.write_annotation_rttm_and_ctm(
+        #     basepath=package_path,
+        #     filename=uniq_id,
+        # )
+        # print(f"====[  MixedCut Generated]===== {mixed_cut.id} {uniq_id}")
+        # print(f"====[  MixedCut Generated]===== {self.count} mixed c
         return mixed_cut
 
 
@@ -1683,7 +1730,7 @@ class MultiSpeakerMixtureGenerator():
     def ConversationSimulator(self):
         raise NotImplementedError("ConversationSimulator is not implemented yet.")
     
-    def json_to_cut(self, json_dict):
+    def json_to_cut(self, json_dict, speaker_index: Union[int, None] = None):
         """
         Convert a json dictionary to a Cut instance.
         """
@@ -1695,15 +1742,28 @@ class MultiSpeakerMixtureGenerator():
         )
         # Note that start=0 and not start=offset because supervision's start if relative to the
         # start of the cut; and cut.start is already set to offset
+
+        if speaker_index is not None:
+            cut_speaker_id = speaker_index
+        else:
+            cut_speaker_id = json_dict.get("speaker_id")
+
+        if json_dict.get("text") is not None and json_dict.get("text") != "":
+            cut_text = json_dict.get("text")
+        else:
+            cut_text = " ".join(json_dict.get("words", []))
+            if cut_text == " ":
+                cut_text = ""
+
         cut.supervisions.append(
             SupervisionSegment(
                 id=cut.id,
                 recording_id=cut.recording_id,
                 start=0,
                 duration=cut.duration,
-                text=json_dict.get("text"),
+                text=cut_text,
                 language=json_dict.get("language", "en"),
-                speaker=json_dict.get("speaker_id"),
+                speaker=cut_speaker_id,
             )
         )
         cut.custom = json_dict
@@ -1745,4 +1805,5 @@ class MultiSpeakerMixtureGenerator():
                 channel_ids=[0],
             )
         else:
+            return Recording.from_file(audio_path)
             return Recording.from_file(audio_path)
