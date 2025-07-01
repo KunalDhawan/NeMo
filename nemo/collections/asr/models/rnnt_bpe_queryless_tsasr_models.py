@@ -63,9 +63,9 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
                 model_path = self.cfg.diar_model_path,
                 num_speakers=self.cfg.model_defaults.get('num_speakers', 4),
                 freeze_diar=self.cfg.freeze_diar,
-                # soft_decision=self.cfg.soft_decision,
-                # gt_decision=self.cfg.gt_decision,
-                # streaming_mode=self.cfg.get('streaming_mode', False),
+                soft_decision=self.cfg.soft_decision,
+                gt_decision=self.cfg.gt_decision,
+                streaming_mode=self.cfg.get('streaming_mode', False),
             )
             self._init_spk_kernel()
         
@@ -296,7 +296,10 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
 
         spk_targets = self.forward_diar(audio_signal=signal, audio_signal_length=signal_len, spk_targets=spk_targets)
         # Extract speaker-specific targets based on speaker IDs
-        self.spk_targets = torch.stack([spk_targets[i, :, spk_ids[i]] for i in range(len(spk_ids))])
+        if spk_targets is not None:
+            self.spk_targets = torch.stack([spk_targets[i, :, spk_ids[i]] for i in range(len(spk_ids))])
+        else:
+            self.spk_targets = None
 
         batch = (signal, signal_len, transcript, transcript_len)
 

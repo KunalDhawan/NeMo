@@ -1500,6 +1500,7 @@ class MultiSpeakerMixtureGenerator():
         outputs=None,
         random_seed=42,
         session_config=None, 
+        num_speakers=2,
     ):
         """
         Args:
@@ -1537,26 +1538,26 @@ class MultiSpeakerMixtureGenerator():
         self.manifest_filepath = manifest_filepath 
         self.manifests = LazyJsonlIterator(manifest_filepath)
         self.background_manifest = background_manifest
-        self.rir_manifest_list= read_rir_manifest(rir_manifest=rir_manifest)
+        self.rir_manifest = read_rir_manifest(rir_manifest=rir_manifest) if rir_manifest else None
 
         self.min_delay = min_delay
         self.simulator_type = simulator_type
         self.outputs = outputs
         self.session_config = session_config
-        self.max_speakers = 8
+        self.max_speakers = num_speakers
 
         self.spk2manifests = groupby(lambda x: x["speaker_id"], self.manifests)
         self.speaker_ids = list(self.spk2manifests.keys())
         print("======  simulator_type", simulator_type)
+
+        type2simulator = {
+            'lsmix': self.LibriSpeechMixSimulator,
+            'audiomix': self.AudioMixtureSimulator,
+            'meeting': self.MeetingSimulator,
+            'conversation': self.ConversationSimulator
+        }
     
-        if simulator_type == 'lsmix':    
-            self.simulator = self.LibriSpeechMixSimulator
-        elif simulator_type == 'audiomix': 
-            self.simulator = self.AudioMixtureSimulator
-        elif simulator_type == 'meeting':
-            self.simulator = self.MeetingSimulator
-        elif simulator_type == 'conversation':
-            self.simulator = self.ConversationSimulator
+        self.simulator = type2simulator[simulator_type]
 
         self.count = 0
 
@@ -1699,7 +1700,7 @@ class MultiSpeakerMixtureGenerator():
             Github: https://github.com/NaoyukiKanda/LibriSpeechMix
         """
         # Sample the speakers
-        sampled_speaker_ids = random.sample(self.speaker_ids, self.num_speakers)
+        sampled_speaker_ids = random.sample(self.speaker_ids, self.max_speakers)
         # Sample the cuts for each speaker
         mono_cuts = []
         for speaker_id in sampled_speaker_ids:
