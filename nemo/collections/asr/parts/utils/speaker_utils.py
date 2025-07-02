@@ -88,9 +88,10 @@ def audio_rttm_map(manifest, attach_dur=False):
 
     AUDIO_RTTM_MAP = {}
     with open(manifest, 'r') as inp_file:
+        print(f"Reading manifest at path: {manifest} ...")
         lines = inp_file.readlines()
-        logging.info("Number of files to diarize: {}".format(len(lines)))
-        for line in lines:
+        logging.info("Number of files to process --- {}".format(len(lines)))
+        for line in tqdm(lines, desc="Processing manifest", leave=True):
             line = line.strip()
             dic = json.loads(line)
 

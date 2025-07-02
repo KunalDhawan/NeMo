@@ -18,6 +18,7 @@ from collections import Counter
 from collections import OrderedDict as od
 from pathlib import Path
 from typing import Dict, List, Union
+from tqdm import tqdm
 
 import librosa
 import numpy as np
@@ -419,7 +420,7 @@ def create_manifest(
     ctm_pathdict = get_path_dict(ctm_path, uniqids, len_wavs)
 
     lines = []
-    for uid in uniqids:
+    for uid in tqdm(uniqids, desc="Processing manifest", leave=True):
         wav, text, rttm, uem, ctm = (
             wav_pathdict[uid],
             text_pathdict[uid],

@@ -189,11 +189,12 @@ class MultiSpeakerSimulator(object):
 
     def __init__(self, cfg):
         self._params = cfg
+        self.logging_message = self._params.data_simulator.get("logging_message", False)
         self.annotator = DataAnnotator(cfg)
         self.sampler = SpeechSampler(cfg)
         # internal params
         self._manifest = read_manifest(self._params.data_simulator.manifest_filepath)
-        self._speaker_samples = build_speaker_samples_map(self._manifest)
+        self._speaker_samples = build_speaker_samples_map(self._manifest, tqdm_bar=self.logging_message)
         self._noise_samples = []
         self._sentence = None
         self._text = ""
@@ -219,6 +220,7 @@ class MultiSpeakerSimulator(object):
         self._audio_read_buffer_dict = {}
         self.add_missing_overlap = self._params.data_simulator.session_params.get("add_missing_overlap", False)
 
+        self.logging_message = self._params.data_simulator.get("logging_message", False)
         if (
             self._params.data_simulator.segment_augmentor.get("augmentor", None)
             and self._params.data_simulator.segment_augmentor.add_seg_aug
@@ -293,9 +295,9 @@ class MultiSpeakerSimulator(object):
             else:
                 permuted_inds = np.hstack((permuted_inds, np.random.permutation(len(all_speaker_ids))[:seq_len]))
             target_count -= seq_len
-
-        logging.info(f"Total {all_speaker_id_counts} speakers in the source dataset.")
-        logging.info(f"Initialized speaker permutations for {num_sess} sessions with {num_speakers} speakers each.")
+        if self.logging_message:
+            logging.info(f"Total {all_speaker_id_counts} speakers in the source dataset.")
+            logging.info(f"Initialized speaker permutations for {num_sess} sessions with {num_speakers} speakers each.")
         return permuted_inds.reshape(num_sess, num_speakers)
 
     def _init_chunk_count(self):
@@ -737,7 +739,7 @@ class MultiSpeakerSimulator(object):
 
             # check the length of the generated sentence in terms of sample count (int).
             if (not is_last_word) and curr_dur_samples + dur_samples > remaining_dur_samples:
-                print(f"In _add_file, BREAKING !! curr_dur_samples {curr_dur_samples} + dur_samples {dur_samples} > remaining_dur_samples {remaining_dur_samples}")
+                # print(f"In _add_file, BREAKING !! curr_dur_samples {curr_dur_samples} + dur_samples {dur_samples} > remaining_dur_samples {remaining_dur_samples}")
                 # if the upcoming loop will exceed the remaining sample count, break out of the loop.
                 break
 
@@ -747,7 +749,7 @@ class MultiSpeakerSimulator(object):
 
             # if silence_count > 0:
             if silence_count > 0 or word == "":
-                print(f"In _add_file, BREAKING !! silence_count {silence_count} or word == ''")
+                # print(f"In _add_file, BREAKING !! silence_count {silence_count} or word == ''")
                 break
 
             self._words.append(word)
@@ -879,8 +881,6 @@ class MultiSpeakerSimulator(object):
                     self._alignments[-1] = float(len(self._sentence) * 1.0 / self._params.data_simulator.sr)
                     new_added_alignments[-1] = new_added_alignments[-1] + float(end_window_amount * 1.0 / self._params.data_simulator.sr)
 
-        if "snap" in audio_manifest['words'] and "to" in audio_manifest['words'] and "seek" in audio_manifest['words'] and word == "seek":
-            import ipdb; ipdb.set_trace()
         del audio_file
         start_cutoff_sec = float(start_cutoff / self._params.data_simulator.sr)
         return sentence_word_count + current_word_count, len(self._sentence), word_idx_range, start_cutoff_sec, new_added_alignments
@@ -923,8 +923,7 @@ class MultiSpeakerSimulator(object):
             # if sentence_word_count >= sl or sentence_samples >= max_samples_in_sentence:
             #     break
         # while sentence_samples < max_samples_in_sentence:
-            print(f"====[  LoopCheck ]===== sentence_word_count {sentence_word_count} < sl: {sl} and sentence_samples: {sentence_samples} < max_samples_in_sentence: {max_samples_in_sentence} \
-                  - deficit: {max_samples_in_sentence - sentence_samples}")
+            # print(f"====[  LoopCheck ]===== sentence_word_count {sentence_word_count} < sl: {sl} and sentence_samples: {sentence_samples} < max_samples_in_sentence: {max_samples_in_sentence} \   - deficit: {max_samples_in_sentence - sentence_samples}")
             _loaded_audio_manifest = load_speaker_sample(
                 speaker_wav_align_map=speaker_wav_align_map,
                 speaker_ids=speaker_ids,
@@ -1165,7 +1164,7 @@ class MultiSpeakerSimulator(object):
         """
         end = start + length
         if end > len(array):  # only occurs in enforce mode
-            logging.info(f"end time {end} exceeds array length {len(array)}")
+            # logging.info(f"end time {end} exceeds array length {len(array)}")
             # print(f"end time {end} array length {len(array)} start-{start} length-{length}")
             array = torch.nn.functional.pad(array, (0, end - len(array)))
             is_speech = torch.nn.functional.pad(is_speech, (0, end - len(is_speech)))
@@ -1522,8 +1521,8 @@ class MultiSpeakerSimulator(object):
                 end_time = word_and_ts_list[end_index - 1][2]
                 dur_time = end_time - stt_time
                 if abs(dur_time - source_seg_dict['duration']) > 0.01:
-                    print(f" Source Segment List lines: {source_seg_dict['words']}")
-                    print(f" Mismatch in duration: dur_time - {dur_time} != sourc seg dict {source_seg_dict['duration']}")
+                    # print(f" Source Segment List lines: {source_seg_dict['words']}")
+                    # print(f" Mismatch in duration: dur_time - {dur_time} != sourc seg dict {source_seg_dict['duration']}")
                     raise ValueError(f" Error, Mismatch in duration: dur_time - {dur_time} != sourc seg dict {source_seg_dict['duration']}")
                     # import ipdb; ipdb.set_trace()
 
@@ -1546,16 +1545,16 @@ class MultiSpeakerSimulator(object):
             
             # if len(new_ctm_entries) != len(new_rttm_entries):
             if True:
-                print(f" =======[ LOOK! ]========> len(source_segment_list) != len(new_rttm_entries) {len(source_segment_list)} != {len(new_rttm_entries)}")
+                # print(f" =======[ LOOK! ]========> len(source_segment_list) != len(new_rttm_entries) {len(source_segment_list)} != {len(new_rttm_entries)}")
                 rttm_end_time = float(new_rttm_entries[-1].split()[1])
                 for stt_time, ctm_string in new_ctm_entries:
                     # segment_end = source_segment_dict['mixed_cut_offset'] + source_segment_dict['segment_duration']
                     start, dur = float(ctm_string.split()[2]), float(ctm_string.split()[3])
                     segment_end = start + dur
                 if abs(segment_end - rttm_end_time) > 0.01:
-                    print(f" RTTM start, end time: {new_rttm_entries[-1]}")
-                    print(f" CTM line string: {ctm_string}")
-                    print(f" CTM Segment end time {segment_end} does not match RTTM end time {rttm_end_time}")
+                    # print(f" RTTM start, end time: {new_rttm_entries[-1]}")
+                    # print(f" CTM line string: {ctm_string}")
+                    # print(f" CTM Segment end time {segment_end} does not match RTTM end time {rttm_end_time}")
                     raise ValueError(f" Error, RTTM start, end time: {new_rttm_entries[-1]}")
                     # import ipdb; ipdb.set_trace()
                 # if len(new_ctm_entries) > 6:
@@ -1705,7 +1704,7 @@ class MultiSpeakerSimulator(object):
         logging.info(f"Data simulation has been completed, results saved at: {basepath}")
 
 
-    def generate_single_session(self, random_seed: int = None):
+    def generate_single_session(self, random_seed: int = None): 
         """
         Generate several multispeaker audio sessions and corresponding list files.
 
@@ -1713,16 +1712,17 @@ class MultiSpeakerSimulator(object):
             random_seed (int): random seed for reproducibility
         """
         self._meta_data_mode = True
-        logging.info(f"Generating Diarization Sessions, Meta Data Only mode: {self._meta_data_mode}")
+        if self.logging_message:
+            logging.info(f"Generating Diarization Sessions, Meta Data Only mode: {self._meta_data_mode}")
         if random_seed is None:
             random_seed = self._params.data_simulator.random_seed
         np.random.seed(random_seed)
         sess_idx = 0
         output_dir = self._params.data_simulator.outputs.output_dir
 
-        basepath = get_cleaned_base_path(
-            output_dir, overwrite_output=self._params.data_simulator.outputs.overwrite_output
-        )
+        # basepath = get_cleaned_base_path(
+        #     output_dir, overwrite_output=self._params.data_simulator.outputs.overwrite_output
+        # )
         # OmegaConf.save(self._params, os.path.join(output_dir, "params.yaml"))
 
         # tp = concurrent.futures.ProcessPoolExecutor(max_workers=self.num_workers)
@@ -1749,6 +1749,7 @@ class MultiSpeakerSimulator(object):
         sess_idx = 0
         
         device = self._device
+        basepath = None
         queue.append((sess_idx, basepath, filename, speaker_ids, speaker_wav_align_map, noise_samples, device))
 
         # for multiprocessing speed, we avoid loading potentially huge manifest list and speaker sample files into each process.
@@ -1768,15 +1769,15 @@ class MultiSpeakerSimulator(object):
         )
         # basepath, filename = self._generate_session(*future)
         basepath, filename, array = self._generate_only_session_metainfo(*future)
-        self.annotator.add_to_filename_lists(basepath=basepath, filename=filename)
+        # self.annotator.add_to_filename_lists(basepath=basepath, filename=filename)
 
         # throw warning if number of speakers is less than requested
         self._check_missing_speakers()
 
-        self.annotator.write_filelist_files(basepath=basepath)
-        logging.info(f"Data simulation has been completed, results saved at: {basepath}")
-
-        return self.annotator.annote_lists['json'], filename, array
+        # self.annotator.write_filelist_files(basepath=basepath)
+        # logging.info(f"Data simulation has been completed, results saved at: {basepath}")
+        # import ipdb; ipdb.set_trace()
+        return self.annotator.annote_lists['json'], filename, array, speaker_ids
 
 
 class RIRMultiSpeakerSimulator(MultiSpeakerSimulator):

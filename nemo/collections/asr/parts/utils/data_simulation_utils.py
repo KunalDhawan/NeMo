@@ -460,7 +460,7 @@ def get_speaker_ids(sess_idx: int, speaker_samples: dict, permutated_speaker_ind
     return speaker_ids
 
 
-def build_speaker_samples_map(manifest: dict) -> dict:
+def build_speaker_samples_map(manifest: dict, tqdm_bar: bool = False) -> dict:
     """
     Build a dictionary for mapping speaker ID to their list of samples
 
@@ -469,8 +469,9 @@ def build_speaker_samples_map(manifest: dict) -> dict:
             Dictionary mapping speaker ID to their list of samples
     """
     speaker_samples = defaultdict(list)
-    logging.info("Building speaker to samples map...")
-    for sample in tqdm(manifest, total=len(manifest)):
+    # logging.info("Building speaker to samples map...")
+    for sample in tqdm(manifest, total=len(manifest), disable=not tqdm_bar):
+    # for sample in manifest:
         speaker_id = sample['speaker_id']
         speaker_samples[speaker_id].append(sample)
     return speaker_samples
