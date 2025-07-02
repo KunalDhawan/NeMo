@@ -606,10 +606,11 @@ def read_multi_speaker_simulator(config: DictConfig) -> tuple[CutSet, bool]:
             session_config=config.get("session_config", None),
             background_manifest=config.get("background_manifest", None),
             rir_manifest=config.get("rir_manifest", None),
+            num_speakers=config.get("num_speakers", 1),
         )
     )
-
-    return multi_speaker_cuts, False
+    is_tarred = config.get("is_tarred", False)
+    return multi_speaker_cuts, is_tarred
 
 def mux(
     *cutsets: CutSet,

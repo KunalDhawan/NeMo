@@ -59,14 +59,6 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
             self.spk_kernel_mask_original = cfg.get('spk_kernel_mask_original', True)
             self.spk_kernel_residual = cfg.get('spk_kernel_residual', True)
 
-            self._init_diar_model(
-                model_path = self.cfg.diar_model_path,
-                num_speakers=self.cfg.model_defaults.get('num_speakers', 4),
-                freeze_diar=self.cfg.freeze_diar,
-                soft_decision=self.cfg.soft_decision,
-                gt_decision=self.cfg.gt_decision,
-                streaming_mode=self.cfg.get('streaming_mode', False),
-            )
             self._init_spk_kernel()
         
     def _init_spk_kernel(self):
@@ -140,80 +132,6 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
         
         return hook_fn
 
-    def _init_diar_model(self, 
-                         model_path = None,
-                         num_speakers=None,
-                         freeze_diar=None,
-                         soft_decision=None,
-                         gt_decision=None,
-                         streaming_mode=None):
-        """
-        Initialize the speaker model.
-        """
-        logging.info(f"Initializing diarization model from pretrained checkpoint {model_path}")
-        self.num_speakers = num_speakers
-        self.freeze_diar = freeze_diar
-        self.soft_decision = soft_decision
-        self.gt_decision = gt_decision
-        self.streaming_mode = streaming_mode
-
-        try:
-            if model_path.endswith('.nemo'):
-                pretrained_diar_model = SortformerEncLabelModel.restore_from(model_path, map_location="cpu")
-                logging.info("Diarization Model restored locally from {}".format(model_path))
-            elif model_path.endswith('.ckpt'):
-                pretrained_diar_model = SortformerEncLabelModel.load_from_checkpoint(model_path, map_location="cpu")
-                logging.info("Diarization Model restored locally from {}".format(model_path))
-            else:
-                pretrained_diar_model = SortformerEncLabelModel.from_pretrained(model_path)
-                logging.info("Diarization Model restored from {} at NGC".format(model_path))
-        except:
-            pretrained_diar_model = SortformerEncLabelModel.from_pretrained("nvidia/diar_sortformer_4spk-v1")
-            logging.info("Diarization Model restored from nvidia/diar_sortformer_4spk-v1 at NGC")
-        
-        if freeze_diar:
-            pretrained_diar_model.eval()
-            pretrained_diar_model.freeze()
-
-        # Register diarization model 
-        self.register_nemo_submodule(
-            name="diarization_model",
-            model=pretrained_diar_model,
-            config_field="diarization_model" 
-        )
-
-        # Change the diarization model cfg for streaming inference
-        if self.streaming_mode:
-            self.diarization_model.streaming_mode = self.streaming_mode
-            self.diarization_model.sortformer_modules.step_len = self.cfg.step_len
-            self.diarization_model.sortformer_modules.mem_len = self.cfg.mem_len
-            self.diarization_model.sortformer_modules.step_left_context = self.cfg.step_left_context
-            self.diarization_model.sortformer_modules.step_right_context = self.cfg.step_right_context
-            self.diarization_model.sortformer_modules.fifo_len = self.cfg.fifo_len
-            self.diarization_model.sortformer_modules.mem_refresh_rate = self.cfg.mem_refresh_rate
-
-    def forward_diar(
-        self,
-        audio_signal=None,
-        audio_signal_length=None,
-        spk_targets=None,
-    ):
-        
-        if self.gt_decision:
-            pass
-        else:
-            # Get diarization predictions from model
-            with torch.set_grad_enabled(not self.freeze_diar):
-                pred_spk_targets = self.diarization_model(audio_signal=audio_signal, audio_signal_length=audio_signal_length)
-                spk_targets = get_pil_targets(pred_spk_targets.clone(), spk_targets.clone(), self.speaker_permutations)
-            
-        if self.soft_decision:
-            pass
-        else:
-            spk_targets = (spk_targets > 0.5).to(spk_targets.dtype)
-
-        return spk_targets
-
     def _setup_dataloader_from_config(self, config: Optional[Dict]):
         if config.get("use_lhotse"):
             return get_lhotse_dataloader_from_config(
@@ -278,11 +196,9 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
 
     def training_step(self, batch, batch_nb):
         
-        signal, signal_len, transcript, transcript_len, spk_targets, spk_ids = batch
+        signal, signal_len, transcript, transcript_len, spk_targets = batch
 
-        spk_targets = self.forward_diar(audio_signal=signal, audio_signal_length=signal_len, spk_targets=spk_targets)
-        # Extract speaker-specific targets based on speaker IDs
-        self.spk_targets = torch.stack([spk_targets[i, :, spk_ids[i]] for i in range(len(spk_ids))])
+        self.spk_targets = spk_targets
 
         batch = (signal, signal_len, transcript, transcript_len)
 
@@ -291,14 +207,9 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
 
     def validation_pass(self, batch, batch_idx, dataloader_idx=0):
 
-        signal, signal_len, transcript, transcript_len, spk_targets, spk_ids = batch
+        signal, signal_len, transcript, transcript_len, spk_targets = batch
 
-        spk_targets = self.forward_diar(audio_signal=signal, audio_signal_length=signal_len, spk_targets=spk_targets)
-        # Extract speaker-specific targets based on speaker IDs
-        if spk_targets is not None:
-            self.spk_targets = torch.stack([spk_targets[i, :, spk_ids[i]] for i in range(len(spk_ids))])
-        else:
-            self.spk_targets = None
+        self.spk_targets = spk_targets
 
         batch = (signal, signal_len, transcript, transcript_len)
 

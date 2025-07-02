@@ -159,6 +159,79 @@ class DataSimConfig:
 class MultiSpeakerSimulatorConfig:
     data_simulator: DataSimConfig = field(default_factory=DataSimConfig)
 
+class Segment:
+    def __init__(self, start, end, speaker_id, text):
+        self.start = start
+        self.end = end
+        self.speaker_id = speaker_id
+        self.text = text
+
+class SegList:
+    def __init__(self, segments: List[Segment] = None, seglst_filepath: str = None):
+        if segments is not None:
+            self.segments = segments
+        elif seglst_filepath is not None:
+            self._load_seglst(seglst_filepath)
+        else:
+            raise ValueError("Either segments or seglst_filepath must be provided")
+    
+    def _load_seglst(self, seglst_filepath: str|list[str]):
+        if isinstance(seglst_filepath, str):
+            with open(seglst_filepath, 'r', encoding='utf-8') as f:
+                seglst = json.load(f)
+                self.segments = [
+                    Segment(seg['start_time'], seg['end_time'], seg['speaker'], seg['words']) for seg in seglst
+                ]
+        elif isinstance(seglst_filepath, list):
+            for seglst_file in seglst_filepath:
+                with open(seglst_file, 'r', encoding='utf-8') as f:
+                    seglst = json.load(f)
+                    segments = [
+                        Segment(seg['start_time'], seg['end_time'], seg['speaker'], seg['words']) for seg in seglst
+                    ]
+                self.segments.extend(segments)
+        else:
+            raise ValueError("seglst_filepath must be a string or a list of strings")
+        self.sort()
+    
+    def __len__(self):
+        return len(self.segments)
+    
+    def __getitem__(self, idx):
+        return self.segments[idx]
+    
+    def __iter__(self):
+        return iter(self.segments)
+    
+    def sort(self):
+        self.segments.sort(key=lambda x: x.start)
+
+    def get_segments(self, min_duration: float, max_duration: float):
+        
+        duration = random.uniform(min_duration, max_duration)
+
+        first_segment_idx = random.randint(0, len(self) - 1)
+        segments = [self[first_segment_idx]]
+
+        offset = self[first_segment_idx].start
+        for i in range(first_segment_idx + 1, len(self)):
+            if self[i].end - offset <= duration:
+                segments.append(self[i])
+            else:
+                break
+        
+        return segments
+    
+    def get_text_from_segments(self, segments: list[Segment], speaker_token_style='<|spltoken*|>', speaker_token_position='sot'):
+        text = ''
+        speakers = set([segment.speaker_id for segment in segments])
+        speaker2start = {spk_id: min(segment.start for segment in segments if segment.speaker_id == spk_id) for spk_id in speakers}
+        sorted_speakers = sorted(speakers, key=lambda x: speaker2start[x])
+        speaker2token = {spk: speaker_token_style.replace('*', str(i)) for i, spk in enumerate(sorted_speakers)}
+        for segment in segments:
+            text += f'{speaker2token[segment.speaker_id]} '
+            text += segment.text
+        return text.strip()
 
 def find_first_nonzero(mat: torch.Tensor, max_cap_val=-1, thres: float = 0.5) -> torch.Tensor:
     """
@@ -1426,6 +1499,7 @@ def speaker_to_target(
         raise ValueError(f"Unsupported cut type type{a_cut}: only MixedCut and MonoCut are supported")
     
     segments_total = []
+
     for i, cut in enumerate(cut_list):
         if hasattr(cut, 'rttm_filepath') and cut.rttm_filepath is not None:
             rttms = SupervisionSet.from_rttm(cut.rttm_filepath)
@@ -1441,7 +1515,15 @@ def speaker_to_target(
                 language=None
             )])
         else:
-            raise ValueError(f"Cut {cut.id} does not have rttm_filepath or speaker_id")
+            rttms = SupervisionSet.from_segments([SupervisionSegment(
+                id=uuid4(),
+                recording_id=cut.recording_id,
+                start=cut.start,
+                duration=cut.duration,
+                channel=1,
+                speaker='0',
+                language=None
+            )])
         
         if boundary_segments: # segments with seg_start < total_end and seg_end > total_start are included
             segments_iterator = find_segments_from_rttm(recording_id=cut.recording_id, rttms=rttms, start_after=cut.start, end_before=cut.end, tolerance=0.0)
@@ -1485,6 +1567,17 @@ def speaker_to_target(
         mask = (soft_mask > soft_thres).float()
     return mask
 
+def get_vad_mask(timestamps, offset, duration, sampling_rate=16000):
+    num_samples = get_hidden_length_from_sample_length(duration * sampling_rate)
+    mask = torch.zeros((num_samples, ))
+    for timestamp in timestamps:
+        stt = max(timestamp[0] - offset, 0)
+        ent = min(timestamp[1] - offset, duration)
+        stf = int(stt / 0.08)
+        enf = int(ent / 0.08)
+        mask[stf:enf] = 1.0 
+    return mask
+
 class MultiSpeakerMixtureGenerator():
     """
     This class is used to simulate multi-speaker audio data,
@@ -1519,7 +1612,7 @@ class MultiSpeakerMixtureGenerator():
                 to avoid the same starting time for multiple speakers.
         """
         self.manifest_filepath = manifest_filepath 
-        self.manifests = LazyJsonlIterator(manifest_filepath)
+        self.manifests = list(LazyJsonlIterator(manifest_filepath))
         self.background_manifest = background_manifest
         self.rir_manifest = read_rir_manifest(rir_manifest=rir_manifest) if rir_manifest else None
 
@@ -1529,18 +1622,22 @@ class MultiSpeakerMixtureGenerator():
         self.session_config = session_config
         self.max_speakers = num_speakers
 
-        self.spk2manifests = groupby(lambda x: x["speaker_id"], self.manifests)
-        self.speaker_ids = list(self.spk2manifests.keys())
+        
         print("======  simulator_type", simulator_type)
 
         type2simulator = {
             'lsmix': self.LibriSpeechMixSimulator,
             'audiomix': self.AudioMixtureSimulator,
+            'channel_separated_audio_mixer': self.ChannelSeparatedAudioMixer,
             'meeting': self.MeetingSimulator,
             'conversation': self.ConversationSimulator
         }
     
         self.simulator = type2simulator[simulator_type]
+
+        if simulator_type == 'lsmix':
+            self.spk2manifests = groupby(lambda x: x["speaker_id"], self.manifests)
+            self.speaker_ids = list(self.spk2manifests.keys())
 
     def __iter__(self):
         return self
@@ -1548,14 +1645,15 @@ class MultiSpeakerMixtureGenerator():
     def __next__(self):
         return self.simulator()
 
-    def _get_custom_dict(self, speaker_id=None):
+    def _get_custom_dict(self, additional_info=None):
         custom = {
             'pnc': 'no',
             'source_lang': 'en',
             'target_lang': 'en',
             'task': 'asr',
-            'speaker_id': speaker_id,
         }
+        if additional_info:
+            custom.update(additional_info)
         return custom
 
     def AudioMixtureSimulator(self):
@@ -1663,19 +1761,77 @@ class MultiSpeakerMixtureGenerator():
         tracks = []
         offset = 0.0
         for speaker_id, mono_cut in zip(sampled_speaker_ids, mono_cuts):
-            custom = {
-                    'pnc': 'no',
-                    'source_lang': 'en',
-                    'target_lang': 'en',
-                    'task': 'asr',
-                    'speaker_id': speaker_id,
-                }
-            mono_cut.custom.update(custom)
             tracks.append(MixTrack(cut=deepcopy(mono_cut), type=type(mono_cut), offset=offset))
             offset += random.uniform(self.min_delay, mono_cut.duration)
     
         mixed_cut = MixedCut(id='lsmix_' + '_'.join([track.cut.id for track in tracks]) + '_' + str(uuid4()), tracks=tracks)
         
+        # update custom for vad_target
+        offset, duration = 0, mixed_cut.duration
+        for i in range(self.max_speakers):
+            additional_info = {
+                'vad_target': get_vad_mask(
+                    timestamps=[[tracks[i].offset, tracks[i].offset + tracks[i].cut.duration]], 
+                    offset=offset, 
+                    duration=duration
+                ),
+                'speaker_id': sampled_speaker_ids[i]
+            }
+            custom = self._get_custom_dict(additional_info=additional_info)
+            mixed_cut.tracks[i].cut.custom.update(custom)
+
+        return mixed_cut
+
+    def ChannelSeparatedAudioMixer(self):
+        """
+        This function simulates a channel-separated audio mixer.
+        """
+        manifest = random.choice(self.manifests)
+        audio_filepath_list = manifest['audio_filepath']
+        seglst_filepath_list = manifest['seglst_filepath']
+        speaker_ids = manifest['speaker_ids']
+        channel_list = manifest['channels']
+
+        selected_channel = random.choice(channel_list)
+        selected_seglst_filepath = seglst_filepath_list[selected_channel]
+        seglst = SegList(seglst_filepath=selected_seglst_filepath)
+        segments = seglst.get_segments(
+            min_duration=10,
+            max_duration=50
+        )
+        offset = min(segment.start for segment in segments)
+        duration = max(segment.end for segment in segments) - offset
+        text = ' '.join([segment.text for segment in segments])
+
+        tracks = []
+        for i_ch in channel_list:
+            audio_filepath = audio_filepath_list[i_ch]
+            json_dict = {
+                'audio_filepath': audio_filepath,
+                'duration': duration,
+                'offset': offset,
+                'speaker_id': speaker_ids[i_ch],
+            }
+            cut = self.json_to_cut(json_dict)
+            if i_ch == selected_channel:
+                additional_info={
+                    'speaker_id': speaker_ids[i_ch],
+                    'text': text,
+                    'vad_target': get_vad_mask(
+                        timestamps=[(s.start, s.end) for s in segments], 
+                        offset=offset, 
+                        duration=duration
+                    )
+                }
+                cut.custom = self._get_custom_dict(
+                    additional_info=additional_info
+                )
+            else:
+                cut.custom = self._get_custom_dict()
+            tracks.append(MixTrack(cut=deepcopy(cut), type=type(cut), offset=0))
+
+        mixed_cut = MixedCut(id='channel_separated_audio_mixer_' + '_'.join([track.cut.id for track in tracks]) + '_' + str(uuid4()), tracks=tracks)
+
         return mixed_cut
 
     def MeetingSimulator(self):
@@ -1702,9 +1858,9 @@ class MultiSpeakerMixtureGenerator():
                 recording_id=cut.recording_id,
                 start=0,
                 duration=cut.duration,
-                text=json_dict.get("text"),
+                text=json_dict.get("text", None),
                 language=json_dict.get("language", "en"),
-                speaker=json_dict.get("speaker_id"),
+                speaker=json_dict.get("speaker_id", None),
             )
         )
         cut.custom = json_dict
@@ -1747,3 +1903,5 @@ class MultiSpeakerMixtureGenerator():
             )
         else:
             return Recording.from_file(audio_path)
+
+
