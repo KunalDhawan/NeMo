@@ -139,3 +139,12 @@ class CacheAwareStreamingConfig:
 
     last_channel_num: int = 0  # number of the last channel layers (like MHA layers) which need caching in the model
     last_time_num: int = 0  # number of the last time layers (like convolutions) which need caching in the model
+    
+    # Cache optimization attributes  
+    use_true_circular_buffers: bool = False  # whether to use true circular buffers for cache (no concatenation)
+    cache_dtype: Optional[Any] = None  # data type for cache tensors (torch.float32, torch.float16, torch.bfloat16)
+    enable_memory_pool: bool = False  # whether to enable memory pool for tensor reuse
+    enable_quantization: bool = False  # whether to enable cache quantization for memory savings
+    pool_size_limit: int = 100  # maximum number of tensors to keep in memory pool
+    prefetch_cache_tensors: bool = False  # whether to pre-allocate cache tensors
+    memory_pool: Optional[Any] = None  # reference to the memory pool instance

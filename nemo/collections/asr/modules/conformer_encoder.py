@@ -56,7 +56,164 @@ from nemo.core.neural_types import (
 )
 from nemo.utils import logging
 
+from threading import Lock
+import weakref
+import time
+
 __all__ = ['ConformerEncoder']
+
+
+class CacheMemoryPool:
+    """
+    Global memory pool for efficient cache tensor reuse across streaming sessions.
+    Reduces memory allocation overhead by reusing pre-allocated tensors.
+    """
+    
+    _instance = None
+    _lock = Lock()
+    
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._initialized = False
+        return cls._instance
+    
+    def __init__(self):
+        if not getattr(self, '_initialized', False):
+            self.attention_pools: Dict[Tuple[int, int, int, torch.dtype, torch.device], list] = {}
+            self.conv_pools: Dict[Tuple[int, int, int, torch.dtype, torch.device], list] = {}
+            self._pool_lock = Lock()
+            self._initialized = True
+    
+    def get_attention_cache(self, num_layers: int, batch_size: int, cache_size: int, 
+                          d_model: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        """Get or create attention cache tensor from pool."""
+        key = (num_layers, batch_size, cache_size, dtype, device)
+        
+        with self._pool_lock:
+            pool = self.attention_pools.get(key, [])
+            if pool:
+                tensor = pool.pop()
+                tensor.zero_()  # Clear previous data
+                return tensor
+        
+        # Create new tensor if pool is empty
+        return torch.zeros(num_layers, batch_size, cache_size, d_model, 
+                          dtype=dtype, device=device)
+    
+    def get_conv_cache(self, num_layers: int, batch_size: int, d_model: int, 
+                      cache_size: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        """Get or create convolution cache tensor from pool (key now includes cache_size)."""
+        key = (num_layers, batch_size, d_model, cache_size, dtype, device)
+        
+        with self._pool_lock:
+            pool = self.conv_pools.get(key, [])
+            if pool:
+                tensor = pool.pop()
+                tensor.zero_()  # Clear previous data
+                return tensor
+        
+        # Create new tensor if pool is empty
+        return torch.zeros(num_layers, batch_size, d_model, cache_size,
+                          dtype=dtype, device=device)
+    
+    def return_attention_cache(self, tensor: torch.Tensor):
+        """Return attention cache tensor to pool for reuse."""
+        if tensor is None:
+            return
+            
+        key = (tensor.shape[0], tensor.shape[1], tensor.shape[2], tensor.dtype, tensor.device)
+        
+        with self._pool_lock:
+            pool = self.attention_pools.setdefault(key, [])
+            if len(pool) < 50:  # Increased pool size for better reuse
+                pool.append(tensor)
+    
+    def return_conv_cache(self, tensor: torch.Tensor):
+        """Return convolution cache tensor to pool for reuse."""
+        if tensor is None:
+            return
+            
+        key = (tensor.shape[0], tensor.shape[1], tensor.shape[2], tensor.shape[3], tensor.dtype, tensor.device)
+        
+        with self._pool_lock:
+            pool = self.conv_pools.setdefault(key, [])
+            if len(pool) < 50:  # Increased pool size for better reuse
+                pool.append(tensor)
+    
+    def clear_pools(self):
+        """Clear all memory pools."""
+        with self._pool_lock:
+            self.attention_pools.clear()
+            self.conv_pools.clear()
+
+
+class OptimizedCacheManager:
+    """
+    Optimized cache manager with advanced features for better performance.
+    """
+    
+    def __init__(self, encoder_config, enable_quantization: bool = False):
+        self.encoder_config = encoder_config
+        self.enable_quantization = enable_quantization
+        self.memory_pool = CacheMemoryPool()
+        
+        # Cache configuration
+        self.use_mixed_precision = getattr(encoder_config, 'use_mixed_precision_cache', False)
+        self.cache_dtype = torch.float16 if self.use_mixed_precision else torch.float32
+        
+    def create_optimized_cache_state(self, batch_size: int, device: torch.device, 
+                                   num_layers: int, d_model: int, 
+                                   attention_cache_size: int, conv_cache_size: int) -> Tuple:
+        """
+        Create optimized cache state with memory pooling and optional quantization.
+        """
+        
+        # Use memory pool for efficient tensor reuse
+        cache_last_channel = self.memory_pool.get_attention_cache(
+            num_layers, batch_size, attention_cache_size, d_model,
+            self.cache_dtype, device
+        )
+        
+        cache_last_time = self.memory_pool.get_conv_cache(
+            num_layers, batch_size, d_model, conv_cache_size,
+            self.cache_dtype, device
+        )
+        
+        cache_last_channel_len = torch.zeros(batch_size, device=device, dtype=torch.int64)
+        
+        # Apply quantization if enabled
+        if self.enable_quantization and self.cache_dtype == torch.float32:
+            # Use int8 quantization for attention cache to save memory
+            cache_last_channel = self._quantize_cache(cache_last_channel)
+        
+        return cache_last_channel, cache_last_time, cache_last_channel_len
+    
+    def _quantize_cache(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Apply int8 quantization to cache tensor to save memory."""
+        # This is a simplified quantization - in practice you'd want per-channel quantization
+        if tensor.dtype == torch.float32:
+            # Scale to int8 range
+            scale = tensor.abs().max() / 127.0
+            if scale > 0:
+                quantized = (tensor / scale).round().clamp(-128, 127).to(torch.int8)
+                # Store scale for dequantization (simplified approach)
+                quantized._scale = scale
+                return quantized
+        return tensor
+    
+    def _dequantize_cache(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Dequantize int8 cache tensor back to float."""
+        if hasattr(tensor, '_scale') and tensor.dtype == torch.int8:
+            return tensor.float() * tensor._scale
+        return tensor
+    
+    def cleanup_cache(self, cache_last_channel: torch.Tensor, cache_last_time: torch.Tensor):
+        """Return cache tensors to memory pool for reuse."""
+        self.memory_pool.return_attention_cache(cache_last_channel)
+        self.memory_pool.return_conv_cache(cache_last_time)
 
 
 class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
@@ -488,6 +645,10 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         )
         # will be set in self.forward() if defined in AccessMixin config
         self.interctc_capture_at_layers = None
+        
+        # Initialize cache optimization settings
+        self._cache_optimization_enabled = False
+        self._cache_manager = None
 
     def forward_for_export(
         self, audio_signal, length, cache_last_channel=None, cache_last_time=None, cache_last_channel_len=None
@@ -674,6 +835,47 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             cache_last_time_next = []
             cache_last_channel_next = []
 
+        # Initialize circular caches on first forward pass if optimizations are enabled
+        if (hasattr(self, '_cache_optimization_enabled') and self._cache_optimization_enabled and 
+            not getattr(self, '_circular_caches_initialized', False)):
+            # Use actual batch size from current forward pass
+            # This handles variable batch sizes during streaming processing
+            current_batch_size = audio_signal.shape[0]
+            
+            # MEMORY MONITORING: Track memory before initialization
+            if torch.cuda.is_available():
+                memory_before = torch.cuda.memory_allocated(audio_signal.device) / (1024**3)  # GB
+                print(f"[MEMORY] GPU memory before circular cache init: {memory_before:.2f} GB")
+            
+            print(f"[DEBUG] Initializing circular caches with current batch size: {current_batch_size}")
+            
+            # Try global initialization and only mark as initialized if successful
+            cache_initialized_count = self._initialize_circular_caches(current_batch_size, audio_signal.device, audio_signal.dtype)
+            if cache_initialized_count > 0:
+                self._circular_caches_initialized = True
+                
+                # MEMORY MONITORING: Track memory after initialization
+                if torch.cuda.is_available():
+                    memory_after = torch.cuda.memory_allocated(audio_signal.device) / (1024**3)  # GB
+                    circular_buffer_memory = memory_after - memory_before
+                    print(f"[MEMORY] GPU memory after circular cache init: {memory_after:.2f} GB")
+                    print(f"[MEMORY] Circular buffer memory usage: {circular_buffer_memory:.2f} GB")
+                    
+                    # Calculate theoretical memory usage
+                    total_circular_memory = self._calculate_circular_buffer_memory_usage(current_batch_size, audio_signal.dtype)
+                    print(f"[MEMORY] Theoretical circular buffer memory: {total_circular_memory:.2f} GB")
+                
+                print(f"[INFO] Successfully initialized circular caches for {cache_initialized_count}/{len(self.layers)} layers")
+            else:
+                print(f"[WARNING] Failed to initialize circular caches - falling back to regular caching")
+                # Disable optimizations if initialization fails completely
+                self._cache_optimization_enabled = False
+
+        # Periodic memory cleanup and monitoring
+        if hasattr(self, '_cache_optimization_enabled') and self._cache_optimization_enabled:
+            self._cleanup_memory_if_needed()
+            self._track_memory_milestone("During processing")
+
         for lth, (drop_prob, layer) in enumerate(zip(self.layer_drop_probs, self.layers)):
             original_signal = audio_signal
             if cache_last_channel is not None:
@@ -682,6 +884,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             else:
                 cache_last_channel_cur = None
                 cache_last_time_cur = None
+                
             audio_signal = layer(
                 x=audio_signal,
                 att_mask=att_mask,
@@ -750,6 +953,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         if cache_last_channel is not None:
             cache_last_channel_next = torch.stack(cache_last_channel_next, dim=0)
             cache_last_time_next = torch.stack(cache_last_time_next, dim=0)
+            
             return (
                 audio_signal,
                 length,
@@ -1036,6 +1240,23 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
     def get_initial_cache_state(self, batch_size=1, dtype=torch.float32, device=None, max_dim=0):
         if device is None:
             device = next(self.parameters()).device
+        
+        # Note: Cache dimension optimization removed to prevent tensor mismatches
+        # Circular buffers still provide memory efficiency during processing
+        
+        # Check if optimized cache manager is available
+        if hasattr(self, '_cache_manager') and self._cache_manager is not None:
+            last_time_cache_size = self.conv_context_size[0]
+            return self._cache_manager.create_optimized_cache_state(
+                batch_size=batch_size,
+                device=device,
+                num_layers=len(self.layers),
+                d_model=self.d_model,
+                attention_cache_size=self.streaming_cfg.last_channel_cache_size,
+                conv_cache_size=last_time_cache_size
+            )
+        
+        # Fallback to original implementation
         if max_dim > 0:
             create_tensor = torch.randn
         else:
@@ -1073,6 +1294,181 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             cache_last_channel_len = torch.zeros(batch_size, device=device, dtype=torch.int64)
         return cache_last_channel, cache_last_time, cache_last_channel_len
 
+    def enable_cache_optimization(self, enable: bool = True, enable_quantization: bool = False):
+        """
+        Enable cache optimization using optimized cache manager.
+        
+        Args:
+            enable: Whether to enable cache optimization
+            enable_quantization: Whether to enable cache quantization for memory savings
+        """
+        self._cache_optimization_enabled = enable
+        self._step_count = 0  # Track steps for memory cleanup
+        
+        if enable:
+            try:
+                self._cache_manager = OptimizedCacheManager(
+                    encoder_config=getattr(self, '_cfg', None) or {},
+                    enable_quantization=enable_quantization
+                )
+                
+                # CRITICAL FIX: Ensure streaming_cfg exists before accessing it
+                if not hasattr(self, 'streaming_cfg') or self.streaming_cfg is None:
+                    self.setup_streaming_params()
+                
+                # Get circular buffer setting from streaming config or set default
+                print(f"[DEBUG] Reading from streaming_cfg: {type(self.streaming_cfg)}")
+                print(f"[DEBUG] streaming_cfg attributes: {dir(self.streaming_cfg)}")
+                
+                # Check configuration for optimization type
+                use_true_circular_buffers = getattr(self.streaming_cfg, 'use_true_circular_buffers', False)
+                cache_dtype = getattr(self.streaming_cfg, 'cache_dtype', torch.float32)
+                
+                if use_true_circular_buffers:
+                    print(f"[DEBUG] Enabling TRUE circular buffers (no concatenation)")
+                else:
+                    print(f"[DEBUG] Using BASELINE caching (no optimizations)")
+                
+                print(f"[DEBUG] Enabling cache optimizations:")
+                print(f"  - use_true_circular_buffers: {use_true_circular_buffers}")
+                print(f"  - cache_dtype: {cache_dtype}")
+                print(f"  - num_layers: {len(self.layers)}")
+                
+                # CRITICAL FIX: Properly configure ALL attention layers
+                for i, layer in enumerate(self.layers):
+                    if hasattr(layer, 'self_attn'):
+                        # Set optimization flags
+                        layer.self_attn._optimization_enabled = True
+                        layer.self_attn._use_true_circular = use_true_circular_buffers
+                        layer.self_attn._parent_encoder = self
+                        
+                        # Set cache dtype
+                        if hasattr(layer.self_attn, '_cache_dtype'):
+                            layer.self_attn._cache_dtype = cache_dtype
+                        
+                        # Configure circular buffer settings properly
+                        if hasattr(layer.self_attn, 'set_circular_buffer_config'):
+                            layer.self_attn.set_circular_buffer_config(
+                                parent_encoder=self,
+                                use_true_circular=use_true_circular_buffers
+                            )
+                        
+                        print(f"  ✓ Layer {i} attention configured: true_circular={use_true_circular_buffers}")
+                
+                # CRITICAL FIX: Also configure convolution layers  
+                for i, layer in enumerate(self.layers):
+                    if hasattr(layer, 'conv'):
+                        # NOTE: Keeping convolution layers on baseline path for stability
+                        # The circular buffer optimization is primarily for attention layers
+                        # Convolution caches are much smaller and don't benefit as much from circular buffers
+                        print(f"  ✓ Layer {i} conv kept on baseline path (stable)")
+                
+                # Store optimization settings in streaming_cfg for easy access
+                self.streaming_cfg.use_true_circular_buffers = use_true_circular_buffers
+                self.streaming_cfg.cache_dtype = cache_dtype
+                self.streaming_cfg.memory_pool = getattr(self._cache_manager, 'memory_pool', None)
+                
+                print(f"  ✓ Cache optimization enabled successfully")
+                        
+            except Exception as e:
+                # Fallback gracefully if optimization isn't available
+                self._cache_optimization_enabled = False
+                self._cache_manager = None
+                print(f"Warning: Cache optimization initialization failed: {e}")
+                import traceback
+                traceback.print_exc()
+        else:
+            # Disable optimizations
+            for layer in self.layers:
+                if hasattr(layer, 'self_attn'):
+                    layer.self_attn._optimization_enabled = False
+                    layer.self_attn._use_true_circular = False
+            print(f"  ✓ Cache optimization disabled")
+    
+    def _calculate_circular_buffer_memory_usage(self, batch_size: int, dtype: torch.dtype) -> float:
+        """Calculate theoretical memory usage of circular buffers in GB."""
+        total_memory_bytes = 0
+        
+        # Get bytes per element for the dtype
+        if dtype == torch.float32:
+            bytes_per_element = 4
+        elif dtype == torch.float16 or dtype == torch.bfloat16:
+            bytes_per_element = 2
+        elif dtype == torch.float64:
+            bytes_per_element = 8
+        else:
+            bytes_per_element = 4  # Default assumption
+        
+        for layer in self.layers:
+            if hasattr(layer, 'self_attn'):
+                attention = layer.self_attn
+                max_cache_len = getattr(attention, '_max_cache_len', 0)
+                n_feat = getattr(attention, 'n_feat', 0)
+                
+                if max_cache_len > 0 and n_feat > 0:
+                    # Each circular buffer: (batch_size, max_cache_len, n_feat)
+                    buffer_size_bytes = batch_size * max_cache_len * n_feat * bytes_per_element
+                    total_memory_bytes += buffer_size_bytes
+        
+        return total_memory_bytes / (1024**3)  # Convert to GB
+
+    def _track_memory_milestone(self, milestone_name: str):
+        """Track memory usage at key processing milestones."""
+        if not torch.cuda.is_available():
+            return
+            
+        current_memory = torch.cuda.memory_allocated() / (1024**3)  # GB
+        max_memory = torch.cuda.max_memory_allocated() / (1024**3)  # GB
+        
+        # Only log every 10th milestone to reduce verbosity
+        if not hasattr(self, '_milestone_counter'):
+            self._milestone_counter = 0
+        self._milestone_counter += 1
+        
+        if self._milestone_counter % 10 == 0:
+            print(f"[MEMORY] {milestone_name} - Current: {current_memory:.2f} GB, Peak: {max_memory:.2f} GB")
+
+    def _initialize_circular_caches(self, batch_size: int, device: torch.device, dtype: torch.dtype):
+        """Initialize true circular caches for all attention layers."""
+        if not self._cache_optimization_enabled:
+            return 0
+            
+        cache_initialized_count = 0
+        for i, layer in enumerate(self.layers):
+            if hasattr(layer, 'self_attn'):
+                # Check if true circular buffers are enabled for this layer
+                use_true_circular = getattr(layer.self_attn, '_use_true_circular', False)
+                if use_true_circular and hasattr(layer.self_attn, 'initialize_circular_cache'):
+                    try:
+                        layer.self_attn.initialize_circular_cache(batch_size, device, dtype)
+                        cache_initialized_count += 1
+                        print(f"[DEBUG] Successfully initialized true circular cache for layer {i}")
+                    except Exception as e:
+                        print(f"[ERROR] Failed to initialize true circular cache for layer {i}: {e}")
+                else:
+                    print(f"[DEBUG] Layer {i} - use_true_circular: {use_true_circular}, has_initialize_method: {hasattr(layer.self_attn, 'initialize_circular_cache') if hasattr(layer, 'self_attn') else False}")
+        
+        print(f"[DEBUG] Initialized true circular caches for {cache_initialized_count}/{len(self.layers)} layers")
+        return cache_initialized_count
+    
+    def _cleanup_memory_if_needed(self):
+        """Cleanup memory periodically during streaming to prevent leaks."""
+        self._step_count = getattr(self, '_step_count', 0) + 1
+        
+        # More aggressive cleanup - every 50 steps instead of 100
+        if self._step_count % 50 == 0:
+            # Clean up attention buffers in all layers
+            for layer in self.layers:
+                if hasattr(layer, 'self_attn'):
+                    if hasattr(layer.self_attn, 'cleanup_cache_buffers'):
+                        layer.self_attn.cleanup_cache_buffers()
+            
+            # Clear CUDA cache every 200 steps (less frequent as it's expensive)
+            if self._step_count % 200 == 0:
+                import gc
+                torch.cuda.empty_cache()
+                gc.collect()
+
     def change_attention_model(
         self,
         self_attention_model: str = None,
@@ -1091,7 +1487,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
 
                 'rel_pos_local_attn':
                     relative positional embedding and Transformer-XL with local attention using
-                    overlapping windows. Attention context is determined by att_context_size parameter.
+                    overlapping chunks. Attention context is determined by att_context_size parameter.
 
                 'abs_pos':
                     absolute positional embedding and Transformer

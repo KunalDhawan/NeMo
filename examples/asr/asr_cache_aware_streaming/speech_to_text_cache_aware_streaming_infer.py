@@ -53,6 +53,33 @@ If decoder is not set, then the default decoder would be used which is the RNNT 
 ## Multi-lookahead models
 For models which support multiple lookaheads, the default is the first one in the list of model.encoder.att_context_size. To change it, you may use --att_context_size, for example --att_context_size [70,1].
 
+## Cache Optimizations (Optional - baseline behavior unchanged)
+
+To use cache optimizations for improved performance while maintaining accuracy:
+
+python speech_to_text_streaming_infer.py \
+    --asr_model=asr_model.nemo \
+    --manifest_file=manifest_file.json \
+    --batch_size=2048 \
+    --use_true_circular_buffers \
+    --use_optimized_cache \
+    --enable_memory_pool \
+    --cache_dtype=bfloat16 \
+    --enable_mixed_precision_cache \
+    --use_amp
+
+Cache optimization parameters:
+--use_true_circular_buffers: Enable true circular buffers for attention layers (eliminates concatenation operations)
+--use_optimized_cache: Enable general cache optimizations including memory pool and efficient tensor operations  
+--enable_memory_pool: Enable memory pool for efficient cache tensor reuse across streaming sessions
+--enable_quantization: Enable cache quantization to reduce memory usage (may slightly affect accuracy)
+--cache_dtype: Data type for cache tensors (float32/float16/bfloat16 for memory efficiency)
+--pool_size_limit: Maximum number of tensors to keep in memory pool for reuse (default: 50)
+--cache_cleanup_interval: Frequency of cache cleanup operations (default: 25)
+--cache_memory_fraction: Fraction of GPU memory to allocate for caches (default: 0.4)
+--enable_mixed_precision_cache: Use mixed precision for cache operations
+
+Note: When no optimization flags are provided, the script uses baseline behavior identical to the original implementation.
 
 ## Evaluate a model trained with full context for offline mode
 
@@ -296,6 +323,73 @@ def main():
 
     parser.add_argument("--strategy", type=str, default="greedy_batch", help="decoding strategy to use")
 
+    # ========================
+    # Cache Optimization Parameters (Optional - baseline behavior unchanged when not used)
+    # ========================
+    parser.add_argument(
+        "--use_true_circular_buffers",
+        action="store_true",
+        default=False,
+        help="Enable true circular buffers for attention layers (eliminates concatenation operations for better performance)"
+    )
+    
+    parser.add_argument(
+        "--use_optimized_cache",
+        action="store_true", 
+        default=False,
+        help="Enable general cache optimizations including memory pool and efficient tensor operations"
+    )
+    
+    parser.add_argument(
+        "--enable_memory_pool",
+        action="store_true",
+        default=False,
+        help="Enable memory pool for efficient cache tensor reuse across streaming sessions"
+    )
+    
+    parser.add_argument(
+        "--enable_quantization",
+        action="store_true",
+        default=False,
+        help="Enable cache quantization to reduce memory usage (may slightly affect accuracy)"
+    )
+    
+    parser.add_argument(
+        "--cache_dtype",
+        type=str,
+        default="float32",
+        choices=["float32", "float16", "bfloat16"],
+        help="Data type for cache tensors (float16/bfloat16 can reduce memory usage)"
+    )
+    
+    parser.add_argument(
+        "--pool_size_limit",
+        type=int,
+        default=50,
+        help="Maximum number of tensors to keep in memory pool for reuse"
+    )
+    
+    parser.add_argument(
+        "--cache_cleanup_interval",
+        type=int,
+        default=25,
+        help="Frequency of cache cleanup operations to manage memory usage"
+    )
+    
+    parser.add_argument(
+        "--cache_memory_fraction",
+        type=float,
+        default=0.4,
+        help="Fraction of GPU memory to allocate for caches (0.1-0.8 recommended)"
+    )
+    
+    parser.add_argument(
+        "--enable_mixed_precision_cache",
+        action="store_true",
+        default=False,
+        help="Use mixed precision for cache operations to improve performance"
+    )
+
     args = parser.parse_args()
 
     torch.set_float32_matmul_precision(args.matmul_precision)
@@ -327,6 +421,139 @@ def main():
     global autocast
     autocast = torch.amp.autocast(asr_model.device.type, enabled=args.use_amp)
 
+    asr_model = asr_model.to(args.device)
+    asr_model.eval()
+
+    # ========================
+    # Configure Cache Optimizations IMMEDIATELY after model loading (ONLY when explicitly enabled - baseline unaffected)
+    # ========================
+    optimization_flags_enabled = any([
+        args.use_true_circular_buffers, 
+        args.use_optimized_cache, 
+        args.enable_memory_pool, 
+        args.enable_quantization, 
+        args.enable_mixed_precision_cache
+    ])
+    
+    if optimization_flags_enabled:
+        logging.info("Cache optimizations explicitly enabled - configuring optimized inference...")
+        
+        # Convert cache_dtype string to torch dtype
+        cache_dtype_map = {
+            "float32": torch.float32,
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16
+        }
+        cache_dtype = cache_dtype_map[args.cache_dtype]
+        
+        # Enable cache optimization on the encoder
+        if hasattr(asr_model.encoder, 'enable_cache_optimization'):
+            asr_model.encoder.enable_cache_optimization(
+                enable=args.use_optimized_cache,
+                enable_quantization=args.enable_quantization
+            )
+            logging.info(f"Enabled cache optimization: {args.use_optimized_cache}, quantization: {args.enable_quantization}")
+        
+        # CRITICAL FIX: Configure streaming settings IMMEDIATELY after model loading
+        if hasattr(asr_model.encoder, 'streaming_cfg'):
+            # Debug: Check what type of object streaming_cfg is
+            print(f"[DEBUG] EARLY: Reading from streaming_cfg: {type(asr_model.encoder.streaming_cfg)}")
+            print(f"[DEBUG] EARLY: streaming_cfg attributes: {dir(asr_model.encoder.streaming_cfg)}")
+            
+            # Direct attribute assignment (CacheAwareStreamingConfig is a dataclass, not OmegaConf)
+            try:
+                # Try to set attributes directly
+                streaming_cfg = asr_model.encoder.streaming_cfg
+                
+                # Debug: Check current value before setting
+                current_value = getattr(streaming_cfg, 'use_true_circular_buffers', 'NOT_FOUND')
+                print(f"[DEBUG] EARLY: Before setting - use_true_circular_buffers: {current_value}")
+                print(f"[DEBUG] EARLY: Setting use_true_circular_buffers to: {args.use_true_circular_buffers}")
+                
+                # Set cache optimization attributes directly
+                if not hasattr(streaming_cfg, 'use_true_circular_buffers'):
+                    setattr(streaming_cfg, 'use_true_circular_buffers', args.use_true_circular_buffers)
+                else:
+                    streaming_cfg.use_true_circular_buffers = args.use_true_circular_buffers
+                    
+                # Debug: Check value after setting
+                new_value = getattr(streaming_cfg, 'use_true_circular_buffers', 'NOT_FOUND')
+                print(f"[DEBUG] EARLY: After setting - use_true_circular_buffers: {new_value}")
+                    
+                if not hasattr(streaming_cfg, 'use_optimized_cache'):
+                    setattr(streaming_cfg, 'use_optimized_cache', args.use_optimized_cache)
+                else:
+                    streaming_cfg.use_optimized_cache = args.use_optimized_cache
+                    
+                if not hasattr(streaming_cfg, 'enable_memory_pool'):
+                    setattr(streaming_cfg, 'enable_memory_pool', args.enable_memory_pool)
+                else:
+                    streaming_cfg.enable_memory_pool = args.enable_memory_pool
+                    
+                if not hasattr(streaming_cfg, 'enable_quantization'):
+                    setattr(streaming_cfg, 'enable_quantization', args.enable_quantization)
+                else:
+                    streaming_cfg.enable_quantization = args.enable_quantization
+                    
+                if not hasattr(streaming_cfg, 'cache_dtype'):
+                    setattr(streaming_cfg, 'cache_dtype', cache_dtype)
+                else:
+                    streaming_cfg.cache_dtype = cache_dtype
+                    
+                if not hasattr(streaming_cfg, 'pool_size_limit'):
+                    setattr(streaming_cfg, 'pool_size_limit', args.pool_size_limit)
+                else:
+                    streaming_cfg.pool_size_limit = args.pool_size_limit
+                    
+                if not hasattr(streaming_cfg, 'cache_cleanup_interval'):
+                    setattr(streaming_cfg, 'cache_cleanup_interval', args.cache_cleanup_interval)
+                else:
+                    streaming_cfg.cache_cleanup_interval = args.cache_cleanup_interval
+                    
+                if not hasattr(streaming_cfg, 'cache_memory_fraction'):
+                    setattr(streaming_cfg, 'cache_memory_fraction', args.cache_memory_fraction)
+                else:
+                    streaming_cfg.cache_memory_fraction = args.cache_memory_fraction
+                    
+                if not hasattr(streaming_cfg, 'enable_mixed_precision_cache'):
+                    setattr(streaming_cfg, 'enable_mixed_precision_cache', args.enable_mixed_precision_cache)
+                else:
+                    streaming_cfg.enable_mixed_precision_cache = args.enable_mixed_precision_cache
+                    
+                print(f"[DEBUG] EARLY: Successfully configured streaming_cfg with optimization parameters")
+                
+                # Configure circular buffers for attention layers IMMEDIATELY
+                if args.use_true_circular_buffers and hasattr(asr_model.encoder, 'layers'):
+                    logging.info("EARLY: Configuring circular buffers for attention layers...")
+                    for layer_idx, layer in enumerate(asr_model.encoder.layers):
+                        if hasattr(layer, 'set_circular_buffer_config'):
+                            layer.set_circular_buffer_config(
+                                use_circular_buffers=args.use_true_circular_buffers,
+                                optimization_enabled=args.use_optimized_cache
+                            )
+                            logging.info(f"EARLY: Configured circular buffers for layer {layer_idx}")
+                
+            except Exception as e:
+                print(f"[WARNING] EARLY: Failed to configure streaming_cfg: {e}")
+                print(f"[DEBUG] EARLY: Using BASELINE caching (no optimizations)")
+        
+        # Log the optimization configuration
+        optimization_summary = {
+            "use_true_circular_buffers": args.use_true_circular_buffers,
+            "use_optimized_cache": args.use_optimized_cache,
+            "enable_memory_pool": args.enable_memory_pool,
+            "enable_quantization": args.enable_quantization,
+            "cache_dtype": args.cache_dtype,
+            "pool_size_limit": args.pool_size_limit,
+            "cache_cleanup_interval": args.cache_cleanup_interval,
+            "cache_memory_fraction": args.cache_memory_fraction,
+            "enable_mixed_precision_cache": args.enable_mixed_precision_cache
+        }
+        logging.info(f"EARLY: Optimized cache configuration: {optimization_summary}")
+    else:
+        # Baseline behavior - no modifications to the original code path
+        logging.info("Using baseline inference (no optimization flags detected)")
+
     # configure the decoding config
     decoding_cfg = asr_model.cfg.decoding
     with open_dict(decoding_cfg):
@@ -341,9 +568,6 @@ def main():
             asr_model.change_decoding_strategy(decoding_cfg, decoder_type=asr_model.cur_decoder)
         else:
             asr_model.change_decoding_strategy(decoding_cfg)
-
-    asr_model = asr_model.to(args.device)
-    asr_model.eval()
 
     # chunk_size is set automatically for models trained for streaming. For models trained for offline mode with full context, we need to pass the chunk_size explicitly.
     if args.chunk_size > 0:

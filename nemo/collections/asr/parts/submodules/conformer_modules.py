@@ -157,6 +157,22 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
         self.dropout = nn.Dropout(dropout)
         self.norm_out = LayerNorm(d_model)
 
+    def set_circular_buffer_config(self, use_circular_buffers: bool = False, optimization_enabled: bool = False):
+        """Set circular buffer configuration for both attention and convolution modules."""
+        # Configure attention module
+        if hasattr(self.self_attn, 'set_circular_buffer_config'):
+            self.self_attn.set_circular_buffer_config(
+                parent_encoder=None,
+                use_true_circular=use_circular_buffers
+            )
+        
+        # Configure convolution module
+        if hasattr(self.conv, 'set_circular_buffer_config'):
+            self.conv.set_circular_buffer_config(
+                use_circular_buffers=use_circular_buffers,
+                optimization_enabled=optimization_enabled
+            )
+
     def forward(self, x, att_mask=None, pos_emb=None, pad_mask=None, cache_last_channel=None, cache_last_time=None):
         """
         Args:
@@ -315,6 +331,14 @@ class ConformerConvolution(nn.Module):
             stride=1,
             padding=0,
             bias=self.use_bias,
+        )
+
+    def set_circular_buffer_config(self, use_circular_buffers: bool = False, optimization_enabled: bool = False):
+        """Set circular buffer configuration for the depthwise convolution."""
+        if hasattr(self.depthwise_conv, 'set_circular_buffer_config'):
+            self.depthwise_conv.set_circular_buffer_config(
+                use_circular_buffers=use_circular_buffers,
+                optimization_enabled=optimization_enabled
         )
 
     def forward(self, x, pad_mask=None, cache=None):
