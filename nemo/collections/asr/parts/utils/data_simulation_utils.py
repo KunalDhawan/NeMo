@@ -455,7 +455,10 @@ def get_speaker_ids(sess_idx: int, speaker_samples: dict, permutated_speaker_ind
         speaker_ids (list): List of speaker IDs
     """
     all_speaker_ids = list(speaker_samples.keys())
-    idx_list = permutated_speaker_inds[sess_idx, :]
+    # Measure the length of permutated_speaker_inds and mod the sess_idx number so that 
+    # sess_idx is always less than the length of permutated_speaker_inds
+    sess_idx_circular = sess_idx % permutated_speaker_inds.shape[0]
+    idx_list = permutated_speaker_inds[sess_idx_circular, :]
     speaker_ids = [all_speaker_ids[i] for i in idx_list]
     return speaker_ids
 
