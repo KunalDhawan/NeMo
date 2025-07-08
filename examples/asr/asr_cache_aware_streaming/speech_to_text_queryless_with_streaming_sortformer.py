@@ -153,7 +153,6 @@ def perform_streaming(
     debug_mode=False):
     batch_size = len(streaming_buffer.streams_length)
     final_offline_tran = None
-
     cache_last_channel, cache_last_time, cache_last_channel_len = asr_model.encoder.get_initial_cache_state(
         batch_size=batch_size
     )

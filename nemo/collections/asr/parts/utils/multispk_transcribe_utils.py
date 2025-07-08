@@ -859,14 +859,14 @@ class SpeakerTaggedASR:
             return None
         else:
             # Get the difference between the current text and the previous text
-            try:
-                if self._prev_history_speaker_texts[spk_idx] in text:
-                    return text.replace(self._prev_history_speaker_texts[spk_idx], "")
-                else:
-                    return text.strip()
-            except:
-                import ipdb; ipdb.set_trace()
+            if self._prev_history_speaker_texts[spk_idx] in text:
+                return text.replace(self._prev_history_speaker_texts[spk_idx], "")
+            else:
+                return text.strip()
 
+    def _update_last_sentence(self, spk_idx, end_time, diff_text):
+        self._speaker_wise_sentences[spk_idx][-1]['end_time'] = end_time
+        self._speaker_wise_sentences[spk_idx][-1]['text'] += diff_text
 
     def get_multi_thread_sentences_values(self, step_num, previous_hypotheses, chunk_length):
         """ 
@@ -894,10 +894,7 @@ class SpeakerTaggedASR:
                     last_end_time = 0.0
 
                 # Case 1 - If start_tiime is greater than end_time + sent_break_sec, then we need to add the sentence
-                if last_end_time > 0.0 and len(diff_text) > 0 and diff_text[0] != " ":
-                    self._speaker_wise_sentences[spk_idx][-1]['end_time'] = end_time
-                    self._speaker_wise_sentences[spk_idx][-1]['text'] += diff_text
-                elif last_end_time == 0.0 or start_time > last_end_time + self._sent_break_sec:
+                if last_end_time == 0.0 or start_time > last_end_time + self._sent_break_sec:
                     print(f"GAP : Gap detected between sentences for speaker [  {spk_idx}  ] is :[ {(start_time - last_end_time):.4f}, diff_text: {diff_text} ]")
                     self._speaker_wise_sentences[spk_idx].append(self._get_new_sentence_dict(speaker=f"speaker_{spk_idx}", 
                                                                                                 start_time=start_time, 
@@ -907,8 +904,7 @@ class SpeakerTaggedASR:
                 # Case 2 - If start_time is less than end_time + sent_break_sec, then we need to update the end_time
                 else:
                     print(f"NO GAP : Gap detected between sentences for speaker {spk_idx} is : {(start_time - last_end_time):.4f}, diff_text: {diff_text}")
-                    self._speaker_wise_sentences[spk_idx][-1]['end_time'] = end_time
-                    self._speaker_wise_sentences[spk_idx][-1]['text'] += diff_text
+                    self._update_last_sentence(spk_idx=spk_idx, end_time=end_time, diff_text=diff_text)
 
             # Update the previous history of the speaker text
             if hypothesis.text is not None:
@@ -1012,16 +1008,16 @@ class SpeakerTaggedASR:
             binary_diar_preds=binary_diar_preds
         )
 
-        transcribed_speaker_texts = [None] * n_mix
+        # transcribed_speaker_texts = [None] * n_mix
         hop_frames = chunk_lengths[0].item() - left_offset - right_offset
 
         all_sentences = self.get_multi_thread_sentences_values(step_num,previous_hypotheses, hop_frames)
-        # if self.cfg.generate_scripts:
-        multi_instance_transcript = print_sentences(sentences=all_sentences, 
+        transcribed_speaker_texts = print_sentences(sentences=all_sentences, 
                         color_palette=get_color_palette(), 
                         params=self.cfg)
-        write_txt(f'{self.cfg.print_path}'.replace(".sh", "_0.sh"), 
-                    multi_instance_transcript.strip()) 
+        if self.cfg.generate_scripts:
+            write_txt(f'{self.cfg.print_path}'.replace(".sh", "_0.sh"), 
+                        transcribed_speaker_texts.strip()) 
         
         return (transcribed_speaker_texts,
                 transcribed_texts,
