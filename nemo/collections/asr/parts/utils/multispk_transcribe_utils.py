@@ -894,10 +894,11 @@ class SpeakerTaggedASR:
                     last_end_time = 0.0
 
                 # Case 1 - If start_tiime is greater than end_time + sent_break_sec, then we need to add the sentence
-                if last_end_time > 0.0 and len(diff_text) > 0 and diff_text[0] != " ":
-                    self._speaker_wise_sentences[spk_idx][-1]['end_time'] = end_time
-                    self._speaker_wise_sentences[spk_idx][-1]['text'] += diff_text
-                elif last_end_time == 0.0 or start_time > last_end_time + self._sent_break_sec:
+                # if last_end_time > 0.0 and len(diff_text) > 0 and diff_text[0] != " ":
+                #     self._speaker_wise_sentences[spk_idx][-1]['end_time'] = end_time
+                #     self._speaker_wise_sentences[spk_idx][-1]['text'] += diff_text
+                # elif 
+                if last_end_time == 0.0 or start_time > last_end_time + self._sent_break_sec:
                     print(f"GAP : Gap detected between sentences for speaker [  {spk_idx}  ] is :[ {(start_time - last_end_time):.4f}, diff_text: {diff_text} ]")
                     self._speaker_wise_sentences[spk_idx].append(self._get_new_sentence_dict(speaker=f"speaker_{spk_idx}", 
                                                                                                 start_time=start_time, 
@@ -948,6 +949,8 @@ class SpeakerTaggedASR:
         binary_diar_preds,
         n_mix,
         cache_gating,
+        cache_gating_buffer_size,
+        valid_speakers_last_time,
         rttm=None
     ):
         
@@ -984,6 +987,7 @@ class SpeakerTaggedASR:
 
         if spk_targets.shape[1] > diar_max_len:
             spk_targets = spk_targets[:, -diar_max_len:]
+        
 
         (
             asr_pred_out_stream,
@@ -992,6 +996,7 @@ class SpeakerTaggedASR:
             cache_last_time,
             cache_last_channel_len,
             previous_hypotheses,
+            valid_speakers_last_time,
             # valid_speaker_ids,
         ) = self.asr_model.conformer_stream_step(
             processed_signal=chunk_audio,
@@ -1008,8 +1013,10 @@ class SpeakerTaggedASR:
             return_transcription=True,
             spk_targets=spk_targets,
             n_mix=n_mix,
+            binary_diar_preds=binary_diar_preds,
             cache_gating=cache_gating,
-            binary_diar_preds=binary_diar_preds
+            cache_gating_buffer_size=cache_gating_buffer_size,
+            valid_speakers_last_time=valid_speakers_last_time,
         )
 
         transcribed_speaker_texts = [None] * n_mix
@@ -1032,4 +1039,5 @@ class SpeakerTaggedASR:
                 cache_last_channel_len,
                 previous_hypotheses,
                 streaming_state,
-                diar_pred_out_stream)
+                diar_pred_out_stream,
+                valid_speakers_last_time)

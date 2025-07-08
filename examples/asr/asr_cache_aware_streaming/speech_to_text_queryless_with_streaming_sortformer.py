@@ -161,6 +161,7 @@ def perform_streaming(
     previous_hypotheses = [Hypothesis(score=0, y_sequence=[]) for i in range(cfg.mix)]
     streaming_buffer_iter = iter(streaming_buffer)
     asr_pred_out_stream, diar_pred_out_stream  = [torch.tensor([]) for i in range(cfg.mix)], None
+    valid_speakers_last_time = None
     streaming_state = diar_model.sortformer_modules.init_streaming_state(
             batch_size = cfg.batch_size,
             async_streaming = True,
@@ -187,7 +188,8 @@ def perform_streaming(
                     cache_last_channel_len,
                     previous_hypotheses,
                     streaming_state,
-                    diar_pred_out_stream) = multispk_asr_streamer.perform_queryless_streaming_stt_spk(
+                    diar_pred_out_stream,
+                    valid_speakers_last_time) = multispk_asr_streamer.perform_queryless_streaming_stt_spk(
                         step_num=step_num,
                         chunk_audio=chunk_audio,
                         chunk_lengths=chunk_lengths,
@@ -206,6 +208,8 @@ def perform_streaming(
                         binary_diar_preds=cfg.binary_diar_preds,
                         n_mix=cfg.mix,
                         cache_gating=cfg.get("cache_gating", False),
+                        cache_gating_buffer_size=cfg.get("cache_gating_buffer_size", 2),
+                        valid_speakers_last_time=valid_speakers_last_time,
                         rttm=rttm[:step_num*14+14].unsqueeze(0).to(asr_model.device) if rttm is not None else None
                     )
 
