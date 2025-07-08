@@ -81,7 +81,6 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
 
         for cut in cuts:
             non_padding_cuts = []
-            
             if isinstance(cut, MonoCut):
                 non_padding_cuts.append(cut)
             elif isinstance(cut, MixedCut):
@@ -104,7 +103,6 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
                 # new channel
                 speaker_targets = [non_padding_cut.vad_target for non_padding_cut in non_padding_cuts if hasattr(non_padding_cut, 'vad_target')]
                 texts = [non_padding_cut.custom['text'] for non_padding_cut in non_padding_cuts if hasattr(non_padding_cut, 'text')]
-
             if len(speaker_targets) > 0:
                 # multi-speaker
                 target_speaker_id = random.choice(range(len(speaker_targets)))

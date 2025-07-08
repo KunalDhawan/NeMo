@@ -1524,12 +1524,14 @@ def speaker_to_target(
                 speaker='0',
                 language=None
             )])
-        
         if boundary_segments: # segments with seg_start < total_end and seg_end > total_start are included
-            segments_iterator = find_segments_from_rttm(recording_id=cut.recording_id, rttms=rttms, start_after=cut.start, end_before=cut.end, tolerance=0.0)
+            segments_iterator = find_segments_from_rttm(recording_id=cut.recording_id, rttms=rttms, start_after=cut.offset, end_before=cut.end, tolerance=0.0)
         else: # segments with seg_start > total_start and seg_end < total_end are included
-            segments_iterator = rttms.find(recording_id=cut.recording_id, start_after=cut.start, end_before=cut.end, adjust_offset=True) #, tolerance=0.0)
-
+            if hasattr(cut, 'offset'): # tarred dataset
+                segments_iterator = rttms.find(recording_id=rttms[0].recording_id, start_after=cut.offset, end_before=cut.offset+cut.duration, adjust_offset=True) #, tolerance=0.0)
+            else:
+                segments_iterator = rttms.find(recording_id=cut.recording_id, start_after=cut.start, end_before=cut.end, adjust_offset=True) #, tolerance=0.0)
+            
         for seg in segments_iterator:
             if seg.start < 0:
                 seg.duration += seg.start
@@ -1877,6 +1879,43 @@ class MultiSpeakerMixtureGenerator():
         mixed_cut = MixedCut(id='channel_separated_audio_mixer_' + '_'.join([track.cut.id for track in tracks]) + '_' + str(uuid4()), tracks=tracks)
 
         return mixed_cut
+
+    def MultiSpeakerMixtureLoader(self):
+
+        manifest = random.choice(self.manifests)
+        audio_filepath = manifest['audio_filepath']
+        seglst_filepath = manifest['seglst_filepath']
+        speaker_ids = manifest['speaker_ids']
+
+        seglst = SegList(seglst_filepath=seglst_filepath)
+        segments = seglst.get_segments(
+            min_duration=10,
+            max_duration=50
+        )
+        offset = min(segment.start for segment in segments)
+        duration = max(segment.end for segment in segments) - offset
+        text = ' '.join([segment.text for segment in segments])
+
+        json_dict = {
+            'audio_filepath': audio_filepath,
+            'duration': duration,
+            'offset': offset,
+            'speaker_id': speaker_ids,
+        }
+        cut = self.json_to_cut(json_dict)
+        additional_info={
+            'text': text,
+            'vad_target': get_vad_mask(
+                timestamps=[(s.start, s.end) for s in segments], 
+                offset=offset, 
+                duration=duration
+            )
+        }
+        cut.custom = self._get_custom_dict(
+            additional_info=additional_info
+        )
+
+        return cut
 
     def MeetingSimulator(self):
         raise NotImplementedError("MeetingSimulator is not implemented yet.")   
