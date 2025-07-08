@@ -441,6 +441,7 @@ class SpeakerTaggedASR:
         self._fix_prev_words_count = cfg.fix_prev_words_count
         self._sentence_render_length = int(self._fix_prev_words_count + cfg.update_prev_words_sentence)
         self._frame_len_sec = 0.08
+        self._feat_frame_len_sec = 0.01
         self._initial_steps = cfg.ignored_initial_frame_steps
         self._all_sentences = []
         # self._stt_words = COMMON_SENTENCE_STARTS
@@ -448,6 +449,13 @@ class SpeakerTaggedASR:
         self._init_evaluator() 
         self._frame_hop_length = self.asr_model.encoder.streaming_cfg.valid_out_len
         self.seglst_dict_list = []
+
+        ### multi-instance configs
+        self._max_speakers = 16
+        self._offset_chunk_start_time = 0.0
+        self._sent_break_sec = 1.5
+        self._speaker_wise_sentences = {}
+        self._prev_history_speaker_texts = [ "" for _ in range(self._max_speakers) ]
     
     def _init_evaluator(self):  
         self.online_evaluators, self._word_and_ts_seq = [], []
@@ -837,7 +845,87 @@ class SpeakerTaggedASR:
                                 )
         transcriptions = self._add_speaker_transcriptions(transcriptions, speaker_transcriptions, word_and_ts_seq)
         return transcriptions
+    
+    def _get_new_sentence_dict(self, speaker, start_time, end_time, text):
+        return {
+            'speaker': speaker,
+            'start_time': start_time,
+            'end_time': end_time,
+            'text': text
+        }
+    
+    def _is_new_text(self, spk_idx, text):
+        if text is None or text == self._prev_history_speaker_texts[spk_idx]:
+            return None
+        else:
+            # Get the difference between the current text and the previous text
+            try:
+                if self._prev_history_speaker_texts[spk_idx] in text:
+                    return text.replace(self._prev_history_speaker_texts[spk_idx], "")
+                else:
+                    return text.strip()
+            except:
+                import ipdb; ipdb.set_trace()
 
+
+    def get_multi_thread_sentences_values(self, step_num, previous_hypotheses, chunk_length):
+        """ 
+        for sentence in sentences:
+        # extract info
+            speaker = sentence['speaker']
+            start_point = sentence['start_time']
+            end_point = sentence['end_time']
+            text = sentence['text']
+        """
+        sentences = []
+        for spk_idx, hypothesis in enumerate(previous_hypotheses):
+            if spk_idx not in self._speaker_wise_sentences:
+                self._speaker_wise_sentences[spk_idx] = []
+
+            diff_text = self._is_new_text(spk_idx=spk_idx, text=hypothesis.text) 
+            if diff_text is not None:
+                start_time = self._offset_chunk_start_time + (hypothesis.timestep[0]) * self._frame_len_sec
+                end_time = self._offset_chunk_start_time + (hypothesis.timestep[-1] + 1) * self._frame_len_sec
+
+                # Get the last end time of the previous sentence or None if no sentences are present
+                if len(self._speaker_wise_sentences[spk_idx]) > 0:
+                    last_end_time = self._speaker_wise_sentences[spk_idx][-1]['end_time']   
+                else:
+                    last_end_time = 0.0
+
+                # Case 1 - If start_tiime is greater than end_time + sent_break_sec, then we need to add the sentence
+                if last_end_time > 0.0 and len(diff_text) > 0 and diff_text[0] != " ":
+                    self._speaker_wise_sentences[spk_idx][-1]['end_time'] = end_time
+                    self._speaker_wise_sentences[spk_idx][-1]['text'] += diff_text
+                elif last_end_time == 0.0 or start_time > last_end_time + self._sent_break_sec:
+                    print(f"GAP : Gap detected between sentences for speaker [  {spk_idx}  ] is :[ {(start_time - last_end_time):.4f}, diff_text: {diff_text} ]")
+                    self._speaker_wise_sentences[spk_idx].append(self._get_new_sentence_dict(speaker=f"speaker_{spk_idx}", 
+                                                                                                start_time=start_time, 
+                                                                                                end_time=end_time, 
+                                                                                                text=diff_text))
+
+                # Case 2 - If start_time is less than end_time + sent_break_sec, then we need to update the end_time
+                else:
+                    print(f"NO GAP : Gap detected between sentences for speaker {spk_idx} is : {(start_time - last_end_time):.4f}, diff_text: {diff_text}")
+                    self._speaker_wise_sentences[spk_idx][-1]['end_time'] = end_time
+                    self._speaker_wise_sentences[spk_idx][-1]['text'] += diff_text
+
+            # Update the previous history of the speaker text
+            if hypothesis.text is not None:
+                self._prev_history_speaker_texts[spk_idx] = hypothesis.text
+        
+        self._offset_chunk_start_time += chunk_length * self._feat_frame_len_sec
+        ### Merge all sentences for each speaker but sort by start_time
+        all_sentences = []
+        for spk_idx, hypothesis in enumerate(previous_hypotheses):
+            all_sentences.extend(self._speaker_wise_sentences[spk_idx])
+        all_sentences.sort(key=lambda x: x['start_time'])
+
+        # if step_num % 30 == 0 and step_num > 1:
+            # print(self._speaker_wise_sentences)
+            # print(diff_text)
+            # import ipdb; ipdb.set_trace()
+        return all_sentences
 
     @measure_eta 
     def perform_queryless_streaming_stt_spk(
@@ -925,36 +1013,15 @@ class SpeakerTaggedASR:
         )
 
         transcribed_speaker_texts = [None] * n_mix
-        # uniq_id = list(self.test_manifest_dict.keys())[0]
-        # if len(self._word_and_ts_seq) < n_mix:
-        #     self._word_and_ts_seq = [deepcopy(self._word_and_ts_seq[0]) for _ in range(n_mix)]
+        hop_frames = chunk_lengths[0].item() - left_offset - right_offset
 
-        # step 1: save the word and time-stamp sequence for each speaker
-        # import ipdb; ipdb.set_trace()
-        # for idx in range(n_mix): 
-        #     if not (len( previous_hypotheses[idx].text) == 0 and step_num <= self._initial_steps):
-        #         # Get the word-level dictionaries for each word in the chunk
-        #         diar_pred_out_stream_idx = torch.zeros_like(diar_pred_out_stream)
-        #         diar_pred_out_stream_idx[:, :, idx] = diar_pred_out_stream[:, :, idx]
-        #         self._word_and_ts_seq[idx] = self.get_frame_and_words_online(uniq_id=uniq_id,
-        #                                                                     step_num=step_num, 
-        #                                                                     diar_pred_out_stream=diar_pred_out_stream_idx[0],
-        #                                                                     previous_hypothesis=previous_hypotheses[idx], 
-        #                                                                     word_and_ts_seq=self._word_and_ts_seq[idx],
-        #                                                                     )
-        #         if len(self._word_and_ts_seq[idx]["words"]) > 0:
-        #             self._word_and_ts_seq[idx] = self.get_sentences_values(session_trans_dict=self._word_and_ts_seq[idx], 
-        #                                                                    sentence_render_length=self._sentence_render_length)
-        #             if self.cfg.eval_mode:
-        #                 der, cpwer, is_update = self.online_evaluators[idx].evaluate_inloop(hyp_seglst=self._word_and_ts_seq[idx]["sentences"], 
-        #                                                                                     end_step_time=self._word_and_ts_seq[idx]["sentences"][-1]["end_time"])
-        #             if self.cfg.generate_scripts:
-        #                 transcribed_speaker_texts[idx] = \
-        #                     print_sentences(sentences=self._word_and_ts_seq[idx]["sentences"], 
-        #                     color_palette=get_color_palette(), 
-        #                     params=self.cfg)
-        #                 write_txt(f'{self.cfg.print_path}'.replace(".sh", f"_{idx}.sh"), 
-        #                           transcribed_speaker_texts[idx].strip())
+        all_sentences = self.get_multi_thread_sentences_values(step_num,previous_hypotheses, hop_frames)
+        # if self.cfg.generate_scripts:
+        multi_instance_transcript = print_sentences(sentences=all_sentences, 
+                        color_palette=get_color_palette(), 
+                        params=self.cfg)
+        write_txt(f'{self.cfg.print_path}'.replace(".sh", "_0.sh"), 
+                    multi_instance_transcript.strip()) 
         
         return (transcribed_speaker_texts,
                 transcribed_texts,
