@@ -134,6 +134,11 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
 
     def _setup_dataloader_from_config(self, config: Optional[Dict]):
         if config.get("use_lhotse"):
+            # Use open_dict to allow dynamic key addition
+            with open_dict(config):
+                config.global_rank = self.global_rank
+                config.world_size = self.world_size
+            
             return get_lhotse_dataloader_from_config(
                 config,
                 global_rank=self.global_rank,
@@ -324,7 +329,6 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
         # B x T x N
         spk_targets = spk_targets[:, :, :n_mix] 
         if vad:
-            # import ipdb; ipdb.set_trace()
             max_probs = torch.max(spk_targets, dim=1).values # B x N
             valid_speakers = max_probs > 0.5 # B x N
             if valid_speakers.sum() == 0:

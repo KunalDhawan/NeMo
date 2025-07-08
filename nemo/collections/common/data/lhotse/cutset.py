@@ -601,12 +601,19 @@ def read_multi_speaker_simulator(config: DictConfig) -> tuple[CutSet, bool]:
         MultiSpeakerMixtureGenerator(
             manifest_filepath=config.manifest_filepath,
             simulator_type=config.simulator_type,
+            sample_rate=config.get("sample_rate", 16000),
             min_delay=config.get("min_delay", 0.5),
-            outputs=config.get("outputs", None),
+            output_dir=config.get("output_dir", None),
             session_config=config.get("session_config", None),
             background_manifest=config.get("background_manifest", None),
             rir_manifest=config.get("rir_manifest", None),
+            rir_ratio_range=config.get("rir_ratio_range", None),
+            rir_perturb_prob_range=config.get("rir_perturb_prob_range", None),
+            rir_variance=config.get("rir_variance", None),
+            noise_ratio_range=config.get("noise_ratio_range", None),
             num_speakers=config.get("num_speakers", 2),
+            global_rank=config.get("global_rank", 0),
+            world_size=config.get("world_size", 1),
         )
     )
     is_tarred = config.get("is_tarred", False)

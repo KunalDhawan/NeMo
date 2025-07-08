@@ -14,6 +14,7 @@
 
 import concurrent
 import os
+import random
 import warnings
 from typing import Dict, List, Tuple
 from copy import deepcopy
@@ -644,6 +645,16 @@ class MultiSpeakerSimulator(object):
                 f"{self._params.data_simulator.session_config.num_speakers}"
             )
 
+    def update_random_seed(self, random_seed: int):
+        """ 
+        Update the random seed for the data simulator. This is used to ensure the reproducibility 
+        for each of different session.
+
+        Args:
+            random_seed (int): Random seed to update.
+        """
+        self._params.data_simulator.random_seed = random_seed
+
     def _add_file(
         self,
         audio_manifest: dict,
@@ -876,10 +887,16 @@ class MultiSpeakerSimulator(object):
                     window = self._get_window(end_window_amount, start=False)
                     sig_start = start_cutoff + prev_dur_samples
                     sig_end = start_cutoff + prev_dur_samples + end_window_amount
-                    windowed_audio_file = torch.multiply(audio_file[sig_start:sig_end], window)
-                    self._sentence = torch.cat((self._sentence, windowed_audio_file), 0).to(self._device)
-                    self._alignments[-1] = float(len(self._sentence) * 1.0 / self._params.data_simulator.sr)
-                    new_added_alignments[-1] = new_added_alignments[-1] + float(end_window_amount * 1.0 / self._params.data_simulator.sr)
+
+                    # if sig_start or sig_end is out of range, raise an error
+                    if sig_start < 0 or sig_end > len(audio_file) or sig_start > len(audio_file):
+                        logging.info(f"sig_start {sig_start} or sig_end {sig_end} is out of range while audio_file length is {len(audio_file)}")
+                        # continue without windowing
+                    else:
+                        windowed_audio_file = torch.multiply(audio_file[sig_start:sig_end], window)
+                        self._sentence = torch.cat((self._sentence, windowed_audio_file), 0).to(self._device)
+                        self._alignments[-1] = float(len(self._sentence) * 1.0 / self._params.data_simulator.sr)
+                        new_added_alignments[-1] = new_added_alignments[-1] + float(end_window_amount * 1.0 / self._params.data_simulator.sr)
 
         del audio_file
         start_cutoff_sec = float(start_cutoff / self._params.data_simulator.sr)
@@ -1704,7 +1721,7 @@ class MultiSpeakerSimulator(object):
         logging.info(f"Data simulation has been completed, results saved at: {basepath}")
 
 
-    def generate_single_session(self, random_seed: int = None): 
+    def generate_single_session(self, random_seed: int = None, sess_idx: int=0): 
         """
         Generate several multispeaker audio sessions and corresponding list files.
 
@@ -1717,8 +1734,10 @@ class MultiSpeakerSimulator(object):
         if random_seed is None:
             random_seed = self._params.data_simulator.random_seed
         np.random.seed(random_seed)
-        sess_idx = 0
-        output_dir = self._params.data_simulator.outputs.output_dir
+        random.seed(random_seed)
+        torch.manual_seed(random_seed)
+        torch.cuda.manual_seed(random_seed)
+        torch.cuda.manual_seed_all(random_seed)
 
         # basepath = get_cleaned_base_path(
         #     output_dir, overwrite_output=self._params.data_simulator.outputs.overwrite_output
@@ -1746,11 +1765,12 @@ class MultiSpeakerSimulator(object):
         speaker_wav_align_map = get_speaker_samples(speaker_ids=speaker_ids, speaker_samples=self._speaker_samples)
         noise_samples = self.sampler.sample_noise_manifest(noise_manifest=source_noise_manifest)
         queue = []
-        sess_idx = 0
+        # sess_idx = 0
         
         device = self._device
         basepath = None
-        queue.append((sess_idx, basepath, filename, speaker_ids, speaker_wav_align_map, noise_samples, device))
+        # queue.append((sess_idx, basepath, filename, speaker_ids, speaker_wav_align_map, noise_samples, device))
+        sess_args = (sess_idx, basepath, filename, speaker_ids, speaker_wav_align_map, noise_samples, device)
 
         # for multiprocessing speed, we avoid loading potentially huge manifest list and speaker sample files into each process.
         if self.num_workers > 1:
@@ -1761,14 +1781,14 @@ class MultiSpeakerSimulator(object):
         self._furthest_sample = [0 for n in range(self._params.data_simulator.session_config.num_speakers)]
         self._audio_read_buffer_dict = {}
 
-        futures.append(queue[sess_idx])
-        future = futures[0]
+        # futures.append(queue[sess_idx])
+        # future = futures[0]
         # generator = futures
         self._noise_samples = self.sampler.sample_noise_manifest(
             noise_manifest=source_noise_manifest,
         )
         # basepath, filename = self._generate_session(*future)
-        basepath, filename, array = self._generate_only_session_metainfo(*future)
+        basepath, filename, array = self._generate_only_session_metainfo(*sess_args)
         # self.annotator.add_to_filename_lists(basepath=basepath, filename=filename)
 
         # throw warning if number of speakers is less than requested

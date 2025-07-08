@@ -60,7 +60,7 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
     def __init__(self, cfg, tokenizer):
         super().__init__()
         self.tokenizer = TokenizerWrapper(tokenizer)
-        self.load_audio = AudioSamples(fault_tolerant=True, num_workers=8)
+        self.load_audio = AudioSamples(fault_tolerant=True)
         self.cfg = cfg
         self.spk_tar_all_zero = self.cfg.get('spk_tar_all_zero',False)
         self.num_speakers = self.cfg.get('num_speakers', 4)
@@ -71,69 +71,55 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, cuts) -> Tuple[torch.Tensor, ...]:
 
-        # import time
-        # start_time = time.time()
         audio, audio_lens, cuts = self.load_audio(cuts)
-        # end_time = time.time()
-        # print(f"====[  Audio Loading Time ] ==== time taken: {end_time - start_time:.3f} seconds")
-
+        if hasattr(cuts[0], 'rttm_filepath') and cuts[0].rttm_filepath or hasattr(cuts[0], 'speaker_id') and cuts[0].speaker_id or hasattr(cuts[0].tracks[0].cut, 'speaker_id'):
+            spk_targets = [torch.as_tensor(speaker_to_target(cut, self.num_speakers, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame, self.spk_tar_all_zero), dtype=torch.float32) for cut in cuts]
+            spk_targets = collate_matrices(spk_targets)
+        else:
+            spk_targets = None
+        
         tokens = []
-        spk_targets = []
+        query_speaker_ids = []
 
         if self.inference_mode:
-            return audio, audio_lens, None, None, None
+            return audio, audio_lens, None, None, None, None
 
-        for idx, cut in enumerate(cuts):
+        for cut in cuts:
             non_padding_cuts = []
+            
             if isinstance(cut, MonoCut):
                 non_padding_cuts.append(cut)
+                if '<|spltoken0|>' in cut.custom['text']:
+                    text_per_speaker = self.split_text(cut.custom['text'])
+                else:
+                    text_per_speaker = [cut.custom['text']]
             elif isinstance(cut, MixedCut):
                 if len(cut.tracks) == 2 and isinstance(cut.tracks[1].cut, PaddingCut):
-                    non_padding_cuts.append(cut.tracks[0].cut)
+                    non_padding_cuts.append(cut)
+                    if '<|spltoken0|>' in cut.tracks[0].cut.custom['text']:
+                        text_per_speaker = self.split_text(cut.tracks[0].cut.custom['text'])
+                    else:
+                        text_per_speaker = [cut.tracks[0].cut.custom['text']]
                 else:
                     for track in cut.tracks:
                         if isinstance(track.cut, MonoCut):
                             non_padding_cuts.append(track.cut)
+                    text_per_speaker = [cut.custom['text'] for cut in non_padding_cuts]
+    
+            if self.fixed_spk_id is None: # Randomly select a speaker during training
+                query_spk_id = random.choice(range(len(text_per_speaker)))
+            else: # fix the speaker id for inference
+                query_spk_id = self.fixed_spk_id
 
-            if "audiomix" in cut.id and isinstance(cut, MixedCut):
-                num_speakers_in_cut = int(cut.id.split("nspk")[-1])
-                texts = ['' for _ in range(num_speakers_in_cut)]
-                for track in cut.tracks:
-                    if len(track.cut.supervisions) > 0 and track.cut.supervisions[0].speaker is not None:
-                        texts[track.cut.supervisions[0].speaker] += f"{track.cut.supervisions[0].text} "
-                texts = [text.strip() for text in texts]
-                speaker_targets = speaker_to_target(cut, self.num_speakers, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame, self.spk_tar_all_zero)
-                speaker_targets = speaker_targets.transpose(0, 1)[:len(texts)]
-            else:
-                if hasattr(non_padding_cuts[0], 'text') and '<|spltoken0|>' in non_padding_cuts[0].text:
-                    # the previous data style with speaker tokens
-                    texts = self.split_text(non_padding_cuts[0].custom['text'])
-                    speaker_targets = speaker_to_target(cut, self.num_speakers, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame, self.spk_tar_all_zero)
-                    speaker_targets = speaker_targets.transpose(0, 1)[:len(texts)]
-                else:
-                    # new channel
-                    speaker_targets = [non_padding_cut.vad_target for non_padding_cut in non_padding_cuts if hasattr(non_padding_cut, 'vad_target')]
-                    speaker_targets = torch.stack(speaker_targets)
-                    texts = [non_padding_cut.custom['text'] for non_padding_cut in non_padding_cuts if hasattr(non_padding_cut, 'text')]
-
-            if speaker_targets.shape[0] > 0:
-                # multi-speaker
-                target_speaker_id = random.choice(range(speaker_targets.shape[0]))
-                text = texts[target_speaker_id]
-                speaker_target = speaker_targets[target_speaker_id]
-            else:
-                # single speaker 
-                text = texts[0]
-                speaker_target = torch.ones((get_hidden_length_from_sample_length(cut.num_samples) ))
-            
+            text = text_per_speaker[query_spk_id]
             tokens.append(torch.as_tensor(self.tokenizer(text, cut.supervisions[0].language)))
-            spk_targets.append(speaker_target)
+            query_speaker_ids.append(query_spk_id)
         
         token_lens = torch.tensor([t.size(0) for t in tokens], dtype=torch.long)
         tokens = collate_vectors(tokens, padding_value=0)
-        spk_targets = collate_vectors(spk_targets, padding_value=0)
-        
-        return audio, audio_lens, tokens, token_lens, spk_targets
+        query_speaker_ids = torch.tensor(query_speaker_ids, dtype=torch.long)
+
+        return audio, audio_lens, tokens, token_lens, spk_targets, query_speaker_ids
 
     def split_text(self, text, speaker_token='<|spltoken*|>'):
         """
