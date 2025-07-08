@@ -944,6 +944,8 @@ class SpeakerTaggedASR:
         binary_diar_preds,
         n_mix,
         cache_gating,
+        cache_gating_buffer_size,
+        valid_speakers_last_time,
         rttm=None
     ):
         
@@ -980,6 +982,7 @@ class SpeakerTaggedASR:
 
         if spk_targets.shape[1] > diar_max_len:
             spk_targets = spk_targets[:, -diar_max_len:]
+        
 
         (
             asr_pred_out_stream,
@@ -988,6 +991,7 @@ class SpeakerTaggedASR:
             cache_last_time,
             cache_last_channel_len,
             previous_hypotheses,
+            valid_speakers_last_time,
             # valid_speaker_ids,
         ) = self.asr_model.conformer_stream_step(
             processed_signal=chunk_audio,
@@ -1004,8 +1008,10 @@ class SpeakerTaggedASR:
             return_transcription=True,
             spk_targets=spk_targets,
             n_mix=n_mix,
+            binary_diar_preds=binary_diar_preds,
             cache_gating=cache_gating,
-            binary_diar_preds=binary_diar_preds
+            cache_gating_buffer_size=cache_gating_buffer_size,
+            valid_speakers_last_time=valid_speakers_last_time,
         )
 
         # transcribed_speaker_texts = [None] * n_mix
@@ -1028,4 +1034,5 @@ class SpeakerTaggedASR:
                 cache_last_channel_len,
                 previous_hypotheses,
                 streaming_state,
-                diar_pred_out_stream)
+                diar_pred_out_stream,
+                valid_speakers_last_time)

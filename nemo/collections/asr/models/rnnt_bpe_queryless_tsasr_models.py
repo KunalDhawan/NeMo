@@ -295,8 +295,10 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
         return_log_probs: bool = False,
         spk_targets: torch.Tensor = None,
         n_mix = 1,
+        binary_diar_preds=False,
         cache_gating=False,
-        binary_diar_preds=False
+        cache_gating_buffer_size=2,
+        valid_speakers_last_time=None
     ):
         """
         It simulates a forward step with caching for streaming purposes.
@@ -330,12 +332,19 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
         spk_targets = spk_targets[:, :, :n_mix] 
         if cache_gating:
             max_probs = torch.max(spk_targets, dim=1).values # B x N
-            valid_speakers = max_probs > 0.5 # B x N
+            valid_speakers = max_probs > 0.5 # B x N, e.g., [True, False, True, False]
+
+            if valid_speakers_last_time is None:
+                valid_speakers_last_time = [torch.zeros_like(valid_speakers).bool()] 
+            valid_speakers_last_time.append(valid_speakers)
+            valid_speakers_last_time = valid_speakers_last_time[-cache_gating_buffer_size:]
+            valid_speakers = torch.any(torch.stack(valid_speakers_last_time), dim=0)
+
         else:
             valid_speakers = torch.ones((spk_targets.size(0), spk_targets.size(2))).bool() # B x N
 
         if valid_speakers.sum() == 0: # early stop when all speakers are absent
-            return previous_pred_out, previous_hypotheses, cache_last_channel, cache_last_time, cache_last_channel_len, previous_hypotheses
+            return previous_pred_out, previous_hypotheses, cache_last_channel, cache_last_time, cache_last_channel_len, previous_hypotheses, valid_speakers_last_time
         valid_speaker_ids = torch.where(valid_speakers)[1] # B 
         
         # spk_targets: (B, T, N) -> (BN, T)
@@ -401,4 +410,4 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
         for i, spk_idx in enumerate(valid_speaker_ids):
             previous_hypotheses[spk_idx] = previous_hypotheses_spk[i]
             previous_pred_out[spk_idx] = asr_pred_out_stream_spk[i]
-        return previous_pred_out, transcribed_texts_spk, cache_last_channel, cache_last_time, cache_last_channel_len, previous_hypotheses
+        return previous_pred_out, transcribed_texts_spk, cache_last_channel, cache_last_time, cache_last_channel_len, previous_hypotheses, valid_speakers_last_time
