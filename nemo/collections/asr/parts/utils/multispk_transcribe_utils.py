@@ -859,7 +859,7 @@ class SpeakerTaggedASR:
         att_context_size,
         binary_diar_preds,
         n_mix,
-        vad,
+        cache_gating,
         rttm=None
     ):
         
@@ -868,9 +868,12 @@ class SpeakerTaggedASR:
             chunk_audio = chunk_audio[..., 1:]
             chunk_lengths -= 1
 
+        # Initialize diar_pred_out_stream for the first step for all speakers
         if diar_pred_out_stream is None:
             diar_pred_out_stream = torch.zeros((chunk_audio.shape[0], 0, self.diar_model.sortformer_modules.n_spk), device=chunk_audio.device)
 
+        # If n_mix == 1, we only have one speaker, so we don't need to do diarization
+        # and set spk_targets to all ones
         if n_mix == 1:
             spk_targets = torch.ones((chunk_audio.shape[0], 14, 1), device=chunk_audio.device) # TODO: fix this hardcoded value
         else:
@@ -894,9 +897,6 @@ class SpeakerTaggedASR:
         if spk_targets.shape[1] > diar_max_len:
             spk_targets = spk_targets[:, -diar_max_len:]
 
-        # if binary_diar_preds:
-        #     spk_targets = (spk_targets > 0.5).float()
-        
         (
             asr_pred_out_stream,
             transcribed_texts,
@@ -920,7 +920,7 @@ class SpeakerTaggedASR:
             return_transcription=True,
             spk_targets=spk_targets,
             n_mix=n_mix,
-            vad=vad,
+            cache_gating=cache_gating,
             binary_diar_preds=binary_diar_preds
         )
 

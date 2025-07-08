@@ -206,7 +206,7 @@ def perform_streaming(
                         pad_and_drop_preencoded=False,
                         binary_diar_preds=cfg.binary_diar_preds,
                         n_mix=cfg.mix,
-                        vad=cfg.get("vad", False),
+                        cache_gating=cfg.get("cache_gating", False),
                         rttm=rttm[:step_num*14+14].unsqueeze(0).to(asr_model.device) if rttm is not None else None
                     )
 
