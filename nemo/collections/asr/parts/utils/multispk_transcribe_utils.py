@@ -432,7 +432,10 @@ class SpeakerTaggedASR:
     ):
         # Required configs, models and datasets for inference
         self.cfg = cfg
-        self.test_manifest_dict = get_audio_rttm_map(self.cfg.manifest_file)
+        if self.cfg.manifest_file:
+            self.test_manifest_dict = get_audio_rttm_map(self.cfg.manifest_file)
+        else:
+            self.test_manifest_dict = {}
         self.asr_model = asr_model
         self.diar_model = diar_model
         
@@ -1022,7 +1025,7 @@ class SpeakerTaggedASR:
                         color_palette=get_color_palette(), 
                         params=self.cfg)
         if self.cfg.generate_scripts:
-            write_txt(f'{self.cfg.print_path}'.replace(".sh", "_0.sh"), 
+            write_txt(f'{self.cfg.print_path}', 
                         transcribed_speaker_texts.strip()) 
         
         return (transcribed_speaker_texts,
