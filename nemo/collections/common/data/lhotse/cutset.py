@@ -603,6 +603,8 @@ def read_multi_speaker_simulator(config: DictConfig) -> tuple[CutSet, bool]:
             simulator_type=config.simulator_type,
             sample_rate=config.get("sample_rate", 16000),
             min_delay=config.get("min_delay", 0.5),
+            min_duration=config.get("min_duration", 0.1),
+            max_duration=config.get("max_duration", 60),
             output_dir=config.get("output_dir", None),
             session_config=config.get("session_config", None),
             background_manifest=config.get("background_manifest", None),
