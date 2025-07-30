@@ -112,23 +112,17 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
                     # the previous data style with speaker tokens
                     texts = self.split_text(non_padding_cuts[0].custom['text'])
                     speaker_targets = speaker_to_target(cut, self.num_speakers, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame, self.spk_tar_all_zero)
-                    speaker_targets = speaker_targets.transpose(0, 1)[:len(texts)]
                 else:
                     # new channel
-                    speaker_targets = [non_padding_cut.vad_target for non_padding_cut in non_padding_cuts if hasattr(non_padding_cut, 'vad_target')]
-                    speaker_targets = torch.stack(speaker_targets)
-                    texts = [non_padding_cut.custom['text'] for non_padding_cut in non_padding_cuts if hasattr(non_padding_cut, 'text')]
+                    speaker_targets, texts = speaker_to_target(cut, self.num_speakers, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame, self.spk_tar_all_zero, return_text=True)
+                    # speaker_targets = torch.stack(speaker_targets)
+                    #texts = [non_padding_cut.custom['text'] for non_padding_cut in non_padding_cuts if hasattr(non_padding_cut, 'text')]
+                speaker_targets = speaker_targets.transpose(0, 1)[:len(texts)]
 
-            if speaker_targets.shape[0] > 0:
-                # multi-speaker
-                target_speaker_id = random.choice(range(speaker_targets.shape[0]))
-                text = texts[target_speaker_id]
-                speaker_target = speaker_targets[target_speaker_id]
-            else:
-                # single speaker 
-                text = texts[0]
-                speaker_target = torch.ones((get_hidden_length_from_sample_length(cut.num_samples) ))
-            
+            target_speaker_id = random.choice(range(len(texts)))
+            text = texts[target_speaker_id]
+            speaker_target = speaker_targets[target_speaker_id]
+
             tokens.append(torch.as_tensor(self.tokenizer(text, cut.supervisions[0].language)))
             spk_targets.append(speaker_target)
         
