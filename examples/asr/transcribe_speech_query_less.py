@@ -40,6 +40,8 @@ from nemo.collections.asr.parts.utils.transcribe_utils import (
     setup_model,
     write_transcription
 )
+from nemo.collections.asr.models.sortformer_diar_models import SortformerEncLabelModel
+
 
 # from nemo.collections.asr.parts.utils.transcribe_spk_utils import transcribe_partial_audio, setup_model, write_transcription
 from nemo.collections.common.parts.preprocessing.manifest import get_full_path
@@ -262,11 +264,21 @@ def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig, List[Hypothesis
     model_cfg.diar_model_path = cfg.diar_model_path
     model_cfg.spk_supervision = cfg.spk_supervision
     model_cfg.binary_diar_preds = cfg.binary_diar_preds
-    asr_model = nemo_asr.models.ASRModel.restore_from(restore_path=cfg.model_path, override_config_path=model_cfg)
+    asr_model = nemo_asr.models.ASRModel.restore_from(restore_path=cfg.model_path, override_config_path=model_cfg, strict=False)
 
     trainer = pl.Trainer(devices=device, accelerator=accelerator)
     asr_model.set_trainer(trainer)
     asr_model = asr_model.eval()
+    if cfg.diar_model_path:
+        if cfg.diar_model_path.endswith(".ckpt"):
+            diar_model = SortformerEncLabelModel.load_from_checkpoint(checkpoint_path=cfg.diar_model_path, 
+                                                                    map_location=map_location, strict=False)
+        elif cfg.diar_model_path.endswith(".nemo"):
+            diar_model = SortformerEncLabelModel.restore_from(restore_path=cfg.diar_model_path, 
+                                                            map_location=map_location)
+        else:
+            raise ValueError("cfg.diar_model_path must end with.ckpt or.nemo!")
+        asr_model.diar_model = diar_model
 
     # we will adjust this flag if the model does not support it
     compute_timestamps = cfg.compute_timestamps
@@ -420,7 +432,8 @@ def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig, List[Hypothesis
                 override_cfg.lang_field = cfg.gt_lang_attr_name
                 override_cfg.fixed_spk_id = cfg.fixed_spk_id
                 override_cfg.mix = cfg.mix
-                transcriptions = asr_model.transcribe(audio=cfg.dataset_manifest, override_config=override_cfg,)
+                transcriptions = asr_model.transcribe(audio=cfg.dataset_manifest, override_config=override_cfg, timestamps=True)
+
     if cfg.dataset_manifest is not None:
         logging.info(f"Finished transcribing from manifest file: {cfg.dataset_manifest}")
         if cfg.presort_manifest:
@@ -473,12 +486,23 @@ def write_transcription_to_seglst(
         session_id = audio_path.split("/")[-1][:-4]
         for j in range(n_mix):
             speaker = str(j)
-            words = transcriptions[i][j].text
+            if not transcriptions[i][j]:
+                continue
+            words = transcriptions[i][j][0]['segment']
+            try:
+                start_time = transcriptions[i][j][0]['start_offset']*0.08
+                end_time = transcriptions[i][j][0]['end_offset']*0.08
+            except:
+                start_time = 0
+                end_time = 0
+
             output_json = {
                 "audio_filepath": audio_path,
                 "session_id": session_id,
                 "speaker": session_id + '-' + speaker,
                 "words": words,
+                "start_time": start_time,
+                "end_time": end_time,
             }
             output_jsons.append(output_json)
 

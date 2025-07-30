@@ -86,6 +86,7 @@ def setup_diarization_model(cfg: DictConfig, map_location: Optional[str] = None)
         raise ValueError("cfg.diar_model_path must end with.ckpt or.nemo!")
     return diar_model, model_name
 
+total_eta = []
 def measure_eta(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
@@ -94,6 +95,8 @@ def measure_eta(func):
         end_time = time.time()  # Record the end time
         eta = end_time - start_time  # Calculate the elapsed time
         logging.info(f"[ ETA ] for '{func.__name__}': {eta:.4f} seconds")  # Print the ETA
+        total_eta.append(eta)
+        logging.info(f"[ Total ETA ] for '{func.__name__}': {sum(total_eta)/len(total_eta):.4f} seconds")  # Print the ETA
         return result  # Return the original function's result
     return wrapper
 
@@ -456,7 +459,7 @@ class SpeakerTaggedASR:
         ### multi-instance configs
         self._max_speakers = 16
         self._offset_chunk_start_time = 0.0
-        self._sent_break_sec = 1.5
+        self._sent_break_sec = cfg.get("sent_break_sec", 1.5)
         self._speaker_wise_sentences = {}
         self._prev_history_speaker_texts = [ "" for _ in range(self._max_speakers) ]
     
@@ -1021,6 +1024,7 @@ class SpeakerTaggedASR:
         hop_frames = chunk_lengths[0].item() - left_offset - right_offset
 
         all_sentences = self.get_multi_thread_sentences_values(step_num,previous_hypotheses, hop_frames)
+        print(all_sentences)
         transcribed_speaker_texts = print_sentences(sentences=all_sentences, 
                         color_palette=get_color_palette(), 
                         params=self.cfg)
@@ -1031,7 +1035,7 @@ class SpeakerTaggedASR:
         return (transcribed_speaker_texts,
                 transcribed_texts,
                 asr_pred_out_stream,
-                transcribed_texts,
+                all_sentences,
                 cache_last_channel,
                 cache_last_time,
                 cache_last_channel_len,

@@ -60,6 +60,15 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
             self.spk_kernel_residual = cfg.get('spk_kernel_residual', True)
 
             self._init_spk_kernel()
+    
+    # def load_diar_model(self, diar_model_path: str):
+    #     """Load the diarization model."""
+    #     # if self.training
+    #     """self.diar_model = SortformerEncLabelModel.from_pretrained(diar_model_path)
+    #     self.diar_model.eval()
+    #     self.diar_model.to(self.device)
+    #     self.diar_model.preprocessor.to(self.device)
+    #     self.diar_model.preprocessor.eval()"""
         
     def _init_spk_kernel(self):
         """Initialize speaker kernel modules and register them to encoder layers."""
@@ -222,9 +231,18 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
 
     def _transcribe_forward(self, batch: Any, trcfg: TranscribeConfig):
 
-        signal, signal_len, transcript, transcript_len, spk_targets, spk_ids = batch
+        signal, signal_len, transcript, transcript_len, spk_targets = batch
 
-        spk_targets = self.forward_diar(audio_signal=signal, audio_signal_length=signal_len, spk_targets=spk_targets)
+        # if hasattr(self, 'diar_model'):
+        #     with torch.no_grad():
+        #         processed_signal, processed_signal_length = self.diar_model.process_signal(audio_signal=signal, audio_signal_length=signal_len)
+        #         processed_signal = processed_signal[:, :, :processed_signal_length.max()]
+        #         emb_seq, emb_seq_len = self.diar_model.frontend_encoder(processed_signal=processed_signal, processed_signal_length=processed_signal_length)
+        #         preds = self.diar_model.forward_infer(emb_seq, emb_seq_len)
+        #     spk_targets = preds
+        #     import ipdb; ipdb.set_trace()
+
+        # spk_targets = self.forward_diar(audio_signal=signal, audio_signal_length=signal_len, spk_targets=spk_targets)
         
         # Multi-instance inference
         n_mix = trcfg.mix

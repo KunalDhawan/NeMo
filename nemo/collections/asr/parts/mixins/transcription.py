@@ -267,6 +267,7 @@ class TranscriptionMixin(ABC):
             generator = self.transcribe_generator(audio, override_config=transcribe_cfg)
 
             for processed_outputs in generator:
+                
                 # Store results
                 if isinstance(processed_outputs, list):
                     # Create a results of the same type as each element in processed_outputs
@@ -302,7 +303,9 @@ class TranscriptionMixin(ABC):
                     # If nested list structure
                     if isinstance(processed_outputs[0], list):
                         for i, processed_output in enumerate(processed_outputs):
-                            results[i].extend(processed_output)
+                            processed_segments = [processed_output[j].timestep['segment'] for j in range(len(processed_output))]
+                            results[i].extend(processed_segments)
+                        del processed_outputs
                     else:
                         # If flat list structure
                         if len(processed_outputs) != len(results):

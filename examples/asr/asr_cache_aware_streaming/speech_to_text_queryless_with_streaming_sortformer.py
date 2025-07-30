@@ -181,7 +181,7 @@ def perform_streaming(
                     (transcribed_speaker_texts,
                     transcribed_texts,
                     asr_pred_out_stream,
-                    transcribed_texts,
+                    all_sentences_with_timestamps,
                     cache_last_channel,
                     cache_last_time,
                     cache_last_channel_len,
@@ -224,13 +224,13 @@ def perform_streaming(
                          f"Time difference for real-time mode: {time_diff:.4f} seconds")
             time.sleep(max(0, (chunk_audio.shape[-1] - cfg.discarded_frames)*cfg.feat_len_sec - 
                            (loop_end_time - loop_start_time) - time_diff * cfg.finetune_realtime_ratio))
-    
+
     final_streaming_tran = extract_transcriptions(previous_hypotheses)
     # torch.save(diar_pred_out_stream, "diar_pred_out_stream.pt")
     if rttm is not None:
         diar_pred_out_stream = rttm
     
-    return final_streaming_tran, final_offline_tran, diar_pred_out_stream
+    return all_sentences_with_timestamps, final_offline_tran, diar_pred_out_stream
 
 
 @hydra_runner(config_name="DiarizationConfig", schema=DiarizationConfig)
@@ -312,7 +312,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         # model_cfg.diar_model_path = cfg.diar_model_path
         model_cfg.spk_supervision = cfg.spk_supervision
         model_cfg.binary_diar_preds = cfg.binary_diar_preds
-        asr_model = nemo_asr.models.EncDecRNNTBPEQLTSASRModel.restore_from(restore_path=cfg.asr_model, override_config_path=model_cfg)
+        asr_model = nemo_asr.models.EncDecRNNTBPEQLTSASRModel.restore_from(restore_path=cfg.asr_model, override_config_path=model_cfg, strict=False)
     else:
         logging.info(f"Using NGC cloud ASR model {args.asr_model}")
         asr_model = nemo_asr.models.ASRModel.from_pretrained(model_name=args.asr_model)
@@ -436,7 +436,8 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
                     streaming_buffer=streaming_buffer,
                     rttm=sample['rttm'],
                 )
-                all_streaming_tran.extend(streaming_tran)
+
+                all_streaming_tran.append(streaming_tran)
                 all_diar_pred_out_stream.append(diar_pred_out_stream)
                 streaming_buffer.reset_buffer()
         
@@ -446,21 +447,23 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
             hyp_json = args.output_path
             records = []
             
-            for i, hyp in enumerate(all_streaming_tran):
-                if hyp == "" or hyp is None:
+            for i, hyps in enumerate(all_streaming_tran):
+                if hyps == []:
                     continue
-                idx = i // args.mix
-                mod = i % args.mix
-                audio_filepath = samples[idx]["audio_filepath"]
+                audio_filepath = samples[i]["audio_filepath"]
                 uniq_id = audio_filepath.split('/')[-1].split('.')[0]
-                if mod % args.mix < args.mix:
-                    record = {
-                        "audio_filepath": audio_filepath, 
+                record = [
+                    {
+                        "audio_filepath": audio_filepath,
                         "session_id": uniq_id,
-                        "speaker": uniq_id + '-' + str(mod),
-                        "words": hyp,
-                    }
-                    records.append(record)
+                        "speaker": hyp['speaker'],
+                        "words": hyp['text'],
+                        "start_time": hyp['start_time'],
+                        "end_time": hyp['end_time']
+                    } for hyp in hyps
+                ]
+                
+                records.extend(record)
             with open(hyp_json, 'w') as out_f:
                 json.dump(records, out_f, indent=4)
             logging.info(f"Saved the transcriptions of the streaming inference in {hyp_json}.")

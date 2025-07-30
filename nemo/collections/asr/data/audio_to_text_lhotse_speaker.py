@@ -81,7 +81,10 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
         spk_targets = []
 
         if self.inference_mode:
-            return audio, audio_lens, None, None, None
+            
+            speaker_targets = [speaker_to_target(cut, self.num_speakers, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame, self.spk_tar_all_zero) for cut in cuts]
+            spk_targets = collate_matrices(speaker_targets, padding_value=0)
+            return audio, audio_lens, None, None, spk_targets
 
         for idx, cut in enumerate(cuts):
             non_padding_cuts = []
