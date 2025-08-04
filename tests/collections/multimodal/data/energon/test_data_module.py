@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,7 +21,7 @@ from pathlib import Path
 
 import numpy as np
 import webdataset as wds
-from megatron.energon.flavors import BaseWebdataset
+from megatron.energon.flavors import BaseWebdatasetFactory
 from PIL import Image
 from transformers import AutoProcessor
 
@@ -159,7 +159,7 @@ class TestEnergonMultiModalDataModuleWithDummyData(unittest.TestCase):
                 )
 
             total_shards = shard_writer.shard
-        BaseWebdataset.prepare_dataset(
+        BaseWebdatasetFactory.prepare_dataset(
             path,
             [f"data-{{0..{total_shards-1}}}.tar"],
             split_parts_ratio=[("train", 1.0), ("val", 1.0)],

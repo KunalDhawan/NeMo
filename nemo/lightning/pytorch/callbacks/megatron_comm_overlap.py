@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -78,7 +78,8 @@ class MegatronCommOverlapCallback(Callback):
         align_param_gather (bool): Align data parallel parameter gather across virtual pipeline chunks
         bucket_size (int): The DDP bucket size, controls the data parallel overlap granularity
         defer_embedding_wgrad_compute (bool): Overlap wgrads with the pipeline drain bubble for the last pipeline stage
-        wgrad_deferral_limit (int): Limit of how many outstanding wgrads may be overlapped with the pipeline drain bubble
+        wgrad_deferral_limit (int): Limit of how many outstanding wgrads may be overlapped with the pipeline drain
+                                    bubble
 
     Example:
         >>> callback = MegatronCommOverlapCallback(tp_comm_overlap=True)
@@ -209,7 +210,53 @@ class MegatronCommOverlapCallback(Callback):
 
         return comm_overlap_cfg
 
+    def _check_num_cuda_device_max_connections(self):
+        import os
+
+        import torch
+
+        from nemo.utils import AppState
+
+        app_state = AppState()
+        tp_size = app_state.tensor_model_parallel_size
+        cp_size = app_state.context_parallel_size
+        major, _ = torch.cuda.get_device_capability()
+        if major > 9:
+            if tp_size > 1 or cp_size > 1:
+                """
+                We need extra connections to avoid serialization of streams,
+                so we use the max connections of 32 instead of the default
+                device connection of 8.
+                """
+                if not (os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS', None) == "32"):
+                    logging.warning(
+                        f"Recommend using CUDA_DEVICE_MAX_CONNECTIONS=32 for best performance \
+                        but get {os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS', None)}"
+                    )
+            else:
+                if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS', None) == "1":
+                    logging.warning(
+                        f"Recommend unsetting CUDA_DEVICE_MAX_CONNECTIONS for best performance \
+                        but get {os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS', None)}"
+                    )
+        else:
+            if tp_size > 1 or cp_size > 1:
+                """
+                Set the device connection to 1 to enforce the kernel queuing
+                order from the host to the execution order on GPU. This is
+                needed to schedule a communication kernel before the
+                overlapping persistent GEMM kernel. Otherwise, the
+                communication kernel will be pushed to the end of the GEMM
+                kernel so failing to overlap the kernels.
+                """
+                if not (os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS', None) == "1"):
+                    logging.warning(
+                        f"Recommend using CUDA_DEVICE_MAX_CONNECTIONS=1 for best performance \
+                        but get {os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS', None)}"
+                    )
+
     def setup(self, trainer: pl.Trainer, pl_module: pl.LightningModule, stage: str) -> None:
+        """Apply configs set in comm_overlap_cfg on trainer config."""
         assert isinstance(trainer.strategy, MegatronStrategy), "MegatronCommOverlapCallback requires MegatronStrategy"
         parallelism_cfg = trainer.strategy.parallelism
 
@@ -237,16 +284,24 @@ class MegatronCommOverlapCallback(Callback):
             if hasattr(trainer.model, '__io__'):
                 self._apply_cfgs(comm_overlap_cfg, trainer.model.__io__.optim.config)
 
+        # setup cuda device max connections
+        self._check_num_cuda_device_max_connections()
+
     def _init_te_userbuffers(self, model_parallel_cfg: ModelParallelConfig):
         from megatron.core import parallel_state
 
         if self.tp_comm_overlap_cfg is None:
             logging.warning(
-                "Tensor parallel overlap: No overlap config provided. Initializing TP comm overlap with the default config."
+                "Tensor parallel overlap: No overlap config provided. Initializing TP comm overlap with the default"
+                " config."
             )
         else:
             # ub_cfgs is a dataclass, however TE needs a dict, so convert here
             self.tp_comm_overlap_cfg = asdict(self.tp_comm_overlap_cfg)
+            # remove keys with None values from dictionary to match TE's expectations
+            self.tp_comm_overlap_cfg = {
+                key: value for key, value in self.tp_comm_overlap_cfg.items() if value is not None
+            }
 
         micro_batch_size = get_micro_batch_size()
         hidden_size = model_parallel_cfg.hidden_size
@@ -274,17 +329,21 @@ class MegatronCommOverlapCallback(Callback):
     # _init_te_userbuffers must run once before any stages, however there isnt such a
     # unified callback, so add a hook for every stage
     def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        """Actions before the training stage starts."""
         if self.need_tp_overlap_ub_init:
             self._init_te_userbuffers(trainer.model.config)
 
     def on_validation_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        """Actions before the validation stage starts."""
         if self.need_tp_overlap_ub_init:
             self._init_te_userbuffers(trainer.model.config)
 
     def on_test_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        """Actions before the test stage starts."""
         if self.need_tp_overlap_ub_init:
             self._init_te_userbuffers(trainer.model.config)
 
     def on_predict_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        """Actions before the predict stage starts."""
         if self.need_tp_overlap_ub_init:
             self._init_te_userbuffers(trainer.model.config)

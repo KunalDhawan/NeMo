@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -201,7 +201,7 @@ class TransformerAEDGreedyInfer(AEDGreedyInfer, Typing):
                 packed_result = []
                 for i in range(len(topk_hypotheses)):
                     # Pack results into Hypotheses
-                    hypotheses = [Hypothesis(score=0.0, y_sequence=[], timestep=[]) for _ in range(self.n_samples)]
+                    hypotheses = [Hypothesis(score=0.0, y_sequence=[], timestamp=[]) for _ in range(self.n_samples)]
                     self.format_hypotheses(hypotheses, decoder_input_ids)
                     packed_result.append(
                         NBestHypotheses(
@@ -212,7 +212,7 @@ class TransformerAEDGreedyInfer(AEDGreedyInfer, Typing):
                 beam_scores = [None for _ in range(len(best_hypo))]
                 best_hypo = best_hypo.cpu()
                 hypotheses = [
-                    Hypothesis(score=0.0, y_sequence=[], timestep=[]) for _ in range(encoder_hidden_states.shape[0])
+                    Hypothesis(score=0.0, y_sequence=[], timestamp=[]) for _ in range(encoder_hidden_states.shape[0])
                 ]
                 # Pack results into Hypotheses
                 packed_result = pack_hypotheses(hypotheses, best_hypo, beam_scores, step_confidence)

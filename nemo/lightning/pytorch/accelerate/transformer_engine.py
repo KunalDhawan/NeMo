@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,6 +19,18 @@ from nemo.utils import logging
 from nemo.utils.import_utils import safe_import_from
 
 te, HAVE_TE = safe_import_from("transformer_engine", "pytorch")
+
+from dataclasses import dataclass
+
+
+@dataclass
+class TEConfig:
+    """Config POD for Transformer Enginer config
+    Options:
+    - fp8_autocast (bool): indicated whether to autocast to FP8 or not.
+    """
+
+    fp8_autocast: bool = False
 
 
 def te_accelerate(model, fp8_autocast=False):

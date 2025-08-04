@@ -147,10 +147,10 @@ def beam_search_eval(
 
     # Override the beam search config with current search candidate configuration
     cfg.decoding.beam_size = beam_width
-    cfg.decoding.beam_alpha = beam_alpha
+    cfg.decoding.ngram_lm_alpha = beam_alpha
     cfg.decoding.beam_beta = beam_beta
     cfg.decoding.return_best_hypothesis = False
-    cfg.decoding.kenlm_path = cfg.kenlm_model_file
+    cfg.decoding.ngram_lm_model = cfg.kenlm_model_file
 
     # Update model's decoding strategy config
     model.cfg.decoding.strategy = cfg.decoding_strategy
@@ -193,7 +193,7 @@ def beam_search_eval(
                     probs_batch[prob_index], device=packed_batch.device, dtype=packed_batch.dtype
                 )
 
-            _, beams_batch = decoding.ctc_decoder_predictions_tensor(
+            beams_batch = decoding.ctc_decoder_predictions_tensor(
                 packed_batch,
                 decoder_lengths=probs_lens,
                 return_hypotheses=True,
@@ -335,9 +335,9 @@ def main(cfg: EvalBeamSearchNGramConfig):
         preds = np.argmax(probs, axis=1)
         preds_tensor = torch.tensor(preds, device='cpu').unsqueeze(0)
         if isinstance(asr_model, EncDecHybridRNNTCTCModel):
-            pred_text = asr_model.ctc_decoding.ctc_decoder_predictions_tensor(preds_tensor)[0][0]
+            pred_text = asr_model.ctc_decoding.ctc_decoder_predictions_tensor(preds_tensor)[0]
         else:
-            pred_text = asr_model._wer.decoding.ctc_decoder_predictions_tensor(preds_tensor)[0][0]
+            pred_text = asr_model._wer.decoding.ctc_decoder_predictions_tensor(preds_tensor)[0]
 
         if cfg.text_processing.do_lowercase:
             pred_text = punctuation_capitalization.do_lowercase([pred_text])[0]

@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -29,7 +29,7 @@ from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.transformer.utils import get_linear_layer as mcore_get_linear_layer
-from megatron.core.utils import make_viewless_tensor
+from megatron.core.utils import get_batch_on_this_cp_rank, make_viewless_tensor
 from torch import Tensor, nn
 
 from nemo.collections.llm import fn
@@ -43,10 +43,10 @@ from nemo.lightning.pytorch.optim import MegatronOptimizerModule, OptimizerModul
 
 HAVE_TE = True
 try:
-    import transformer_engine  # pylint: disable=W0611
+    import transformer_engine  # noqa: F401 pylint: disable=W0611
     from megatron.core.models.bert import bert_layer_specs
     from megatron.core.models.bert.bert_model import BertModel as MCoreBert
-except (ImportError, ModuleNotFoundError) as e:
+except (ImportError, ModuleNotFoundError):
     HAVE_TE = False
     MCoreBert = TransformerLayer  # Place holder for import checking. BERT requires TE installed.
 
@@ -73,7 +73,7 @@ def bert_data_step(dataloder_iter) -> Dict[str, torch.Tensor]:
 
     _batch = {key: val.cuda(non_blocking=True) if key in required_keys else None for key, val in _batch.items()}
     # slice batch along sequence dimension for context parallelism
-    output = get_batch_on_this_context_parallel_rank(_batch)
+    output = get_batch_on_this_cp_rank(_batch)
 
     return output
 
@@ -148,8 +148,9 @@ class BertConfig(TransformerConfig, io.IOMixin):
     bert_binary_head: bool = True
     add_lm_head: bool = True
     num_tokentypes: float = None
+    mask_vocab_padding_tokens: bool = False
 
-    def configure_model(self, tokenizer) -> "MCoreBertModelWrapperWithPostLNSupport":
+    def configure_model(self, tokenizer, vp_stage: Optional[int] = None) -> "MCoreBertModelWrapperWithPostLNSupport":
         """Configure the BERT Model.
         For bert_type == 'megatron', num_tokentypes in embedding is controlled by whether model has binary head.
         For bert_type == 'huggingface', tokentypes embedding is always added with num_tokentypes = 2.
@@ -169,7 +170,9 @@ class BertConfig(TransformerConfig, io.IOMixin):
         if self.num_tokentypes is None:
             self.num_tokentypes = 2 if self.bert_binary_head else 0
 
-        print(self.num_tokentypes)
+        # During fake lightning initialization, pass 0 to bypass the assertion that vp_stage must be
+        # non-None when using virtual pipeline model parallelism
+        vp_stage = vp_stage or 0
         return MCoreBertModelWrapperWithPostLNSupport(
             bert_type=self.bert_type,
             add_pooler=self.add_pooler,
@@ -177,9 +180,10 @@ class BertConfig(TransformerConfig, io.IOMixin):
             num_tokentypes=self.num_tokentypes,
             transformer_layer_spec=transformer_layer_spec,
             vocab_size=get_vocab_size(self, tokenizer.vocab_size, self.make_vocab_size_divisible_by),
+            tokenizer=tokenizer if self.mask_vocab_padding_tokens else None,
             max_sequence_length=self.seq_length,
-            pre_process=parallel_state.is_pipeline_first_stage(),
-            post_process=parallel_state.is_pipeline_last_stage(),
+            pre_process=parallel_state.is_pipeline_first_stage(ignore_virtual=False, vp_stage=vp_stage),
+            post_process=parallel_state.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage),
             fp16_lm_cross_entropy=self.fp16_lm_cross_entropy,
             parallel_output=self.parallel_output,
             share_embeddings_and_output_weights=self.share_embeddings_and_output_weights,
@@ -189,6 +193,7 @@ class BertConfig(TransformerConfig, io.IOMixin):
             seq_len_interpolation_factor=self.seq_len_interpolation_factor,
             add_binary_head=self.bert_binary_head,
             return_embeddings=False,  # TODO
+            vp_stage=vp_stage,
         )
 
 
@@ -199,11 +204,13 @@ class MCoreBertModelWrapperWithPostLNSupport(MCoreBert):
     when bert_type is set to 'huggingface', it will initialize post layer norm BERT model.
     """
 
-    def __init__(self, bert_type='megatron', add_pooler=True, *args, **kwargs):
-
+    def __init__(
+        self, bert_type='megatron', add_pooler=True, tokenizer: Optional["TokenizerSpec"] = None, *args, **kwargs
+    ):
         super(MCoreBertModelWrapperWithPostLNSupport, self).__init__(*args, **kwargs)
         self.add_pooler = add_pooler
         self.bert_type = bert_type
+        self.tokenizer = tokenizer
 
         assert (
             self.bert_type == 'megatron' or self.bert_type == 'huggingface'
@@ -217,6 +224,7 @@ class MCoreBertModelWrapperWithPostLNSupport(MCoreBert):
             post_process=self.post_process,
             post_layer_norm=True if self.bert_type == 'megatron' else False,
             bert_type=self.bert_type,
+            vp_stage=kwargs.get('vp_stage', None),
         )
 
         # In Megatron-LM, pooler is added only if add_binary_head=True.
@@ -264,6 +272,7 @@ class MCoreBertModelWrapperWithPostLNSupport(MCoreBert):
         lm_labels: Tensor = None,
         loss_mask: Tensor = None,
         inference_params=None,
+        hidden_states_only=False,
     ):
         """Forward function of BERT model
 
@@ -280,7 +289,7 @@ class MCoreBertModelWrapperWithPostLNSupport(MCoreBert):
         hidden_states = super().forward(input_ids, attention_mask, tokentype_ids, lm_labels, inference_params)
         self.post_process = original_post_process
 
-        if not self.post_process:
+        if not self.post_process or hidden_states_only:
             return hidden_states
 
         if self.return_embeddings:
@@ -317,6 +326,22 @@ class MCoreBertModelWrapperWithPostLNSupport(MCoreBert):
                 'loss_mask': loss_mask,
             }
 
+        # mask vocab padding tokens from sum term of softmax
+        if self.tokenizer:
+            from megatron.core.tensor_parallel.utils import VocabUtility
+
+            unpadded_vocab_size = self.tokenizer.vocab_size
+
+            get_vocab_range = VocabUtility.vocab_range_from_per_partition_vocab_size
+            padded_vocab_size = logits.size()[-1]
+            rank = parallel_state.get_tensor_model_parallel_rank()
+            world_size = parallel_state.get_tensor_model_parallel_world_size()
+            vocab_start_index, _ = get_vocab_range(padded_vocab_size, rank, world_size)  # gets range on this tp rank
+
+            # mask tokens past unpadded_vocab_size. must be offset by where each tp rank's vocab range starts
+            mask_start = max(unpadded_vocab_size - vocab_start_index, 0)
+            logits[:, :, mask_start:] = float('-inf')
+
         loss = self.compute_language_model_loss(lm_labels, logits)
 
         return {
@@ -337,18 +362,21 @@ class TransformerLayerSubmodulesWithPostLNSupport(TransformerLayerSubmodules):
 
 
 class TransformerLayerWithPostLNSupport(TransformerLayer):
-    """Adapted from mcore's TransformerLayer with additional post-attention LN and post MLP LN support."""
+    """
+    Adapted from mcore's TransformerLayer with additional post-attention LN and
+    post MLP LN support.
+    """
 
     def __init__(self, *args, **kwargs):
         super(TransformerLayerWithPostLNSupport, self).__init__(*args, **kwargs)
-        ## [Module add: Post attention LN]
+        # [Module add: Post attention LN]
         self.post_att_layernorm = build_module(
             self.submodules_config.post_att_layernorm,
             config=self.config,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
         )
-        ## [Module add: Post MLP LN]
+        # [Module add: Post MLP LN]
         self.post_mlp_layernorm = build_module(
             self.submodules_config.post_mlp_layernorm,
             config=self.config,
@@ -365,6 +393,7 @@ class TransformerLayerWithPostLNSupport(TransformerLayer):
         rotary_pos_emb=None,
         inference_params=None,
         packed_seq_params=None,
+        **kwargs,
     ):
         """
         Perform a forward pass through the transformer layer.
@@ -494,6 +523,7 @@ class TransformerBlockWithPostLNSupport(TransformerBlock):
         rotary_pos_emb: Tensor = None,
         inference_params: InferenceParams = None,
         packed_seq_params: PackedSeqParams = None,
+        **kwargs,
     ):
         """
         Perform the forward pass through the transformer block.
@@ -560,10 +590,10 @@ class BertModel(L.LightningModule, io.IOMixin, io.ConnectorMixin, fn.FNMixin):
         self._training_loss_reduction = None
         self._validation_loss_reduction = None
 
-    def configure_model(self) -> None:
+    def configure_model(self, vp_stage: Optional[int] = None) -> None:
         """Setup the BERT Model based on config definition."""
         if not hasattr(self, "module"):
-            self.module = self.config.configure_model(self.tokenizer)
+            self.module = self.config.configure_model(self.tokenizer, vp_stage)
 
     def forward(
         self,
@@ -603,42 +633,6 @@ class BertModel(L.LightningModule, io.IOMixin, io.ConnectorMixin, fn.FNMixin):
             )
 
         return self._validation_loss_reduction
-
-
-def get_batch_on_this_context_parallel_rank(batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    """
-    Modifies the batch data based on the context parallel rank,
-    if the context parallel world size is greater than 1. Otherwise the batch is returned as-is.
-
-    Args:
-        batch (dict): The input batch data.
-
-    Returns:
-        dict: The modified batch data based on the context parallel rank.
-    """
-    if cp_size := parallel_state.get_context_parallel_world_size() > 1:
-        num_valid_tokens_in_ub = None
-        if "loss_mask" in batch and batch["loss_mask"] is not None:
-            num_valid_tokens_in_ub = batch["loss_mask"].sum()
-
-        cp_rank = parallel_state.get_context_parallel_rank()
-        for key, val in batch.items():
-            if val is not None:
-                seq_dim = 1 if key != "attention_mask" else 2
-                _val = val.view(
-                    *val.shape[0:seq_dim],
-                    2 * cp_size,
-                    val.shape[seq_dim] // (2 * cp_size),
-                    *val.shape[(seq_dim + 1) :],
-                )
-                index = torch.tensor([cp_rank, (2 * cp_size - cp_rank - 1)], device="cpu", pin_memory=True).cuda(
-                    non_blocking=True
-                )
-                _val = _val.index_select(seq_dim, index)
-                _val = _val.view(*val.shape[0:seq_dim], -1, *_val.shape[(seq_dim + 2) :])
-                batch[key] = _val
-        batch["num_valid_tokens_in_ub"] = num_valid_tokens_in_ub
-    return batch
 
 
 def get_packed_seq_params(batch: Dict[str, torch.Tensor]) -> PackedSeqParams:

@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,19 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# pylint: disable=missing-function-docstring
 
 
 import logging
 import multiprocessing
 from collections import defaultdict
 from pathlib import Path
-from typing import Optional, Union
 
 import torch
 from tensorrt_llm._utils import pad_vocab_size, str_dtype_to_torch
 from tqdm import tqdm
 
 from nemo.export.trt_llm.converter.utils import save_scaling_factor, save_val, split_and_save_weight, weights_dict
+from nemo.export.utils import torch_dtype_from_precision
 
 LOGGER = logging.getLogger("NeMo")
 
@@ -34,22 +36,6 @@ layer_names = {
     "final_layernorm.weight": "final_layernorm.weight",
     "final_layernorm.bias": "final_layernorm.bias",
 }
-
-
-def torch_dtype_from_precision(precision: Union[int, str], megatron_amp_O2: Optional[bool] = None) -> torch.dtype:
-    """Mapping from PTL precision types to corresponding PyTorch parameter datatype."""
-    # Copied from nemo.collections.nlp.parts.utils_funcs to avoid extra depenencies for NIM.
-    if megatron_amp_O2 is not None and megatron_amp_O2 is False:
-        return torch.float32
-
-    if precision in ['bf16', 'bf16-mixed']:
-        return torch.bfloat16
-    elif precision in [16, '16', '16-mixed']:
-        return torch.float16
-    elif precision in [32, '32', '32-true']:
-        return torch.float32
-    else:
-        raise ValueError(f"Could not parse the precision of `{precision}` to a valid torch.dtype")
 
 
 def extract_layers_with_prefix(model_, prefix):
@@ -152,9 +138,6 @@ def convert_model_to_trt_llm_ckpt(
 
     has_position_embedding = get_layer_name("position_embedding", prefix) in model_state_dict
     has_lm_head = get_layer_name("output_layer", prefix) in model_state_dict
-    share_embeddings_and_output = nemo_model_config.get("share_embeddings_and_output_weights", False)
-    embedding_scaling = nemo_model_config.get("apply_embedding_scaling", False)
-    hidden_size = nemo_model_config["hidden_size"]
 
     num_layers = nemo_model_config["num_layers"]
     training_tp_size = 1
@@ -325,8 +308,8 @@ def dist_model_to_trt_llm_ckpt(
     pp_last_rank = parallel_state.get_pipeline_model_parallel_last_rank()
     pp_size = parallel_state.get_pipeline_model_parallel_world_size()
     pp_group = parallel_state.get_pipeline_model_parallel_group()
-    pp_is_last = parallel_state.is_pipeline_last_stage(ignore_virtual=True)
-    pp_is_first = parallel_state.is_pipeline_first_stage(ignore_virtual=True)
+    pp_is_last = parallel_state.is_pipeline_last_stage()
+    pp_is_first = parallel_state.is_pipeline_first_stage()
     vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
     if not vp_size:
         vp_size = 1

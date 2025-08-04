@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,10 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import re
 from abc import abstractmethod
 from dataclasses import dataclass, field, is_dataclass
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Union
 
 import torch
 from omegaconf import OmegaConf
@@ -175,7 +174,10 @@ class AbstractMultiTaskDecoding(ConfidenceMixin):
                 self.preserve_alignments = self.cfg.beam.get('preserve_alignments', False)
 
         if strategy in ['greedy', 'greedy_batch']:
-
+            if self.cfg.greedy.get('ngram_lm_model') is not None:
+                raise ValueError(
+                    "Greedy strategy cannot be used with ngram_lm_model. Use beam strategy with beam=1 instead."
+                )
             self.decoding = TransformerAEDGreedyInfer(
                 transformer_decoder=self.transformer_decoder,
                 log_softmax_module=self.log_softmax_module,
@@ -200,6 +202,8 @@ class AbstractMultiTaskDecoding(ConfidenceMixin):
                 max_generation_delta=self.cfg.beam.get('max_generation_delta', -1),
                 return_best_hypothesis=self.cfg.beam.get('return_best_hypothesis', True),
                 preserve_alignments=self.preserve_alignments,
+                ngram_lm_model=self.cfg.beam.get('ngram_lm_model', None),
+                ngram_lm_alpha=self.cfg.beam.get('ngram_lm_alpha', 0.0),
             )
 
         else:
@@ -216,7 +220,7 @@ class AbstractMultiTaskDecoding(ConfidenceMixin):
         decoder_input_ids: Optional[torch.Tensor] = None,
         return_hypotheses: bool = False,
         partial_hypotheses: Optional[List[Hypothesis]] = None,
-    ) -> Tuple[List[str], Optional[List[List[str]]], Optional[Union[Hypothesis, NBestHypotheses]]]:
+    ) -> Union[List[Hypothesis], List[List[Hypothesis]]]:
         """
         Decode an encoder output by autoregressive decoding of the Decoder+Joint networks.
 
@@ -226,18 +230,14 @@ class AbstractMultiTaskDecoding(ConfidenceMixin):
             return_hypotheses: bool. If set to True it will return list of Hypothesis or NBestHypotheses
 
         Returns:
-            If `return_best_hypothesis` is set:
-                A tuple (hypotheses, None):
-                hypotheses - list of Hypothesis (best hypothesis per sample).
+            If `return_all_hypothesis` is set:
+                A list[list[Hypothesis]].
                     Look at rnnt_utils.Hypothesis for more information.
 
-            If `return_best_hypothesis` is not set:
-                A tuple(hypotheses, all_hypotheses)
-                hypotheses - list of Hypothesis (best hypothesis per sample).
+            If `return_all_hypothesis` is not set:
+                A list[Hypothesis].
+                List of best hypotheses
                     Look at rnnt_utils.Hypothesis for more information.
-                all_hypotheses - list of NBestHypotheses. Each NBestHypotheses further contains a sorted
-                    list of all the hypotheses of the model per sample.
-                    Look at rnnt_utils.NBestHypotheses for more information.
         """
         # Compute hypotheses
         with torch.inference_mode():
@@ -265,11 +265,10 @@ class AbstractMultiTaskDecoding(ConfidenceMixin):
                 all_hypotheses.append(decoded_hyps)
 
             if return_hypotheses:
-                return hypotheses, all_hypotheses
+                return all_hypotheses
 
-            best_hyp_text = [h.text for h in hypotheses]
-            all_hyp_text = [h.text for hh in all_hypotheses for h in hh]
-            return best_hyp_text, all_hyp_text
+            all_hyp = [[Hypothesis(h.score, h.y_sequence, h.text) for h in hh] for hh in all_hypotheses]
+            return all_hyp
 
         else:
             hypotheses = self.decode_hypothesis(prediction_list)
@@ -280,10 +279,9 @@ class AbstractMultiTaskDecoding(ConfidenceMixin):
                     self.preserve_word_confidence or self.preserve_token_confidence
                 ):
                     hypotheses = self.compute_confidence(hypotheses)
-                return hypotheses, None
+                return hypotheses
 
-            best_hyp_text = [h.text for h in hypotheses]
-            return best_hyp_text, None
+            return [Hypothesis(h.score, h.y_sequence, h.text) for h in hypotheses]
 
     def decode_hypothesis(self, hypotheses_list: List[Hypothesis]) -> List[Union[Hypothesis, NBestHypotheses]]:
         """

@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -95,7 +95,7 @@ def qnemo_to_tensorrt_llm(
     build_cmd += f"--use_fused_mlp {'enable' if use_fused_mlp else 'disable'} "
 
     if not use_qdq:
-        build_cmd += f"--gemm_plugin auto "
+        build_cmd += "--gemm_plugin auto "
 
     if max_seq_len is not None:
         build_cmd += f"--max_seq_len {max_seq_len} "

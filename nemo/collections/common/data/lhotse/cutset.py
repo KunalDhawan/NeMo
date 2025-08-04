@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -31,16 +31,19 @@ from nemo.collections.common.data.lhotse.nemo_adapters import (
     expand_sharded_filepaths,
 )
 from nemo.collections.common.data.lhotse.text_adapters import (
+    AudioTurn,
     LhotseTextAdapter,
     LhotseTextPairAdapter,
+    NeMoMultimodalConversation,
     NeMoMultimodalConversationJsonlAdapter,
     NeMoSFTJsonlAdapter,
+    TextTurn,
 )
 from nemo.collections.common.parts.preprocessing.manifest import get_full_path
 from nemo.collections.asr.parts.utils.asr_multispeaker_utils import MultiSpeakerMixtureGenerator
 
 
-def read_cutset_from_config(config: DictConfig | dict) -> Tuple[CutSet, bool]:
+def read_cutset_from_config(config: Union[DictConfig, dict]) -> Tuple[CutSet, bool]:
     """
     Reads NeMo configuration and creates a CutSet either from Lhotse or NeMo manifests.
 
@@ -50,19 +53,23 @@ def read_cutset_from_config(config: DictConfig | dict) -> Tuple[CutSet, bool]:
     if not isinstance(config, DictConfig):
         config = DictConfig(config)
     if config.get("input_cfg") is not None:
-        return read_dataset_config(config)
-    # Now, we'll figure out if we should read Lhotse manifest or NeMo manifest.
-    use_nemo_manifest = all(config.get(opt) is None for opt in ("cuts_path", "shar_path"))
-    if use_nemo_manifest:
-        if config.get("manifest_filepath") is None:
-            raise IncompleteConfigError("You must specify either: manifest_filepath, cuts_path, or shar_path")
-        cuts, is_tarred = read_nemo_manifest(config)
+        cuts, is_tarred = read_dataset_config(config)
     else:
-        cuts, is_tarred = read_lhotse_manifest(config)
+        # Now, we'll figure out if we should read Lhotse manifest or NeMo manifest.
+        use_nemo_manifest = all(config.get(opt) is None for opt in ("cuts_path", "shar_path"))
+        if use_nemo_manifest:
+            if config.get("manifest_filepath") is None:
+                raise IncompleteConfigError("You must specify either: manifest_filepath, cuts_path, or shar_path")
+            cuts, is_tarred = read_nemo_manifest(config)
+        else:
+            cuts, is_tarred = read_lhotse_manifest(config)
+
     return cuts, is_tarred
 
 
 class IncompleteConfigError(RuntimeError):
+    """Placeholder for an error raised."""
+
     pass
 
 
@@ -91,7 +98,7 @@ def get_parser_fn(data_type_name: str):
     return KNOWN_DATA_CONFIG_TYPES[data_type_name]
 
 
-def data_type_parser(name: str | list[str]):
+def data_type_parser(name: Union[str, list[str]]):
     """
     Decorator used to register data type parser functions.
     Parsing function reads a dataloading config and returns a tuple
@@ -191,7 +198,9 @@ def read_dataset_config(config) -> tuple[CutSet, bool]:
         "force_finite": config.get("force_finite", False),
         "max_open_streams": config.get("max_open_streams", None),
         "token_equivalent_duration": config.get("token_equivalent_duration", None),
-        "tarred_random_access": config.get("tarred_random_access", False),
+        "skip_missing_manifest_entries": config.get("skip_missing_manifest_entries", False),
+        "force_map_dataset": config.get("force_map_dataset", False),
+        "force_iterable_dataset": config.get("force_iterable_dataset", False),
     }
     input_cfg = config.input_cfg
     if isinstance(input_cfg, (str, Path)):
@@ -202,6 +211,7 @@ def read_dataset_config(config) -> tuple[CutSet, bool]:
 
 
 def parse_group(grp_cfg: DictConfig, propagate_attrs: dict) -> [CutSet, bool]:
+    """Parse a group configuration, potentially combining multiple datasets."""
     assert grp_cfg.type in get_known_config_data_types(), f"Unknown item type in dataset config list: {grp_cfg.type=}"
 
     # Note: Text data types will return is_tarred=True.
@@ -223,6 +233,7 @@ def parse_group(grp_cfg: DictConfig, propagate_attrs: dict) -> [CutSet, bool]:
 
 @data_type_parser("txt")
 def read_txt_paths(config: DictConfig) -> tuple[CutSet, bool]:
+    """Read paths to text files and create a CutSet."""
     cuts = CutSet(
         LhotseTextAdapter(
             paths=config.paths,
@@ -238,6 +249,7 @@ def read_txt_paths(config: DictConfig) -> tuple[CutSet, bool]:
 
 @data_type_parser("txt_pair")
 def read_txt_pair_paths(config: DictConfig) -> tuple[CutSet, bool]:
+    """Read paths to source and target text files and create a CutSet."""
     cuts = CutSet(
         LhotseTextPairAdapter(
             source_paths=config.source_paths,
@@ -257,6 +269,7 @@ def read_txt_pair_paths(config: DictConfig) -> tuple[CutSet, bool]:
 
 @data_type_parser("nemo_sft_jsonl")
 def read_nemo_sft_jsonl(config: DictConfig) -> tuple[CutSet, bool]:
+    """Read paths to Nemo SFT JSONL files and create a CutSet."""
     cuts = CutSet(
         NeMoSFTJsonlAdapter(
             paths=config.paths,
@@ -272,6 +285,7 @@ def read_nemo_sft_jsonl(config: DictConfig) -> tuple[CutSet, bool]:
 
 @data_type_parser("multimodal_conversation")
 def read_multimodal_conversation_jsonl(config: DictConfig) -> tuple[CutSet, bool]:
+    """Read paths to multimodal conversation JSONL files and create a CutSet."""
     cuts = CutSet(
         NeMoMultimodalConversationJsonlAdapter(
             manifest_filepath=config.manifest_filepath,
@@ -288,6 +302,7 @@ def read_multimodal_conversation_jsonl(config: DictConfig) -> tuple[CutSet, bool
 
 
 def attach_tags(cut, tags: dict):
+    """Attach extra tags to a cut dynamically."""
     for key, val in tags.items():
         setattr(cut, key, val)
     return cut
@@ -297,6 +312,7 @@ def attach_tags(cut, tags: dict):
 def parse_and_combine_datasets(
     config_list: Union[list[DictConfig], ListConfig], propagate_attrs: dict
 ) -> tuple[CutSet, bool]:
+    """Parse a list of dataset configurations, potentially combining multiple datasets."""
     cuts = []
     weights = []
     tarred_status = []
@@ -322,10 +338,24 @@ def parse_and_combine_datasets(
         if (w := item.get("weight")) is not None:
             weights.append(w)
 
-    assert all(t == tarred_status[0] for t in tarred_status), "Mixing tarred and non-tarred datasets is not supported."
+    all_same_tarred_status = all(t == tarred_status[0] for t in tarred_status)
+    if not all_same_tarred_status:
+        if propagate_attrs["force_map_dataset"] or propagate_attrs["force_iterable_dataset"]:
+            logging.warning(
+                f"Not all datasets in the group have the same tarred status, using provided force_map_dataset "
+                f"({propagate_attrs['force_map_dataset']}) and force_iterable_dataset "
+                f"({propagate_attrs['force_iterable_dataset']}) to determine the final tarred status."
+            )
+        else:
+            raise ValueError(
+                "Mixing tarred and non-tarred datasets is not supported when neither force_map_dataset "
+                "nor force_iterable_dataset is True."
+            )
+
     assert len(weights) == 0 or len(cuts) == len(
         weights
     ), "Missing dataset weight. When weighting datasets, every dataset must have a specified weight."
+
     if len(cuts) > 1:
         cuts = mux(
             *cuts,
@@ -341,6 +371,7 @@ def parse_and_combine_datasets(
 
 @data_type_parser(["lhotse", "lhotse_shar"])
 def read_lhotse_manifest(config) -> tuple[CutSet, bool]:
+    """Read paths to Lhotse manifest files and create a CutSet."""
     is_tarred = config.get("shar_path") is not None
     if is_tarred:
         # Lhotse Shar is the equivalent of NeMo's native "tarred" dataset.
@@ -357,9 +388,9 @@ def read_lhotse_manifest(config) -> tuple[CutSet, bool]:
         #   to observe different data examples than in the previous run.
         # - integer means we'll set a specific seed in every worker, and data would be duplicated across them.
         #   This is mostly useful for unit testing or debugging.
-        shard_seed = config.shard_seed
-        metadata_only = config.metadata_only
-        force_finite = config.force_finite
+        shard_seed = config.get("shard_seed", "trng")
+        metadata_only = config.get("metadata_only", False)
+        force_finite = config.get("force_finite", False)
         if config.get("cuts_path") is not None:
             warnings.warn("Note: lhotse.cuts_path will be ignored because lhotse.shar_path was provided.")
         if isinstance(config.shar_path, (str, Path)):
@@ -399,11 +430,12 @@ def read_lhotse_manifest(config) -> tuple[CutSet, bool]:
                 logging.info(f"- {path=} {weight=}")
                 cutsets.append(cs)
                 weights.append(weight)
+
             cuts = mux(
                 *cutsets,
                 weights=weights,
-                max_open_streams=config.max_open_streams,
-                seed=config.shard_seed,
+                max_open_streams=config.get("max_open_streams", None),
+                seed=shard_seed,
                 force_finite=force_finite,
             )
         elif isinstance(config.shar_path, Mapping):
@@ -430,7 +462,28 @@ def read_lhotse_manifest(config) -> tuple[CutSet, bool]:
     return cuts, is_tarred
 
 
-def _resolve_shar_inputs(path: str | Path, only_metadata: bool) -> dict:
+@data_type_parser(["lhotse_as_conversation"])
+def read_lhotse_as_conversation(config) -> tuple[CutSet, bool]:
+    def cut_to_conversation(cut: Cut) -> NeMoMultimodalConversation:
+        turns = [
+            AudioTurn(cut=cut, role="user", audio_locator_tag=config.audio_locator_tag),
+            TextTurn(value=cut.supervisions[0].text, role="assistant"),
+        ]
+        if hasattr(cut, "context"):
+            turns = [TextTurn(value=cut.context, role="user")] + turns
+        return NeMoMultimodalConversation(
+            id=cut.id,
+            turns=turns,
+            token_equivalent_duration=config.token_equivalent_duration,
+            custom=cut.custom,
+        )
+
+    cuts, is_tarred = read_cutset_from_config(config)
+    cuts = cuts.map(cut_to_conversation)
+    return cuts, is_tarred
+
+
+def _resolve_shar_inputs(path: Union[str, Path], only_metadata: bool) -> dict:
     if only_metadata:
         return dict(fields={"cuts": sorted(Path(path).glob("cuts.*"))})
     else:
@@ -438,6 +491,7 @@ def _resolve_shar_inputs(path: str | Path, only_metadata: bool) -> dict:
 
 
 def resolve_relative_paths(cut: Cut, manifest_path: str) -> Cut:
+    """Resolve relative paths in a Cut object to their full paths."""
     if isinstance(cut, PaddingCut):
         return cut
 
@@ -487,35 +541,39 @@ def resolve_relative_paths(cut: Cut, manifest_path: str) -> Cut:
 
 @data_type_parser(["nemo", "nemo_tarred"])
 def read_nemo_manifest(config) -> tuple[CutSet, bool]:
-    common_kwargs = {
-        "text_field": config.text_field,
-        "lang_field": config.lang_field,
-        "shuffle_shards": config.shuffle,
-        "shard_seed": config.shard_seed,
-        "extra_fields": config.get("extra_fields", None),
-    }
+    """Read NeMo manifest and return a Lhotse CutSet."""
+    common_kwargs = {}
+    for key in ("text_field", "lang_field", "shuffle", "shard_seed", "extra_fields"):
+        if key in config:
+            if key == "shuffle":
+                common_kwargs["shuffle_shards"] = config[key]
+            else:
+                common_kwargs[key] = config[key]
     # The option below is to allow a special case of NeMo manifest iteration as Lhotse CutSet
     # without performing any I/O. NeMo manifests typically don't have sampling_rate information required by Lhotse,
     # so lhotse has to look up the headers of audio files to fill it on-the-fly.
     # (this only has an impact on non-tarred data; tarred data is read into memory anyway).
     # This is useful for utility scripts that iterate metadata and estimate optimal batching settings
     # and other data statistics.
-    notar_kwargs = {"metadata_only": config.metadata_only}
-    metadata_only = config.metadata_only
-    force_finite = config.force_finite
+    metadata_only = config.get("metadata_only", False)
+    force_finite = config.get("force_finite", False)
+    notar_kwargs = {"metadata_only": metadata_only}
     is_tarred = config.get("tarred_audio_filepaths") is not None
     if isinstance(config.manifest_filepath, (str, Path)):
-        logging.info(f"Initializing Lhotse CutSet from a single NeMo manifest (tarred): '{config.manifest_filepath}'")
+        logging.info(
+            f"""Initializing Lhotse CutSet from a single NeMo manifest 
+            (is_tarred={is_tarred}): '{config.manifest_filepath}'"""
+        )
         if is_tarred and not metadata_only:
             cuts = CutSet(
                 LazyNeMoTarredIterator(
                     config.manifest_filepath,
                     tar_paths=config.tarred_audio_filepaths,
-                    tarred_random_access=config.tarred_random_access,
+                    skip_missing_manifest_entries=config.get("skip_missing_manifest_entries", False),
                     **common_kwargs,
                 )
             )
-            if not config.tarred_random_access and not force_finite:
+            if not force_finite:
                 cuts = cuts.repeat()
         else:
             cuts = CutSet(LazyNeMoIterator(config.manifest_filepath, **notar_kwargs, **common_kwargs))
@@ -534,26 +592,28 @@ def read_nemo_manifest(config) -> tuple[CutSet, bool]:
         #   i.e., NeMo concatenated dataset
         #   Assume it's [path1, path2, ...] (while tarred_audio_filepaths in the same format).
         logging.info(
-            f"Initializing Lhotse CutSet from multiple tarred NeMo manifest sources with a weighted multiplexer. "
-            f"We found the following sources and weights: "
+            f"""Initializing Lhotse CutSet from multiple NeMo manifest 
+            (is_tarred={is_tarred}) sources with a weighted multiplexer.
+            We found the following sources and weights: """
         )
         cutsets = []
         weights = []
         tar_paths = config.tarred_audio_filepaths if is_tarred else repeat((None,))
         # Create a stream for each dataset.
         for manifest_info, tar_path in zip(config.manifest_filepath, tar_paths):
-            if isinstance(tar_path, (list, tuple, ListConfig)):
+            if is_tarred and isinstance(tar_path, (list, tuple, ListConfig)):
                 # if it's in option 1 or 2
                 (tar_path,) = tar_path
                 manifest_path = manifest_info[0]
             else:
+                # if it's in option 3
                 manifest_path = manifest_info
             # First, convert manifest_path[+tar_path] to an iterator.
             if is_tarred and not metadata_only:
                 nemo_iter = LazyNeMoTarredIterator(
                     manifest_path=manifest_path,
                     tar_paths=tar_path,
-                    tarred_random_access=config.tarred_random_access,
+                    skip_missing_manifest_entries=config.get("skip_missing_manifest_entries", False),
                     **common_kwargs,
                 )
             else:
@@ -578,19 +638,18 @@ def read_nemo_manifest(config) -> tuple[CutSet, bool]:
             #   split the manifest to individual shards if applicable.
             #   This helps the multiplexing achieve closer data distribution
             #   to the one desired in spite of the limit.
-            if config.max_open_streams is not None:
+            if config.get("max_open_streams") is not None:
                 for subiter in nemo_iter.to_shards():
                     cutsets.append(CutSet(subiter))
                     weights.append(weight)
             else:
                 cutsets.append(CutSet(nemo_iter))
                 weights.append(weight)
-        # Finally, we multiplex the dataset streams to mix the data.
         cuts = mux(
             *cutsets,
             weights=weights,
-            max_open_streams=config.max_open_streams,
-            seed=config.shard_seed,
+            max_open_streams=config.get("max_open_streams"),
+            seed=config.get("shard_seed", "trng"),
             force_finite=force_finite or metadata_only,
         )
     return cuts, is_tarred
@@ -623,9 +682,9 @@ def read_multi_speaker_simulator(config: DictConfig) -> tuple[CutSet, bool]:
 
 def mux(
     *cutsets: CutSet,
-    weights: list[int | float],
-    max_open_streams: int | None = None,
-    seed: str | int = "trng",
+    weights: list[Union[int, float]],
+    max_open_streams: Union[int, None] = None,
+    seed: Union[str, int] = "trng",
     force_finite: bool = False,
 ) -> CutSet:
     """
@@ -639,7 +698,11 @@ def mux(
     else:
         if not force_finite:
             cutsets = [cs.repeat() for cs in cutsets]
-        cuts = CutSet.mux(*cutsets, weights=weights, seed=seed)
+        if len(cutsets) == 1:
+            # CutSet.mux must take more than one CutSet.
+            cuts = cutsets[0]
+        else:
+            cuts = CutSet.mux(*cutsets, weights=weights, seed=seed)
     return cuts
 
 
@@ -649,7 +712,8 @@ def guess_parse_cutset(inp: Union[str, dict, omegaconf.DictConfig]) -> CutSet:
     * a string path to YAML input spec (see :func:`read_dataset_config` for details)
     * a string path to Lhotse non-tarred JSONL manifest
     * a string path to NeMo non-tarred JSON manifest
-    * a dictionary specifying inputs with keys available in :class:`nemo.collections.common.data.lhotse.dataloader.LhotseDataLoadingConfig`
+    * a dictionary specifying inputs with keys available in
+        :class:`nemo.collections.common.data.lhotse.dataloader.LhotseDataLoadingConfig`
 
     It's intended to be used in a generic context where we are not sure which way the user will specify the inputs.
     """

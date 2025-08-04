@@ -142,7 +142,7 @@ def load_config(mixtral_config, tokenizer_path, tokenizer_type):
     assert nemo_config.num_moe_experts > 0, "num_experts must be greater than zero."
     nemo_config.moe_router_topk = int(mixtral_config['num_experts_per_tok'])
     assert nemo_config.moe_router_topk > 0, "moe_router_topk must be greater than zero."
-    nemo_config.moe_router_pre_softmax = True
+    nemo_config.moe_router_pre_softmax = False
     nemo_config.use_cpu_initialization = True
     # Mixtral uses SiLU, but it is the same as swish with beta = 1.
     nemo_config.activation = 'fast-swiglu'
@@ -554,6 +554,8 @@ if __name__ == '__main__':
     if args.low_ram:
         os.makedirs(args.tmp_dir, exist_ok=True)
 
+    # Fake init expert model parallel for conversion
+    parallel_state._EXPERT_TENSOR_PARALLEL_GROUP = 0
     parallel_state.set_expert_model_parallel_world_size(1)
     checkpoint = OrderedDict()
     for i, ckpt_part in enumerate(convert(args)):

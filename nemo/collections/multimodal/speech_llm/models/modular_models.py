@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# flake8: noqa
 
 import itertools
 import json
@@ -1077,7 +1079,7 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
                 peft_cfg_cls = PEFT_CONFIG_MAP[model_cfg.peft.peft_scheme]
                 model.load_adapters(cfg.model.peft.restore_from_path, peft_cfg_cls(model_cfg), map_location="cpu")
             else:
-                torch_state_dict = torch.load(cfg.model.peft.restore_from_path)['state_dict']
+                torch_state_dict = torch.load(cfg.model.peft.restore_from_path, weights_only=False)['state_dict']
                 model.load_state_dict(torch_state_dict, strict=False)
         elif cfg.model.peft.restore_from_ckpt.checkpoint_dir and cfg.model.peft.restore_from_ckpt.checkpoint_name:
             checkpoint_path = os.path.join(
@@ -1096,7 +1098,7 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
                     peft_cfg_cls = PEFT_CONFIG_MAP[cfg.model.peft.peft_scheme]
                     model.load_adapters(checkpoint_path, peft_cfgs=peft_cfg_cls(model_cfg), map_location="cpu")
                 else:
-                    model.load_state_dict(torch.load(checkpoint_path), strict=False)
+                    model.load_state_dict(torch.load(checkpoint_path, weights_only=False), strict=False)
             else:
                 raise NotImplementedError("distributed checkpointing of PEFT weights is not supported")
         elif model_cfg.peft.get("peft_scheme", None):
@@ -1446,6 +1448,9 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
                 continue
             # Expand on_validation_epoch_end from parent class MegatronGPTModel as on_validation_epoch_end doesnt take outputs arg
             loss_vals = [x['loss'] for x in output]
+            assert (
+                self.cfg.get("virtual_pipeline_model_parallel_size", None) is None
+            ), "Virtual pipeline model parallel size is no longer supported for nemo 1.0"
             if parallel_state.is_pipeline_last_stage():
                 # only the last pipeline parallel stages return loss with their batch size
                 if self.cfg.data.get('validation_drop_last', True):

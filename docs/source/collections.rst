@@ -12,28 +12,6 @@ Documentation for the individual collections
 
    nlp/nemo_megatron/intro
    nlp/machine_translation/machine_translation
-   nlp/megatron_onnx_export
-   nlp/quantization
-
-.. toctree::
-   :maxdepth: 1
-   :caption: Multimodal Models (MMs)
-   :name: Multimodal
-   :titlesonly:
-
-   multimodal/mllm/intro
-   multimodal/vlm/intro
-   multimodal/text2img/intro
-   multimodal/nerf/intro
-   multimodal/speech_llm/intro
-
-.. toctree::
-   :maxdepth: 1
-   :caption: Vision (CV)
-   :name: vision
-   :titlesonly:
-
-   vision/intro
 
 .. toctree::
    :maxdepth: 1
@@ -47,6 +25,7 @@ Documentation for the individual collections
    asr/speaker_diarization/intro
    asr/ssl/intro
    asr/speech_intent_slot/intro
+   speechlm2/intro
 
 .. toctree::
    :maxdepth: 1

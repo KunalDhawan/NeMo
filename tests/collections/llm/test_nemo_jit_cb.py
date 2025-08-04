@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -35,9 +35,8 @@ DATA_PATH = '/home/TestData/lite/hf_cache/squad/'
 def make_squad_hf_dataset(data_path, tokenizer):
     tokenizer = getattr(tokenizer, 'tokenizer', tokenizer)
 
-    def formatting_prompts_func(examples):
-        alpaca_prompt = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
-
+    def fmt(examples):
+        prompt = """
     ### Instruction:
     {}
 
@@ -51,14 +50,14 @@ def make_squad_hf_dataset(data_path, tokenizer):
         output = examples["answers"]['text']
         if isinstance(output, list):
             output = output[0]
-        text = alpaca_prompt.format(instruction, input, output) + "<eos>"
+        text = prompt.format(instruction, input, output) + "<eos>"
         tokens = tokenizer.text_to_ids(text)
         return {'input_ids': tokens, 'labels': tokens}
 
     datamodule = llm.HFDatasetDataModule(data_path, split="train[:100]", pad_token_id=tokenizer.eos_id)
 
     datamodule.map(
-        formatting_prompts_func,
+        fmt,
         batched=False,
         batch_size=2,
         remove_columns=["id", "title", "context", "question", 'answers'],

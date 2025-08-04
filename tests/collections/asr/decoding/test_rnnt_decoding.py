@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import os
-from functools import lru_cache
+from functools import cached_property, lru_cache
+from pathlib import Path
+from typing import Optional
 
 import pytest
 import torch
@@ -29,6 +32,7 @@ from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTBPEDecoding,
 from nemo.collections.asr.parts.utils import rnnt_utils
 from nemo.core.utils import numba_utils
 from nemo.core.utils.numba_utils import __NUMBA_MINIMUM_VERSION__
+from tests.collections.asr.decoding.test_timestamps import BaseTimestampsTest
 
 NUMBA_RNNT_LOSS_AVAILABLE = numba_utils.numba_cpu_is_supported(
     __NUMBA_MINIMUM_VERSION__
@@ -87,6 +91,7 @@ def get_model_encoder_output(data_dir, model_name):
         model = ASRModel.from_pretrained(model_name, map_location='cpu')  # type: ASRModel
         model.preprocessor.featurizer.dither = 0.0
         model.preprocessor.featurizer.pad_to = 0
+        model.eval()
 
         audio, sr = librosa.load(path=audio_filepath, sr=16000, mono=True)
 
@@ -118,55 +123,6 @@ def decode_text_from_nbest_hypotheses(hyps, decoding):
     return hypotheses, all_hypotheses
 
 
-def check_char_timestamps(hyp: rnnt_utils.Hypothesis, decoding: RNNTDecoding):
-    assert hyp.timestep is not None
-    assert isinstance(hyp.timestep, dict)
-    assert 'timestep' in hyp.timestep
-    assert 'char' in hyp.timestep
-    assert 'word' in hyp.timestep
-    assert 'segment' in hyp.timestep
-
-    words = hyp.text.split(decoding.word_seperator)
-    words = list(filter(lambda x: x != '', words))
-    assert len(hyp.timestep['word']) == len(words)
-
-    segments = []
-    segment = []
-
-    for word in words:
-        segment.append(word)
-        if word[-1] in decoding.segment_seperators:
-            segments.append(' '.join(segment))
-            segment = []
-
-    if segment:
-        segments.append(' '.join(segment))
-
-    assert len(hyp.timestep['segment']) == len(segments)
-
-
-def check_subword_timestamps(hyp: rnnt_utils.Hypothesis, decoding: RNNTBPEDecoding):
-    assert hyp.timestep is not None
-    assert isinstance(hyp.timestep, dict)
-    assert 'timestep' in hyp.timestep
-    assert 'char' in hyp.timestep
-    assert 'word' in hyp.timestep
-    assert 'segment' in hyp.timestep
-
-    chars = list(hyp.text)
-    chars = list(filter(lambda x: x not in ['', ' ', '#'], chars))
-    all_chars = [list(decoding.tokenizer.tokens_to_text(data['char'])) for data in hyp.timestep['char']]
-    all_chars = [char for subword in all_chars for char in subword]
-    all_chars = list(filter(lambda x: x not in ['', ' ', '#'], all_chars))
-    assert len(chars) == len(all_chars)
-
-    segments_count = sum([hyp.text.count(seperator) for seperator in decoding.segment_seperators])
-    if not hyp.text or hyp.text[-1] not in decoding.segment_seperators:
-        segments_count += 1
-
-    assert len(hyp.timestep['segment']) == segments_count
-
-
 def check_beam_decoding(test_data_dir, beam_config):
     beam_size = beam_config.pop("beam_size", 1)
     model, encoded, encoded_len = get_model_encoder_output(test_data_dir, 'nvidia/parakeet-tdt_ctc-110m')
@@ -195,8 +151,41 @@ def check_beam_decoding(test_data_dir, beam_config):
         for idx, hyp_ in enumerate(all_hyps):
             print("Hyp index", idx + 1, "text :", hyp_.text)
 
-            assert len(hyp_.timestep) > 0
-            print("Timesteps", hyp_.timestep)
+            assert len(hyp_.timestamp) > 0
+            print("Timesteps", hyp_.timestamp)
+            print()
+
+
+def check_tdt_greedy_decoding(test_data_dir, use_cuda_graph_decoder: bool, lm_path: Optional[str | Path] = None):
+    model, encoded, encoded_len = get_model_encoder_output(test_data_dir, 'nvidia/parakeet-tdt_ctc-110m')
+
+    model_config = model.to_config_dict()
+
+    decoding_algo = greedy_decode.GreedyBatchedTDTInfer(
+        model.decoder,
+        model.joint,
+        blank_index=model.decoder.blank_idx,
+        durations=list(model_config["model_defaults"]["tdt_durations"]),
+        max_symbols_per_step=10,
+        preserve_alignments=False,
+        preserve_frame_confidence=False,
+        use_cuda_graph_decoder=use_cuda_graph_decoder,
+        ngram_lm_model=str(lm_path) if lm_path else None,
+        ngram_lm_alpha=0.5 if lm_path else 0.0,
+    )
+
+    enc_out = encoded
+    enc_len = encoded_len
+
+    with torch.no_grad():
+        hyps: rnnt_utils.Hypothesis = decoding_algo(encoder_output=enc_out, encoded_lengths=enc_len)[0]
+        all_hyps = decode_text_from_greedy_hypotheses(hyps, model.decoding)
+
+        print("Decoding result")
+        for idx, hyp_ in enumerate(all_hyps):
+            print(f"Hyp index {idx + 1} | text : {hyp_.text}")
+            assert len(hyp_.timestamp) > 0
+            print("Timesteps", hyp_.timestamp)
             print()
 
 
@@ -258,7 +247,7 @@ class TestRNNTDecoding:
 
                     t_u.append(int(label))
 
-                print(f"Tokens at timestep {t} = {t_u}")
+                print(f"Tokens at timestamp {t} = {t_u}")
             print()
 
     @pytest.mark.skipif(
@@ -396,15 +385,15 @@ class TestRNNTDecoding:
                     if len(t_u) > 1:
                         assert t_u[-1] == blank_id
 
-                        # No blank token should be present in the current timestep other than at the end
+                        # No blank token should be present in the current timestamp other than at the end
                         for token in t_u[:-1]:
                             assert token != blank_id
 
-                    print(f"Tokens at timestep {t} = {t_u}")
+                    print(f"Tokens at timestamp {t} = {t_u}")
                 print()
 
-                assert len(hyp_.timestep) > 0
-                print("Timesteps", hyp_.timestep)
+                assert len(hyp_.timestamp) > 0
+                print("Timesteps", hyp_.timestamp)
                 print()
 
     @pytest.mark.skipif(
@@ -438,9 +427,11 @@ class TestRNNTDecoding:
             decoding_cfg=cfg, decoder=model.decoder, joint=model.joint, tokenizer=model.tokenizer
         )
 
-        hyps, _ = decoding.rnnt_decoder_predictions_tensor(encoded, encoded_len, return_hypotheses=True)
-
-        check_subword_timestamps(hyps[0], decoding)
+        hyps = decoding.rnnt_decoder_predictions_tensor(encoded, encoded_len, return_hypotheses=True)
+        if isinstance(hyps[0], list):
+            BaseTimestampsTest.check_subword_timestamps(hyps[0][0], decoding)
+        else:
+            BaseTimestampsTest.check_subword_timestamps(hyps[0], decoding)
 
     @pytest.mark.skipif(
         not NUMBA_RNNT_LOSS_AVAILABLE,
@@ -473,9 +464,26 @@ class TestRNNTDecoding:
 
         decoding = RNNTDecoding(decoding_cfg=cfg, decoder=model.decoder, joint=model.joint, vocabulary=vocab)
 
-        hyps, _ = decoding.rnnt_decoder_predictions_tensor(encoded, encoded_len, return_hypotheses=True)
+        hyps = decoding.rnnt_decoder_predictions_tensor(encoded, encoded_len, return_hypotheses=True)
 
-        check_char_timestamps(hyps[0], decoding)
+        if isinstance(hyps[0], list):
+            BaseTimestampsTest.check_char_timestamps(hyps[0][0], decoding)
+        else:
+            BaseTimestampsTest.check_char_timestamps(hyps[0], decoding)
+
+    @pytest.mark.skipif(
+        not NUMBA_RNNT_LOSS_AVAILABLE,
+        reason='RNNTLoss has not been compiled with appropriate numba version.',
+    )
+    @pytest.mark.with_downloads
+    @pytest.mark.unit
+    @pytest.mark.parametrize("use_cuda_graph_decoder", [True, False])
+    @pytest.mark.parametrize("use_lm", [True, False])
+    def test_tdt_greedy_decoding(self, test_data_dir, use_cuda_graph_decoder: bool, use_lm: bool):
+        kenlm_model_path = Path(test_data_dir) / "asr/kenlm_ngram_lm/parakeet-tdt_ctc-110m-libri-1024.kenlm.tmp.arpa"
+        check_tdt_greedy_decoding(
+            test_data_dir, use_cuda_graph_decoder=use_cuda_graph_decoder, lm_path=kenlm_model_path if use_lm else None
+        )
 
     @pytest.mark.skipif(
         not NUMBA_RNNT_LOSS_AVAILABLE,
@@ -524,3 +532,62 @@ class TestRNNTDecoding:
         )
         beam_config["ngram_lm_model"] = kenlm_model_path
         check_beam_decoding(test_data_dir, beam_config)
+
+
+class TestRNNTTimestamps(BaseTimestampsTest):
+    """RNNT-specific timestamp tests that inherit from BaseTimestampsTest"""
+
+    def _convert_offsets(self, offsets):
+        result = copy.deepcopy(offsets)
+        for offset in result:
+            offset['char'] = [offset['char']]
+        return result
+
+    @property
+    def char_offsets_chars(self):
+        return self._convert_offsets(super().char_offsets_chars)
+
+    @property
+    def char_offsets_wpe(self):
+        return self._convert_offsets(super().char_offsets_wpe)
+
+    @property
+    def char_offsets_bpe(self):
+        return self._convert_offsets(super().char_offsets_bpe)
+
+    @cached_property
+    def decoding_char(self):
+        cfg = RNNTDecodingConfig()
+        vocab = char_vocabulary()
+        decoder = get_rnnt_decoder(vocab_size=len(vocab))
+        joint = get_rnnt_joint(vocab_size=len(vocab))
+        decoding = RNNTDecoding(decoding_cfg=cfg, decoder=decoder, joint=joint, vocabulary=vocab)
+        return decoding
+
+    @cached_property
+    def decoding_subword_wpe(self):
+        cfg = RNNTDecodingConfig()
+        vocab = self.tmp_tokenizer.vocab
+        decoder = get_rnnt_decoder(vocab_size=len(vocab))
+        joint = get_rnnt_joint(vocab_size=len(vocab))
+        decoding = RNNTBPEDecoding(decoding_cfg=cfg, decoder=decoder, joint=joint, tokenizer=self.tmp_tokenizer)
+        return decoding
+
+    @cached_property
+    def decoding_subword_bpe(self):
+        vocab = self.bpe_tokenizer.vocab
+        cfg = RNNTDecodingConfig()
+        decoder = get_rnnt_decoder(vocab_size=len(vocab))
+        joint = get_rnnt_joint(vocab_size=len(vocab))
+        decoding = RNNTBPEDecoding(decoding_cfg=cfg, decoder=decoder, joint=joint, tokenizer=self.bpe_tokenizer)
+        return decoding
+
+    @pytest.mark.unit
+    def test_word_offsets_subword_wpe(self, tmp_tokenizer):
+        self.tmp_tokenizer = tmp_tokenizer
+        super().test_word_offsets_subword_wpe()
+
+    @pytest.mark.unit
+    def test_word_offsets_subword_wpe_other_delimiter(self, tmp_tokenizer):
+        self.tmp_tokenizer = tmp_tokenizer
+        super().test_word_offsets_subword_wpe_other_delimiter()

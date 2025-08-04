@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
 from typing import Callable, Optional
 
 import lightning.pytorch as pl
@@ -51,8 +50,6 @@ def model() -> run.Config[pl.LightningModule]:
             >>> model_config = model()
             >>> print(model_config)
     """
-    # Disable cuDNN attention since TE 1.8 does not support head dim > 128
-    os.environ['NVTE_FUSED_ATTN'] = "0"
     return run.Config(GemmaModel, config=run.Config(GemmaConfig2B))
 
 
@@ -168,10 +165,6 @@ def pretrain_recipe(
         Python API usage:
             >>> recipe = pretrain_recipe(name="gemma_2b_pretrain", num_nodes=2)
             >>> print(recipe)
-
-    Note:
-        For more details on pre-training LLMs with NeMo, see the pre-training
-        guide in the `examples/llm/pretrain/` directory.
     """
     return run.Partial(
         fn,
@@ -272,9 +265,7 @@ def finetune_recipe(
             >>> print(recipe)
 
     Note:
-        This recipe uses the SQuAD dataset for fine-tuning. For more information
-        on fine-tuning LLMs with NeMo, see the fine-tuning guide in the
-        `examples/llm/finetune/` directory.
+        This recipe uses the SQuAD dataset for fine-tuning.
     """
     recipe = default_finetune_recipe(
         model(), "google/gemma-2b", dir, name, num_nodes, num_gpus_per_node, packed_sequence

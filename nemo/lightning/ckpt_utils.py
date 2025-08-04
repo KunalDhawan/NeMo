@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,11 +21,36 @@ WEIGHTS_PATH: str = "weights"
 CONTEXT_PATH: str = "context"
 ADAPTER_META_FILENAME = "adapter_metadata.json"
 
+# When saving checkpoints/adapters in HF format we use directories starting with "hf_".
+HF_WEIGHTS_PATH: str = "hf_weights"
+HF_ADAPTER_PATH: str = "hf_adapter"
+HF_ADAPTER_CONFIG_FILENAME = "adapter_config.json"
+
 
 def idempotent_path_append(base_dir: Union[str, Path], suffix) -> Path:
-    from nemo.lightning.resume import AdapterPath
+    """Appends a given suffix to a base directory path only if it is not already present.
 
-    assert isinstance(base_dir, Path)
+    This function takes a base directory (either a string or Path) and ensures that
+    the suffix is appended to the path. If the base directory is an AdapterPath instance,
+    it also appends the suffix to the AdapterPath's base_model_path if the suffix
+    is not already part of that path.
+
+    Args:
+        base_dir (Union[str, Path]): The base directory or path object.
+        suffix (str): The suffix to append to the base directory.
+
+    Returns:
+        Path: The updated path object with the suffix appended if it was not already present.
+    """
+    from nemo.lightning.resume import AdapterPath
+    from nemo.utils.msc_utils import import_multistorageclient, is_multistorageclient_url
+
+    if is_multistorageclient_url(base_dir):
+        msc = import_multistorageclient()
+        base_dir = msc.Path(base_dir)
+    else:
+        base_dir = Path(base_dir)
+
     if base_dir.parts[-1] != suffix:
         base_dir = base_dir / suffix
     if isinstance(base_dir, AdapterPath) and base_dir.base_model_path.parts[-1] != suffix:
@@ -45,10 +70,17 @@ def ckpt_to_dir(filepath: Union[str, Path]) -> Path:
     to be used as a directory for distributed checkpoints
     """
     from nemo.lightning.resume import AdapterPath
+    from nemo.utils.msc_utils import import_multistorageclient, is_multistorageclient_url
 
     if isinstance(filepath, AdapterPath):
         return filepath
-    filepath = Path(filepath)
+
+    if is_multistorageclient_url(filepath):
+        msc = import_multistorageclient()
+        filepath = msc.Path(filepath)
+    else:
+        filepath = Path(filepath)
+
     if not filepath.suffix == ".ckpt":
         filepath = filepath.with_suffix(filepath.suffix + ".ckpt")
 

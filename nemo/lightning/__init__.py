@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -28,10 +28,16 @@ from nemo.lightning.fabric.plugins import FabricMegatronMixedPrecision
 from nemo.lightning.fabric.strategies import FabricMegatronStrategy
 from nemo.lightning.nemo_logger import NeMoLogger
 from nemo.lightning.pytorch.callbacks.model_checkpoint import ModelCheckpoint
-from nemo.lightning.pytorch.optim import LRSchedulerModule, MegatronOptimizerModule, OptimizerModule, lr_scheduler
+from nemo.lightning.pytorch.optim import (
+    LRSchedulerModule,
+    MegatronOptimizerModule,
+    OptimizerModule,
+    PytorchOptimizerModule,
+    lr_scheduler,
+)
 from nemo.lightning.pytorch.plugins import MegatronDataSampler, MegatronMixedPrecision
 from nemo.lightning.pytorch.plugins import data_sampler as _data_sampler
-from nemo.lightning.pytorch.strategies import FSDPStrategy, MegatronStrategy
+from nemo.lightning.pytorch.strategies import FSDP2Strategy, FSDPStrategy, MegatronStrategy
 from nemo.lightning.pytorch.strategies.utils import RestoreConfig
 from nemo.lightning.pytorch.trainer import Trainer, configure_no_restart_validation_training_loop
 from nemo.lightning.resume import AutoResume
@@ -59,7 +65,9 @@ __all__ = [
     "MegatronDataSampler",
     "MegatronMixedPrecision",
     "MegatronOptimizerModule",
+    "PytorchOptimizerModule",
     "FSDPStrategy",
+    "FSDP2Strategy",
     "RestoreConfig",
     "lr_scheduler",
     "NeMoLogger",

@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ def get_args():
     parser = argparse.ArgumentParser(description='Merge LoRA weights with base LLM')
     parser.add_argument('--lora_checkpoint_path', type=str, help="Path to finetuned LORA checkpoint")
     parser.add_argument('--output_path', type=str, help="Path to save merged checkpoint")
+    parser.add_argument('--legacy_ckpt', action="store_true", help="Load ckpt saved with TE < 1.14")
     return parser.parse_args()
 
 
@@ -28,4 +29,5 @@ if __name__ == '__main__':
     llm.peft.merge_lora(
         lora_checkpoint_path=args.lora_checkpoint_path,
         output_path=args.output_path,
+        legacy_ckpt=args.legacy_ckpt,
     )

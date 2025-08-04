@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -118,8 +118,10 @@ def trainer(
             grad_reduce_in_fp32=True,
             overlap_grad_reduce=True,
             overlap_param_gather=True,
-            average_in_collective=True,
+            average_in_collective=True,  # Not supported for custom FSDP for now, need to be set to False if using FSDP
+            data_parallel_sharding_strategy="optim_grads_params",  # For custom FSDP only
         ),
+        fsdp=None,  # Set to 'megatron' to use Megatron FSDP, 'pytorch' to use PyTorch FSDP 2 (WIP)
     )
 
     trainer = run.Config(
@@ -176,10 +178,6 @@ def pretrain_recipe(
         Python API usage:
             >>> recipe = pretrain_recipe(name="llama3_8b_pretrain", num_nodes=2)
             >>> print(recipe)
-
-    Note:
-        For more details on pre-training LLMs with NeMo, see the pre-training
-        guide in the `examples/llm/pretrain/` directory.
     """
     recipe = run.Partial(
         fn,
@@ -218,12 +216,28 @@ def pretrain_performance_optimizations(recipe: run.Partial) -> run.Partial:
         Use this method with caution and only when you need maximum performance.
         It may not be suitable for all hardware configurations or use cases.
     """
-    recipe.trainer.callbacks.append(
-        run.Config(
-            MegatronCommOverlapCallback,
-            tp_comm_overlap=False,
-        )
+    if not recipe.trainer.callbacks:
+        recipe.trainer.callbacks = []
+
+    garbage_collection_callback = run.Config(
+        GarbageCollectionCallback,
+        gc_interval_train=100,
+        gc_interval_val=100,
     )
+    mcomm_overlap_callback = run.Config(
+        MegatronCommOverlapCallback,
+        tp_comm_overlap=False,
+    )
+    recipe.trainer.callbacks.extend(
+        [
+            garbage_collection_callback,
+            mcomm_overlap_callback,
+        ]
+    )
+
+    recipe.trainer.plugins.grad_reduce_in_fp32 = False
+    recipe.optim.config.use_precision_aware_optimizer = False
+
     return recipe
 
 
@@ -269,9 +283,7 @@ def finetune_recipe(
             >>> print(recipe)
 
     Note:
-        This recipe uses the SQuAD dataset for fine-tuning. For more information
-        on fine-tuning LLMs with NeMo, see the fine-tuning guide in the
-        `examples/llm/finetune/` directory.
+        This recipe uses the SQuAD dataset for fine-tuning.
     """
     # Default to unpacked data in normal mode and packed data in performance mode
     # once packing recipe is well tested, change this default to true
@@ -338,11 +350,10 @@ def finetune_performance_optimizations(
     """
     recipe.trainer.strategy.tensor_model_parallel_size = 1
 
-    if not hasattr(recipe.trainer, "callbacks"):
+    if not hasattr(recipe.trainer, "callbacks") or recipe.trainer.callbacks is None:
         recipe.trainer.callbacks = []
 
     if peft_scheme is None or peft_scheme.lower() == 'none':
-        recipe.trainer.plugins.grad_reduce_in_fp32 = False
         recipe.trainer.strategy.ddp = run.Config(
             DistributedDataParallelConfig,
             check_for_nan_in_grad=True,
@@ -351,15 +362,17 @@ def finetune_performance_optimizations(
             overlap_param_gather=True,
             average_in_collective=True,
         )
-        recipe.trainer.callbacks.append(
-            run.Config(
-                MegatronCommOverlapCallback,
-                tp_comm_overlap=False,
-            )
-        )
     else:
         recipe.peft.target_modules = ['linear_qkv']
 
+    recipe.trainer.plugins.grad_reduce_in_fp32 = False
+
+    recipe.trainer.callbacks.append(
+        run.Config(
+            MegatronCommOverlapCallback,
+            tp_comm_overlap=False,
+        )
+    )
     recipe.trainer.callbacks.append(run.Config(TimingCallback))
     recipe.trainer.callbacks.append(
         run.Config(
@@ -368,5 +381,7 @@ def finetune_performance_optimizations(
             100,
         )
     )
+
+    recipe.optim.config.use_precision_aware_optimizer = False
 
     return recipe

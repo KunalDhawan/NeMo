@@ -387,7 +387,7 @@ class FilterbankFeatures(nn.Module):
             hop_length=self.hop_length,
             win_length=self.win_length,
             center=False if self.exact_pad else True,
-            window=self.window.to(dtype=torch.float),
+            window=self.window.to(dtype=torch.float, device=x.device),
             return_complex=True,
         )
 
@@ -417,7 +417,9 @@ class FilterbankFeatures(nn.Module):
         return self.fb
 
     def forward(self, x, seq_len, linear_spec=False):
-        seq_len = self.get_seq_len(seq_len)
+        seq_len_unfixed = self.get_seq_len(seq_len)
+        # fix for seq_len = 0 for streaming; if size was 0, it is always padded to 1, and normalizer fails
+        seq_len = torch.where(seq_len == 0, torch.zeros_like(seq_len_unfixed), seq_len_unfixed)
 
         if self.stft_pad_amount is not None:
             x = torch.nn.functional.pad(
@@ -455,8 +457,11 @@ class FilterbankFeatures(nn.Module):
         if linear_spec:
             return x, seq_len
 
-        # dot with filterbank energies
-        x = torch.matmul(self.fb.to(x.dtype), x)
+        # disable autocast, otherwise it might be automatically casted to fp16
+        # on fp16 compatible GPUs and get NaN values for input value of 65520
+        with torch.amp.autocast(x.device.type, enabled=False):
+            # dot with filterbank energies
+            x = torch.matmul(self.fb.to(x.dtype), x)
         # log features if required
         if self.log:
             if self.log_zero_guard_type == "add":

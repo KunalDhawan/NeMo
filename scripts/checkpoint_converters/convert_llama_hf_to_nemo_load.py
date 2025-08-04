@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -257,11 +257,11 @@ def convert(args):
     if 'tokenizer_model' not in hf_config:
         if args.llama31:
             if hf_config['num_hidden_layers'] == 32:
-                model.cfg.tokenizer.update(type='meta-llama/Meta-Llama-3.1-8B')
+                model.cfg.tokenizer.update(type='meta-llama/Llama-3.1-8B')
             elif hf_config['num_hidden_layers'] == 80:
                 model.cfg.tokenizer.update(type='meta-llama/Meta-Llama-3.1-70B')
             elif hf_config['num_hidden_layers'] == 126:
-                model.cfg.tokenizer.update(type='meta-llama/Meta-Llama-3.1-8B')  # 405B tokenizer is the same as 8B
+                model.cfg.tokenizer.update(type='meta-llama/Llama-3.1-8B')  # 405B tokenizer is the same as 8B
             else:
                 logging.warning("Unexpected model config for Llama3. Tokenizer config has not been modified.")
         else:

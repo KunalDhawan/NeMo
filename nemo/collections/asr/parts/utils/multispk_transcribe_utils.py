@@ -624,7 +624,7 @@ class SpeakerTaggedASR:
     ):        
         word_and_ts_seq['uniq_id'] = uniq_id
 
-        for word_index, hyp_word_dict in enumerate(asr_hypothesis.timestep['word']):
+        for word_index, hyp_word_dict in enumerate(asr_hypothesis.timestamp['word']):
             time_stt_end_tuple=(hyp_word_dict['start_offset'], hyp_word_dict['end_offset'])
             word_dict = get_word_dict_content_offline(cfg=self.cfg, 
                                                         word=hyp_word_dict['word'],
@@ -657,7 +657,7 @@ class SpeakerTaggedASR:
         new_words = word_seq[word_and_ts_seq["offset_count"]:]
         new_token_group = self.asr_model.tokenizer.text_to_tokens(new_words)
         new_tokens = list(itertools.chain(*new_token_group))
-        frame_inds_seq = (torch.tensor(previous_hypothesis.timestep) + offset).tolist()
+        frame_inds_seq = (torch.tensor(previous_hypothesis.timestamp) + offset).tolist()
         frame_inds_seq = fix_frame_time_step(self.cfg, new_tokens, new_words, frame_inds_seq)
         min_len = min(len(new_words), len(frame_inds_seq))
         word_and_ts_seq['uniq_id'] = uniq_id
@@ -805,14 +805,14 @@ class SpeakerTaggedASR:
             if speaker_transcriptions[sess_idx] is not None:
                 trans_hyp[sess_idx].text = speaker_transcriptions[sess_idx]
             speaker_added_word_dicts = [] 
-            for word_idx, trans_wdict in enumerate(trans_hyp[0].timestep['word']):
+            for word_idx, trans_wdict in enumerate(trans_hyp[0].timestamp['word']):
                 trans_wdict_copy = deepcopy(trans_wdict)
                 trans_wdict_copy['speaker'] = word_and_ts_seq[sess_idx]['words'][word_idx]['speaker']
                 speaker_added_word_dicts.append(trans_wdict_copy)
-            trans_hyp[sess_idx].timestep['word'] = speaker_added_word_dicts
+            trans_hyp[sess_idx].timestamp['word'] = speaker_added_word_dicts
             w_count = 0
             segment_list = []
-            for word_idx, trans_segdict in enumerate(trans_hyp[0].timestep['segment']):
+            for word_idx, trans_segdict in enumerate(trans_hyp[0].timestamp['segment']):
                 words = trans_segdict['segment'].split()
                 spk_vote_pool = []
                 for word in words:
@@ -822,7 +822,7 @@ class SpeakerTaggedASR:
                     w_count += 1
                 trans_segdict['speaker'] = f"speaker_{torch.mode(torch.tensor(spk_vote_pool), dim=0).values.item()}"
                 segment_list.append(trans_segdict)
-            trans_hyp[sess_idx].timestep['segment'] = segment_list
+            trans_hyp[sess_idx].timestamp['segment'] = segment_list
                 
         transcriptions = (trans_hyp, trans_hyp)
         return transcriptions
@@ -890,8 +890,8 @@ class SpeakerTaggedASR:
 
             diff_text = self._is_new_text(spk_idx=spk_idx, text=hypothesis.text) 
             if diff_text is not None:
-                start_time = self._offset_chunk_start_time + (hypothesis.timestep[0]) * self._frame_len_sec
-                end_time = self._offset_chunk_start_time + (hypothesis.timestep[-1] + 1) * self._frame_len_sec
+                start_time = self._offset_chunk_start_time + (hypothesis.timestamp[0]) * self._frame_len_sec
+                end_time = self._offset_chunk_start_time + (hypothesis.timestamp[-1] + 1) * self._frame_len_sec
 
                 # Get the last end time of the previous sentence or None if no sentences are present
                 if len(self._speaker_wise_sentences[spk_idx]) > 0:
@@ -966,11 +966,12 @@ class SpeakerTaggedASR:
 
         # If n_mix == 1, we only have one speaker, so we don't need to do diarization
         # and set spk_targets to all ones
+
         if n_mix == 1:
             spk_targets = torch.ones((chunk_audio.shape[0], 14, 1), device=chunk_audio.device) # TODO: fix this hardcoded value
         else:
             if rttm is None:
-
+                
                 streaming_state, diar_pred_out_stream = self.diar_model.forward_streaming_step(
                     processed_signal=chunk_audio.transpose(1, 2),
                     processed_signal_length=chunk_lengths,

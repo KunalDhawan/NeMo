@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -103,6 +103,7 @@ def setup_microbatch_calculator(
                 micro_batch_size=micro_batch_size,
                 data_parallel_size=app_state.data_parallel_size,
                 rampup_batch_size=rampup_batch_size,
+                decrease_batch_size_if_needed=False,
             )
         else:
             if isinstance(_GLOBAL_NUM_MICROBATCHES_CALCULATOR, ConstantNumMicroBatchesCalculator):
@@ -121,6 +122,7 @@ def setup_microbatch_calculator(
                 micro_batch_size=micro_batch_size,
                 data_parallel_size=app_state.data_parallel_size,
                 rampup_batch_size=rampup_batch_size,
+                decrease_batch_size_if_needed=False,
             )
         else:
             if isinstance(_GLOBAL_NUM_MICROBATCHES_CALCULATOR, ConstantNumMicroBatchesCalculator):

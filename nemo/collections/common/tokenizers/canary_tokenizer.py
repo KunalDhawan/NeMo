@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -189,6 +189,29 @@ class CanaryTokenizer(AggregateTokenizer):
         )
         spl_tokenizer = SentencePieceTokenizer(str(model_path))
         return spl_tokenizer
+
+
+class CanaryBPETokenizer(SentencePieceTokenizer):
+    """
+    Thin wrapper around SPE tokenizer that overwrites SPE's BOS/EOS/PAD with Canary's special tokens
+    for compatibility with CanaryTokenizer (aggregate).
+    """
+
+    @cached_property
+    def eos_id(self) -> int:
+        return self.token_to_id(CANARY_EOS)
+
+    @cached_property
+    def bos_id(self) -> int:
+        return self.token_to_id(CANARY_BOS)
+
+    @cached_property
+    def nospeech_id(self) -> int:
+        return self.token_to_id(CANARY_NOSPEECH)
+
+    @cached_property
+    def pad_id(self) -> int:
+        return self.token_to_id(CANARY_PAD)
 
 
 def _map_canary1_to_canary2_lang(lang: str, available_langs: list[str]) -> str:

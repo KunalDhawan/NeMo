@@ -60,8 +60,11 @@ def get_buffered_pred_feat_rnnt(
         filepaths = []
         with open(manifest, "r", encoding='utf_8') as mfst_f:
             print("Parsing manifest files...")
-            for l in mfst_f:
-                row = json.loads(l.strip())
+            for L in mfst_f:
+                L = L.strip()
+                if not L:
+                    continue
+                row = json.loads(L)
                 audio_file = get_full_path(audio_file=row['audio_filepath'], manifest_file=manifest)
                 filepaths.append(audio_file)
                 if 'text' in row:
@@ -142,16 +145,19 @@ def get_buffered_pred_feat(
         raise ValueError("Either filepaths or manifest shoud not be None")
 
     if filepaths:
-        for l in tqdm(filepaths, desc="Sample:"):
+        for L in tqdm(filepaths, desc="Sample:"):
             asr.reset()
-            asr.read_audio_file(l, delay, model_stride_in_secs)
+            asr.read_audio_file(L, delay, model_stride_in_secs)
             hyp = asr.transcribe(tokens_per_chunk, delay)
             hyps.append(hyp)
     else:
         with open(manifest, "r", encoding='utf_8') as mfst_f:
-            for l in tqdm(mfst_f, desc="Sample:"):
+            for L in tqdm(mfst_f, desc="Sample:"):
                 asr.reset()
-                row = json.loads(l.strip())
+                L = L.strip()
+                if not L:
+                    continue
+                row = json.loads(L)
                 if 'text' in row:
                     refs.append(row['text'])
                 audio_file = get_full_path(audio_file=row['audio_filepath'], manifest_file=manifest)
@@ -182,6 +188,7 @@ def get_buffered_pred_feat_multitaskAED(
     manifest: str = None,
     filepaths: List[list] = None,
     delay: float = 0.0,
+    timestamps: bool = False,
 ) -> List[rnnt_utils.Hypothesis]:
     # Create a preprocessor to convert audio samples into raw features,
     # Normalization will be done per buffer in frame_bufferer
@@ -211,6 +218,7 @@ def get_buffered_pred_feat_multitaskAED(
                 'target_lang': 'en',
                 'pnc': 'yes',
                 'answer': 'nothing',
+                'timestamp': 'yes' if timestamps else 'no',
             }
             asr.reset()
             asr.read_audio_file(audio_file, delay, model_stride_in_secs, meta_data=meta)
@@ -221,7 +229,14 @@ def get_buffered_pred_feat_multitaskAED(
             lines = list(fin.readlines())
             for line in tqdm(lines, desc="Transcribing:", total=len(lines), ncols=80):
                 asr.reset()
-                sample = json.loads(line.strip())
+                line = line.strip()
+                if not line:
+                    continue
+                sample = json.loads(line)
+                if (
+                    timestamps
+                ):  # user convenience so that they don't need to make another manifest with timestamp field or modify the existing one
+                    sample['timestamp'] = 'yes'
                 if 'text' in sample:
                     refs.append(sample['text'])
                 audio_file = get_full_path(audio_file=sample['audio_filepath'], manifest_file=manifest)
@@ -236,6 +251,9 @@ def get_buffered_pred_feat_multitaskAED(
 
 def wrap_transcription(hyps: List[str]) -> List[rnnt_utils.Hypothesis]:
     """Wrap transcription to the expected format in func write_transcription"""
+    if isinstance(hyps[0], rnnt_utils.Hypothesis):
+        return hyps
+
     wrapped_hyps = []
     for hyp in hyps:
         hypothesis = rnnt_utils.Hypothesis(score=0.0, y_sequence=[], text=hyp)
@@ -309,6 +327,9 @@ def prepare_audio_data(cfg: DictConfig) -> Tuple[List[str], bool]:
 
         with open(cfg.dataset_manifest, "rt") as fh:
             for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
                 item = json.loads(line)
                 item[audio_key] = get_full_path(item[audio_key], cfg.dataset_manifest)
                 if item.get("duration") is None and cfg.presort_manifest:
@@ -338,7 +359,7 @@ def read_and_maybe_sort_manifest(path: str, try_sort: bool = False) -> List[dict
 
 def restore_transcription_order(manifest_path: str, transcriptions: list) -> list:
     with open(manifest_path) as f:
-        items = [(idx, json.loads(l)) for idx, l in enumerate(f)]
+        items = [(idx, json.loads(l)) for idx, l in enumerate(f) if l.strip() != ""]
     if not all("duration" in item[1] and item[1]["duration"] is not None for item in items):
         return transcriptions
     new2old = [item[0] for item in sorted(items, reverse=True, key=lambda it: it[1]["duration"])]
@@ -440,7 +461,7 @@ def write_transcription(
                     item = {'audio_filepath': filepaths[idx], pred_text_attr_name: transcription.text}
 
                     if timestamps:
-                        timestamps = transcription.timestep
+                        timestamps = transcription.timestamp
                         if timestamps is not None and isinstance(timestamps, dict):
                             timestamps.pop(
                                 'timestep', None
@@ -458,6 +479,9 @@ def write_transcription(
         else:
             with open(cfg.dataset_manifest, 'r', encoding='utf-8') as fr:
                 for idx, line in enumerate(fr):
+                    line = line.strip()
+                    if not line:
+                        continue
                     item = json.loads(line)
                     if not return_hypotheses:  # transcription is str
                         item[pred_text_attr_name] = best_hyps[idx]
@@ -465,7 +489,7 @@ def write_transcription(
                         item[pred_text_attr_name] = best_hyps[idx].text
 
                         if timestamps:
-                            timestamps = best_hyps[idx].timestep
+                            timestamps = best_hyps[idx].timestamp
                             if timestamps is not None and isinstance(timestamps, dict):
                                 timestamps.pop(
                                     'timestep', None
@@ -539,7 +563,7 @@ def compute_metrics_per_sample(
 
     with open(manifest_path, 'r') as manifest:
         lines = manifest.readlines()
-        samples = [json.loads(line) for line in lines]
+        samples = [json.loads(line) for line in lines if line.strip() != ""]
         samples_with_metrics = []
 
         logging.info(f"Computing {', '.join(metrics)} per sample")
@@ -578,61 +602,6 @@ def compute_metrics_per_sample(
     return samples_with_metrics
 
 
-def process_timestamp_outputs(outputs, subsampling_factor: int = 1, window_stride: float = 0.01):
-    """
-    Process the timestamps from list of hypothesis to user friendly format.
-    Converts the start and end duration from frames to seconds.
-    Args:
-        outputs: List of Hypothesis objects.
-        subsampling_factor: int, Subsampling factor used in the model.
-        window_stride: float, Window stride used in the model. (sometimes referred to as hop length/shift)
-    Returns:
-        List of Hypothesis objects with processed timestamps
-
-    """
-
-    if outputs is None:
-        return outputs
-
-    if isinstance(outputs, rnnt_utils.Hypothesis):
-        outputs = [outputs]
-
-    if not isinstance(outputs[0], rnnt_utils.Hypothesis):
-        raise ValueError(f"Expected Hypothesis object, got {type(outputs[0])}")
-
-    def process_timestamp(timestamp, subsampling_factor, window_stride):
-        """
-        Process the timestamp for a single hypothesis.
-        return the start and end duration in seconds.
-        """
-        for idx, val in enumerate(timestamp):
-            start_offset = val['start_offset']
-            end_offset = val['end_offset']
-            start = start_offset * window_stride * subsampling_factor
-            end = end_offset * window_stride * subsampling_factor
-            val['start'] = start
-            val['end'] = end
-
-        return timestamp
-
-    for idx, hyp in enumerate(outputs):
-        if not hasattr(hyp, 'timestep'):
-            raise ValueError(
-                f"Expected Hypothesis object to have 'timestep' attribute, when compute_timestamps is \
-                    enabled but got {hyp}"
-            )
-        timestep = hyp.timestep
-        if 'word' in timestep:
-            outputs[idx].timestep['word'] = process_timestamp(timestep['word'], subsampling_factor, window_stride)
-        if 'char' in timestep:
-            outputs[idx].timestep['char'] = process_timestamp(timestep['char'], subsampling_factor, window_stride)
-        if 'segment' in timestep:
-            outputs[idx].timestep['segment'] = process_timestamp(
-                timestep['segment'], subsampling_factor, window_stride
-            )
-    return outputs
-
-
 class PunctuationCapitalization:
     def __init__(self, punctuation_marks: str):
         """
@@ -644,7 +613,7 @@ class PunctuationCapitalization:
         """
         if punctuation_marks:
             self.regex_punctuation = re.compile(fr"([{''.join(punctuation_marks)}])")
-            self.regex_extra_space = re.compile('\s{2,}')
+            self.regex_extra_space = re.compile(r'\s{2,}')
         else:
             self.regex_punctuation = None
 

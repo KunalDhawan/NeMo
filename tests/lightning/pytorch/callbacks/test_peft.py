@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -71,7 +71,7 @@ class TestPEFT:
             for key, val in linear_adapter.state_dict().items():
                 if key in linear.state_dict():
                     continue
-                assert key in ['lora_a', 'lora_b']
+                assert key in ['lora_a.weight', 'lora_b.weight']
 
     def test_linear_adapter_monkey_patch(self):
         from copy import deepcopy
@@ -89,12 +89,13 @@ class TestPEFT:
         for key, val in linear_adapter.state_dict().items():
             if key in state_init:
                 continue
-            assert key in ['lora_a', 'lora_b']
+            assert key in ['lora_a.weight', 'lora_b.weight']
 
+        state_dict = linear_adapter.state_dict()
         for key in ['lora_a', 'lora_b']:
             assert hasattr(linear_adapter, key), f"Expected {key} to be in module"
-            assert key in linear_adapter.state_dict(), f"Expected {key} to be in state dict"
-            assert getattr(linear_adapter, key).requires_grad == True, "Expected {key} to require_grad"
+            assert f'{key}.weight' in state_dict, f"Expected {key} to be in state dict"
+            assert getattr(linear_adapter, key).weight.requires_grad == True, "Expected {key} to require_grad"
 
     def test_peft_setup(self):
         peft = self.DummyPEFT()
@@ -143,3 +144,67 @@ class TestPEFT:
         trainer.strategy.load_model_state_dict.assert_called_once_with({"dummy_state": "dummy_value"}, strict=False)
         trainer.strategy.init_model_parallel.assert_called_once()
         trainer.strategy.setup_optimizers.assert_called_once_with(trainer)
+
+    def test_params_to_save(self):
+        # Create model and PEFT instance
+        model = self.DummyModel()
+        peft = self.DummyPEFT()
+        trainer = MagicMock()
+        trainer.lightning_module = model
+
+        # Freeze conv, keep linear trainable
+        model.conv.requires_grad_(False)
+        model.linear.requires_grad_(True)
+
+        # Call set_params_to_save
+        peft.set_params_to_save(trainer)
+
+        # Expected trainable parameter names
+        expected_trainable = {'linear.weight', 'linear.bias'}
+
+        # Check that params_to_save contains exactly the expected parameters
+        assert hasattr(peft, 'params_to_save'), "params_to_save not set"
+        assert (
+            peft.params_to_save == expected_trainable
+        ), f"Expected trainable params {expected_trainable}, but got {peft.params_to_save}"
+
+        # Verify that the parameters marked as trainable actually require gradients
+        for name, param in model.named_parameters():
+            if name in peft.params_to_save:
+                assert param.requires_grad, f"Parameter {name} should require gradients"
+            else:
+                assert not param.requires_grad, f"Parameter {name} should not require gradients"
+
+    def test_params_to_save_batchnorm(self):
+        # Create model and PEFT instance
+        model = self.DummyModel()
+        model.bn = nn.BatchNorm2d(8)
+        peft = self.DummyPEFT()
+        trainer = MagicMock()
+        trainer.lightning_module = model
+
+        # Freeze everything
+        model.freeze()
+
+        # Call set_params_to_save
+        peft.set_params_to_save(trainer)
+
+        # Expect BN buffers to be saved
+        expected_trainable = {
+            'bn.running_mean',
+            'bn.running_var',
+            'bn.num_batches_tracked',
+        }
+
+        # Check that params_to_save contains exactly the expected parameters
+        assert hasattr(peft, 'params_to_save'), "params_to_save not set"
+        assert (
+            peft.params_to_save == expected_trainable
+        ), f"Expected trainable params {expected_trainable}, but got {peft.params_to_save}"
+
+        # Verify that the parameters marked as trainable actually require gradients
+        for name, param in model.named_parameters():
+            if name in peft.params_to_save:
+                assert param.requires_grad, f"Parameter {name} should require gradients"
+            else:
+                assert not param.requires_grad, f"Parameter {name} should not require gradients"
