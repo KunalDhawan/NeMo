@@ -35,7 +35,8 @@ class SpeakerMask(torch.nn.Module):
         mask: (B, T)
         """
         if mask.shape[1] < x.shape[1]:
-            mask = F.pad(mask, (0, x.shape[1] - mask.shape[1]), mode='replicate')
+            # pad zero to the left
+            mask = F.pad(mask, (x.shape[1] - mask.shape[1], 0), mode='constant', value=0)
 
         if mask.shape[1] > x.shape[1]:
             mask = mask[:, -x.shape[1]:]

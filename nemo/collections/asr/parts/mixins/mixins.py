@@ -724,7 +724,156 @@ class ASRModuleMixin(ASRAdapterModelMixin):
             result.append(encoded_len)
 
         return tuple(result)
+    
+    def conformer_stream_step_masked(
+        self,
+        processed_signal: torch.Tensor,
+        processed_signal_length: torch.Tensor = None,
+        cache_last_channel: torch.Tensor = None,
+        cache_last_time: torch.Tensor = None,
+        cache_last_channel_len: torch.Tensor = None,
+        keep_all_outputs: bool = True,
+        previous_hypotheses: List['Hypothesis'] = None,
+        previous_pred_out: torch.Tensor = None,
+        drop_extra_pre_encoded: int = None,
+        return_transcription: bool = True,
+        return_log_probs: bool = False,
+        spk_targets: torch.Tensor = None,
+        n_mix = 1,
+        binary_diar_preds=False,
+        cache_gating=False,
+        cache_gating_buffer_size=2,
+        valid_speakers_last_time=None
+    ):
+        """
+        It simulates a forward step with caching for streaming purposes.
+        It supports the ASR models where their encoder supports streaming like Conformer.
+        Args:
+            processed_signal: the input audio signals
+            processed_signal_length: the length of the audios
+            cache_last_channel: the cache tensor for last channel layers like MHA
+            cache_last_channel_len: engths for cache_last_channel
+            cache_last_time: the cache tensor for last time layers like convolutions
+            keep_all_outputs: if set to True, would not drop the extra outputs specified by encoder.streaming_cfg.valid_out_len
+            previous_hypotheses: the hypotheses from the previous step for RNNT models
+            previous_pred_out: the predicted outputs from the previous step for CTC models
+            drop_extra_pre_encoded: number of steps to drop from the beginning of the outputs after the downsampling module. This can be used if extra paddings are added on the left side of the input.
+            return_transcription: whether to decode and return the transcriptions. It can not get disabled for Transducer models.
+            return_log_probs: whether to return the log probs, only valid for ctc model
 
+        Returns:
+            greedy_predictions: the greedy predictions from the decoder
+            all_hyp_or_transcribed_texts: the decoder hypotheses for Transducer models and the transcriptions for CTC models
+            cache_last_channel_next: the updated tensor cache for last channel layers to be used for next streaming step
+            cache_last_time_next: the updated tensor cache for last time layers to be used for next streaming step
+            cache_last_channel_next_len: the updated lengths for cache_last_channel
+            best_hyp: the best hypotheses for the Transducer models
+            log_probs: the logits tensor of current streaming chunk, only returned when return_log_probs=True
+            encoded_len: the length of the output log_probs + history chunk log_probs, only returned when return_log_probs=True
+        """
+        # Multi-instance inference
+        # N: # speakers
+        # B x T x N
+        spk_targets = spk_targets[:, :, :n_mix] 
+        if cache_gating:
+            max_probs = torch.max(spk_targets, dim=1).values # B x N
+            valid_speakers = max_probs > 0.5 # B x N, e.g., [True, False, True, False]
+
+            if valid_speakers_last_time is None:
+                valid_speakers_last_time = [torch.zeros_like(valid_speakers).bool()] 
+            valid_speakers_last_time.append(valid_speakers)
+            valid_speakers_last_time = valid_speakers_last_time[-cache_gating_buffer_size:]
+            valid_speakers = torch.any(torch.stack(valid_speakers_last_time), dim=0)
+
+        else:
+            valid_speakers = torch.ones((spk_targets.size(0), spk_targets.size(2))).bool() # B x N
+
+        if valid_speakers.sum() == 0: # early stop when all speakers are absent
+            return previous_pred_out, previous_hypotheses, cache_last_channel, cache_last_time, cache_last_channel_len, previous_hypotheses, valid_speakers_last_time
+        valid_speaker_ids = torch.where(valid_speakers)[1] # B 
+        
+        # spk_targets: (B, T, N) -> (BN, T)
+        mask0 = spk_targets[:, :, 0] > spk_targets[:, :, 1]
+        mask1 = spk_targets[:, :, 1] > spk_targets[:, :, 0]
+        mask = torch.cat([mask0.unsqueeze(-1), mask1.unsqueeze(-1)], dim=-1)
+
+        spk_targets = spk_targets * mask
+        spk_targets = spk_targets.transpose(1, 2).reshape(-1, spk_targets.size(1))
+        if binary_diar_preds:
+            spk_targets = (spk_targets > 0.5).float()
+
+        # 
+        spk_targets = spk_targets[valid_speakers.reshape(-1)]
+    
+        mi_processed_signal = []
+        mi_processed_signal_length = []
+        for i in range(processed_signal.size(0)):
+            mi_processed_signal.append(processed_signal[[i]].repeat(valid_speakers[i].sum(), 1, 1))
+            mi_processed_signal_length.append(processed_signal_length[[i]].repeat(valid_speakers[i].sum()))
+        
+        processed_signal = torch.cat(mi_processed_signal, dim=0)
+        processed_signal_length = torch.cat(mi_processed_signal_length, dim=0)
+        
+        # Initialization for the first step for all speakers
+        # Just duplicating cache for all speakers (n_mix = # speakers)
+        if cache_last_channel_len.shape[0] != n_mix: 
+            cache_last_channel = cache_last_channel.unsqueeze(2).repeat(1, 1, n_mix, 1, 1).reshape(cache_last_channel.size(0), -1, cache_last_channel.size(2), cache_last_channel.size(3))
+            cache_last_time = cache_last_time.unsqueeze(2).repeat(1, 1, n_mix, 1, 1).reshape(cache_last_time.size(0), -1, cache_last_time.size(2), cache_last_time.size(3))
+            cache_last_channel_len = cache_last_channel_len.unsqueeze(1).repeat(1, n_mix).reshape(-1)
+
+        # Selecting cache for valid speakers
+        cache_last_channel_spk = cache_last_channel[:, valid_speakers.reshape(-1)]
+        cache_last_time_spk = cache_last_time[:, valid_speakers.reshape(-1)]
+        cache_last_channel_len_spk = cache_last_channel_len[valid_speakers.reshape(-1)]
+        
+        # Selecting previous hypotheses and predictions for valid speakers
+        previous_pred_out_spk = [previous_pred_out[i] for i in valid_speaker_ids]
+        previous_hypotheses_spk = [previous_hypotheses[i] for i in valid_speaker_ids]
+        
+        # mask the processed signal
+        mask = spk_targets.unsqueeze(-1).repeat(1, 1, 8).flatten(1, 2)
+        if mask.size(1) > processed_signal.size(2):
+            mask = mask[:, -processed_signal.size(2):]
+        else:
+            mask = torch.nn.functional.pad(mask, (processed_signal.size(2) - mask.size(1), 0), mode='constant', value=0)
+        
+        mask = mask.unsqueeze(1)
+        processed_signal = processed_signal * mask
+        processed_signal[torch.where(processed_signal == 0)] = -16.6355
+
+        # Forward pass for valid speakers
+        (
+            asr_pred_out_stream_spk,
+            transcribed_texts_spk,
+            cache_last_channel_spk,
+            cache_last_time_spk,
+            cache_last_channel_len_spk,
+            previous_hypotheses_spk 
+        ) = self.conformer_stream_step(
+            processed_signal=processed_signal,
+            processed_signal_length=processed_signal_length,
+            cache_last_channel=cache_last_channel_spk,
+            cache_last_time=cache_last_time_spk,
+            cache_last_channel_len=cache_last_channel_len_spk,
+            keep_all_outputs=keep_all_outputs,
+            previous_hypotheses=previous_hypotheses_spk,
+            previous_pred_out=previous_pred_out_spk,
+            drop_extra_pre_encoded=drop_extra_pre_encoded,
+            return_transcription=return_transcription,
+            return_log_probs=return_log_probs
+        )
+        
+        # update cache for valid speakers, and keep the rest unchanged 
+        cache_last_channel[:, valid_speakers.reshape(-1)] = cache_last_channel_spk
+        cache_last_time[:, valid_speakers.reshape(-1)] = cache_last_time_spk
+        cache_last_channel_len[valid_speakers.reshape(-1)] = cache_last_channel_len_spk
+
+        for i, spk_idx in enumerate(valid_speaker_ids):
+            previous_hypotheses[spk_idx] = previous_hypotheses_spk[i]
+            previous_pred_out[spk_idx] = asr_pred_out_stream_spk[i]
+
+        return previous_pred_out, transcribed_texts_spk, cache_last_channel, cache_last_time, cache_last_channel_len, previous_hypotheses, valid_speakers_last_time
+    
     @torch.no_grad()
     def transcribe_simulate_cache_aware_streaming(
         self,

@@ -699,7 +699,7 @@ class SpeakerTaggedASR:
                 word_and_ts_seq = correct_speaker_assignments(word_and_ts_seq=word_and_ts_seq, 
                                                                 sentence_render_length=self._sentence_render_length)
         return word_and_ts_seq
-    
+        
     @measure_eta 
     def perform_streaming_stt_spk(
         self,
@@ -989,7 +989,6 @@ class SpeakerTaggedASR:
 
         if spk_targets.shape[1] > diar_max_len:
             spk_targets = spk_targets[:, -diar_max_len:]
-        
 
         (
             asr_pred_out_stream,
@@ -1001,6 +1000,119 @@ class SpeakerTaggedASR:
             valid_speakers_last_time,
             # valid_speaker_ids,
         ) = self.asr_model.conformer_stream_step(
+            processed_signal=chunk_audio,
+            processed_signal_length=chunk_lengths,
+            cache_last_channel=cache_last_channel,
+            cache_last_time=cache_last_time,
+            cache_last_channel_len=cache_last_channel_len,
+            keep_all_outputs=is_buffer_empty,
+            previous_hypotheses=previous_hypotheses,
+            previous_pred_out=asr_pred_out_stream,
+            drop_extra_pre_encoded=calc_drop_extra_pre_encoded(
+                self.asr_model, step_num, pad_and_drop_preencoded
+            ),
+            return_transcription=True,
+            spk_targets=spk_targets,
+            n_mix=n_mix,
+            binary_diar_preds=binary_diar_preds,
+            cache_gating=cache_gating,
+            cache_gating_buffer_size=cache_gating_buffer_size,
+            valid_speakers_last_time=valid_speakers_last_time,
+        )
+        # transcribed_speaker_texts = [None] * n_mix
+        hop_frames = chunk_lengths[0].item() - left_offset - right_offset
+
+        all_sentences = self.get_multi_thread_sentences_values(step_num,previous_hypotheses, hop_frames)
+        print(all_sentences)
+        transcribed_speaker_texts = print_sentences(sentences=all_sentences, 
+                        color_palette=get_color_palette(), 
+                        params=self.cfg)
+        if self.cfg.generate_scripts:
+            write_txt(f'{self.cfg.print_path}', 
+                        transcribed_speaker_texts.strip()) 
+        
+        return (transcribed_speaker_texts,
+                transcribed_texts,
+                asr_pred_out_stream,
+                all_sentences,
+                cache_last_channel,
+                cache_last_time,
+                cache_last_channel_len,
+                previous_hypotheses,
+                streaming_state,
+                diar_pred_out_stream,
+                valid_speakers_last_time)
+
+    @measure_eta 
+    def perform_masked_streaming_stt_spk(
+        self,
+        step_num,
+        chunk_audio,
+        chunk_lengths,
+        cache_last_channel,
+        cache_last_time,
+        cache_last_channel_len,
+        previous_hypotheses,
+        asr_pred_out_stream,
+        diar_pred_out_stream,
+        streaming_state,
+        left_offset,
+        right_offset,
+        is_buffer_empty,
+        pad_and_drop_preencoded,
+        att_context_size,
+        binary_diar_preds,
+        n_mix,
+        cache_gating,
+        cache_gating_buffer_size,
+        valid_speakers_last_time,
+        rttm=None
+    ):
+        if step_num > 0:
+            left_offset = 8
+            chunk_audio = chunk_audio[..., 1:]
+            chunk_lengths -= 1
+
+        # Initialize diar_pred_out_stream for the first step for all speakers
+        if diar_pred_out_stream is None:
+            diar_pred_out_stream = torch.zeros((chunk_audio.shape[0], 0, self.diar_model.sortformer_modules.n_spk), device=chunk_audio.device)
+
+        # If n_mix == 1, we only have one speaker, so we don't need to do diarization
+        # and set spk_targets to all ones
+
+        if n_mix == 1:
+            spk_targets = torch.ones((chunk_audio.shape[0], 14, 1), device=chunk_audio.device) # TODO: fix this hardcoded value
+        else:
+            if rttm is None:
+                
+                streaming_state, diar_pred_out_stream = self.diar_model.forward_streaming_step(
+                    processed_signal=chunk_audio.transpose(1, 2),
+                    processed_signal_length=chunk_lengths,
+                    streaming_state=streaming_state,
+                    total_preds=torch.zeros((chunk_audio.shape[0], 0, self.diar_model.sortformer_modules.n_spk), device=chunk_audio.device),
+                    left_offset=left_offset,
+                    right_offset=right_offset,
+                )
+
+                spk_targets = diar_pred_out_stream
+            else:
+                spk_targets = rttm
+
+        diar_max_len = att_context_size[-1] + 1
+
+        if spk_targets.shape[1] > diar_max_len:
+            spk_targets = spk_targets[:, -diar_max_len:]
+        
+        (
+            asr_pred_out_stream,
+            transcribed_texts,
+            cache_last_channel,
+            cache_last_time,
+            cache_last_channel_len,
+            previous_hypotheses,
+            valid_speakers_last_time,
+            # valid_speaker_ids,
+        ) = self.asr_model.conformer_stream_step_masked(
             processed_signal=chunk_audio,
             processed_signal_length=chunk_lengths,
             cache_last_channel=cache_last_channel,
