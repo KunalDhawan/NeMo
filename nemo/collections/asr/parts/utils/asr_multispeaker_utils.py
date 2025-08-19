@@ -647,12 +647,12 @@ def speaker_to_target(
         speaker2text = defaultdict(list)
         for seg in segments_total:
             speaker2text[seg.speaker].append(seg.text)
-        texts = [' '.join(text_list) for text_list in speaker2text.values()]
+        texts = [' '.join(speaker2text[speaker]) for speaker in speaker_ats]
+        if len(texts) > num_speakers:
+            texts = texts[:num_speakers]
         return mask, texts
     else:
         return mask
-
-
 
 def read_seglst(seglst_filepath: str, session_id: Optional[str] = None):
     """
@@ -671,7 +671,6 @@ def read_seglst(seglst_filepath: str, session_id: Optional[str] = None):
             ) for i, seg in enumerate(seglst)
         ]
         
-
 class MultiSpeakerMixtureGenerator():
     """
     This class is used to simulate multi-speaker audio data,
@@ -970,7 +969,6 @@ class MultiSpeakerMixtureGenerator():
         mixed_cut = MixedCut(id=uniq_id, tracks=all_spk_tracks + noise_tracks)
         mixed_cut.id = uniq_id
 
-        import ipdb; ipdb.set_trace()   
         return mixed_cut
 
     def LibriSpeechMixSimulator(self):
@@ -1027,16 +1025,7 @@ class MultiSpeakerMixtureGenerator():
             
         sorted_supervisions = sorted(list(itertools.chain.from_iterable(all_supervisions)), key=lambda x: x.start)
         # find the start and the end of the segment
-        start_idx = random.randint(0, len(sorted_supervisions) - 1)
-        end_idx = start_idx 
-        offset = sorted_supervisions[start_idx].start
-        for i in range(start_idx + 1, len(sorted_supervisions)):
-            if sorted_supervisions[i].end - offset <= self.min_duration:
-                end_idx = i
-            else:
-                break
-        segment_offset = offset
-        segment_duration = sorted_supervisions[end_idx].end - offset
+        segment_offset, segment_duration = self._get_offset_and_duration(sorted_supervisions)
         
         tracks = []
         if self.rir_manifest is not None:
@@ -1067,7 +1056,7 @@ class MultiSpeakerMixtureGenerator():
                 speaker_rir_recording = speaker_rir_mapping[i_ch]
                 cut.custom.update(self._get_custom_dict(speaker_id=i_ch))
                 rir_ratio_varied = self._get_rir_ratio_varied(rir_ratio)
-                print(f"-[ RIR Perturbed ]----->>> rir_ratio: {rir_ratio}, rir_ratio_varied: {rir_ratio_varied}, rir_perturb_prob: {rir_perturb_prob}")
+                # print(f"-[ RIR Perturbed ]----->>> rir_ratio: {rir_ratio}, rir_ratio_varied: {rir_ratio_varied}, rir_perturb_prob: {rir_perturb_prob}")
 
                 rir_mono_cut = cut.reverb_rir(speaker_rir_recording).perturb_volume(rir_ratio_varied)
                 cln_mono_cut = cut.perturb_volume(1-rir_ratio_varied)
@@ -1079,17 +1068,14 @@ class MultiSpeakerMixtureGenerator():
                                     type=type(rir_mono_cut), 
                                     offset=0,
                                     )
+                rir_mix_track.cut.supervisions = []
                 tracks.extend([cln_mix_track, rir_mix_track])
-            
+
         uniq_id = 'channel_separated_audio_mixer_' + '_'.join([track.cut.id for track in tracks]) + '_' + str(uuid4())
         mixed_cut = MixedCut(
             id=uniq_id, 
-            tracks=tracks, 
-            # custom={
-            #     'session_id': manifest['session_id'],
-            # }
-        )
-        # self._save_audio_and_annotation(mixed_cut, uniq_id)
+            tracks=tracks)
+
         return mixed_cut
 
     def MultiSpeakerMixtureLoader(self):
@@ -1119,18 +1105,6 @@ class MultiSpeakerMixtureGenerator():
     def ConversationSimulator(self):
         raise NotImplementedError("ConversationSimulator is not implemented yet.")
 
-    # def _get_offset_and_duration(self, supervisions):
-    #     """
-    #     Get the offset and duration of the segment.
-    #     supervisions should be sorted by start time
-    #     """
-    #     import ipdb; ipdb.set_trace()
-    #     offsets, durations = self.stg_v4(supervisions)
-    #     idx = random.randint(0, len(offsets) - 1)
-    #     segment_offset = offsets[idx]
-    #     segment_duration = durations[idx]
-    #     import ipdb; ipdb.set_trace()
-    #     return segment_offset, segment_duration
     def _get_offset_and_duration(self, supervisions):
         """
         Get the offset and duration of the segment.
@@ -1228,109 +1202,3 @@ class MultiSpeakerMixtureGenerator():
             )
         else:
             return Recording.from_file(audio_path)
-
-    def stg_v4(
-        self, 
-        supervisions: list[SupervisionSegment], 
-        round_digits: int = 3, 
-        edge_ovl_thres: float = -0.5, 
-        leading_word_thres: int = 5, 
-        seg_hop: int = 0,
-        min_gap: int = 100
-    ):
-        """
-        Get the start and end time of the segment.
-        """
-        offsets, durations = [], []
-        sid = 0
-        cuts = []
-        while sid < len(supervisions) - 1:
-            use_seg_hop = True
-            cut_sups = []
-            text = supervisions[sid].text
-            
-            # skip case 1: the overlap duration at the beginning is larger than the threshold
-            if sid and supervisions[sid-1].end - supervisions[sid].start > edge_ovl_thres: # checking overlap duration at the beginning
-                sid += 1
-                continue
-            # skip case 2: the first segment is too short, will also remove that later in _process function
-            words = text.split()
-            if len(words) <= leading_word_thres and supervisions[sid].speaker != supervisions[sid+1].speaker:
-                sid += 1
-                continue
-
-            # skip case 3: the start time of the first segment is exactly the same as that of previous segment
-            if sid and supervisions[sid-1].start == supervisions[sid].start:
-                sid += 1
-                continue
-            
-            starts, ends = [], []
-            for eid in range(sid, len(supervisions)):
-                if text: 
-                    starts.append(supervisions[eid].start)
-                    ends.append(supervisions[eid].end)
-                    cut_sups.append(supervisions[eid])
-                else: # if words is empty, this means that there is a mismatch between rttm and ctm, and we will skip this segment
-                    break
-
-                # large gap between two segments
-                if eid < len(supervisions) - 1 and supervisions[eid+1].start - max(ends) > min_gap:                
-                    break
-
-                if max(ends) - min(starts) > self.min_duration: 
-
-                    # check if all segments are included, this is the rare case but will cause the disagreement between rttm and lhotse
-                    for eid_sub in range(eid+1, len(supervisions)):
-                        if supervisions[eid_sub].end <= max(ends):
-                            starts.append(supervisions[eid_sub].start)
-                            ends.append(supervisions[eid_sub].end)
-                            cut_sups.append(supervisions[eid_sub])
-                            eid = eid_sub
-                            use_seg_hop = False
-                        elif supervisions[eid_sub].start >= max(ends):
-                            break
-
-                        if max(ends) - min(starts) > self.max_duration:
-                            break
-
-                    if not use_seg_hop:
-                        sid = eid_sub
-                    break
-                    
-            # update the start index of the next segment
-            if use_seg_hop:
-                if seg_hop == 0: 
-                    sid = eid + 1
-                elif seg_hop > 0:
-                    sid = sid + seg_hop
-                else:
-                    raise ValueError(f"args.seg_hop should be greater than or equal to 0 but got {seg_hop}")
-                
-            # skip case 4: the overlap duration at the end is larger than the threshold
-            if eid < len(supervisions) - 1 and max(ends) - supervisions[eid+1].start > edge_ovl_thres: # checking overlap duration at the end
-                continue
-
-            # skip case 5: two segments start at the same time
-            if len(starts) > 1 and starts[0] == starts[1]:
-                continue
-
-            # skip case 6: too short or too long segment
-            start, end = min(starts), max(ends)
-            dur=round(end - start, round_digits)
-            if dur < self.min_duration or dur > self.max_duration:
-                continue
-
-            offsets.append(start)
-            durations.append(dur)
-
-            # cut_sups = SupervisionSet.from_segments(cut_sups)
-            # cut = MonoCut(
-            #     id=f'{recording_id}-{int(start*10**round_digits):09d}-{int(end*10**round_digits):09d}',
-            #     start=start,
-            #     duration=dur,
-            #     channel=0,
-            #     supervisions=cut_sups
-            # )
-            # cuts.append(cut)
-
-        return offsets, durations

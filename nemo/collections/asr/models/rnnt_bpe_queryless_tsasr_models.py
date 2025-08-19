@@ -47,28 +47,13 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
 
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
         super().__init__(cfg=cfg, trainer=trainer)
+        # config for speaker kernel
+        self.spk_kernel_type = cfg.get('spk_kernel_type', None)
+        self.spk_kernel_layers = cfg.get('spk_kernel_layers', [])
+        self.spk_kernel_mask_original = cfg.get('spk_kernel_mask_original', True)
+        self.spk_kernel_residual = cfg.get('spk_kernel_residual', True)
 
-        if self.cfg.get('diar_model_path', None):
-            self.num_speakers = cfg.model_defaults.get('num_speakers', 4)
-            speaker_inds = list(range(self.num_speakers))
-            self.speaker_permutations = torch.tensor(list(itertools.permutations(speaker_inds)))  # Get all permutations
-
-            # config for speaker kernel
-            self.spk_kernel_type = cfg.get('spk_kernel_type', None)
-            self.spk_kernel_layers = cfg.get('spk_kernel_layers', [])
-            self.spk_kernel_mask_original = cfg.get('spk_kernel_mask_original', True)
-            self.spk_kernel_residual = cfg.get('spk_kernel_residual', True)
-
-            self._init_spk_kernel()
-    
-    # def load_diar_model(self, diar_model_path: str):
-    #     """Load the diarization model."""
-    #     # if self.training
-    #     """self.diar_model = SortformerEncLabelModel.from_pretrained(diar_model_path)
-    #     self.diar_model.eval()
-    #     self.diar_model.to(self.device)
-    #     self.diar_model.preprocessor.to(self.device)
-    #     self.diar_model.preprocessor.eval()"""
+        self._init_spk_kernel()
         
     def _init_spk_kernel(self):
         """Initialize speaker kernel modules and register them to encoder layers."""
@@ -111,18 +96,49 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
         self.encoder_hooks = []
         for layer_idx, kernel in self.spk_kernels.items():
             idx = int(layer_idx)
-            
+
             if idx == 0:
-                hook = self.encoder.pre_encode.register_forward_hook(
-                    self._get_spk_kernel_hook(layer_idx)
+                hook = self.encoder.layers[idx].register_forward_pre_hook(
+                    self._get_spk_kernel_hook_pre_layer(layer_idx), with_kwargs=True
                 )
-            else:
-                hook = self.encoder.layers[idx-1].register_forward_hook(
-                    self._get_spk_kernel_hook(layer_idx)
+
+            if idx > 0:
+                # Attach a post-hook after each layer from 0 to 16.
+                # Since idx > 0, we attach to layer idx-1.
+                hook = self.encoder.layers[idx - 1].register_forward_hook(
+                    self._get_spk_kernel_hook_post_layer(layer_idx)
                 )
             self.encoder_hooks.append(hook)
 
-    def _get_spk_kernel_hook(self, layer_idx: str):
+    def _get_spk_kernel_hook_pre_layer(self, layer_idx: str):
+        """
+        Returns a hook function for applying speaker kernel transformation.
+        
+        Args:
+            layer_idx (str): Index of the layer to apply the kernel
+            
+        Returns:
+            callable: Hook function that applies speaker kernel
+        """
+
+        def hook_fn(module, args, kwargs):
+            # Pre-hooks with with_kwargs=True must return a (new_args, new_kwargs) tuple.
+            # The input tensor is passed as a keyword argument, so we find it in 'kwargs'.
+            if 'x' in kwargs:
+                x = kwargs['x']
+                x = self.spk_kernels[layer_idx](x, self.spk_targets)
+                kwargs['x'] = x
+            elif args:
+                # Fallback in case the call signature ever changes
+                x, *rest = args
+                x = self.spk_kernels[layer_idx](x, self.spk_targets)
+                args = (x, *rest)
+
+            return args, kwargs
+
+        return hook_fn
+
+    def _get_spk_kernel_hook_post_layer(self, layer_idx: str):
         """
         Returns a hook function for applying speaker kernel transformation.
         
@@ -210,9 +226,7 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
 
     def training_step(self, batch, batch_nb):
         
-        signal, signal_len, transcript, transcript_len, spk_targets = batch
-
-        self.spk_targets = spk_targets
+        signal, signal_len, transcript, transcript_len, self.spk_targets = batch
 
         batch = (signal, signal_len, transcript, transcript_len)
 
@@ -221,9 +235,7 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
 
     def validation_pass(self, batch, batch_idx, dataloader_idx=0):
 
-        signal, signal_len, transcript, transcript_len, spk_targets = batch
-
-        self.spk_targets = spk_targets
+        signal, signal_len, transcript, transcript_len, self.spk_targets = batch
 
         batch = (signal, signal_len, transcript, transcript_len)
 
@@ -233,17 +245,6 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
 
         signal, signal_len, transcript, transcript_len, spk_targets = batch
 
-        # if hasattr(self, 'diar_model'):
-        #     with torch.no_grad():
-        #         processed_signal, processed_signal_length = self.diar_model.process_signal(audio_signal=signal, audio_signal_length=signal_len)
-        #         processed_signal = processed_signal[:, :, :processed_signal_length.max()]
-        #         emb_seq, emb_seq_len = self.diar_model.frontend_encoder(processed_signal=processed_signal, processed_signal_length=processed_signal_length)
-        #         preds = self.diar_model.forward_infer(emb_seq, emb_seq_len)
-        #     spk_targets = preds
-        #     import ipdb; ipdb.set_trace()
-
-        # spk_targets = self.forward_diar(audio_signal=signal, audio_signal_length=signal_len, spk_targets=spk_targets)
-        
         # Multi-instance inference
         n_mix = trcfg.mix
         self.spk_targets = spk_targets[:, :, :n_mix].transpose(1, 2).reshape(-1, spk_targets.size(1)) # B x T x N_mix -> BN_mix x T
