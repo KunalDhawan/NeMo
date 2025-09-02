@@ -95,7 +95,7 @@ class FluxConfig(TransformerConfig, io.IOMixin):
     hidden_dropout: float = 0
     attention_dropout: float = 0
     use_cpu_initialization: bool = True
-    gradient_accumulation_fusion: bool = True
+    gradient_accumulation_fusion: bool = False
     enable_cuda_graph: bool = False
     use_te_rng_tracker: bool = False
     cuda_graph_warmup_steps: int = 2
@@ -370,7 +370,10 @@ class Flux(VisionModule):
         if load_dist_ckpt:
             from megatron.core import dist_checkpointing
 
-            sharded_state_dict = dict(state_dict=self.sharded_state_dict(prefix="module."))
+            sharded_sd_metadata = dist_checkpointing.load_content_metadata(ckpt_path)
+            sharded_state_dict = dict(
+                state_dict=self.sharded_state_dict(prefix="module.", metadata=sharded_sd_metadata)
+            )
             loaded_state_dict = dist_checkpointing.load(
                 sharded_state_dict=sharded_state_dict, checkpoint_dir=ckpt_path
             )

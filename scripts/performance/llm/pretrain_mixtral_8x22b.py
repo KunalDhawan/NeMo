@@ -19,17 +19,18 @@ import nemo_run as run
 
 from nemo.collections.llm.recipes.mixtral_8x22b_64k import pretrain_recipe
 from nemo.collections.nlp.modules.common.tokenizer_utils import get_nmt_tokenizer
-from nemo.lightning.run.plugins import MemoryProfilePlugin, NsysPlugin, PerfEnvPlugin
+from nemo.lightning.run.plugins import MemoryProfilePlugin, NsysPlugin
 
 from ..argument_parser import parse_cli_args
-from ..utils import (
+from ..executors import slurm_executor
+from ..helpers import (
     args_sanity_check,
+    build_perf_env_plugin,
     get_user_configs,
-    hf_tokenizer,
     set_exp_logging_configs,
     set_primary_perf_configs,
-    slurm_executor,
 )
+from ..utils import hf_tokenizer
 
 
 def override_recipe_configs(
@@ -70,6 +71,7 @@ def override_recipe_configs(
         etp_size,
         enable_cuda_graphs,
         use_mcore_fsdp,
+        use_fsdp_double_buffer=args.use_fsdp_double_buffer,
         use_user_buffer_registration=args.use_user_buffer_registration,
         use_sharp=args.use_sharp,
         recompute_layers=recompute_layers,
@@ -77,6 +79,8 @@ def override_recipe_configs(
         compute_dtype=args.compute_dtype,
         fp8_recipe=args.fp8_recipe,
         nccl_communicator_config_path=args.nccl_communicator_config_path,
+        use_te_act_func=args.use_te_act_func,
+        act_func_fp8_input_store=args.act_func_fp8_input_store,
     )
     recipe = set_exp_logging_configs(
         recipe, "pre_train", "llm", "mixtral", args.tensorboard, args.wandb, args.wandb_prj_name, args.wandb_job_name
@@ -90,11 +94,6 @@ def override_recipe_configs(
             get_nmt_tokenizer, library="null", model_name="NullTokenizer", vocab_size=32000
         )
         recipe.model.tokenizer = recipe.data.tokenizer
-
-    # to mitigate the incorrect gradient_scaling_factor calculation in megatron.core
-    # under scenario average_in_collective=True and tp_size != etp_size, disabling average_in_collective.
-    if etp_size is not None and etp_size != tp_size:
-        recipe.trainer.strategy.ddp.average_in_collective = False
 
     return recipe
 
@@ -143,6 +142,7 @@ if __name__ == "__main__":
     exp_name = f"{splitext(basename(__file__))[0]}_{args.compute_dtype}_{exp_config}"
 
     executor = slurm_executor(
+        args.gpu.lower(),
         args.account,
         args.partition,
         args.log_dir,
@@ -158,13 +158,7 @@ if __name__ == "__main__":
         network='sharp' if args.use_sharp else None,
     )
 
-    plugins = [
-        PerfEnvPlugin(
-            enable_vboost=True,
-            nccl_pp_comm_chunksize=2097152 if pp_size > 1 else None,
-            gpu_sm100_or_newer=(args.gpu.lower() in ['b200', 'gb200']),
-        )
-    ]
+    plugins = [build_perf_env_plugin(args, pp_size=pp_size)]
     if args.enable_nsys:
         plugins.append(NsysPlugin(start_step=5, end_step=6))
     if args.enable_memory_profile:

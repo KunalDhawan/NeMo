@@ -229,6 +229,7 @@ class ModelConnector(Connector, Generic[SourceT, TargetT]):
         -------
             Tuple[pl.LightningModule, pl.Trainer]: The loaded model and the trainer configured with the model.
         """
+        from nemo.collections.llm.modelopt import set_modelopt_spec_if_exists_in_ckpt
         from nemo.lightning import MegatronStrategy, Trainer, _strategy_lib
         from nemo.lightning.io.api import load_context
 
@@ -242,6 +243,8 @@ class ModelConnector(Connector, Generic[SourceT, TargetT]):
 
         # skip initialization since a checkpoint is loaded in this function
         model.config.perform_initialization = False
+        # set modelopt spec if required
+        set_modelopt_spec_if_exists_in_ckpt(model, path)
 
         is_peft_ckpt = model.model_transform is not None
         callbacks = []
@@ -272,11 +275,17 @@ class ModelConnector(Connector, Generic[SourceT, TargetT]):
 
             model.trainer = _trainer
             model = model.model_transform(model)
+            load_path = ckpt_to_weights_subdir(path, is_saving=False)
+            sharded_sd_metadata = _trainer.strategy.unwrapped_checkpoint_io.load_content_metadata(load_path)
             adapter_sharded_state_dict = {
-                k: v for k, v in _trainer.strategy.megatron_parallel.sharded_state_dict().items() if ".adapter." in k
+                k: v
+                for k, v in _trainer.strategy.megatron_parallel.sharded_state_dict(
+                    metadata=sharded_sd_metadata
+                ).items()
+                if ".adapter." in k
             }
             adapter_state = _trainer.strategy.checkpoint_io.load_checkpoint(
-                ckpt_to_weights_subdir(path, is_saving=False), sharded_state_dict=adapter_sharded_state_dict
+                load_path, sharded_state_dict=adapter_sharded_state_dict
             )
             _trainer.strategy.load_model_state_dict(adapter_state, strict=False)
         else:

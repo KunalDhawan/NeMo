@@ -17,15 +17,16 @@ from os.path import basename, splitext
 import nemo_run as run
 
 from nemo.collections.diffusion.recipes.flux_12b import pretrain_recipe
-from nemo.lightning.run.plugins import NsysPlugin, PerfEnvPlugin
+from nemo.lightning.run.plugins import NsysPlugin
 
 from ..argument_parser import parse_cli_args
-from ..utils import (
+from ..executors import slurm_executor
+from ..helpers import (
     args_sanity_check,
+    build_perf_env_plugin,
     get_user_configs,
     set_exp_logging_configs,
     set_primary_perf_configs,
-    slurm_executor,
 )
 
 
@@ -64,6 +65,11 @@ def override_recipe_configs(
         enable_cuda_graphs=enable_cuda_graphs,
         compute_dtype=args.compute_dtype,
         fp8_recipe=args.fp8_recipe,
+        use_mcore_fsdp=args.use_mcore_fsdp,
+        use_fsdp_double_buffer=args.use_fsdp_double_buffer,
+        use_user_buffer_registration=args.use_user_buffer_registration,
+        use_te_act_func=args.use_te_act_func,
+        act_func_fp8_input_store=args.act_func_fp8_input_store,
     )
     recipe = set_exp_logging_configs(
         recipe,
@@ -94,6 +100,7 @@ if __name__ == "__main__":
     exp_name = f"{splitext(basename(__file__))[0]}_{args.compute_dtype}_{exp_config}"
 
     executor = slurm_executor(
+        args.gpu.lower(),
         args.account,
         args.partition,
         args.log_dir,
@@ -107,13 +114,7 @@ if __name__ == "__main__":
         nemo_home=args.nemo_home,
     )
 
-    plugins = [
-        PerfEnvPlugin(
-            enable_vboost=True,
-            nccl_pp_comm_chunksize=2097152 if pp_size > 1 else None,
-            gpu_sm100_or_newer=(args.gpu.lower() in ['b200', 'gb200']),
-        ),
-    ]
+    plugins = [build_perf_env_plugin(args, pp_size=pp_size)]
     if args.enable_nsys:
         plugins.append(NsysPlugin(start_step=5, end_step=6))
 

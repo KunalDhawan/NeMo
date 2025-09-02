@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import contextlib
+import inspect
 from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Union
@@ -24,6 +25,8 @@ from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper 
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import InferenceWrapperConfig
 from megatron.core.models.gpt.gpt_model import GPTModel as MCoreGPTModel
 from megatron.core.optimizer import OptimizerConfig
+from megatron.core.transformer.dot_product_attention import DotProductAttention as MCoreDotProductAttention
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_batch_on_this_cp_rank
@@ -164,7 +167,7 @@ def transformer_engine_layer_spec(config: "GPTConfig") -> ModuleSpec:
     return gpt_layer_specs.get_gpt_layer_with_transformer_engine_spec(**kwargs)
 
 
-def transformer_engine_full_layer_spec(config: "GPTConfig") -> ModuleSpec:
+def transformer_engine_full_layer_spec(config: "GPTConfig", vp_stage: Optional[int] = None) -> ModuleSpec:
     """Create a full Transformer Engine layer specification with autocast support.
 
     Args:
@@ -177,7 +180,7 @@ def transformer_engine_full_layer_spec(config: "GPTConfig") -> ModuleSpec:
         get_gpt_full_te_layer_autocast_spec,
     )
 
-    return get_gpt_full_te_layer_autocast_spec(transformer_config=config)
+    return get_gpt_full_te_layer_autocast_spec(transformer_config=config, vp_stage=vp_stage)
 
 
 def local_layer_spec(config: "GPTConfig") -> ModuleSpec:
@@ -199,7 +202,7 @@ def local_layer_spec(config: "GPTConfig") -> ModuleSpec:
     )
 
 
-def default_layer_spec(config: "GPTConfig") -> ModuleSpec:
+def default_layer_spec(config: "GPTConfig", vp_stage: Optional[int] = None) -> ModuleSpec:
     """Determine the most appropriate layer specification based on availability.
 
     Uses Transformer Engine specs if available, otherwise falls back to local implementation.
@@ -212,14 +215,14 @@ def default_layer_spec(config: "GPTConfig") -> ModuleSpec:
     """
     if HAVE_TE:
         if config.use_transformer_engine_full_layer_spec:
-            return transformer_engine_full_layer_spec(config)
+            return transformer_engine_full_layer_spec(config, vp_stage=vp_stage)
         else:
             return transformer_engine_layer_spec(config)
     else:
         return local_layer_spec(config)
 
 
-def mtp_block_spec(config: "GPTConfig") -> Optional[ModuleSpec]:
+def mtp_block_spec(config: "GPTConfig", vp_stage: Optional[int] = None) -> Optional[ModuleSpec]:
     """Pass in the MTP block spec if model has MTP layers.
 
     Args:
@@ -232,10 +235,13 @@ def mtp_block_spec(config: "GPTConfig") -> Optional[ModuleSpec]:
         from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
 
         if isinstance(config.transformer_layer_spec, Callable):
-            spec = config.transformer_layer_spec(config)
+            if 'vp_stage' in inspect.signature(config.transformer_layer_spec).parameters:
+                spec = config.transformer_layer_spec(config, vp_stage=vp_stage)
+            else:
+                spec = config.transformer_layer_spec(config)
         else:
             spec = config.transformer_layer_spec
-        return get_gpt_mtp_block_spec(config, spec, use_transformer_engine=HAVE_TE)
+        return get_gpt_mtp_block_spec(config, spec, use_transformer_engine=HAVE_TE, vp_stage=vp_stage)
     else:
         return None
 
@@ -322,7 +328,8 @@ class GPTConfig(TransformerConfig, io.IOMixin):
         Returns:
             MCoreGPTModel: Configured Megatron Core GPT model instance
         """
-        if self.enable_cuda_graph:
+        # Enable per-Transformer layer cuda graph.
+        if self.enable_cuda_graph and self.cuda_graph_scope != "full_iteration":
             assert HAVE_TE, "Transformer Engine is required for cudagraphs."
             assert getattr(self, "use_te_rng_tracker", False), (
                 "Transformer engine's RNG tracker is required for cudagraphs, it can be "
@@ -333,17 +340,34 @@ class GPTConfig(TransformerConfig, io.IOMixin):
         is_pipeline_asymmetric = getattr(self, "account_for_embedding_in_pipeline_split", False) or getattr(
             self, "account_for_loss_in_pipeline_split", False
         )
-        if vp_size and not is_pipeline_asymmetric:
+        is_pipeline_asymmetric |= (
+            getattr(self, "num_layers_in_first_pipeline_stage", None)
+            or getattr(self, "num_layers_in_last_pipeline_stage", None)
+        ) is not None
+        is_flexible_pp_layout = is_pipeline_asymmetric or (
+            getattr(self, "pipeline_model_parallel_layout", None) is not None
+        )
+        if vp_size and not is_flexible_pp_layout:
             p_size = self.pipeline_model_parallel_size
             assert (
                 self.num_layers // p_size
             ) % vp_size == 0, "Make sure the number of model chunks is the same across all pipeline stages."
 
+        import inspect
+
         from megatron.core import parallel_state
+
+        # During fake lightning initialization, pass 0 to bypass the assertion that vp_stage must be
+        # non-None when using virtual pipeline model parallelism
+        vp_stage = vp_stage or 0
 
         transformer_layer_spec = self.transformer_layer_spec
         if not isinstance(transformer_layer_spec, ModuleSpec):
-            transformer_layer_spec = transformer_layer_spec(self)
+            # Check if the transformer_layer_spec function accepts vp_stage parameter
+            if 'vp_stage' in inspect.signature(transformer_layer_spec).parameters:
+                transformer_layer_spec = transformer_layer_spec(self, vp_stage=vp_stage)
+            else:
+                transformer_layer_spec = transformer_layer_spec(self)
 
         if self.vocab_size is not None:
             vocab_size = self.vocab_size
@@ -359,16 +383,15 @@ class GPTConfig(TransformerConfig, io.IOMixin):
         if self.init_model_with_meta_device:
             model_init_device_context = partial(torch.device, device='meta')
 
-        import inspect
-
         if 'mtp_block_spec' in inspect.signature(MCoreGPTModel.__init__).parameters:
-            kwargs = {"mtp_block_spec": mtp_block_spec(self)}
+            kwargs = {"mtp_block_spec": mtp_block_spec(self, vp_stage=vp_stage)}
         else:
             kwargs = {}
+
+        if self.attention_backend == AttnBackend.local:
+            if hasattr(transformer_layer_spec, 'submodules'):
+                transformer_layer_spec.submodules.self_attention.submodules.core_attention = MCoreDotProductAttention
         with model_init_device_context():
-            # During fake lightning initialization, pass 0 to bypass the assertion that vp_stage must be
-            # non-None when using virtual pipeline model parallelism
-            vp_stage = vp_stage or 0
             model = MCoreGPTModel(
                 self,
                 transformer_layer_spec=transformer_layer_spec,
@@ -573,6 +596,8 @@ class GPTModel(L.LightningModule, io.IOMixin, io.ConnectorMixin, fn.FNMixin):
 
         This method ensures the model is instantiated from the configuration.
         """
+        from nemo.collections.llm.modelopt.model_utils import restore_modelopt_state
+
         if not hasattr(self, "module"):
             with contextlib.ExitStack() as stack:
                 # Apply requested context managers for this block
@@ -580,6 +605,12 @@ class GPTModel(L.LightningModule, io.IOMixin, io.ConnectorMixin, fn.FNMixin):
                     stack.enter_context(cm)
 
                 self.module = self.config.configure_model(self.tokenizer, vp_stage=vp_stage)
+
+            # Restore ModelOpt state if it exists.
+            # NOTE: Also called in MegatronStrategy.load_checkpoint but we do it for GPTModel here first,
+            # for transformations which add new parameters to the model that need to be included in the optimizer.
+            # TODO: Add to other models when needed.
+            restore_modelopt_state(self.module, trainer=self._trainer)  # `self.trainer` throws exception if not set
 
     def forward(
         self,

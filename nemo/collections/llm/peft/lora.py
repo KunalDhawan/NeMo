@@ -51,6 +51,7 @@ class LoRALinear(AdapterWrapper):
         # pylint: disable=C0115,C0116
         linear_output, bias, layernorm_output = self.base_linear_forward(x, *args, **kwargs)
         adapter_output = self.adapter(layernorm_output.contiguous())
+        adapter_output = adapter_output.reshape(linear_output.shape)
         return linear_output + adapter_output, bias
 
 
@@ -461,7 +462,9 @@ class LoRA(PEFT, ModuleMatcher):
                     lora_dtype=self.lora_dtype,
                 )
 
-            input_is_parallel, in_features, out_features, disable_sp_comm = get_adapter_attributes_from_linear(m)
+            input_is_parallel, in_features, out_features, disable_sp_comm, base_linear_is_parallel = (
+                get_adapter_attributes_from_linear(m)
+            )
             logging.info(f"Adding lora to: {full_name}")
             adapter = ParallelLinearAdapter(
                 in_features,
@@ -482,6 +485,7 @@ class LoRA(PEFT, ModuleMatcher):
                 a2a_experimental=self.a2a_experimental,
                 disable_sequence_parallel_comm=disable_sp_comm,
                 dropout_recompute=self.dropout_recompute,
+                base_linear_is_parallel=base_linear_is_parallel,
             )
             return LoRALinear(m, adapter)
         return m
@@ -515,13 +519,14 @@ class LoRAMerge(PEFT):
         if not isinstance(m, LoRALinear):
             return m
         logging.info(f'merging {(prefix if prefix else "") + "." + (name if name else "")}')
-        base_weight = m.to_wrap.weight
-        lora_weight = (
-            m.adapter.alpha
-            / m.adapter.dim
-            * m.adapter.linear_out.weight.to(base_weight.device)
-            @ m.adapter.linear_in.weight.to(base_weight.device)
-        )
-        merged_weight = base_weight + lora_weight
-        m.to_wrap.weight.data = merged_weight
+        lora_weight = m.adapter.alpha / m.adapter.dim * m.adapter.linear_out.weight @ m.adapter.linear_in.weight
+        if hasattr(m.to_wrap, "weight"):
+            base_weight = m.to_wrap.weight
+            merged_weight = base_weight + lora_weight.to(base_weight.device)
+            m.to_wrap.weight.data = merged_weight
+        else:  # TE Grouped Linear
+            for i in range(m.to_wrap.num_gemms):
+                base_weight = getattr(m.to_wrap, f"weight{i}")
+                merged_weight = base_weight + lora_weight.to(base_weight.device)
+                getattr(m.to_wrap, f"weight{i}").data = merged_weight
         return m
