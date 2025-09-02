@@ -449,7 +449,12 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
             
             for i, hyps in enumerate(all_streaming_tran):
                 if hyps == []:
-                    continue
+                    hyp = {}
+                    hyp['speaker'] = 'speaker_0'
+                    hyp['text'] = ''
+                    hyp['start_time'] = 0
+                    hyp['end_time'] = 0
+                    hyps.append(hyp)
                 audio_filepath = samples[i]["audio_filepath"]
                 uniq_id = audio_filepath.split('/')[-1].split('.')[0]
                 record = [
