@@ -462,6 +462,7 @@ class SpeakerTaggedASR:
         self._sent_break_sec = cfg.get("sent_break_sec", 1.5)
         self._speaker_wise_sentences = {}
         self._prev_history_speaker_texts = [ "" for _ in range(self._max_speakers) ]
+        self.second_speaker_detected = False
     
     def _init_evaluator(self):  
         self.online_evaluators, self._word_and_ts_seq = [], []
@@ -967,8 +968,10 @@ class SpeakerTaggedASR:
         # If n_mix == 1, we only have one speaker, so we don't need to do diarization
         # and set spk_targets to all ones
 
+        diar_max_len = att_context_size[-1] + 1
+
         if n_mix == 1:
-            spk_targets = torch.ones((chunk_audio.shape[0], 14, 1), device=chunk_audio.device) # TODO: fix this hardcoded value
+            spk_targets = torch.ones((chunk_audio.shape[0], diar_max_len, 1), device=chunk_audio.device) # TODO: fix this hardcoded value
         else:
             if rttm is None:
                 
@@ -984,8 +987,11 @@ class SpeakerTaggedASR:
                 spk_targets = diar_pred_out_stream
             else:
                 spk_targets = rttm
+        self.second_speaker_detected = self.second_speaker_detected or any(spk_targets[0, :, 1:].max(0).values > 0.5)
 
-        diar_max_len = att_context_size[-1] + 1
+        if not self.second_speaker_detected:
+            spk_targets = torch.zeros((chunk_audio.shape[0], diar_max_len, n_mix), device=chunk_audio.device)
+            spk_targets[:, :, 0] = 1.
 
         if spk_targets.shape[1] > diar_max_len:
             spk_targets = spk_targets[:, -diar_max_len:]

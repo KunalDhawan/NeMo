@@ -432,7 +432,7 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
             previous_hypotheses[spk_idx] = previous_hypotheses_spk[i]
             previous_pred_out[spk_idx] = asr_pred_out_stream_spk[i]
 
-        import ipdb; ipdb.set_trace()
+        # import ipdb; ipdb.set_trace()
         return previous_pred_out, transcribed_texts_spk, cache_last_channel, cache_last_time, cache_last_channel_len, previous_hypotheses, valid_speakers_last_time
     
     def conformer_stream_step_masked(
