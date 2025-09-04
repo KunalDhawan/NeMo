@@ -53,6 +53,8 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
         self.spk_kernel_mask_original = cfg.get('spk_kernel_mask_original', True)
         self.spk_kernel_residual = cfg.get('spk_kernel_residual', True)
 
+        self.add_bg_spk_kernel = cfg.get('add_bg_spk_kernel', False)
+
         self.spk_targets = None
 
         self._init_spk_kernel()
@@ -67,6 +69,7 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
         # Initialize speaker kernels for each specified layer
         hidden_size = self.cfg.model_defaults.enc_hidden
         self.spk_kernels = torch.nn.ModuleDict()
+        self.bg_spk_kernels = torch.nn.ModuleDict()
         
         kernel_types = {
             'mask': SpeakerMask,
@@ -79,6 +82,8 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
         for layer_idx in self.spk_kernel_layers:
             if kernel_class is not None:
                 self.spk_kernels[str(layer_idx)] = kernel_class(hidden_size, hidden_size, mask_original=self.spk_kernel_mask_original, residual=self.spk_kernel_residual)
+                if self.add_bg_spk_kernel:
+                    self.bg_spk_kernels[str(layer_idx)] = kernel_class(hidden_size, hidden_size, mask_original=self.spk_kernel_mask_original, residual=self.spk_kernel_residual)
 
         if self.spk_kernels:
             logging.info(f"Initialized speaker kernels for layers: {list(self.spk_kernels.keys())}")
@@ -103,6 +108,10 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
                 hook = self.encoder.layers[idx].register_forward_pre_hook(
                     self._get_spk_kernel_hook_pre_layer(layer_idx), with_kwargs=True
                 )
+                if self.add_bg_spk_kernel:
+                    bg_hook = self.encoder.layers[idx].register_forward_pre_hook(
+                        self._get_bg_spk_kernel_hook_pre_layer(layer_idx), with_kwargs=True
+                    )
 
             if idx > 0:
                 # Attach a post-hook after each layer from 0 to 16.
@@ -110,6 +119,10 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
                 hook = self.encoder.layers[idx - 1].register_forward_hook(
                     self._get_spk_kernel_hook_post_layer(layer_idx)
                 )
+                if self.add_bg_spk_kernel:
+                    bg_hook = self.encoder.layers[idx - 1].register_forward_pre_hook(
+                        self._get_bg_spk_kernel_hook_post_layer(layer_idx), with_kwargs=True
+                    )
             self.encoder_hooks.append(hook)
 
     def _get_spk_kernel_hook_pre_layer(self, layer_idx: str):
@@ -140,6 +153,31 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
 
         return hook_fn
 
+    def _get_bg_spk_kernel_hook_pre_layer(self, layer_idx: str):
+        """
+        Returns a hook function for applying background speaker kernel transformation.
+        
+        Args:
+            layer_idx (str): Index of the layer to apply the kernel
+            
+        Returns:
+            callable: Hook function that applies background speaker kernel
+        """
+
+        def hook_fn(module, args, kwargs):
+            if 'x' in kwargs:
+                x = kwargs['x']
+                x = self.bg_spk_kernels[layer_idx](x, self.bg_spk_targets)
+                kwargs['x'] = x
+            elif args:
+                x, *rest = args
+                x = self.bg_spk_kernels[layer_idx](x, self.bg_spk_targets)
+                args = (x, *rest)
+
+            return args, kwargs
+
+        return hook_fn
+
     def _get_spk_kernel_hook_post_layer(self, layer_idx: str):
         """
         Returns a hook function for applying speaker kernel transformation.
@@ -156,6 +194,17 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
                 x = self.spk_kernels[layer_idx](x, self.spk_targets)
                 return (x, *cache)
             return self.spk_kernels[layer_idx](output, self.spk_targets)
+        
+        return hook_fn
+
+    def _get_bg_spk_kernel_hook_post_layer(self, layer_idx: str):
+
+        def hook_fn(module, input, output):
+            if isinstance(output, tuple):
+                x, *cache = output
+                x = self.spk_kernels[layer_idx](x, self.bg_spk_targets)
+                return (x, *cache)
+            return self.spk_kernels[layer_idx](output, self.bg_spk_targets)
         
         return hook_fn
 
@@ -228,7 +277,7 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
 
     def training_step(self, batch, batch_nb):
         
-        signal, signal_len, transcript, transcript_len, self.spk_targets = batch
+        signal, signal_len, transcript, transcript_len, self.spk_targets, self.bg_spk_targets = batch
 
         batch = (signal, signal_len, transcript, transcript_len)
 
@@ -237,7 +286,7 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
 
     def validation_pass(self, batch, batch_idx, dataloader_idx=0):
 
-        signal, signal_len, transcript, transcript_len, self.spk_targets = batch
+        signal, signal_len, transcript, transcript_len, self.spk_targets, self.bg_spk_targets = batch
 
         batch = (signal, signal_len, transcript, transcript_len)
 
@@ -432,7 +481,7 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
             previous_hypotheses[spk_idx] = previous_hypotheses_spk[i]
             previous_pred_out[spk_idx] = asr_pred_out_stream_spk[i]
 
-        # import ipdb; ipdb.set_trace()
+        import ipdb; ipdb.set_trace()
         return previous_pred_out, transcribed_texts_spk, cache_last_channel, cache_last_time, cache_last_channel_len, previous_hypotheses, valid_speakers_last_time
     
     def conformer_stream_step_masked(

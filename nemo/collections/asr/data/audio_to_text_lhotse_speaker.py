@@ -79,6 +79,7 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
 
         tokens = []
         spk_targets = []
+        bg_spk_targets = []
 
         if self.inference_mode:
             
@@ -120,17 +121,21 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
                 speaker_targets = speaker_targets.transpose(0, 1)[:len(texts)]
 
             target_speaker_id = random.choice(range(len(texts)))
+            non_target_speaker_ids = [i for i in range(len(texts)) if i != target_speaker_id]
             text = texts[target_speaker_id]
             speaker_target = speaker_targets[target_speaker_id]
+            bg_speaker_target = speaker_targets[non_target_speaker_ids].sum(dim=0) > 0
 
             tokens.append(torch.as_tensor(self.tokenizer(text, cut.supervisions[0].language)))
             spk_targets.append(speaker_target)
+            bg_spk_targets.append(bg_speaker_target)
         
         token_lens = torch.tensor([t.size(0) for t in tokens], dtype=torch.long)
         tokens = collate_vectors(tokens, padding_value=0)
         spk_targets = collate_vectors(spk_targets, padding_value=0)
+        bg_spk_targets = collate_vectors(bg_spk_targets, padding_value=0)
         
-        return audio, audio_lens, tokens, token_lens, spk_targets
+        return audio, audio_lens, tokens, token_lens, spk_targets, bg_spk_targets
 
     def split_text(self, text, speaker_token='<|spltoken*|>'):
         """
