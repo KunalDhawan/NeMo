@@ -32,181 +32,24 @@ from nemo.collections.asr.parts.mixins import (
     TranscribeConfig,
     TranscriptionReturnType,
 )
+from nemo.collections.asr.parts.mixins.speaker_kernels import SpeakerKernelMixin
 
 from nemo.collections.asr.models.rnnt_bpe_models import EncDecRNNTBPEModel
 from nemo.collections.asr.models.sortformer_diar_models import SortformerEncLabelModel
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
-from nemo.collections.asr.modules.speaker_kernels import SpeakerMask, SpeakerConcat
 from nemo.collections.asr.parts.utils.asr_multispeaker_utils import get_pil_targets
+from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
 
 from nemo.core.classes.common import typecheck
 from nemo.utils import logging
 
-class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
+class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel, SpeakerKernelMixin):
     """Base class for encoder decoder RNNT-based models with subword tokenization."""
 
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
         super().__init__(cfg=cfg, trainer=trainer)
-        # config for speaker kernel
-        self.spk_kernel_type = cfg.get('spk_kernel_type', None)
-        self.spk_kernel_layers = cfg.get('spk_kernel_layers', [])
-        self.spk_kernel_mask_original = cfg.get('spk_kernel_mask_original', True)
-        self.spk_kernel_residual = cfg.get('spk_kernel_residual', True)
-
-        self.add_bg_spk_kernel = cfg.get('add_bg_spk_kernel', False)
-
-        self.spk_targets = None
-
-        self._init_spk_kernel()
-        
-    def _init_spk_kernel(self):
-        """Initialize speaker kernel modules and register them to encoder layers."""
-        if not isinstance(self.spk_kernel_layers, ListConfig):
-            if self.spk_kernel_type is not None:
-                raise ValueError(f"spk_kernel_layers must be a list, got {type(self.spk_kernel_layers)}")
-            return
-
-        # Initialize speaker kernels for each specified layer
-        hidden_size = self.cfg.model_defaults.enc_hidden
-        self.spk_kernels = torch.nn.ModuleDict()
-        self.bg_spk_kernels = torch.nn.ModuleDict()
-        
-        kernel_types = {
-            'mask': SpeakerMask,
-            'concat': SpeakerConcat,
-            'sinusoidal': None
-        }
-
-        # Create kernel for each layer index
-        kernel_class = kernel_types[self.spk_kernel_type]
-        for layer_idx in self.spk_kernel_layers:
-            if kernel_class is not None:
-                self.spk_kernels[str(layer_idx)] = kernel_class(hidden_size, hidden_size, mask_original=self.spk_kernel_mask_original, residual=self.spk_kernel_residual)
-                if self.add_bg_spk_kernel:
-                    self.bg_spk_kernels[str(layer_idx)] = kernel_class(hidden_size, hidden_size, mask_original=self.spk_kernel_mask_original, residual=self.spk_kernel_residual)
-
-        if self.spk_kernels:
-            logging.info(f"Initialized speaker kernels for layers: {list(self.spk_kernels.keys())}")
-            self._attach_spk_kernel_hooks()
-        else:
-            logging.info("No speaker kernels initialized")
-
-    def _attach_spk_kernel_hooks(self):
-        """
-        Attach speaker kernel hooks to encoder layers.
-        Following NeMo pattern of separating hook attachment logic.
-        """
-        # Only attach hooks if not already attached
-        if hasattr(self, 'encoder_hooks'):
-            return
-
-        self.encoder_hooks = []
-        for layer_idx, kernel in self.spk_kernels.items():
-            idx = int(layer_idx)
-
-            if idx == 0:
-                hook = self.encoder.layers[idx].register_forward_pre_hook(
-                    self._get_spk_kernel_hook_pre_layer(layer_idx), with_kwargs=True
-                )
-                if self.add_bg_spk_kernel:
-                    bg_hook = self.encoder.layers[idx].register_forward_pre_hook(
-                        self._get_bg_spk_kernel_hook_pre_layer(layer_idx), with_kwargs=True
-                    )
-
-            if idx > 0:
-                # Attach a post-hook after each layer from 0 to 16.
-                # Since idx > 0, we attach to layer idx-1.
-                hook = self.encoder.layers[idx - 1].register_forward_hook(
-                    self._get_spk_kernel_hook_post_layer(layer_idx)
-                )
-                if self.add_bg_spk_kernel:
-                    bg_hook = self.encoder.layers[idx - 1].register_forward_pre_hook(
-                        self._get_bg_spk_kernel_hook_post_layer(layer_idx), with_kwargs=True
-                    )
-            self.encoder_hooks.append(hook)
-
-    def _get_spk_kernel_hook_pre_layer(self, layer_idx: str):
-        """
-        Returns a hook function for applying speaker kernel transformation.
-        
-        Args:
-            layer_idx (str): Index of the layer to apply the kernel
-            
-        Returns:
-            callable: Hook function that applies speaker kernel
-        """
-
-        def hook_fn(module, args, kwargs):
-            # Pre-hooks with with_kwargs=True must return a (new_args, new_kwargs) tuple.
-            # The input tensor is passed as a keyword argument, so we find it in 'kwargs'.
-            if 'x' in kwargs:
-                x = kwargs['x']
-                x = self.spk_kernels[layer_idx](x, self.spk_targets)
-                kwargs['x'] = x
-            elif args:
-                # Fallback in case the call signature ever changes
-                x, *rest = args
-                x = self.spk_kernels[layer_idx](x, self.spk_targets)
-                args = (x, *rest)
-
-            return args, kwargs
-
-        return hook_fn
-
-    def _get_bg_spk_kernel_hook_pre_layer(self, layer_idx: str):
-        """
-        Returns a hook function for applying background speaker kernel transformation.
-        
-        Args:
-            layer_idx (str): Index of the layer to apply the kernel
-            
-        Returns:
-            callable: Hook function that applies background speaker kernel
-        """
-
-        def hook_fn(module, args, kwargs):
-            if 'x' in kwargs:
-                x = kwargs['x']
-                x = self.bg_spk_kernels[layer_idx](x, self.bg_spk_targets)
-                kwargs['x'] = x
-            elif args:
-                x, *rest = args
-                x = self.bg_spk_kernels[layer_idx](x, self.bg_spk_targets)
-                args = (x, *rest)
-
-            return args, kwargs
-
-        return hook_fn
-
-    def _get_spk_kernel_hook_post_layer(self, layer_idx: str):
-        """
-        Returns a hook function for applying speaker kernel transformation.
-        
-        Args:
-            layer_idx (str): Index of the layer to apply the kernel
-            
-        Returns:
-            callable: Hook function that applies speaker kernel
-        """
-        def hook_fn(module, input, output):
-            if isinstance(output, tuple):
-                x, *cache = output
-                x = self.spk_kernels[layer_idx](x, self.spk_targets)
-                return (x, *cache)
-            return self.spk_kernels[layer_idx](output, self.spk_targets)
-        
-        return hook_fn
-
-    def _get_bg_spk_kernel_hook_post_layer(self, layer_idx: str):
-
-        def hook_fn(module, input, output):
-            if isinstance(output, tuple):
-                x, *cache = output
-                x = self.spk_kernels[layer_idx](x, self.bg_spk_targets)
-                return (x, *cache)
-            return self.spk_kernels[layer_idx](output, self.bg_spk_targets)
-        
-        return hook_fn
+        # Initialize speaker kernel functionality from mixin
+        self._init_speaker_kernel_config(cfg)
 
     def _setup_dataloader_from_config(self, config: Optional[Dict]):
         if config.get("use_lhotse"):
@@ -276,8 +119,11 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
         return encoded, encoded_len
 
     def training_step(self, batch, batch_nb):
-        
-        signal, signal_len, transcript, transcript_len, self.spk_targets, self.bg_spk_targets = batch
+        """Training step with speaker targets."""
+        signal, signal_len, transcript, transcript_len, spk_targets, bg_spk_targets = batch
+
+        # Set speaker targets using mixin method
+        self.set_speaker_targets(spk_targets, bg_spk_targets)
 
         batch = (signal, signal_len, transcript, transcript_len)
 
@@ -285,22 +131,28 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
 
 
     def validation_pass(self, batch, batch_idx, dataloader_idx=0):
+        """Validation pass with speaker targets."""
+        signal, signal_len, transcript, transcript_len, spk_targets, bg_spk_targets = batch
 
-        signal, signal_len, transcript, transcript_len, self.spk_targets, self.bg_spk_targets = batch
+        # Set speaker targets using mixin method
+        self.set_speaker_targets(spk_targets, bg_spk_targets)
 
         batch = (signal, signal_len, transcript, transcript_len)
 
         return super().validation_pass(batch, batch_idx, dataloader_idx)
 
     def _transcribe_forward(self, batch: Any, trcfg: TranscribeConfig):
-
+        """Transcribe forward with speaker targets."""
         signal, signal_len, transcript, transcript_len, spk_targets = batch
 
         # Multi-instance inference
         n_mix = trcfg.mix
-        self.spk_targets = spk_targets[:, :, :n_mix].transpose(1, 2).reshape(-1, spk_targets.size(1)) # B x T x N_mix -> BN_mix x T
+        processed_spk_targets = spk_targets[:, :, :n_mix].transpose(1, 2).reshape(-1, spk_targets.size(1)) # B x T x N_mix -> BN_mix x T
         signal = signal.unsqueeze(1).repeat(1, n_mix, 1).reshape(-1, signal.size(1)) # B x T -> BN_mix x T
         signal_len = signal_len.unsqueeze(1).repeat(1, n_mix).reshape(-1) # B -> BN_mix
+
+        # Set speaker targets using mixin method
+        self.set_speaker_targets(processed_spk_targets)
 
         batch = (signal, signal_len, transcript, transcript_len)
 
@@ -422,8 +274,8 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
         if binary_diar_preds:
             spk_targets = (spk_targets > 0.5).float()
 
-        # 
-        self.spk_targets = spk_targets[valid_speakers.reshape(-1)]
+        # Set processed speaker targets for valid speakers using mixin method
+        self.set_speaker_targets(spk_targets[valid_speakers.reshape(-1)])
     
         mi_processed_signal = []
         mi_processed_signal_length = []
@@ -481,7 +333,6 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
             previous_hypotheses[spk_idx] = previous_hypotheses_spk[i]
             previous_pred_out[spk_idx] = asr_pred_out_stream_spk[i]
 
-        import ipdb; ipdb.set_trace()
         return previous_pred_out, transcribed_texts_spk, cache_last_channel, cache_last_time, cache_last_channel_len, previous_hypotheses, valid_speakers_last_time
     
     def conformer_stream_step_masked(
@@ -560,8 +411,11 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
         spk_targets = spk_targets.transpose(1, 2).reshape(-1, spk_targets.size(1))
         spk_targets = (spk_targets > 0.5).float()
 
-        # 
-        spk_targets = spk_targets[valid_speakers.reshape(-1)]
+        # Process speaker targets for valid speakers only
+        valid_spk_targets = spk_targets[valid_speakers.reshape(-1)]
+        
+        # Set speaker targets for hooks using mixin method
+        self.set_speaker_targets(valid_spk_targets)
     
         mi_processed_signal = []
         mi_processed_signal_length = []
@@ -588,8 +442,8 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel):
         previous_pred_out_spk = [previous_pred_out[i] for i in valid_speaker_ids]
         previous_hypotheses_spk = [previous_hypotheses[i] for i in valid_speaker_ids]
         
-        # mask the processed signal
-        mask = spk_targets.unsqueeze(-1).repeat(1, 1, 8).flatten(1, 2)
+        # mask the processed signal using valid speaker targets
+        mask = valid_spk_targets.unsqueeze(-1).repeat(1, 1, 8).flatten(1, 2)
         if mask.size(1) > processed_signal.size(2):
             mask = mask[:, -processed_signal.size(2):]
         else:

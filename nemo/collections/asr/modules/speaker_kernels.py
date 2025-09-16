@@ -16,12 +16,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-__all__ = ['SpeakerMask', 'SpeakerConcat']
+from nemo.collections.common.parts.adapter_modules import LinearAdapter
+
+__all__ = ['SpeakerMask', 'SpeakerConcat', 'LinearSpeakerKernelAdapter']
 
 class SpeakerMask(torch.nn.Module):
-    def __init__(self, input_size, output_size, mask_original=True, residual=True):
+    def __init__(
+        self, 
+        input_size, 
+        output_size, 
+        mask_original=True, 
+        residual=True):
         super().__init__()
-        self.feedforward = torch.nn.Sequential(
+        self.feedforward = nn.Sequential(
+            # nn.LayerNorm(input_size),
             torch.nn.Linear(input_size, output_size*2),
             torch.nn.ReLU(),
             torch.nn.Linear(output_size*2, output_size)
