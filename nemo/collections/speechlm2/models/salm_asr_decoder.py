@@ -44,6 +44,7 @@ from nemo.collections.common.tokenizers import AutoTokenizer
 from nemo.collections.speechlm2.data.salm_dataset import left_collate_vectors
 from nemo.collections.speechlm2.models.salm import _resolve_audios_in_prompt, replace_placeholders_and_build_targets
 from nemo.collections.speechlm2.modules.perception import AudioTranscriptionPerceptionModule
+from nemo.collections.speechlm2.modules.rotary_embedding import ConstrainedRotaryEmbedding, inject_rotary_embedding
 from nemo.collections.speechlm2.parts.hf_hub import HFHubMixin
 from nemo.collections.speechlm2.parts.lora import maybe_install_lora
 from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen
@@ -96,6 +97,9 @@ class SALMWithAsrDecoder(LightningModule, HFHubMixin):
 
         maybe_install_lora(self)
 
+        # Initialize constrained rotary embeddings if enabled
+        self._setup_rotary_embeddings()
+
         self._use_fsdp = False
         self._use_tp = False
 
@@ -138,6 +142,112 @@ class SALMWithAsrDecoder(LightningModule, HFHubMixin):
     @property
     def sampling_rate(self) -> int:
         return self.perception.preprocessor.featurizer.sample_rate
+
+    def _setup_rotary_embeddings(self):
+        """
+        Setup constrained rotary embeddings for the SALM ASR decoder if enabled in config.
+        This injects rotary embeddings into the HuggingFace LLM attention layers.
+        """
+        rope_config = self.cfg.get("rotary_embedding", None)
+        if rope_config is None or not rope_config.get("enabled", False):
+            logging.info("Constrained rotary embeddings disabled")
+            return
+            
+        logging.info("Setting up constrained rotary embeddings for SALM ASR decoder")
+        
+        # Get the base model (handle both PeftModel and regular models)
+        llm = self.llm
+        if hasattr(llm, 'base_model'):
+            llm = llm.base_model.model
+        elif hasattr(llm, 'model'):
+            llm = llm.model
+            
+        # Default config with speech-optimized settings
+        default_config = {
+            "freqs_for": "lang",  # Language-style frequencies
+            "theta": 50000,  # Will be adjusted based on max_time
+            "max_time": rope_config.get("max_time", 7200),  # 2 hours of audio
+            "use_xpos": rope_config.get("use_xpos", False),  # XPos for length extrapolation
+            "interpolate_factor": rope_config.get("interpolate_factor", 1.0),
+            "cache_if_possible": True,
+        }
+        
+        # Update with user config (excluding non-constructor parameters)
+        rope_cfg = {**default_config}
+        for k, v in rope_config.items():
+            if k != "enabled":  # Skip the enabled flag as it's not a constructor parameter
+                rope_cfg[k] = v
+        
+        # Inject rotary embeddings into all attention layers
+        for layer_idx, transformer_block in enumerate(llm.layers):
+            if hasattr(transformer_block, 'self_attn'):
+                inject_rotary_embedding(transformer_block.self_attn, rope_cfg)
+                logging.debug(f"Injected rotary embeddings into layer {layer_idx}")
+        
+        # Store config for later use
+        self.rotary_config = rope_cfg
+        logging.info(f"Constrained rotary embeddings enabled with max_time={rope_cfg['max_time']}s")
+
+    def _compute_modality_segments(self, input_ids, audio_embs):
+        """
+        Compute modality segments for mixed audio/text sequences.
+        
+        Args:
+            input_ids: Token IDs with audio placeholders
+            audio_embs: List of audio embedding tensors
+            
+        Returns:
+            List of (start, end, modality_type, time_scale) tuples for each modality segment
+        """
+        segments = []
+        audio_idx = 0
+        current_pos = 0
+        
+        for batch_idx in range(input_ids.shape[0]):
+            batch_segments = []
+            current_pos = 0
+            
+            for pos in range(input_ids.shape[1]):
+                if input_ids[batch_idx, pos] == self.audio_locator_tag_id:
+                    if audio_idx < len(audio_embs):
+                        # Audio segment
+                        audio_len = audio_embs[audio_idx].shape[0]
+                        audio_duration = audio_len * self.token_equivalent_duration
+                        time_scale = audio_duration / audio_len if audio_len > 0 else 1.0
+                        
+                        batch_segments.append((current_pos, current_pos + audio_len, 'audio', time_scale))
+                        current_pos += audio_len
+                        audio_idx += 1
+                else:
+                    # Text token segment (length 1)
+                    batch_segments.append((current_pos, current_pos + 1, 'text', 1.0))
+                    current_pos += 1
+            
+            segments.append(batch_segments)
+        
+        return segments
+
+    def _set_modality_segments_on_layers(self, segments):
+        """
+        Set modality segments on all attention layers that have rotary embeddings.
+        
+        Args:
+            segments: List of (start, end, modality_type, time_scale) tuples for each batch
+        """
+        if not hasattr(self, 'rotary_config') or segments is None:
+            return
+        
+        # Get the base model (handle both PeftModel and regular models)
+        llm = self.llm
+        if hasattr(llm, 'base_model'):
+            llm = llm.base_model.model
+        elif hasattr(llm, 'model'):
+            llm = llm.model
+        
+        # Set segments on all attention layers
+        for transformer_block in llm.layers:
+            if hasattr(transformer_block, 'self_attn') and hasattr(transformer_block.self_attn, 'rotary_emb'):
+                transformer_block.self_attn._current_modality_segments = segments
 
     def forward(
         self,
@@ -209,6 +319,19 @@ class SALMWithAsrDecoder(LightningModule, HFHubMixin):
             replacements=audio_embs,
             target_ids=batch["input_ids"].where(batch["loss_mask"], -100),  # CrossEntropyLoss().ignore_index
         )
+        
+        # Compute modality segments for rotary embeddings (before truncation)
+        if hasattr(self, 'rotary_config'):
+            modality_segments = self._compute_modality_segments(batch["input_ids"], audio_embs)
+            # Adjust segments for sequence truncation (removing last position for target shift)
+            adjusted_segments = []
+            for batch_segments in modality_segments:
+                adj_segments = [(start, min(end, input_embs.shape[1] - 1), mod_type, time_scale) 
+                               for start, end, mod_type, time_scale in batch_segments 
+                               if start < input_embs.shape[1] - 1]
+                adjusted_segments.append(adj_segments)
+            self._set_modality_segments_on_layers(adjusted_segments)
+        
         input_embs = input_embs[:, :-1]
         attention_mask = attention_mask[:, :-1]
         target_ids = target_ids[:, 1:]
@@ -517,6 +640,11 @@ class SALMWithAsrDecoder(LightningModule, HFHubMixin):
                 replacements=audio_embeds,
                 target_ids=None,
             )
+            
+            # Compute and set modality segments for generation
+            if hasattr(self, 'rotary_config'):
+                modality_segments = self._compute_modality_segments(tokens, audio_embeds)
+                self._set_modality_segments_on_layers(modality_segments)
         else:
             # Text-only with embeddings - no audio placeholders to replace
             input_embeds = token_embeds
