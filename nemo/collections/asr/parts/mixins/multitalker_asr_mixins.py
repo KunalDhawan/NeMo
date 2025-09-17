@@ -11,125 +11,267 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
-import os
-from typing import Any, Dict, List, Optional
+
+from typing import Dict, Optional
 import torch
-import torch.nn.functional as F
-from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
-from pytorch_lightning import Trainer
+import torch.nn as nn
+from abc import ABC, abstractmethod
+from omegaconf import ListConfig
 
-from nemo.collections.asr.data.audio_to_text_lhotse_speaker import LhotseSpeechToTextSpkBpeDataset
+from nemo.collections.asr.modules.speaker_kernels import SpeakerMask, SpeakerConcat
+from nemo.utils import logging
 
-from nemo.collections.asr.parts.mixins import (
-    TranscribeConfig,
-    TranscriptionReturnType,
-)
-from nemo.collections.asr.parts.mixins.speaker_kernels import SpeakerKernelMixin
+__all__ = ['SpeakerKernelMixin']
 
-from nemo.collections.asr.models.rnnt_bpe_models import EncDecRNNTBPEModel
-from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
-from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
+def get_spk_kernel_class(
+    spk_kernel_type,
+    input_size,
+    d_model,
+    dropout=0.5
+):
+    if spk_kernel_type == 'ff':
+        return nn.Sequential(nn.Linear(input_size, d_model * 2), nn.ReLU(), nn.Dropout(dropout), nn.Linear(d_model, input_size))
+    elif spk_kernel_type == 'conv2d':
+        return 
+    elif spk_kernel_type == 'mha':
+        return
 
-class EncDecMultiTalkerRNNTBPEModel(EncDecRNNTBPEModel, SpeakerKernelMixin):
-    """Base class for encoder decoder RNNT-based models with subword tokenization."""
-
-    def __init__(self, cfg: DictConfig, trainer: Trainer = None):
-        super().__init__(cfg=cfg, trainer=trainer)
-        # Initialize speaker kernel functionality from mixin
-        self._init_speaker_kernel_config(cfg)
-
-    def _setup_dataloader_from_config(self, config: Optional[Dict]):
-        if config.get("use_lhotse"):
-            # Use open_dict to allow dynamic key addition
-            with open_dict(config):
-                config.global_rank = self.global_rank
-                config.world_size = self.world_size
-            
-            return get_lhotse_dataloader_from_config(
-                config,
-                global_rank=self.global_rank,
-                world_size=self.world_size,
-                dataset=LhotseSpeechToTextSpkBpeDataset(cfg = config, tokenizer=self.tokenizer,),
-            )
-
-    def training_step(self, batch, batch_nb):
-        """Training step with speaker targets."""
-        signal, signal_len, transcript, transcript_len, spk_targets, bg_spk_targets = batch
-
-        # Set speaker targets using mixin method
-        self.set_speaker_targets(spk_targets, bg_spk_targets)
-
-        batch = (signal, signal_len, transcript, transcript_len)
-
-        return super().training_step(batch, batch_nb)
-
-
-    def validation_pass(self, batch, batch_idx, dataloader_idx=0):
-        """Validation pass with speaker targets."""
-        signal, signal_len, transcript, transcript_len, spk_targets, bg_spk_targets = batch
-
-        # Set speaker targets using mixin method
-        self.set_speaker_targets(spk_targets, bg_spk_targets)
-
-        batch = (signal, signal_len, transcript, transcript_len)
-
-        return super().validation_pass(batch, batch_idx, dataloader_idx)
-
-    def _transcribe_forward(self, batch: Any, trcfg: TranscribeConfig):
-        """Transcribe forward with speaker targets."""
-        signal, signal_len, transcript, transcript_len, spk_targets, bg_spk_targets = batch
-
-        # Set speaker targets using mixin method
-        self.set_speaker_targets(spk_targets, bg_spk_targets)
-
-        batch = (signal, signal_len, transcript, transcript_len)
-
-        return super()._transcribe_forward(batch, trcfg)
+class SpeakerKernelMixin:
+    """
+    Mixin class for models that need speaker kernel functionality.
     
-    def _setup_transcribe_dataloader(self, config: Dict) -> 'torch.utils.data.DataLoader':
+    This mixin provides:
+    - Speaker kernel initialization
+    - Hook attachment for applying speaker kernels at specific encoder layers
+    - Support for both main and background speaker kernels
+    
+    Models using this mixin should have the following config parameters:
+    - spk_kernel_type: Type of speaker kernel ('mask', 'concat', 'sinusoidal')
+    - spk_kernel_layers: List of layer indices where to apply speaker kernels
+    - spk_kernel_mask_original: Whether to mask original features
+    - spk_kernel_residual: Whether to use residual connections
+    - add_bg_spk_kernel: Whether to add background speaker kernels
+    """
+    
+    def _init_speaker_kernel_config(self, cfg):
         """
-        Setup function for a temporary data loader which wraps the provided audio file.
-
+        Initialize speaker kernel configuration from model config.
+        
         Args:
-            config: A python dictionary which contains the following keys:
-            paths2audio_files: (a list) of paths to audio files. The files should be relatively short fragments. \
-                Recommended length per file is between 5 and 25 seconds.
-            batch_size: (int) batch size to use during inference. \
-                Bigger will result in better throughput performance but would use more memory.
-            temp_dir: (str) A temporary directory where the audio manifest is temporarily
-                stored.
-
-        Returns:
-            A pytorch DataLoader for the given audio file(s).
+            cfg: Model configuration containing speaker kernel parameters
         """
-        if 'dataset_manifest' in config:
-            manifest_filepath = config['dataset_manifest']
-            batch_size = config['batch_size']
+        # Speaker kernel config
+        self.spk_kernel_type = cfg.get('spk_kernel_type', None)
+        self.spk_kernel_layers = cfg.get('spk_kernel_layers', [])
+        self.spk_kernel_mask_original = cfg.get('spk_kernel_mask_original', True)
+        self.spk_kernel_residual = cfg.get('spk_kernel_residual', True)
+        self.add_bg_spk_kernel = cfg.get('add_bg_spk_kernel', False)
+        
+        # Initialize speaker target containers
+        self.spk_targets = None
+        self.bg_spk_targets = None
+        
+        # Initialize speaker kernels
+        self._init_spk_kernel()
+        
+    def _init_spk_kernel(self):
+        """Initialize speaker kernel modules and register them to encoder layers."""
+        if not isinstance(self.spk_kernel_layers, ListConfig):
+            if self.spk_kernel_type is not None:
+                raise ValueError(f"spk_kernel_layers must be a list, got {type(self.spk_kernel_layers)}")
+            return
+
+        # Initialize speaker kernels for each specified layer
+        hidden_size = self.cfg.model_defaults.enc_hidden
+        self.spk_kernels = torch.nn.ModuleDict()
+        self.bg_spk_kernels = torch.nn.ModuleDict()
+    
+        # Create kernel for each layer index
+        for layer_idx in self.spk_kernel_layers:
+            self.spk_kernels[str(layer_idx)] = get_spk_kernel_class(
+                spk_kernel_type='ff',
+                input_size=hidden_size,
+                d_model=self.cfg.model.encoder.d_model,
+                dropout=0.5
+            )
+            if self.add_bg_spk_kernel:
+                self.bg_spk_kernels[str(layer_idx)] = get_spk_kernel_class(
+                    spk_kernel_type='ff',
+                    input_size=hidden_size,
+                    d_model=self.cfg.model.encoder.d_model,
+                    dropout=0.5
+                )
+
+        if self.spk_kernels:
+            logging.info(f"Initialized speaker kernels for layers: {list(self.spk_kernels.keys())}")
+            self._attach_spk_kernel_hooks()
         else:
-            manifest_filepath = os.path.join(config['temp_dir'], 'manifest.json')
-            batch_size = min(config['batch_size'], len(config['paths2audio_files']))
+            logging.info("No speaker kernels initialized")
 
-        dl_config = {
-            'manifest_filepath': manifest_filepath,
-            'sample_rate': self.preprocessor._sample_rate,
-            'batch_size': batch_size,
-            'shuffle': False,
-            'num_workers': config.get('num_workers', min(batch_size, os.cpu_count() - 1)),
-            'pin_memory': True,
-            'use_lhotse': True,
-            'use_bucketing': False,
-            'channel_selector': config.get('channel_selector', None),
-            'inference_mode': self.cfg.test_ds.get('inference_mode', True),
-            'fixed_spk_id': config.get('fixed_spk_id', None)
-        }
+    def _attach_spk_kernel_hooks(self):
+        """
+        Attach speaker kernel hooks to encoder layers.
+        Following NeMo pattern of separating hook attachment logic.
+        """
+        # Only attach hooks if not already attached
+        if hasattr(self, 'encoder_hooks'):
+            return
 
-        if config.get("augmentor"):
-            dl_config['augmentor'] = config.get("augmentor")
+        self.encoder_hooks = []
+        for layer_idx, kernel in self.spk_kernels.items():
+            idx = int(layer_idx)
 
-        temporary_datalayer = self._setup_dataloader_from_config(config=DictConfig(dl_config))
+            if idx == 0:
+                hook = self.encoder.layers[idx].register_forward_pre_hook(
+                    self._get_spk_kernel_hook_pre_layer(layer_idx), with_kwargs=True
+                )
 
-        return temporary_datalayer
+            if idx > 0:
+                # Attach a post-hook after each layer from 0 to 16.
+                # Since idx > 0, we attach to layer idx-1.
+                hook = self.encoder.layers[idx - 1].register_forward_hook(
+                    self._get_spk_kernel_hook_post_layer(layer_idx)
+                )
+            self.encoder_hooks.append(hook)
+
+    def _get_spk_kernel_hook_pre_layer(self, layer_idx: str):
+        """
+        Returns a hook function for applying speaker kernel transformation.
+        
+        Args:
+            layer_idx (str): Index of the layer to apply the kernel
+            
+        Returns:
+            callable: Hook function that applies speaker kernel
+        """
+
+        def hook_fn(module, args, kwargs):
+            # Pre-hooks with with_kwargs=True must return a (new_args, new_kwargs) tuple.
+            # The input tensor is passed as a keyword argument, so we find it in 'kwargs'.
+            if self.spk_targets is None:
+                return args, kwargs
+                
+            if 'x' in kwargs:
+                x = kwargs['x']
+                x_spk = self.spk_kernels[layer_idx](self.mask_with_speaker_targets(x, self.spk_targets))
+                x_bg_spk = self.bg_spk_kernels[layer_idx](self.mask_with_speaker_targets(x, self.bg_spk_targets))
+                # residual connection
+                x = x + x_spk + x_bg_spk
+                kwargs['x'] = x
+            elif args:
+                # Fallback in case the call signature ever changes
+                x, *rest = args
+                x_spk = self.spk_kernels[layer_idx](self.mask_with_speaker_targets(x, self.spk_targets))
+                x_bg_spk = self.bg_spk_kernels[layer_idx](self.mask_with_speaker_targets(x, self.bg_spk_targets))
+                # residual connection
+                x = x + x_spk + x_bg_spk
+                args = (x, *rest)
+
+            return args, kwargs
+
+        return hook_fn
+
+    def _get_spk_kernel_hook_post_layer(self, layer_idx: str):
+        """
+        Returns a hook function for applying speaker kernel transformation.
+        
+        Args:
+            layer_idx (str): Index of the layer to apply the kernel
+            
+        Returns:
+            callable: Hook function that applies speaker kernel
+        """
+        def hook_fn(module, input, output):
+            if self.spk_targets is None:
+                return output
+                
+            if isinstance(output, tuple):
+                x, *cache = output
+            else:
+                x = output
+
+            x_spk = self.spk_kernels[layer_idx](self.mask_with_speaker_targets(x, self.spk_targets))
+            x_bg_spk = self.bg_spk_kernels[layer_idx](self.mask_with_speaker_targets(x, self.bg_spk_targets))
+            # residual connection
+            x = x + x_spk + x_bg_spk
+
+            if isinstance(output, tuple):
+                return (x, *cache)
+            return x
+        
+        return hook_fn
+
+    def _cleanup_speaker_kernel_hooks(self):
+        """
+        Clean up speaker kernel hooks to prevent memory leaks.
+        Can be called during model cleanup or when switching between modes.
+        """
+        if hasattr(self, 'encoder_hooks'):
+            for hook in self.encoder_hooks:
+                try:
+                    hook.remove()
+                except Exception as e:
+                    logging.warning(f"Failed to remove speaker kernel hook: {e}")
+            delattr(self, 'encoder_hooks')
+            logging.info("Speaker kernel hooks cleaned up")
+
+    def set_speaker_targets(self, spk_targets: Optional[torch.Tensor] = None, 
+                           bg_spk_targets: Optional[torch.Tensor] = None):
+        """
+        Set speaker targets for the model.
+        
+        Args:
+            spk_targets: Main speaker targets tensor
+            bg_spk_targets: Background speaker targets tensor
+        """
+        self.spk_targets = spk_targets
+        self.bg_spk_targets = bg_spk_targets
+
+    def clear_speaker_targets(self):
+        """Clear speaker targets."""
+        self.spk_targets = None
+        self.bg_spk_targets = None
+    
+    def solve_length_mismatch(self, x, mask):
+        """
+        Solve length mismatch between x and mask.
+        """
+        if mask is None:
+            mask = torch.ones_like(x[:, :, 0])
+
+        if mask.shape[1] < x.shape[1]:
+            # pad zero to the left
+            mask = torch.nn.functional.pad(mask, (x.shape[1] - mask.shape[1], 0), mode='constant', value=1)
+
+        if mask.shape[1] > x.shape[1]:
+            mask = mask[:, -x.shape[1]:]
+
+        return mask
+
+    def mask_with_speaker_targets(self, x, spk_targets):
+        """
+        Mask the input with speaker targets.
+        """
+        mask = self.solve_length_mismatch(x, spk_targets)
+        x_spk = x * mask.unsqueeze(2)
+        return x_spk
+
+    def concat_with_speaker_targets(self, x, spk_targets):
+        """
+        Concatenate the input with speaker targets.
+        """
+        mask = self.solve_length_mismatch(x, spk_targets)
+        x_spk = x * mask.unsqueeze(2)
+        return x_spk
+
+# Inference mixins
+class MultiTalkerASRMixin(ABC):
+    """
+    Mixin class for models that need multi-talker ASR functionality.
+    """
+
+    def __init__(self):
+        super().__init__()
 
     def conformer_stream_step(
         self,
