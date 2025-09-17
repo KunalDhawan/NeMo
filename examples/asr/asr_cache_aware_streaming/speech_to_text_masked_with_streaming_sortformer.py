@@ -417,7 +417,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         )
         for sample_idx, sample in enumerate(samples):
             processed_signal, processed_signal_length, stream_id = streaming_buffer.append_audio_file(
-                sample['audio_filepath'], offset=sample['offset'], duration=sample['duration'], stream_id=-1
+                sample['audio_filepath'], stream_id=-1
             )
             if "text" in sample:
                 all_refs_text.append(sample["text"])
