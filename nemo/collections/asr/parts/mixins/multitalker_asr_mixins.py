@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, Optional
+from typing import Any, Dict, List, Optional
 import torch
 import torch.nn as nn
 from abc import ABC, abstractmethod
@@ -30,7 +30,7 @@ def get_spk_kernel_class(
     dropout=0.5
 ):
     if spk_kernel_type == 'ff':
-        return nn.Sequential(nn.Linear(input_size, d_model * 2), nn.ReLU(), nn.Dropout(dropout), nn.Linear(d_model, input_size))
+        return nn.Sequential(nn.Linear(input_size, d_model), nn.ReLU(), nn.Dropout(dropout), nn.Linear(d_model, input_size))
     elif spk_kernel_type == 'conv2d':
         return 
     elif spk_kernel_type == 'mha':
@@ -91,14 +91,14 @@ class SpeakerKernelMixin:
             self.spk_kernels[str(layer_idx)] = get_spk_kernel_class(
                 spk_kernel_type='ff',
                 input_size=hidden_size,
-                d_model=self.cfg.model.encoder.d_model,
+                d_model=self.cfg.encoder.d_model,
                 dropout=0.5
             )
             if self.add_bg_spk_kernel:
                 self.bg_spk_kernels[str(layer_idx)] = get_spk_kernel_class(
                     spk_kernel_type='ff',
                     input_size=hidden_size,
-                    d_model=self.cfg.model.encoder.d_model,
+                    d_model=self.cfg.encoder.d_model,
                     dropout=0.5
                 )
 
