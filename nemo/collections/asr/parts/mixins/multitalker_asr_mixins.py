@@ -89,14 +89,14 @@ class SpeakerKernelMixin:
         # Create kernel for each layer index
         for layer_idx in self.spk_kernel_layers:
             self.spk_kernels[str(layer_idx)] = get_spk_kernel_class(
-                spk_kernel_type='ff',
+                spk_kernel_type=self.spk_kernel_type,
                 input_size=hidden_size,
                 d_model=self.cfg.encoder.d_model,
                 dropout=0.5
             )
             if self.add_bg_spk_kernel:
                 self.bg_spk_kernels[str(layer_idx)] = get_spk_kernel_class(
-                    spk_kernel_type='ff',
+                    spk_kernel_type=self.spk_kernel_type,
                     input_size=hidden_size,
                     d_model=self.cfg.encoder.d_model,
                     dropout=0.5
