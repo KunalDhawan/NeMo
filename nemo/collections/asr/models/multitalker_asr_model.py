@@ -12,22 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-import copy
 import os
-from typing import Dict, List, Optional, Union
-import itertools
-import numpy as np
+from typing import Any, Dict, List, Optional
 import torch
 import torch.nn.functional as F
 from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
 from pytorch_lightning import Trainer
-from typing import Any, Dict, List, Optional, Tuple
-from torch.utils.data import DataLoader
 
 from nemo.collections.asr.data.audio_to_text_lhotse_speaker import LhotseSpeechToTextSpkBpeDataset
 
-from nemo.core.classes.mixins import AccessMixin
-from nemo.collections.asr.parts.preprocessing.segment import ChannelSelectorType
 from nemo.collections.asr.parts.mixins import (
     TranscribeConfig,
     TranscriptionReturnType,
@@ -35,15 +28,10 @@ from nemo.collections.asr.parts.mixins import (
 from nemo.collections.asr.parts.mixins.speaker_kernels import SpeakerKernelMixin
 
 from nemo.collections.asr.models.rnnt_bpe_models import EncDecRNNTBPEModel
-from nemo.collections.asr.models.sortformer_diar_models import SortformerEncLabelModel
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
-from nemo.collections.asr.parts.utils.asr_multispeaker_utils import get_pil_targets
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
 
-from nemo.core.classes.common import typecheck
-from nemo.utils import logging
-
-class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel, SpeakerKernelMixin):
+class EncDecMultiTalkerRNNTBPEModel(EncDecRNNTBPEModel, SpeakerKernelMixin):
     """Base class for encoder decoder RNNT-based models with subword tokenization."""
 
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
@@ -64,59 +52,6 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel, SpeakerKernelMixin):
                 world_size=self.world_size,
                 dataset=LhotseSpeechToTextSpkBpeDataset(cfg = config, tokenizer=self.tokenizer,),
             )
-        
-    @typecheck()
-    def forward(
-        self, input_signal=None, input_signal_length=None, processed_signal=None, processed_signal_length=None
-    ):
-        """
-        Forward pass of the model. Note that for RNNT Models, the forward pass of the model is a 3 step process,
-        and this method only performs the first step - forward of the acoustic model.
-
-        Please refer to the `training_step` in order to see the full `forward` step for training - which
-        performs the forward of the acoustic model, the prediction network and then the joint network.
-        Finally, it computes the loss and possibly compute the detokenized text via the `decoding` step.
-
-        Please refer to the `validation_step` in order to see the full `forward` step for inference - which
-        performs the forward of the acoustic model, the prediction network and then the joint network.
-        Finally, it computes the decoded tokens via the `decoding` step and possibly compute the batch metrics.
-
-        Args:
-            input_signal: Tensor that represents a batch of raw audio signals,
-                of shape [B, T]. T here represents timesteps, with 1 second of audio represented as
-                `self.sample_rate` number of floating point values.
-            input_signal_length: Vector of length B, that contains the individual lengths of the audio
-                sequences.
-            processed_signal: Tensor that represents a batch of processed audio signals,
-                of shape (B, D, T) that has undergone processing via some DALI preprocessor.
-            processed_signal_length: Vector of length B, that contains the individual lengths of the
-                processed audio sequences.
-
-        Returns:
-            A tuple of 2 elements -
-            1) The log probabilities tensor of shape [B, T, D].
-            2) The lengths of the acoustic sequence after propagation through the encoder, of shape [B].
-        """
-        has_input_signal = input_signal is not None and input_signal_length is not None
-        has_processed_signal = processed_signal is not None and processed_signal_length is not None
-        if (has_input_signal ^ has_processed_signal) is False:
-            raise ValueError(
-                f"{self} Arguments ``input_signal`` and ``input_signal_length`` are mutually exclusive "
-                " with ``processed_signal`` and ``processed_signal_len`` arguments."
-            )
-
-        if not has_processed_signal:
-            processed_signal, processed_signal_length = self.preprocessor(
-                input_signal=input_signal,
-                length=input_signal_length,
-            )
-
-        # Spec augment is not applied during evaluation/testing
-        if self.spec_augmentation is not None and self.training:
-            processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
-
-        encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
-        return encoded, encoded_len
 
     def training_step(self, batch, batch_nb):
         """Training step with speaker targets."""
@@ -143,16 +78,10 @@ class EncDecRNNTBPEQLTSASRModel(EncDecRNNTBPEModel, SpeakerKernelMixin):
 
     def _transcribe_forward(self, batch: Any, trcfg: TranscribeConfig):
         """Transcribe forward with speaker targets."""
-        signal, signal_len, transcript, transcript_len, spk_targets = batch
-
-        # Multi-instance inference
-        n_mix = trcfg.mix
-        processed_spk_targets = spk_targets[:, :, :n_mix].transpose(1, 2).reshape(-1, spk_targets.size(1)) # B x T x N_mix -> BN_mix x T
-        signal = signal.unsqueeze(1).repeat(1, n_mix, 1).reshape(-1, signal.size(1)) # B x T -> BN_mix x T
-        signal_len = signal_len.unsqueeze(1).repeat(1, n_mix).reshape(-1) # B -> BN_mix
+        signal, signal_len, transcript, transcript_len, spk_targets, bg_spk_targets = batch
 
         # Set speaker targets using mixin method
-        self.set_speaker_targets(processed_spk_targets)
+        self.set_speaker_targets(spk_targets, bg_spk_targets)
 
         batch = (signal, signal_len, transcript, transcript_len)
 
