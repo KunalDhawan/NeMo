@@ -148,8 +148,6 @@ class SpeakerKernelMixin:
         def hook_fn(module, args, kwargs):
             # Pre-hooks with with_kwargs=True must return a (new_args, new_kwargs) tuple.
             # The input tensor is passed as a keyword argument, so we find it in 'kwargs'.
-            if self.spk_targets is None:
-                return args, kwargs
                 
             if 'x' in kwargs:
                 x = kwargs['x']
