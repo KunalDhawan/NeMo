@@ -15,6 +15,7 @@
 import json
 from dataclasses import dataclass, is_dataclass
 from typing import Optional, Union, List, Tuple, Dict, Any
+from unittest import TextTestResult
 
 import torch
 import pytorch_lightning as pl
@@ -159,16 +160,8 @@ def perform_streaming(
     pad_and_drop_preencoded=False,
     rttm=None,
     debug_mode=False):
-    batch_size = len(streaming_buffer.streams_length)
-    final_offline_tran = None
 
     streaming_buffer_iter = iter(streaming_buffer)
-    streaming_state = diar_model.sortformer_modules.init_streaming_state(
-            batch_size = cfg.batch_size,
-            async_streaming = True,
-            device = diar_model.device
-        )
-    left_offset, right_offset = 0, 0
 
     multispk_asr_streamer = SpeakerTaggedASR(cfg, asr_model, diar_model)
     session_start_time = time.time()
@@ -368,7 +361,6 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         samples = []
         all_refs_text = []
 
-
         with open(args.manifest_file, 'r') as f:
             for line in f:
                 item = json.loads(line)
@@ -385,13 +377,10 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
                 if 'offset' not in item:
                     samples[-1]['offset'] = 0
 
-        # Override batch size: The batch size should be equal to the number of samples in the manifest file
-        # args.batch_size = 1
         logging.info(f"Loaded {len(samples)} from the manifest at {args.manifest_file}.")
 
         start_time = time.time()
         all_streaming_tran = []
-        all_diar_pred_out_stream = []
         streaming_buffer = CacheAwareStreamingAudioBuffer(
             model=asr_model,
             online_normalization=online_normalization,
@@ -417,37 +406,37 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
                 )
 
                 all_streaming_tran.extend([
-                    [hyp.text for hyp in asr_state.previous_hypothesis] for asr_state in instance_manager.asr_state_bank
+                    [hyp.text for hyp in asr_state.previous_hypothesis if hyp is not None] for asr_state in instance_manager.asr_state_bank
                 ])
-                # all_diar_pred_out_stream.append(diar_pred_out_stream)
+
                 streaming_buffer.reset_buffer()        
 
-        if args.output_path is not None:
-            torch.save(all_diar_pred_out_stream, args.output_path.replace('.json', '_diar_pred_out_stream.pt'))
-            hyp_json = args.output_path
-            records = []
-            
-            for i, hyps in enumerate(all_streaming_tran):
-                if hyps == []:
-                    continue
-                audio_filepath = samples[i]["audio_filepath"]
-                uniq_id = audio_filepath.split('/')[-1].split('.')[0]
-                record = [
-                    {
-                        "audio_filepath": audio_filepath,
-                        "session_id": uniq_id,
-                        "speaker": j,
-                        "words": hyp,
-                        # "start_time": hyp['start_time'],
-                        # "end_time": hyp['end_time']
-                    } for j, hyp in enumerate(hyps)
-                ]
+    if args.output_path is not None:
+        write_to_json(all_streaming_tran, samples, args.output_path)
 
-                records.extend(record)
+def write_to_json(all_texts, samples, output_path):
+    records = []
+    for i, texts in enumerate(all_texts):
+        if texts == []:
+            continue
+        audio_filepath = samples[i]["audio_filepath"]
+        uniq_id = audio_filepath.split('/')[-1].split('.')[0]
+        record = [
+            {
+                "audio_filepath": audio_filepath,
+                "session_id": uniq_id,
+                "speaker": j,
+                "words": text,
+                # "start_time": hyp['start_time'],
+                # "end_time": hyp['end_time']
+            } for j, text in enumerate(texts)
+        ]
 
-            with open(hyp_json, 'w') as out_f:
-                json.dump(records, out_f, indent=4)
-            logging.info(f"Saved the transcriptions of the streaming inference in {hyp_json}.")
+        records.extend(record)
                 
+    with open(output_path, 'w') as out_f:
+        json.dump(records, out_f, indent=4)
+    logging.info(f"Saved the transcriptions of the streaming inference in {output_path}.")
+
 if __name__ == '__main__':
     main()

@@ -948,26 +948,110 @@ class SpeakerTaggedASR:
         step_num,
         chunk_audio,
         chunk_lengths,
-        cache_last_channel,
-        cache_last_time,
-        cache_last_channel_len,
-        previous_hypotheses,
-        asr_pred_out_stream,
-        diar_pred_out_stream,
-        streaming_state,
-        left_offset,
-        right_offset,
         is_buffer_empty,
-        pad_and_drop_preencoded,
+        drop_extra_pre_encoded,
         att_context_size,
         binary_diar_preds,
-        n_mix,
         cache_gating,
         cache_gating_buffer_size,
-        valid_speakers_last_time,
         rttm=None
     ):
+
+        nframes_per_chunk = att_context_size[1] + 1
+        if step_num == 0:
+            self.instance_manager.reset(batch_size=chunk_audio.shape[0])
+            self.instance_manager.to(chunk_audio.device)
+
+        # Step 1: get diar states
+        diar_states = self.instance_manager.diar_states
+        diar_pred_out_stream = diar_states.diar_pred_out_stream
+        previous_chunk_preds = diar_states.previous_chunk_preds
+        diar_streaming_state = diar_states.streaming_state
+        # Step 2: diarize
+        new_streaming_state, new_diar_pred_out_stream = self.diar_model.forward_streaming_step(
+            processed_signal=chunk_audio.transpose(1, 2),
+            processed_signal_length=chunk_lengths,
+            streaming_state=diar_streaming_state,
+            total_preds=diar_pred_out_stream,
+            drop_extra_pre_encoded=drop_extra_pre_encoded
+        )
+        new_chunk_preds = new_diar_pred_out_stream[:, -nframes_per_chunk:]
+
+        # Step 3: update diar states
+        self.instance_manager.update_diar_state(
+            diar_pred_out_stream=new_diar_pred_out_stream,
+            previous_chunk_preds=new_chunk_preds,
+            diar_streaming_state=new_streaming_state
+        )
+        # Step 4: find active speakers
+        if cache_gating:
+            active_speakers = self.find_active_speakers(new_chunk_preds, n_active_speakers_per_stream=self.n_active_speakers_per_stream)
+        else:
+            active_speakers = None
+
+        chunk_audio, chunk_lengths = self.forward_pre_encoded(chunk_audio, chunk_lengths, drop_extra_pre_encoded)
+
+        # Step 5: generate instance for active speakers
+        asr_states = self.instance_manager.asr_state_bank
+
+        (
+            active_chunk_audio,
+            active_chunk_lengths,
+            active_speaker_targets,
+            inactive_speaker_targets,
+            active_previous_hypotheses,
+            active_asr_pred_out_stream,
+            active_cache_last_channel,
+            active_cache_last_time,
+            active_cache_last_channel_len 
+        ) = self.get_active_speakers_info(
+            active_speakers=active_speakers, 
+            chunk_audio=chunk_audio, 
+            chunk_lengths=chunk_lengths, 
+        )
+
+        if active_chunk_audio is None:
+            return
+        # Step 6: set active speaker and non-target speaker 
+        self.asr_model.set_speaker_targets(active_speaker_targets, inactive_speaker_targets)
+
+        # Step 7: ASR forward pass for active speakers
+        (
+            pred_out_stream,
+            transcribed_texts,
+            cache_last_channel,
+            cache_last_time,
+            cache_last_channel_len,
+            previous_hypotheses,
+        ) = self.asr_model.conformer_stream_step(
+                processed_signal=active_chunk_audio,
+                processed_signal_length=active_chunk_lengths,
+                cache_last_channel=active_cache_last_channel,
+                cache_last_time=active_cache_last_time,
+                cache_last_channel_len=active_cache_last_channel_len,
+                keep_all_outputs=is_buffer_empty,
+                previous_hypotheses=active_previous_hypotheses,
+                previous_pred_out=active_asr_pred_out_stream,
+                drop_extra_pre_encoded=drop_extra_pre_encoded,
+                return_transcription=True,
+                bypass_pre_encode=True
+            )
+        # Step 8: update ASR states
+        active_id = 0
+        for batch_idx, speaker_ids in enumerate(active_speakers):
+            for speaker_id in speaker_ids:
+                self.instance_manager.update_asr_state(
+                    batch_idx,
+                    speaker_id,
+                    cache_last_channel[:, active_id],
+                    cache_last_time[:, active_id],
+                    cache_last_channel_len[active_id],
+                    previous_hypotheses[active_id],
+                    pred_out_stream[active_id]
+                )
+                active_id += 1
         
+        import ipdb; ipdb.set_trace()
         if step_num > 0:
             left_offset = 8
             chunk_audio = chunk_audio[..., 1:]
@@ -1071,22 +1155,27 @@ class SpeakerTaggedASR:
             speaker_ids_list.append(speaker_ids[mask].tolist())
         return speaker_ids_list
     
-    def get_active_speakers_info(self, asr_states, diar_states, active_speakers, chunk_audio, chunk_lengths):
+    def get_active_speakers_info(self, active_speakers, chunk_audio, chunk_lengths):
         active_chunk_audio = []
         active_chunk_lengths = []
         active_speaker_targets = []
-        active_bg_speaker_targets = []
+        inactive_speaker_targets = []
         active_previous_hypotheses = []
         active_asr_pred_out_stream = []
         active_cache_last_channel = []
         active_cache_last_time = []
         active_cache_last_channel_len = []
+        asr_states = self.instance_manager.asr_state_bank
+        diar_states = self.instance_manager.diar_states
         for batch_idx, speaker_ids in enumerate(active_speakers):
             for speaker_id in speaker_ids:
                 active_chunk_audio.append(chunk_audio[batch_idx, :])
                 active_chunk_lengths.append(chunk_lengths[batch_idx])
-                active_speaker_targets.append(diar_states.diar_pred_out_stream[batch_idx, :, speaker_id])
-                active_bg_speaker_targets.append((diar_states.diar_pred_out_stream[batch_idx, :, speaker_ids] > 0.5).sum(dim=-1) > 0)
+                active_speaker_targets.append(diar_states.previous_chunk_preds[batch_idx, :, speaker_id])
+                inactive_speaker_ids = [i for i in range(len(speaker_ids)) if i != speaker_id]
+                inactive_speaker_targets.append((diar_states.previous_chunk_preds[batch_idx, :, inactive_speaker_ids] > 0.5).sum(dim=0) > 0)
+                if speaker_id not in asr_states[batch_idx].get_speakers():
+                    self.instance_manager.add_speaker(batch_idx, speaker_id)
                 active_previous_hypotheses.append(asr_states[batch_idx].previous_hypothesis[speaker_id])
                 active_asr_pred_out_stream.append(asr_states[batch_idx].previous_pred_out[speaker_id])
                 active_cache_last_channel.append(asr_states[batch_idx].cache_last_channel[:, speaker_id])
@@ -1097,11 +1186,11 @@ class SpeakerTaggedASR:
         active_chunk_audio = torch.stack(active_chunk_audio)
         active_chunk_lengths = torch.stack(active_chunk_lengths)
         active_speaker_targets = torch.stack(active_speaker_targets)
-        active_bg_speaker_targets = torch.stack(active_bg_speaker_targets)
+        inactive_speaker_targets = torch.stack(inactive_speaker_targets)
         active_cache_last_channel = torch.stack(active_cache_last_channel).transpose(0, 1)
         active_cache_last_time = torch.stack(active_cache_last_time).transpose(0, 1)
         active_cache_last_channel_len = torch.stack(active_cache_last_channel_len)
-        return active_chunk_audio, active_chunk_lengths, active_speaker_targets, active_bg_speaker_targets, active_previous_hypotheses, active_asr_pred_out_stream, active_cache_last_channel, active_cache_last_time, active_cache_last_channel_len
+        return active_chunk_audio, active_chunk_lengths, active_speaker_targets, inactive_speaker_targets, active_previous_hypotheses, active_asr_pred_out_stream, active_cache_last_channel, active_cache_last_time, active_cache_last_channel_len
 
     def forward_pre_encoded(self, audio_signal: torch.Tensor, length: torch.Tensor, drop_extra_pre_encoded: int=0) -> None:
         """
@@ -1134,7 +1223,7 @@ class SpeakerTaggedASR:
     ):
         nframes_per_chunk = att_context_size[1] + 1
         if step_num == 0:
-            self.instance_manager.reset()
+            self.instance_manager.reset(batch_size=chunk_audio.shape[0])
             self.instance_manager.to(chunk_audio.device)
 
         # Step 1: get diar states
@@ -1163,7 +1252,7 @@ class SpeakerTaggedASR:
             active_speakers = self.find_active_speakers(new_chunk_preds, n_active_speakers_per_stream=self.n_active_speakers_per_stream)
         else:
             active_speakers = None
-        
+
         chunk_audio, chunk_lengths = self.forward_pre_encoded(chunk_audio, chunk_lengths, drop_extra_pre_encoded)
 
         # Step 5: generate instance for active speakers
@@ -1173,15 +1262,13 @@ class SpeakerTaggedASR:
             active_chunk_audio,
             active_chunk_lengths,
             active_speaker_targets,
-            active_bg_speaker_targets,
+            inactive_speaker_targets,
             active_previous_hypotheses,
             active_asr_pred_out_stream,
             active_cache_last_channel,
             active_cache_last_time,
             active_cache_last_channel_len 
         ) = self.get_active_speakers_info(
-            asr_states=self.instance_manager.asr_state_bank,
-            diar_states=self.instance_manager.diar_states,
             active_speakers=active_speakers, 
             chunk_audio=chunk_audio, 
             chunk_lengths=chunk_lengths, 
@@ -1327,7 +1414,11 @@ class MultiTalkerInstanceManager:
 
         self.reset()
         
-    def reset(self):
+    def reset(self, batch_size=None, num_speakers=None):
+        if batch_size is not None:
+            self.batch_size = batch_size
+        if num_speakers is not None:
+            self.num_speakers = num_speakers
         for i in range(self.batch_size):
             self.asr_state_bank[i].reset(self.asr_model.encoder.get_initial_cache_state(batch_size=1))
         self.diar_states = self.DiarState(batch_size=self.batch_size, num_speakers=self.num_speakers)
