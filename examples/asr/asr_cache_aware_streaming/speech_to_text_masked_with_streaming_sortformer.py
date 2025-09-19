@@ -143,24 +143,26 @@ def format_time(seconds):
     minutes = math.floor(seconds / 60)
     sec = seconds % 60
     return f"{minutes}:{sec:05.2f}"
+
+def calc_drop_extra_pre_encoded(asr_model, step_num, pad_and_drop_preencoded):
+    # for the first step there is no need to drop any tokens after the downsampling as no caching is being used
+    if step_num == 0 and not pad_and_drop_preencoded:
+        return 0
+    else:
+        return asr_model.encoder.streaming_cfg.drop_extra_pre_encoded
     
 def perform_streaming(
     cfg, 
     asr_model, 
     diar_model, 
     streaming_buffer, 
+    pad_and_drop_preencoded=False,
     rttm=None,
     debug_mode=False):
     batch_size = len(streaming_buffer.streams_length)
     final_offline_tran = None
-    cache_last_channel, cache_last_time, cache_last_channel_len = asr_model.encoder.get_initial_cache_state(
-        batch_size=batch_size
-    )
 
-    previous_hypotheses = [Hypothesis(score=0, y_sequence=[]) for i in range(cfg.mix)]
     streaming_buffer_iter = iter(streaming_buffer)
-    asr_pred_out_stream, diar_pred_out_stream  = [torch.tensor([]) for i in range(cfg.mix)], None
-    valid_speakers_last_time = None
     streaming_state = diar_model.sortformer_modules.init_streaming_state(
             batch_size = cfg.batch_size,
             async_streaming = True,
@@ -178,59 +180,39 @@ def perform_streaming(
         with torch.inference_mode():
             with autocast:
                 with torch.no_grad(): 
-                    (transcribed_speaker_texts,
-                    transcribed_texts,
-                    asr_pred_out_stream,
-                    all_sentences_with_timestamps,
-                    cache_last_channel,
-                    cache_last_time,
-                    cache_last_channel_len,
-                    previous_hypotheses,
-                    streaming_state,
-                    diar_pred_out_stream,
-                    valid_speakers_last_time) = multispk_asr_streamer.perform_masked_streaming_stt_spk(
+                    multispk_asr_streamer.perform_masked_streaming_stt_spk(
                         step_num=step_num,
                         chunk_audio=chunk_audio,
                         chunk_lengths=chunk_lengths,
-                        cache_last_channel=cache_last_channel,
-                        cache_last_time=cache_last_time,
-                        cache_last_channel_len=cache_last_channel_len,
                         is_buffer_empty=streaming_buffer.is_buffer_empty(),
-                        previous_hypotheses=previous_hypotheses,
-                        asr_pred_out_stream=asr_pred_out_stream,
-                        diar_pred_out_stream=diar_pred_out_stream,
-                        streaming_state=streaming_state,
-                        left_offset=left_offset,
-                        right_offset=right_offset,
+                        drop_extra_pre_encoded=calc_drop_extra_pre_encoded(
+                            asr_model, step_num, pad_and_drop_preencoded
+                        ),
                         att_context_size=cfg.att_context_size,
-                        pad_and_drop_preencoded=False,
                         binary_diar_preds=cfg.binary_diar_preds,
-                        n_mix=cfg.mix,
                         cache_gating=cfg.get("cache_gating", False),
                         cache_gating_buffer_size=cfg.get("cache_gating_buffer_size", 2),
-                        valid_speakers_last_time=valid_speakers_last_time,
                         rttm=rttm[:step_num*14+14].unsqueeze(0).to(asr_model.device) if rttm is not None else None
                     )
-
-        if debug_mode:
-            logging.info(f"Streaming transcriptions: {extract_transcriptions(previous_hypotheses)}")
         
-        loop_end_time = time.time()
-        feat_frame_count += (chunk_audio.shape[-1] - cfg.discarded_frames)
-        if cfg.real_time_mode:
-            time_diff = max(0, (time.time() - session_start_time) - feat_frame_count * cfg.feat_len_sec)
-            eta_min_sec = format_time(time.time() - session_start_time)
-            logging.info(f"[   REAL TIME MODE   ] min:sec - {eta_min_sec} "
-                         f"Time difference for real-time mode: {time_diff:.4f} seconds")
-            time.sleep(max(0, (chunk_audio.shape[-1] - cfg.discarded_frames)*cfg.feat_len_sec - 
-                           (loop_end_time - loop_start_time) - time_diff * cfg.finetune_realtime_ratio))
+    #     if debug_mode:
+    #         logging.info(f"Streaming transcriptions: {extract_transcriptions(previous_hypotheses)}")
+        
+    #     loop_end_time = time.time()
+    #     feat_frame_count += (chunk_audio.shape[-1] - cfg.discarded_frames)
+    #     if cfg.real_time_mode:
+    #         time_diff = max(0, (time.time() - session_start_time) - feat_frame_count * cfg.feat_len_sec)
+    #         eta_min_sec = format_time(time.time() - session_start_time)
+    #         logging.info(f"[   REAL TIME MODE   ] min:sec - {eta_min_sec} "
+    #                      f"Time difference for real-time mode: {time_diff:.4f} seconds")
+    #         time.sleep(max(0, (chunk_audio.shape[-1] - cfg.discarded_frames)*cfg.feat_len_sec - 
+    #                        (loop_end_time - loop_start_time) - time_diff * cfg.finetune_realtime_ratio))
 
-    final_streaming_tran = extract_transcriptions(previous_hypotheses)
-    # torch.save(diar_pred_out_stream, "diar_pred_out_stream.pt")
-    if rttm is not None:
-        diar_pred_out_stream = rttm
-    
-    return all_sentences_with_timestamps, final_offline_tran, diar_pred_out_stream
+    # final_streaming_tran = extract_transcriptions(previous_hypotheses)
+    # # torch.save(diar_pred_out_stream, "diar_pred_out_stream.pt")
+    # if rttm is not None:
+    #     diar_pred_out_stream = rttm    
+    return multispk_asr_streamer.instance_manager
 
 
 @hydra_runner(config_name="DiarizationConfig", schema=DiarizationConfig)
@@ -425,18 +407,20 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
 
             if (sample_idx + 1) % args.batch_size == 0 or sample_idx == len(samples) - 1:
                 logging.info(f"Starting to stream samples {sample_idx - len(streaming_buffer) + 1} to {sample_idx}...")
-                streaming_tran, offline_tran, diar_pred_out_stream = perform_streaming(
+                instance_manager = perform_streaming(
                     cfg=cfg,
                     asr_model=asr_model,
                     diar_model=diar_model,
                     streaming_buffer=streaming_buffer,
+                    pad_and_drop_preencoded=args.pad_and_drop_preencoded,       
                     rttm=sample['rttm'],
                 )
 
-                all_streaming_tran.append(streaming_tran)
-                all_diar_pred_out_stream.append(diar_pred_out_stream)
-                streaming_buffer.reset_buffer()
-        
+                all_streaming_tran.extend([
+                    [hyp.text for hyp in asr_state.previous_hypothesis] for asr_state in instance_manager.asr_state_bank
+                ])
+                # all_diar_pred_out_stream.append(diar_pred_out_stream)
+                streaming_buffer.reset_buffer()        
 
         if args.output_path is not None:
             torch.save(all_diar_pred_out_stream, args.output_path.replace('.json', '_diar_pred_out_stream.pt'))
@@ -452,14 +436,15 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
                     {
                         "audio_filepath": audio_filepath,
                         "session_id": uniq_id,
-                        "speaker": hyp['speaker'],
-                        "words": hyp['text'],
-                        "start_time": hyp['start_time'],
-                        "end_time": hyp['end_time']
-                    } for hyp in hyps
+                        "speaker": j,
+                        "words": hyp,
+                        # "start_time": hyp['start_time'],
+                        # "end_time": hyp['end_time']
+                    } for j, hyp in enumerate(hyps)
                 ]
-                
+
                 records.extend(record)
+
             with open(hyp_json, 'w') as out_f:
                 json.dump(records, out_f, indent=4)
             logging.info(f"Saved the transcriptions of the streaming inference in {hyp_json}.")

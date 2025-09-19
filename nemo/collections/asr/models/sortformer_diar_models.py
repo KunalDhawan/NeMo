@@ -746,6 +746,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         chunk_pre_encode_embs, chunk_pre_encode_lengths = self.encoder.pre_encode(
             x=processed_signal, lengths=processed_signal_length
         )
+        # To match the output of the ASR model, we need to drop the extra pre-encoded embeddings
         if drop_extra_pre_encoded > 0:
             chunk_pre_encode_embs = chunk_pre_encode_embs[:, drop_extra_pre_encoded:, :]
             chunk_pre_encode_lengths = chunk_pre_encode_lengths - drop_extra_pre_encoded

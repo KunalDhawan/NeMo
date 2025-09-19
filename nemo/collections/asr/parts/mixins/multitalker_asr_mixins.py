@@ -18,7 +18,6 @@ import torch.nn as nn
 from abc import ABC, abstractmethod
 from omegaconf import ListConfig
 
-from nemo.collections.asr.modules.speaker_kernels import SpeakerMask, SpeakerConcat
 from nemo.utils import logging
 
 __all__ = ['SpeakerKernelMixin']
@@ -411,9 +410,9 @@ class MultiTalkerASRMixin(ABC):
         cache_last_channel: torch.Tensor = None,
         cache_last_time: torch.Tensor = None,
         cache_last_channel_len: torch.Tensor = None,
-        keep_all_outputs: bool = True,
         previous_hypotheses: List['Hypothesis'] = None,
         previous_pred_out: torch.Tensor = None,
+        keep_all_outputs: bool = True,
         drop_extra_pre_encoded: int = None,
         return_transcription: bool = True,
         return_log_probs: bool = False,
