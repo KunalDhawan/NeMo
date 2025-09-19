@@ -942,6 +942,68 @@ class SpeakerTaggedASR:
             # import ipdb; ipdb.set_trace()
         return all_sentences
 
+    def find_active_speakers(self, diar_preds, n_active_speakers_per_stream):
+        max_probs = torch.max(diar_preds, dim=1).values # B x T x N --> B x N
+        top_values, top_indices = torch.topk(max_probs, k=n_active_speakers_per_stream, dim=1)
+        masks = top_values > 0.5
+
+        speaker_ids_list = []
+        for speaker_ids, mask in zip(top_indices, masks):   
+            speaker_ids_list.append(speaker_ids[mask].tolist())
+        return speaker_ids_list
+    
+    def get_active_speakers_info(self, active_speakers, chunk_audio, chunk_lengths):
+        active_chunk_audio = []
+        active_chunk_lengths = []
+        active_speaker_targets = []
+        inactive_speaker_targets = []
+        active_previous_hypotheses = []
+        active_asr_pred_out_stream = []
+        active_cache_last_channel = []
+        active_cache_last_time = []
+        active_cache_last_channel_len = []
+        asr_states = self.instance_manager.asr_state_bank
+        diar_states = self.instance_manager.diar_states
+        for batch_idx, speaker_ids in enumerate(active_speakers):
+            for speaker_id in speaker_ids:
+                active_chunk_audio.append(chunk_audio[batch_idx, :])
+                active_chunk_lengths.append(chunk_lengths[batch_idx])
+                active_speaker_targets.append(diar_states.previous_chunk_preds[batch_idx, :, speaker_id])
+                inactive_speaker_ids = [i for i in range(len(speaker_ids)) if i != speaker_id]
+                inactive_speaker_targets.append((diar_states.previous_chunk_preds[batch_idx, :, inactive_speaker_ids] > 0.5).sum(dim=-1) > 0)
+                if speaker_id not in asr_states[batch_idx].get_speakers():
+                    self.instance_manager.add_speaker(batch_idx, speaker_id)
+                active_previous_hypotheses.append(asr_states[batch_idx].previous_hypothesis[speaker_id])
+                active_asr_pred_out_stream.append(asr_states[batch_idx].previous_pred_out[speaker_id])
+                active_cache_last_channel.append(asr_states[batch_idx].cache_last_channel[:, speaker_id])
+                active_cache_last_time.append(asr_states[batch_idx].cache_last_time[:, speaker_id])
+                active_cache_last_channel_len.append(asr_states[batch_idx].cache_last_channel_len[speaker_id])
+        if len(active_chunk_audio) == 0:
+            return None, None, None, None, None, None, None, None, None
+        active_chunk_audio = torch.stack(active_chunk_audio)
+        active_chunk_lengths = torch.stack(active_chunk_lengths)
+        active_speaker_targets = torch.stack(active_speaker_targets)
+        inactive_speaker_targets = torch.stack(inactive_speaker_targets)
+        active_cache_last_channel = torch.stack(active_cache_last_channel).transpose(0, 1)
+        active_cache_last_time = torch.stack(active_cache_last_time).transpose(0, 1)
+        active_cache_last_channel_len = torch.stack(active_cache_last_channel_len)
+        return active_chunk_audio, active_chunk_lengths, active_speaker_targets, inactive_speaker_targets, active_previous_hypotheses, active_asr_pred_out_stream, active_cache_last_channel, active_cache_last_time, active_cache_last_channel_len
+
+    def forward_pre_encoded(self, audio_signal: torch.Tensor, length: torch.Tensor, drop_extra_pre_encoded: int=0) -> None:
+        """
+        Forward the pre-encoded features through the ASR model.
+        """
+        audio_signal = torch.transpose(audio_signal, 1, 2)
+
+        audio_signal, length = self.asr_model.encoder.pre_encode(x=audio_signal, lengths=length)
+        length = length.to(torch.int64)
+        # `self.streaming_cfg` is set by setup_streaming_cfg(), called in the init
+        if drop_extra_pre_encoded:
+            audio_signal = audio_signal[:, drop_extra_pre_encoded :, :]
+            length = (length - drop_extra_pre_encoded).clamp(min=0)
+
+        return audio_signal, length
+
     @measure_eta 
     def perform_queryless_streaming_stt_spk(
         self,
@@ -984,16 +1046,15 @@ class SpeakerTaggedASR:
             diar_streaming_state=new_streaming_state
         )
         # Step 4: find active speakers
+        diar_chunk_preds = new_diar_pred_out_stream[:, -nframes_per_chunk*cache_gating_buffer_size:]
         if cache_gating:
-            active_speakers = self.find_active_speakers(new_chunk_preds, n_active_speakers_per_stream=self.n_active_speakers_per_stream)
+            active_speakers = self.find_active_speakers(diar_chunk_preds, n_active_speakers_per_stream=self.n_active_speakers_per_stream)
         else:
             active_speakers = None
 
         chunk_audio, chunk_lengths = self.forward_pre_encoded(chunk_audio, chunk_lengths, drop_extra_pre_encoded)
 
         # Step 5: generate instance for active speakers
-        asr_states = self.instance_manager.asr_state_bank
-
         (
             active_chunk_audio,
             active_chunk_lengths,
@@ -1010,9 +1071,12 @@ class SpeakerTaggedASR:
             chunk_lengths=chunk_lengths, 
         )
 
-        if active_chunk_audio is None:
+        if active_chunk_audio is None: # do not forward if no active speakers
             return
         # Step 6: set active speaker and non-target speaker 
+        if binary_diar_preds:
+            active_speaker_targets = (active_speaker_targets > 0.5).float()
+            inactive_speaker_targets = (inactive_speaker_targets > 0.5).float()
         self.asr_model.set_speaker_targets(active_speaker_targets, inactive_speaker_targets)
 
         # Step 7: ASR forward pass for active speakers
@@ -1050,162 +1114,6 @@ class SpeakerTaggedASR:
                     pred_out_stream[active_id]
                 )
                 active_id += 1
-        
-        import ipdb; ipdb.set_trace()
-        if step_num > 0:
-            left_offset = 8
-            chunk_audio = chunk_audio[..., 1:]
-            chunk_lengths -= 1
-
-        # Initialize diar_pred_out_stream for the first step for all speakers
-        if diar_pred_out_stream is None:
-            diar_pred_out_stream = torch.zeros((chunk_audio.shape[0], 0, self.diar_model.sortformer_modules.n_spk), device=chunk_audio.device)
-
-        # If n_mix == 1, we only have one speaker, so we don't need to do diarization
-        # and set spk_targets to all ones
-
-        diar_max_len = att_context_size[-1] + 1
-
-        if n_mix == 1:
-            spk_targets = torch.ones((chunk_audio.shape[0], diar_max_len, 1), device=chunk_audio.device) # TODO: fix this hardcoded value
-        else:
-            if rttm is None:
-                
-                streaming_state, diar_pred_out_stream = self.diar_model.forward_streaming_step(
-                    processed_signal=chunk_audio.transpose(1, 2),
-                    processed_signal_length=chunk_lengths,
-                    streaming_state=streaming_state,
-                    total_preds=diar_pred_out_stream,
-                    left_offset=left_offset,
-                    right_offset=right_offset,
-                )
-
-                spk_targets = diar_pred_out_stream
-            else:
-                spk_targets = rttm
-        self.second_speaker_detected = self.second_speaker_detected or any(spk_targets[0, :, 1:].max(0).values > 0.5)
-
-        if not self.second_speaker_detected:
-            spk_targets = torch.zeros((chunk_audio.shape[0], diar_max_len, n_mix), device=chunk_audio.device)
-            spk_targets[:, :, 0] = 1.
-
-        if spk_targets.shape[1] > diar_max_len:
-            spk_targets = spk_targets[:, -diar_max_len:]
-
-        (
-            asr_pred_out_stream,
-            transcribed_texts,
-            cache_last_channel,
-            cache_last_time,
-            cache_last_channel_len,
-            previous_hypotheses,
-            valid_speakers_last_time,
-            # valid_speaker_ids,
-        ) = self.asr_model.conformer_stream_step(
-            processed_signal=chunk_audio,
-            processed_signal_length=chunk_lengths,
-            cache_last_channel=cache_last_channel,
-            cache_last_time=cache_last_time,
-            cache_last_channel_len=cache_last_channel_len,
-            keep_all_outputs=is_buffer_empty,
-            previous_hypotheses=previous_hypotheses,
-            previous_pred_out=asr_pred_out_stream,
-            drop_extra_pre_encoded=calc_drop_extra_pre_encoded(
-                self.asr_model, step_num, pad_and_drop_preencoded
-            ),
-            return_transcription=True,
-            spk_targets=spk_targets,
-            n_mix=n_mix,
-            binary_diar_preds=binary_diar_preds,
-            cache_gating=cache_gating,
-            cache_gating_buffer_size=cache_gating_buffer_size,
-            valid_speakers_last_time=valid_speakers_last_time,
-        )
-        # transcribed_speaker_texts = [None] * n_mix
-        hop_frames = chunk_lengths[0].item() - left_offset - right_offset
-
-        all_sentences = self.get_multi_thread_sentences_values(step_num,previous_hypotheses, hop_frames)
-        print(all_sentences)
-        transcribed_speaker_texts = print_sentences(sentences=all_sentences, 
-                        color_palette=get_color_palette(), 
-                        params=self.cfg)
-        if self.cfg.generate_scripts:
-            write_txt(f'{self.cfg.print_path}', 
-                        transcribed_speaker_texts.strip()) 
-        
-        return (transcribed_speaker_texts,
-                transcribed_texts,
-                asr_pred_out_stream,
-                all_sentences,
-                cache_last_channel,
-                cache_last_time,
-                cache_last_channel_len,
-                previous_hypotheses,
-                streaming_state,
-                diar_pred_out_stream,
-                valid_speakers_last_time)
-
-    def find_active_speakers(self, diar_preds, n_active_speakers_per_stream):
-        max_probs = torch.max(diar_preds, dim=1).values # B x T x N --> B x N
-        top_values, top_indices = torch.topk(max_probs, k=n_active_speakers_per_stream, dim=1)
-        masks = top_values > 0.5
-
-        speaker_ids_list = []
-        for speaker_ids, mask in zip(top_indices, masks):   
-            speaker_ids_list.append(speaker_ids[mask].tolist())
-        return speaker_ids_list
-    
-    def get_active_speakers_info(self, active_speakers, chunk_audio, chunk_lengths):
-        active_chunk_audio = []
-        active_chunk_lengths = []
-        active_speaker_targets = []
-        inactive_speaker_targets = []
-        active_previous_hypotheses = []
-        active_asr_pred_out_stream = []
-        active_cache_last_channel = []
-        active_cache_last_time = []
-        active_cache_last_channel_len = []
-        asr_states = self.instance_manager.asr_state_bank
-        diar_states = self.instance_manager.diar_states
-        for batch_idx, speaker_ids in enumerate(active_speakers):
-            for speaker_id in speaker_ids:
-                active_chunk_audio.append(chunk_audio[batch_idx, :])
-                active_chunk_lengths.append(chunk_lengths[batch_idx])
-                active_speaker_targets.append(diar_states.previous_chunk_preds[batch_idx, :, speaker_id])
-                inactive_speaker_ids = [i for i in range(len(speaker_ids)) if i != speaker_id]
-                inactive_speaker_targets.append((diar_states.previous_chunk_preds[batch_idx, :, inactive_speaker_ids] > 0.5).sum(dim=0) > 0)
-                if speaker_id not in asr_states[batch_idx].get_speakers():
-                    self.instance_manager.add_speaker(batch_idx, speaker_id)
-                active_previous_hypotheses.append(asr_states[batch_idx].previous_hypothesis[speaker_id])
-                active_asr_pred_out_stream.append(asr_states[batch_idx].previous_pred_out[speaker_id])
-                active_cache_last_channel.append(asr_states[batch_idx].cache_last_channel[:, speaker_id])
-                active_cache_last_time.append(asr_states[batch_idx].cache_last_time[:, speaker_id])
-                active_cache_last_channel_len.append(asr_states[batch_idx].cache_last_channel_len[speaker_id])
-        if len(active_chunk_audio) == 0:
-            return None, None, None, None, None, None, None, None, None
-        active_chunk_audio = torch.stack(active_chunk_audio)
-        active_chunk_lengths = torch.stack(active_chunk_lengths)
-        active_speaker_targets = torch.stack(active_speaker_targets)
-        inactive_speaker_targets = torch.stack(inactive_speaker_targets)
-        active_cache_last_channel = torch.stack(active_cache_last_channel).transpose(0, 1)
-        active_cache_last_time = torch.stack(active_cache_last_time).transpose(0, 1)
-        active_cache_last_channel_len = torch.stack(active_cache_last_channel_len)
-        return active_chunk_audio, active_chunk_lengths, active_speaker_targets, inactive_speaker_targets, active_previous_hypotheses, active_asr_pred_out_stream, active_cache_last_channel, active_cache_last_time, active_cache_last_channel_len
-
-    def forward_pre_encoded(self, audio_signal: torch.Tensor, length: torch.Tensor, drop_extra_pre_encoded: int=0) -> None:
-        """
-        Forward the pre-encoded features through the ASR model.
-        """
-        audio_signal = torch.transpose(audio_signal, 1, 2)
-
-        audio_signal, length = self.asr_model.encoder.pre_encode(x=audio_signal, lengths=length)
-        length = length.to(torch.int64)
-        # `self.streaming_cfg` is set by setup_streaming_cfg(), called in the init
-        if drop_extra_pre_encoded:
-            audio_signal = audio_signal[:, drop_extra_pre_encoded :, :]
-            length = (length - drop_extra_pre_encoded).clamp(min=0)
-
-        return audio_signal, length
 
     @measure_eta 
     def perform_masked_streaming_stt_spk(
@@ -1216,7 +1124,6 @@ class SpeakerTaggedASR:
         is_buffer_empty,
         drop_extra_pre_encoded,
         att_context_size,
-        binary_diar_preds,
         cache_gating,
         cache_gating_buffer_size,
         rttm=None
@@ -1248,8 +1155,9 @@ class SpeakerTaggedASR:
             diar_streaming_state=new_streaming_state
         )
         # Step 4: find active speakers
+        diar_chunk_preds = new_diar_pred_out_stream[:, -nframes_per_chunk*cache_gating_buffer_size:]
         if cache_gating:
-            active_speakers = self.find_active_speakers(new_chunk_preds, n_active_speakers_per_stream=self.n_active_speakers_per_stream)
+            active_speakers = self.find_active_speakers(diar_chunk_preds, n_active_speakers_per_stream=self.n_active_speakers_per_stream)
         else:
             active_speakers = None
 

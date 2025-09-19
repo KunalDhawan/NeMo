@@ -182,7 +182,6 @@ def perform_streaming(
                             asr_model, step_num, pad_and_drop_preencoded
                         ),
                         att_context_size=cfg.att_context_size,
-                        binary_diar_preds=cfg.binary_diar_preds,
                         cache_gating=cfg.get("cache_gating", False),
                         cache_gating_buffer_size=cfg.get("cache_gating_buffer_size", 2),
                         rttm=rttm[:step_num*14+14].unsqueeze(0).to(asr_model.device) if rttm is not None else None
