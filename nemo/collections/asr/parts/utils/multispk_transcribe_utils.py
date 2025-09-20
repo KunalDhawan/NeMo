@@ -1161,7 +1161,7 @@ class SpeakerTaggedASR:
         else:
             active_speakers = None
 
-        chunk_audio, chunk_lengths = self.forward_pre_encoded(chunk_audio, chunk_lengths, drop_extra_pre_encoded)
+        # chunk_audio, chunk_lengths = self.forward_pre_encoded(chunk_audio, chunk_lengths, drop_extra_pre_encoded)
 
         # Step 5: generate instance for active speakers
         asr_states = self.instance_manager.asr_state_bank
@@ -1186,10 +1186,17 @@ class SpeakerTaggedASR:
             return
         # Step 6: mask the non-active speakers
         mask = (active_speaker_targets > 0.5).float()
-        if mask.shape[1] > active_chunk_audio.shape[1]:
+        mask = mask.unsqueeze(-1).repeat(1, 1, 8).flatten(1, 2)
+
+        if mask.shape[1] >= active_chunk_audio.shape[2]:
             logging.warning(f"Mask shape {mask.shape} is greater than active_chunk_audio shape {active_chunk_audio.shape}")
-            mask = mask[:, :active_chunk_audio.shape[1]]
-        masked_active_chunk_audio = active_chunk_audio * mask.unsqueeze(-1)
+            mask = mask[:, :active_chunk_audio.shape[2]]
+        else:
+            logging.warning(f"Mask shape {mask.shape} is less than active_chunk_audio shape {active_chunk_audio.shape}")
+            mask = torch.nn.functional.pad(mask, (active_chunk_audio.shape[2] - mask.shape[1], 0), mode='constant', value=0)
+
+        masked_active_chunk_audio = active_chunk_audio * mask.unsqueeze(1)
+        masked_active_chunk_audio[torch.where(masked_active_chunk_audio == 0)] = -16.6355
 
         # Step 7: ASR forward pass for active speakers
         (
@@ -1210,7 +1217,7 @@ class SpeakerTaggedASR:
                 previous_pred_out=active_asr_pred_out_stream,
                 drop_extra_pre_encoded=drop_extra_pre_encoded,
                 return_transcription=True,
-                bypass_pre_encode=True
+                bypass_pre_encode=False
             )
         # Step 8: update ASR states
         active_id = 0
