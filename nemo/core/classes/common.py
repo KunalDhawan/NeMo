@@ -77,7 +77,9 @@ ALLOWED_TARGET_PREFIXES = [
 
 ALLOWED_NEMO_SUBMODULE_PREFIXES = [
     "nemo.collections.common.tokenizers",
-    "nemo.collections.common.parts.adapter_modules",
+    "nemo.collections.common.parts",
+    "nemo.collections.asr.modules",
+    "nemo.collections.asr.parts",
 ]
 
 
