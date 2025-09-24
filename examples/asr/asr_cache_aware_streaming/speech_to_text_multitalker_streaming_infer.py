@@ -21,6 +21,8 @@ import torch
 import pytorch_lightning as pl
 from omegaconf import OmegaConf
 from omegaconf import open_dict
+from lhotse.dataset.collation import collate_matrices
+
 
 import nemo.collections.asr as nemo_asr
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
@@ -162,6 +164,8 @@ def perform_streaming(
     debug_mode=False):
 
     streaming_buffer_iter = iter(streaming_buffer)
+    if rttms is not None:
+        rttms = collate_matrices(rttms).to(asr_model.device)
 
     multispk_asr_streamer = SpeakerTaggedASR(cfg, asr_model, diar_model)
     session_start_time = time.time()
@@ -173,7 +177,7 @@ def perform_streaming(
         with torch.inference_mode():
             with autocast:
                 with torch.no_grad(): 
-                    multispk_asr_streamer.perform_masked_streaming_stt_spk(
+                    multispk_asr_streamer.perform_parallel_streaming_stt_spk(
                         step_num=step_num,
                         chunk_audio=chunk_audio,
                         chunk_lengths=chunk_lengths,
@@ -407,7 +411,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
                     diar_model=diar_model,
                     streaming_buffer=streaming_buffer,
                     pad_and_drop_preencoded=args.pad_and_drop_preencoded,       
-                    rttms=rttms,
+                    rttms=rttms if cfg.spk_supervision == "rttm" else None,
                 )
 
                 all_streaming_tran.extend([
