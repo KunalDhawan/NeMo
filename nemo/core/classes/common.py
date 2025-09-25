@@ -120,6 +120,7 @@ def _is_target_allowed(target: str) -> bool:
     # If it's a class: allow only subclasses of safe bases
     if isinstance(obj, type):
         from nemo.core.classes.modelPT import ModelPT
+
         SAFE_BASES = (torch.nn.Module, ModelPT)
         try:
             if issubclass(obj, SAFE_BASES):
@@ -133,7 +134,7 @@ def _is_target_allowed(target: str) -> bool:
         if any(module_name.startswith(p) for p in ALLOWED_NEMO_SUBMODULE_PREFIXES):
             return True
         return False
-    
+
     # otherwise disallow
     return False
 
