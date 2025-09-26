@@ -61,7 +61,7 @@ class DiarizationConfig:
     diar_model_path: Optional[str] = None  # Path to a .nemo file
     diar_pretrained_name: Optional[str] = None  # Name of a pretrained model
     audio_dir: Optional[str] = None  # Path to a directory which contains audio files
-    # dataset_manifest: Optional[str] = None  # Path to dataset's JSON manifest
+    num_speakers: Optional[int] = 4
     
     audio_key: str = 'audio_filepath'  # Used to override the default audio key in dataset_manifest
     postprocessing_yaml: Optional[str] = None  # Path to a yaml file for postprocessing configurations
@@ -83,13 +83,13 @@ class DiarizationConfig:
     ignore_overlap: bool = False # If True, DER will be calculated only for non-overlapping segments
     
     # Streaming diarization configs
-    streaming_mode: bool = True # If True, streaming diarization will be used. 
-    mem_len: int = 188
-    # mem_refresh_rate: int = 0
+    streaming_mode: bool = True # If True, streaming diarization will be used.
+    spkcache_len: int = 188
+    spkcache_refresh_rate: int = 0
     fifo_len: int = 188
-    step_len: int = 0
-    step_left_context: int = 0
-    step_right_context: int = 0
+    chunk_len: int = 0
+    chunk_left_context: int = 0
+    chunk_right_context: int = 0
 
     # If `cuda` is a negative number, inference will be on CPU only.
     cuda: Optional[int] = None
@@ -118,6 +118,7 @@ class DiarizationConfig:
     
     word_window: int = 50
     fix_speaker_assignments: bool = False
+    sentence_break_threshold_in_sec: float = 10000.0
     fix_prev_words_count: int = 5
     update_prev_words_sentence: int = 5
     left_frame_shift: int = -1
@@ -187,23 +188,6 @@ def perform_streaming(
                         rttm=rttm[:step_num*14+14].unsqueeze(0).to(asr_model.device) if rttm is not None else None
                     )
         
-    #     if debug_mode:
-    #         logging.info(f"Streaming transcriptions: {extract_transcriptions(previous_hypotheses)}")
-        
-    #     loop_end_time = time.time()
-    #     feat_frame_count += (chunk_audio.shape[-1] - cfg.discarded_frames)
-    #     if cfg.real_time_mode:
-    #         time_diff = max(0, (time.time() - session_start_time) - feat_frame_count * cfg.feat_len_sec)
-    #         eta_min_sec = format_time(time.time() - session_start_time)
-    #         logging.info(f"[   REAL TIME MODE   ] min:sec - {eta_min_sec} "
-    #                      f"Time difference for real-time mode: {time_diff:.4f} seconds")
-    #         time.sleep(max(0, (chunk_audio.shape[-1] - cfg.discarded_frames)*cfg.feat_len_sec - 
-    #                        (loop_end_time - loop_start_time) - time_diff * cfg.finetune_realtime_ratio))
-
-    # final_streaming_tran = extract_transcriptions(previous_hypotheses)
-    # # torch.save(diar_pred_out_stream, "diar_pred_out_stream.pt")
-    # if rttm is not None:
-    #     diar_pred_out_stream = rttm    
     return multispk_asr_streamer.instance_manager
 
 
