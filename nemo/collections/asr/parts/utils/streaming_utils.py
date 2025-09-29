@@ -28,7 +28,7 @@ from nemo.collections.asr.data.audio_to_text_lhotse_prompted import PromptedAudi
 from nemo.collections.asr.models import ASRModel
 from nemo.collections.asr.parts.mixins.streaming import StreamingEncoder
 from nemo.collections.asr.parts.preprocessing.features import normalize_batch
-from nemo.collections.asr.parts.preprocessing.segment import get_samples
+from nemo.collections.asr.parts.preprocessing.segment import get_samples, AudioSegment
 from nemo.collections.asr.parts.utils import rnnt_utils
 from nemo.collections.asr.parts.utils.timestamp_utils import get_forced_aligned_timestamps_with_external_model
 from nemo.collections.common.tokenizers.canary_tokenizer import CanaryBPETokenizer
@@ -1513,6 +1513,7 @@ class CacheAwareStreamingAudioBuffer:
             pad_and_drop_preencoded (bool): if true pad first audio chunk and always drop preencoded
         '''
         self.model = model
+        self.sample_rate = model._cfg.sample_rate
         self.buffer = None
         self.buffer_idx = 0
         self.streams_length = None
@@ -1668,8 +1669,13 @@ class CacheAwareStreamingAudioBuffer:
         preprocessor = self.model.from_config_dict(cfg.preprocessor)
         return preprocessor.to(self.get_model_device())
 
-    def append_audio_file(self, audio_filepath, stream_id=-1):
-        audio = get_samples(audio_filepath)
+    def append_audio_file(self, audio_filepath, offset: float = 0.0, duration: float = None, stream_id=-1, trim=False):
+        segment = AudioSegment.segment_from_file(
+            audio_filepath, target_sr=self.sample_rate, n_segments=-1, trim=trim,
+        )
+        end_time = (offset + duration) if duration is not None else (offset + segment.duration)
+        segment.subsegment(start_time=offset, end_time=end_time)
+        audio = segment._samples 
         processed_signal, processed_signal_length, stream_id = self.append_audio(audio, stream_id)
         return processed_signal, processed_signal_length, stream_id
 
