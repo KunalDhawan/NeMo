@@ -16,9 +16,9 @@
 import torch
 
 from nemo.core.classes import Loss, Typing, typecheck
-from nemo.core.neural_types import LabelsType, LengthsType, LossType, NeuralType, ProbsType
+from nemo.core.neural_types import LabelsType, LengthsType, LossType, NeuralType, ProbsType, LogitsType
 
-__all__ = ['BCELoss']
+__all__ = ['BCELoss', 'BCEWithLogitsLoss']
 
 
 class BCELoss(Loss, Typing):
@@ -133,4 +133,65 @@ class BCELoss(Loss, Typing):
                     loss = (binary_weight * norm_weight * self.loss_f(probs, labels)).sum()
                 else:
                     loss = self.loss_f(probs, labels)
+        return loss
+
+
+class BCEWithLogitsLoss(Loss, Typing):
+    """
+    Computes Binary Cross Entropy (BCE) loss with logits. This class expects raw logits as input.
+    """
+
+    @property
+    def input_types(self):
+        """Input types definitions for AnguarLoss."""
+        return {
+            "logits": NeuralType(('B', 'T', 'C'), LogitsType()),
+            'labels': NeuralType(('B', 'T', 'C'), LabelsType()),
+            "target_lens": NeuralType(('B'), LengthsType()),
+        }
+
+    @property
+    def output_types(self):
+        """
+        Output types definitions for binary cross entropy loss. Weights for labels can be set using weight variables.
+        """
+        return {"loss": NeuralType(elements_type=LossType())}
+
+    def __init__(
+        self,
+        reduction: str = 'mean',
+    ):
+        """
+        A custom loss function that supports class normalization,
+        weighted binary cross-entropy, and optional sorting.
+
+        Args:
+            reduction (str): Specifies the reduction to apply to the output,
+                options are 'mean', 'sum', or 'none'. Default is 'mean'.
+        """
+        super().__init__()
+        self.loss_f = torch.nn.BCEWithLogitsLoss(reduction=reduction)
+
+    @typecheck()
+    def forward(self, logits, labels, target_lens):
+        """
+        Calculate binary cross entropy loss based on logits, labels and target_lens variables.
+
+        Args:
+            logits (torch.tensor)
+                Predicted logit value. Sigmoid is not expected.
+            labels (torch.tensor)
+                Groundtruth label for the predicted samples.
+            target_lens (torch.tensor):
+                The actual length of the sequence without zero-padding.
+
+        Returns:
+            loss (NeuralType)
+                Binary cross entropy loss value.
+        """
+        logits_list = [logits[k, : target_lens[k], :] for k in range(logits.shape[0])]
+        targets_list = [labels[k, : target_lens[k], :] for k in range(labels.shape[0])]
+        logits = torch.cat(logits_list, dim=0)
+        labels = torch.cat(targets_list, dim=0)
+        loss = self.loss_f(logits, labels)
         return loss

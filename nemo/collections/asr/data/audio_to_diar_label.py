@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import random
 from collections import OrderedDict
 from statistics import mode
 from typing import Dict, List, Optional, Tuple
@@ -1074,6 +1075,10 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         soft_targets: bool = False,
         subsampling_factor: int = 8,
         device: str = 'cpu',
+        subsegment_mode: bool = False,
+        subsegment_min_len_sec: float = 15.0,
+        subsegment_two_chunks_rate: float = 0.0,
+        subsegment_min_chunk_len_sec: float = 10.0,
     ):
         super().__init__()
         self.collection = EndtoEndDiarizationSpeechLabel(
@@ -1102,6 +1107,18 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         self.floor_decimal = 10**self.round_digits
         self.device = device
         self.global_rank = global_rank
+        self.subsegment_mode = subsegment_mode
+        self.subsegment_min_len_sec = subsegment_min_len_sec
+        self.subsegment_two_chunks_rate = subsegment_two_chunks_rate
+        self.subsegment_min_chunk_len_sec = subsegment_min_chunk_len_sec
+        if self.session_len_sec > 0:
+            assert self.subsegment_min_len_sec <= self.session_len_sec, (
+                f"subsegment_min_len_sec ({self.subsegment_min_len_sec}) cannot be greater than "
+                f"session_len_sec ({self.session_len_sec})"
+            )
+            assert self.subsegment_min_chunk_len_sec * 2 <= self.session_len_sec, (
+                "twice subsegment_min_chunk_len_sec cannot be greater than session_len_sec"
+            )
 
     def __len__(self):
         return len(self.collection)
@@ -1254,11 +1271,197 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         target_len = torch.tensor([ts_tensor.shape[0]])
         return target_len
 
+    def _create_subsegment(self, sample, offset):
+        audio_signal = self.featurizer.process(sample.audio_file, offset=offset, duration=sample.duration)
+        duration = sample.duration
+        
+        with open(sample.rttm_file, 'r') as f:
+            rttm_lines = f.readlines()
+        
+        rttm_timestamps, sess_to_global_spkids = extract_frame_info_from_rttm(offset, duration, rttm_lines)
+        num_speakers = len(sess_to_global_spkids)
+        all_spks = list(sess_to_global_spkids.keys())
+
+        if num_speakers > self.max_spks:
+            spks_tokeep = sorted(random.sample(all_spks, self.max_spks))
+        else:
+            spks_tokeep = all_spks
+
+        spks_todrop = [spk for spk in all_spks if spk not in spks_tokeep]
+        logging.info(f"uniq_id: {sample.uniq_id}, num_speakers: {num_speakers}, spks_tokeep: {spks_tokeep}, spks_todrop: {spks_todrop}")
+
+        frame_level_target = get_frame_targets_from_rttm(
+            rttm_timestamps=rttm_timestamps,
+            offset=offset,
+            duration=duration,
+            round_digits=self.round_digits,
+            feat_per_sec=self.feat_per_sec,
+            max_spks=num_speakers,
+        )
+        #logging.info(f"uniq_id: {sample.uniq_id}, frame_level_target: {frame_level_target.shape}")
+
+        if spks_todrop:
+            activity_todrop = frame_level_target[:, spks_todrop].sum(dim=1) > 0
+            frames_to_keep_mask = torch.logical_not(activity_todrop)
+
+            # Filter frame-level targets based on the mask
+            frame_level_target = frame_level_target[frames_to_keep_mask]
+
+            # Create a corresponding mask for the audio signal by expanding the frame mask
+            samples_per_frame = int(self.featurizer.sample_rate / self.feat_per_sec)
+            audio_mask = frames_to_keep_mask.repeat_interleave(samples_per_frame)
+
+            # Ensure audio_signal and audio_mask have the same length before applying mask
+            min_audio_len = min(audio_signal.shape[0], audio_mask.shape[0])
+            audio_signal = audio_signal[:min_audio_len]
+            audio_mask = audio_mask[:min_audio_len]
+
+            # Apply the mask to the audio signal
+            audio_signal = audio_signal[audio_mask]
+
+        frame_level_target = frame_level_target[:, spks_tokeep]
+
+        if frame_level_target.shape[1] < self.max_spks:
+            pad_width = self.max_spks - frame_level_target.shape[1]
+            frame_level_target = torch.nn.functional.pad(frame_level_target, (0, pad_width), 'constant', 0)
+
+        #logging.info(f"uniq_id: {sample.uniq_id}, audio_signal after dropping spks: {audio_signal.shape}")
+        #logging.info(f"uniq_id: {sample.uniq_id}, frame_level_target after dropping spks: {frame_level_target.shape}")
+        # Randomly trim the segment to a variable length between subsegment_min_len_sec and session_len_sec
+        current_duration_frames = frame_level_target.shape[0]
+        max_len_frames = int(self.session_len_sec * self.feat_per_sec)
+        min_len_frames = int(self.subsegment_min_len_sec * self.feat_per_sec)
+
+        if self.session_len_sec > 0 and current_duration_frames > min_len_frames:
+            use_two_chunks = random.random() < self.subsegment_two_chunks_rate
+            min_chunk_len_frames = int(self.subsegment_min_chunk_len_sec * self.feat_per_sec)
+
+            two_chunks_sampled = False
+            if use_two_chunks and current_duration_frames > 2 * max_len_frames:
+                logging.info(
+                    f"uniq_id: {sample.uniq_id}, trying two chunks: max_len_frames: {max_len_frames}, current_duration_frames: {current_duration_frames}"
+                )
+
+                silence_frames_mask = frame_level_target.sum(dim=1) == 0
+                silence_frame_indices = torch.where(silence_frames_mask)[0]
+
+                len1_max = max_len_frames - min_chunk_len_frames
+                len1 = random.randint(min_chunk_len_frames, len1_max)
+                len2 = max_len_frames - len1
+
+                potential_start1_indices = silence_frame_indices[
+                    silence_frame_indices <= current_duration_frames - max_len_frames
+                ]
+
+                if len(potential_start1_indices) > 0:
+                    start1 = potential_start1_indices[
+                        random.randint(0, len(potential_start1_indices) - 1)
+                    ].item()
+                    logging.info(f"uniq_id: {sample.uniq_id}, successfully sampled start1: {start1}, len1: {len1}")
+                    s2_min = start1 + len1
+                    s2_max = current_duration_frames - len2
+                    valid_start2_indices = silence_frame_indices[
+                        (silence_frame_indices >= s2_min) & (silence_frame_indices <= s2_max)
+                    ]
+
+                    len2_is_fixed = True
+                    if len(valid_start2_indices) == 0:
+                        s2_min_fallback = s2_max + 1
+                        s2_max_fallback = current_duration_frames - min_chunk_len_frames
+                        if s2_max_fallback >= s2_min_fallback:
+                            valid_start2_indices = silence_frame_indices[
+                                (silence_frame_indices >= s2_min_fallback) & (silence_frame_indices <= s2_max_fallback)
+                            ]
+                            len2_is_fixed = False
+                            logging.info(f"uniq_id: {sample.uniq_id}, can't sample start2 of len2: {len2}, trying to reduce len2")
+
+                    if len(valid_start2_indices) > 0:
+                        start2 = valid_start2_indices[random.randint(0, len(valid_start2_indices) - 1)].item()
+
+                        if not len2_is_fixed:
+                            len2 = min(max_len_frames - len1, current_duration_frames - start2)
+
+                        end1, end2 = start1 + len1, start2 + len2
+                        logging.info(f"uniq_id: {sample.uniq_id}, successfully sampled start2: {start2}, len2: {len2}, total len: {len1 + len2}")
+                        logging.info(f"uniq_id: {sample.uniq_id}, sanity check: start1 targets: {frame_level_target[start1]}, start2 targets: {frame_level_target[start2]}")
+
+                        if random.random() < 0.5:
+                            starts, ends = [start1, start2], [end1, end2]
+                        else:
+                            starts, ends = [start2, start1], [end2, end1]
+
+                        logging.info(f"uniq_id: {sample.uniq_id}, starts: {starts}, ends: {ends}")
+
+                        frame_level_target = torch.cat(
+                            [frame_level_target[starts[0] : ends[0]], frame_level_target[starts[1] : ends[1]]]
+                        )
+
+                        samples_per_frame = self.featurizer.sample_rate / self.feat_per_sec
+                        audio_signal = torch.cat(
+                            [
+                                audio_signal[int(starts[0] * samples_per_frame) : int(ends[0] * samples_per_frame)],
+                                audio_signal[int(starts[1] * samples_per_frame) : int(ends[1] * samples_per_frame)],
+                            ]
+                        )
+                        logging.info(
+                            f"uniq_id: {sample.uniq_id}, audio_signal after two-chunk trimming: {audio_signal.shape}"
+                        )
+                        logging.info(
+                            f"uniq_id: {sample.uniq_id}, frame_level_target after two-chunk trimming: {frame_level_target.shape}"
+                        )
+                        two_chunks_sampled = True
+                    else:
+                        logging.info(f"uniq_id: {sample.uniq_id}, can't sample start2, falling back to single chunk")
+                else:
+                    logging.info(f"uniq_id: {sample.uniq_id}, can't sample start1, falling back to single chunk")
+
+            if not two_chunks_sampled:
+                # Get a single chunk
+                max_start_frame = current_duration_frames - min_len_frames
+                start_frame = random.randint(0, max_start_frame)
+                subsegment_len_frames = min(current_duration_frames - start_frame, max_len_frames)
+                end_frame = start_frame + subsegment_len_frames
+                #logging.info(
+                #    f"uniq_id: {sample.uniq_id}, subsegment_len_frames: {subsegment_len_frames}, max_len_frames: {max_len_frames}"
+                #)
+
+                frame_level_target = frame_level_target[start_frame:end_frame]
+                samples_per_frame = self.featurizer.sample_rate / self.feat_per_sec
+                start_sample = int(start_frame * samples_per_frame)
+                end_sample = int(end_frame * samples_per_frame)
+                audio_signal = audio_signal[start_sample:end_sample]
+                #logging.info(f"uniq_id: {sample.uniq_id}, audio_signal after trimming: {audio_signal.shape}")
+                #logging.info(f"uniq_id: {sample.uniq_id}, frame_level_target after trimming: {frame_level_target.shape}")
+
+        if audio_signal.shape[0] == 0:
+            # If all audio was dropped, return empty tensors to be skipped by collate_fn or handled downstream
+            return (
+                torch.tensor([]),
+                torch.tensor(0).long(),
+                torch.tensor([[]]),
+                torch.tensor(0),
+            )
+
+        audio_signal_length = torch.tensor(audio_signal.shape[0]).long()
+        #logging.info(f"uniq_id: {sample.uniq_id}, audio_signal_length: {audio_signal_length}")
+        session_len_sec = audio_signal.shape[0] / self.featurizer.sample_rate
+
+        target_len = self.get_segment_timestamps(duration=session_len_sec, sample_rate=self.featurizer.sample_rate)
+        target_len = torch.clamp(target_len, max=self.get_frame_count_from_time_series_length(audio_signal.shape[0]))
+        targets = self.get_soft_targets_seg(feat_level_target=frame_level_target, target_len=target_len)
+        targets = targets[:target_len, :]
+        logging.info(f"uniq_id: {sample.uniq_id}, targets: {targets.shape}, target_len: {target_len}")
+        return audio_signal, audio_signal_length, targets, target_len
+
     def __getitem__(self, index):
         sample = self.collection[index]
         if sample.offset is None:
             sample.offset = 0
         offset = sample.offset
+
+        if self.subsegment_mode:
+            return self._create_subsegment(sample, offset)
+
         if self.session_len_sec < 0:
             session_len_sec = sample.duration
         else:
@@ -1402,6 +1605,10 @@ class AudioToSpeechE2ESpkDiarDataset(_AudioToSpeechE2ESpkDiarDataset):
         global_rank: int,
         soft_targets: bool,
         device: str,
+        subsegment_mode: bool = False,
+        subsegment_min_len_sec: float = 15.0,
+        subsegment_two_chunks_rate: float = 0.0,
+        subsegment_min_chunk_len_sec: float = 10.0,
     ):
         super().__init__(
             manifest_filepath=manifest_filepath,
@@ -1414,6 +1621,10 @@ class AudioToSpeechE2ESpkDiarDataset(_AudioToSpeechE2ESpkDiarDataset):
             global_rank=global_rank,
             soft_targets=soft_targets,
             device=device,
+            subsegment_mode=subsegment_mode,
+            subsegment_min_len_sec=subsegment_min_len_sec,
+            subsegment_two_chunks_rate=subsegment_two_chunks_rate,
+            subsegment_min_chunk_len_sec=subsegment_min_chunk_len_sec,
         )
 
     def eesd_train_collate_fn(self, batch):

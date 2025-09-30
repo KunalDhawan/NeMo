@@ -16,9 +16,11 @@ import math
 from typing import Optional, Union
 
 import torch
+import torch.nn.functional as F
 from lhotse import SupervisionSet
 from lhotse.cut import MixedCut, MonoCut
-
+from scipy.optimize import linear_sum_assignment
+from nemo.utils import logging
 
 def find_first_nonzero(mat: torch.Tensor, max_cap_val=-1, thres: float = 0.5) -> torch.Tensor:
     """
@@ -174,6 +176,96 @@ def get_pil_targets(labels: torch.Tensor, preds: torch.Tensor, speaker_permutati
     # Reconstruct labels based on the best permutation for each batch
     max_score_permed_labels = reconstruct_labels(labels, batch_perm_inds)  # (batch_size, num_speakers, num_classes)
     return max_score_permed_labels  # (batch_size, num_speakers, num_classes)
+
+
+def get_pil_targets_hungarian(
+    labels: torch.Tensor,
+    logits: torch.Tensor,
+    cls_preds: Optional[torch.Tensor] = None,
+    cls_preds_weight: float = 1.0,
+    metric: str = 'bce',
+) -> torch.Tensor:
+    """
+    Calculates permutation-invariant training (PIT) targets using the Hungarian algorithm.
+    This function finds the optimal permutation of labels to match the predictions by maximizing
+    the dot product between them. This is useful when the number of speakers in labels and
+    predictions differ.
+    Args:
+        labels (torch.Tensor): Ground truth labels of shape (B, T, S), where B is the batch size,
+            T is the number of frames, and S is the number of speakers in labels.
+        logits (torch.Tensor): Predicted speaker logits of shape (B, T, N), where N is the
+            number of speakers in predictions. It is assumed that N >= S.
+        cls_preds (torch.Tensor, optional): Predicted speaker existence probabilities of shape (B, N).
+            If provided, these probabilities are added to the match score to bias the assignment.
+            Defaults to None.
+        cls_preds_weight (float): Weight for the `cls_preds` contribution. Defaults to 1.0.
+        metric (str): Metric to use for the match score. Can be 'accuracy' or 'bce'.
+            If 'accuracy' is used, sigmoid is applied to logits. Defaults to 'bce'.
+    Returns:
+        torch.Tensor: The permuted labels that best match the predictions, of shape (B, T, N).
+    """
+    batch_size, _num_frames, num_speakers_labels = labels.shape
+    _batch_size, _num_frames, num_speakers_preds = logits.shape
+
+    if num_speakers_labels > num_speakers_preds:
+        raise ValueError(
+            f"Number of speakers in labels ({num_speakers_labels}) should not be greater than in predictions ({num_speakers_preds})."
+        )
+
+    # Expand dimensions to calculate the pair-wise match score
+    # logits_expanded: (B, T, N) -> (B, T, 1, N) -> (B, T, S, N)
+    # labels_expanded: (B, T, S) -> (B, T, S, 1) -> (B, T, S, N)
+    logits_expanded = logits.unsqueeze(2).expand(-1, -1, num_speakers_labels, -1)
+    labels_expanded = labels.unsqueeze(3).expand(-1, -1, -1, num_speakers_preds)
+
+    # Calculate match score by averaging the element-wise product over the time dimension.
+    # The result is a match score matrix of shape (B, S, N).
+    if metric == 'accuracy':
+        preds_expanded = torch.sigmoid(logits_expanded)
+        match_score_matrix = (preds_expanded * labels_expanded + (1 - preds_expanded) * (1 - labels_expanded)).mean(
+            dim=1
+        )
+    elif metric == 'bce':
+        # Negative BCE with logits, since we want to maximize the score
+        match_score_matrix = -F.binary_cross_entropy_with_logits(
+            logits_expanded, labels_expanded.to(logits_expanded.dtype), reduction='none'
+        ).mean(dim=1)
+    elif metric == 'dot_product':
+        preds_expanded = torch.sigmoid(logits_expanded)
+        match_score_matrix = (preds_expanded * labels_expanded).mean(dim=1)
+    else:
+        raise ValueError(f"Unsupported metric for Hungarian assignment: {metric}")
+
+    active_speaker_mask = torch.any(labels > 0.5, dim=1)  # (B, S)
+    # If cls_preds is provided, add it to the match score to bias the assignment.
+    if cls_preds is not None:
+        # Add cls_preds contribution only for active speakers
+        match_score_matrix = match_score_matrix + cls_preds_weight * cls_preds.unsqueeze(1)
+        
+    #logging.info(f"match_score_matrix: {match_score_matrix}")
+    # Only consider active speakers for the match score
+    match_score_matrix = match_score_matrix * active_speaker_mask.unsqueeze(2).to(match_score_matrix.dtype)
+    #logging.info(f"match_score_matrix after active speaker mask: {match_score_matrix}")
+
+    # linear_sum_assignment minimizes the cost, so we use the negative of the score for maximization.
+    # We also convert to float32, as numpy doesn't support bfloat16.
+    cost_matrix_np = -match_score_matrix.detach().cpu().to(torch.float32).numpy()
+
+    # Find the best permutation using the Hungarian algorithm for each item in the batch
+    batch_col_ind = []
+    for i in range(batch_size):
+        _row_ind, col_ind = linear_sum_assignment(cost_matrix_np[i])
+        batch_col_ind.append(torch.from_numpy(col_ind).to(labels.device))
+
+    batch_col_ind = torch.stack(batch_col_ind)
+
+    # Create a permutation matrix P of shape (B, S, N) by one-hot encoding the column indices
+    # found by the Hungarian algorithm.
+    P = torch.nn.functional.one_hot(batch_col_ind, num_classes=num_speakers_preds).float()
+
+    # Reconstruct labels with the best permutation
+    reconstructed_labels = torch.matmul(labels, P)
+    return reconstructed_labels
 
 
 def find_segments_from_rttm(

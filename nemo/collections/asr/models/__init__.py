@@ -36,6 +36,7 @@ from nemo.collections.asr.models.rnnt_bpe_models import EncDecRNNTBPEModel
 from nemo.collections.asr.models.rnnt_models import EncDecRNNTModel
 from nemo.collections.asr.models.slu_models import SLUIntentSlotBPEModel
 from nemo.collections.asr.models.sortformer_diar_models import SortformerEncLabelModel
+from nemo.collections.asr.models.nextformer_diar_models import NextformerEncLabelModel
 from nemo.collections.asr.models.ssl_models import (
     EncDecDenoiseMaskedTokenPredModel,
     EncDecMaskedTokenPredModel,
