@@ -54,60 +54,13 @@ import time
 from functools import wraps
 import math
 
-import jiwer
-from jiwer.transforms import RemoveKaldiNonWords
-import re
-# import string as strfrm
-
-jiwer_tn_version6_scoring = jiwer.Compose(
-    [
-        RemoveKaldiNonWords(),
-        jiwer.SubstituteRegexes({r"\"": " ", "^[ \t]+|[ \t]+$": "", r"\u2019": "'"}),
-        jiwer.RemoveEmptyStrings(),
-        jiwer.RemoveMultipleSpaces(),
-    ]
-)
-jiwer_tn_version7_scoring = jiwer.Compose(
-    [
-        jiwer.SubstituteRegexes(
-            {
-                "(?:^|(?<= ))(hm|hmm|mhm|mmh|mmm)(?:(?= )|$)": "hmmm",
-                "(?:^|(?<= ))(uhm|um|umm|umh|ummh)(?:(?= )|$)": "ummm",
-                "(?:^|(?<= ))(uh|uhh)(?:(?= )|$)": "uhhh",
-            }
-        ),
-        jiwer.RemoveEmptyStrings(),
-        jiwer.RemoveMultipleSpaces(),
-    ]
-)
-
-
-def tn_version7_norm_scoring(txt):
-    return jiwer_tn_version7_scoring(
-        jiwer_tn_version6_scoring(txt)  # noqa: E731
-    )  # noqa: E731
-
-def normalize_text(line):
-    line = line.replace("((", "").replace("))", "")
-    # Remove all the bracketed words
-    line = re.sub(r'\[\[.*?\]\]', '', line)
-    line = re.sub(r'\[.*?\]', '', line)
-    line = re.sub( r'\{.*?\}', '', line)
-    # Remove all the language tags
-    line = re.sub(r"[^'a-zA-Z0-9]", ' ', line)
-    line = tn_version7_norm_scoring(line)
-    line = line.lower().strip()
-    line = re.sub(' +', ' ', line).strip()
-    return line
-
-
-
 @dataclass
 class DiarizationConfig:
     # Required configs
     diar_model_path: Optional[str] = None  # Path to a .nemo file
     diar_pretrained_name: Optional[str] = None  # Name of a pretrained model
     audio_dir: Optional[str] = None  # Path to a directory which contains audio files
+    num_speakers: Optional[int] = 4
     
     audio_key: str = 'audio_filepath'  # Used to override the default audio key in dataset_manifest
     postprocessing_yaml: Optional[str] = None  # Path to a yaml file for postprocessing configurations
@@ -158,7 +111,7 @@ class DiarizationConfig:
     output_path: Optional[str] = None
     pad_and_drop_preencoded: bool = False
     set_decoder: Optional[str] = None # ["ctc", "rnnt"]
-    att_context_size: Optional[str] = None
+    att_context_size: Optional[list] = None
     generate_scripts: bool = True
     output_seglst_file: Optional[str] = None
     
@@ -256,7 +209,7 @@ def perform_streaming(
                     cache_last_channel_len,
                     previous_hypotheses,
                     streaming_state,
-                    diar_pred_out_stream) = multispk_asr_streamer.perform_streaming_stt_spk(
+                    diar_pred_out_stream) = multispk_asr_streamer.perform_serial_streaming_stt_spk(
                         step_num=step_num,
                         chunk_audio=chunk_audio,
                         chunk_lengths=chunk_lengths,
@@ -334,6 +287,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         diar_model = SortformerEncLabelModel.restore_from(restore_path=cfg.diar_model_path, 
                                                           map_location=map_location)
     else:
+        import ipdb; ipdb.set_trace()
         raise ValueError("cfg.diar_model_path must end with.ckpt or.nemo!")
     trainer = pl.Trainer(devices=device, accelerator=accelerator)
     diar_model.set_trainer(trainer)
@@ -377,9 +331,10 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
 
     if args.att_context_size is not None:
         if hasattr(asr_model.encoder, "set_default_att_context_size"):
-            asr_model.encoder.set_default_att_context_size(att_context_size=json.loads(args.att_context_size))
+            asr_model.encoder.set_default_att_context_size(att_context_size=args.att_context_size)
         else:
             raise ValueError("Model does not support multiple lookaheads.")
+
     global autocast
     autocast = torch.amp.autocast(asr_model.device.type, enabled=args.use_amp)
 

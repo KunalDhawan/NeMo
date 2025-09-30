@@ -483,7 +483,7 @@ class SpeakerTaggedASR:
         ### multi-instance configs
         self._max_speakers = 16
         self._offset_chunk_start_time = 0.0
-        self._sent_break_sec = cfg.get("sent_break_sec", 1.5)
+        self._sent_break_sec = cfg.get("sent_break_sec", 2.5)
         self._speaker_wise_sentences = {}
         self._prev_history_speaker_texts = [ "" for _ in range(self._max_speakers) ]
         self.second_speaker_detected = False
@@ -824,64 +824,72 @@ class SpeakerTaggedASR:
         self._speaker_wise_sentences[spk_idx][-1]['end_time'] = end_time
         self._speaker_wise_sentences[spk_idx][-1]['text'] += diff_text
 
-    # def get_multi_thread_sentences_values(self, step_num, previous_hypotheses, chunk_length):
-    #     """ 
-    #     Get the sentences values for the given step number for writing and displaying the sentences.
+    def get_multi_thread_sentences_values(self, step_num, speaker_mapping, previous_hypotheses, chunk_length):
+        """ 
+        Get the sentences values for the given step number for writing and displaying the sentences.
 
-    #     Args:
-    #         step_num (int): the step number
-    #         previous_hypotheses (List[Hypothesis]): the previous hypotheses
-    #         chunk_length (int): the chunk length
+        Args:
+            step_num (int): the step number
+            speaker_mapping (Dict[int, int]): the speaker mapping
+            previous_hypotheses (List[Hypothesis]): the previous hypotheses
+            chunk_length (int): the chunk length
 
-    #     Returns:
-    #         sentences (List[Dict[str, Any]]): the sentences values
-    #     """
-    #     sentences = []
-    #     for spk_idx, hypothesis in enumerate(previous_hypotheses):
-    #         if spk_idx not in self._speaker_wise_sentences:
-    #             self._speaker_wise_sentences[spk_idx] = []
+        Returns:
+            sentences (List[Dict[str, Any]]): the sentences values
+        """
+        for prev_hyp_idx, spk_idx in speaker_mapping.items():
+            hypothesis = previous_hypotheses[prev_hyp_idx]
 
-    #         diff_text = self._is_new_text(spk_idx=spk_idx, text=hypothesis.text) 
-    #         if diff_text is not None:
-    #             start_time = self._offset_chunk_start_time + (hypothesis.timestamp[0]) * self._frame_len_sec
-    #             end_time = self._offset_chunk_start_time + (hypothesis.timestamp[-1] + 1) * self._frame_len_sec
+            if spk_idx not in self._speaker_wise_sentences:
+                self._speaker_wise_sentences[spk_idx] = []
 
-    #             # Get the last end time of the previous sentence or None if no sentences are present
-    #             if len(self._speaker_wise_sentences[spk_idx]) > 0:
-    #                 last_end_time = self._speaker_wise_sentences[spk_idx][-1]['end_time']   
-    #             else:
-    #                 last_end_time = 0.0
+            diff_text = self._is_new_text(spk_idx=spk_idx, text=hypothesis.text) 
+            if diff_text is not None:
 
-    #             # Case 1 - If start_tiime is greater than end_time + sent_break_sec, then we need to add the sentence
-    #             if last_end_time == 0.0 or start_time > last_end_time + self._sent_break_sec:
-    #                 if self.cfg.debug_mode:
-    #                     logging.info(f"GAP : Gap detected between sentences for speaker [  {spk_idx}  ] is :[ {(start_time - last_end_time):.4f}, diff_text: {diff_text} ]")
-    #                 self._speaker_wise_sentences[spk_idx].append(self._get_new_sentence_dict(speaker=f"speaker_{spk_idx}", 
-    #                                                                                             start_time=start_time, 
-    #                                                                                             end_time=end_time, 
-    #                                                                                             text=diff_text))
+                sep_flag = False
+                if len(hypothesis.timestamp) > 0:
+                    start_time = self._offset_chunk_start_time + (hypothesis.timestamp[0]) * self._frame_len_sec
+                    end_time = self._offset_chunk_start_time + (hypothesis.timestamp[-1] + 1) * self._frame_len_sec
+                else:
+                    start_time = self._offset_chunk_start_time 
+                    end_time = self._offset_chunk_start_time +  hypothesis.length.item() * self._frame_len_sec
+                    sep_flag = True
 
-    #             # Case 2 - If start_time is less than end_time + sent_break_sec, then we need to update the end_time
-    #             else:
-    #                 if self.cfg.debug_mode:
-    #                     logging.info(f"NO GAP : Gap detected between sentences for speaker {spk_idx} is : {(start_time - last_end_time):.4f}, diff_text: {diff_text}")
-    #                 self._update_last_sentence(spk_idx=spk_idx, end_time=end_time, diff_text=diff_text)
+                # Get the last end time of the previous sentence or None if no sentences are present
+                if len(self._speaker_wise_sentences[spk_idx]) > 0:
+                    last_end_time = self._speaker_wise_sentences[spk_idx][-1]['end_time']   
+                else:
+                    last_end_time = 0.0
 
-    #         # Update the previous history of the speaker text
-    #         if hypothesis.text is not None:
-    #             self._prev_history_speaker_texts[spk_idx] = hypothesis.text
+                # Case 1 - If start_tiime is greater than end_time + sent_break_sec, then we need to add the sentence
+                if sep_flag or (last_end_time == 0.0 or start_time > last_end_time + self._sent_break_sec):
+                    if self.cfg.debug_mode:
+                        logging.info(f"GAP : Gap detected between sentences for speaker [  {spk_idx}  ] is :[ {(start_time - last_end_time):.4f}, diff_text: {diff_text} ]")
+                    self._speaker_wise_sentences[spk_idx].append(self._get_new_sentence_dict(speaker=f"speaker_{spk_idx}", 
+                                                                                             start_time=start_time, 
+                                                                                             end_time=end_time, 
+                                                                                             text=diff_text.lstrip()))
+
+                # Case 2 - If start_time is less than end_time + sent_break_sec, then we need to update the end_time
+                else:
+                    if self.cfg.debug_mode:
+                        logging.info(f"NO GAP : Gap detected between sentences for speaker {spk_idx} is : {(start_time - last_end_time):.4f}, diff_text: {diff_text}")
+                    self._update_last_sentence(spk_idx=spk_idx, end_time=end_time, diff_text=diff_text)
+
+            # Update the previous history of the speaker text
+            if hypothesis.text is not None:
+                self._prev_history_speaker_texts[spk_idx] = hypothesis.text
         
-    #     self._offset_chunk_start_time += chunk_length * self._feat_frame_len_sec
-    #     ### Merge all sentences for each speaker but sort by start_time
-    #     all_sentences = []
-    #     for spk_idx, hypothesis in enumerate(previous_hypotheses):
-    #         all_sentences.extend(self._speaker_wise_sentences[spk_idx])
-    #     all_sentences.sort(key=lambda x: x['start_time'])
-
-    #     return all_sentences
+        self._offset_chunk_start_time += chunk_length * self._feat_frame_len_sec
+        ### Merge all sentences for each speaker but sort by start_time
+        all_sentences = []
+        for spk_idx in range(len(self._speaker_wise_sentences)):
+            all_sentences.extend(self._speaker_wise_sentences[spk_idx])
+        all_sentences.sort(key=lambda x: x['start_time'])
+        return all_sentences
 
     def find_active_speakers(self, diar_preds, n_active_speakers_per_stream):
-        max_probs = torch.max(diar_preds, dim=1).values # B x T x N --> B x N
+        max_probs = torch.max(diar_preds, dim=1).values # (B, T, N) --> (B, N)
         top_values, top_indices = torch.topk(max_probs, k=n_active_speakers_per_stream, dim=1)
         masks = top_values > 0.5
 
@@ -978,7 +986,10 @@ class SpeakerTaggedASR:
         is_buffer_empty,
         pad_and_drop_preencoded,
     ):
-        
+        if step_num == 0:
+            self.instance_manager.reset(batch_size=chunk_audio.shape[0])
+            self.instance_manager.to(chunk_audio.device)
+         
         (
             asr_pred_out_stream,
             transcribed_texts,
@@ -1001,10 +1012,7 @@ class SpeakerTaggedASR:
             return_transcription=True,
         )
 
-        if step_num == 0:
-            self.instance_manager.reset(batch_size=chunk_audio.shape[0])
-            self.instance_manager.to(chunk_audio.device)
-        
+
         if diar_pred_out_stream is None:
             diar_pred_out_stream = torch.zeros((chunk_audio.shape[0], 0, self.diar_model.sortformer_modules.n_spk), device=chunk_audio.device)
 
@@ -1029,6 +1037,7 @@ class SpeakerTaggedASR:
 
         transcribed_speaker_texts = [None] * len(self.test_manifest_dict)
         for idx, (uniq_id, _) in enumerate(self.test_manifest_dict.items()): 
+            # import ipdb; ipdb.set_trace()
             if not (len( previous_hypotheses[idx].text) == 0 and step_num <= self._initial_steps):
                 # Get the word-level dictionaries for each word in the chunk
                 self._word_and_ts_seq[idx] = self.get_frame_and_words_online(uniq_id=uniq_id,
@@ -1097,7 +1106,8 @@ class SpeakerTaggedASR:
         if self._cache_gating:
             active_speakers = self.find_active_speakers(diar_chunk_preds, n_active_speakers_per_stream=self.n_active_speakers_per_stream)
         else:
-            active_speakers = [[list(range(self.n_active_speakers_per_stream))] for _ in range(chunk_audio.shape[0])]
+            # active_speakers = [[list(range(self.n_active_speakers_per_stream))] for _ in range(chunk_audio.shape[0])]
+            active_speakers = [list(range(self.n_active_speakers_per_stream)) for _ in range(chunk_audio.shape[0])]
 
         if (self._masked_asr and self._use_mask_preencode) or not self._masked_asr:
             chunk_audio, chunk_lengths = self.forward_pre_encoded(chunk_audio, chunk_lengths, drop_extra_pre_encoded)
@@ -1155,8 +1165,11 @@ class SpeakerTaggedASR:
             )
         # Step 8: update ASR states
         active_id = 0
+        batch_speaker_mapping = []
         for batch_idx, speaker_ids in enumerate(active_speakers):
+            speaker_mapping = {}
             for speaker_id in speaker_ids:
+                speaker_mapping[active_id] = speaker_id
                 self.instance_manager.update_asr_state(
                     batch_idx,
                     speaker_id,
@@ -1167,6 +1180,17 @@ class SpeakerTaggedASR:
                     pred_out_stream[active_id]
                 )
                 active_id += 1
+            batch_speaker_mapping.append(speaker_mapping)
+
+            if batch_idx in self.cfg.print_sample_indices and self.cfg.generate_scripts:
+                all_sentences = self.get_multi_thread_sentences_values(step_num=step_num, 
+                                                                    speaker_mapping=batch_speaker_mapping[0],
+                                                                    previous_hypotheses=previous_hypotheses, 
+                                                                    chunk_length=chunk_lengths[0].item() )
+                transcribed_speaker_texts = print_sentences(sentences=all_sentences, 
+                                color_palette=get_color_palette(), 
+                                params=self.cfg)
+                write_txt(f'{self.cfg.print_path}', transcribed_speaker_texts.strip()) 
 
 
 class MultiTalkerInstanceManager:
