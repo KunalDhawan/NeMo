@@ -13,11 +13,11 @@
 # limitations under the License.
 
 import json
-from dataclasses import dataclass, is_dataclass
+from dataclasses import dataclass, is_dataclass, field
 from typing import Optional, Union, List, Tuple, Dict, Any
-from unittest import TextTestResult
 
 import torch
+import os
 import pytorch_lightning as pl
 from omegaconf import OmegaConf
 from omegaconf import open_dict
@@ -130,9 +130,11 @@ class DiarizationConfig:
     discarded_frames: int = 8
     limit_max_spks: int = 2
     print_time: bool = True
+    print_sample_indices: List[int] = field(default_factory=lambda: [0])
     colored_text: bool = True
     real_time_mode: bool = False
     print_path: str = "./"
+
     ignored_initial_frame_steps: int = 5
     verbose: bool = False
 
@@ -260,8 +262,7 @@ def launch_parallel_streaming(
     streaming_buffer_iter = iter(streaming_buffer)
     multispk_asr_streamer = SpeakerTaggedASR(cfg, asr_model, diar_model)
     for step_num, (chunk_audio, chunk_lengths) in enumerate(streaming_buffer_iter):
-        
-        logging.info(f"Step ID: {step_num}")
+        # logging.info(f"Step ID: {step_num}")
         with torch.inference_mode():
             with autocast:
                 with torch.no_grad(): 
@@ -290,8 +291,8 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         
     if cfg.diar_model_path is None and cfg.diar_pretrained_name is None:
         raise ValueError("Both cfg.diar_model_path and cfg.pretrained_name cannot be None!")
-    if cfg.audio_dir is None and cfg.manifest_file is None:
-        raise ValueError("Both cfg.audio_dir and cfg.manifest_file cannot be None!")
+    if cfg.audio_file is None and cfg.manifest_file is None:
+        raise ValueError("Both cfg.audio_file and cfg.manifest_file cannot be None!")
 
     # setup GPU
     torch.set_float32_matmul_precision(cfg.matmul_precision)
@@ -412,27 +413,27 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     else:
         online_normalization = False
     
+    all_streaming_tran = []
     if cfg.audio_file is not None:
         # stream a single audio file
+        samples = [{'audio_filepath': cfg.audio_file,}]
         streaming_buffer = CacheAwareStreamingAudioBuffer(
             model=asr_model,
             online_normalization=online_normalization,
             pad_and_drop_preencoded=cfg.pad_and_drop_preencoded,
         )
-        processed_signal, processed_signal_length, stream_id = streaming_buffer.append_audio_file(
-            cfg.audio_file, stream_id=-1
-        )
+        streaming_buffer.append_audio_file(audio_filepath=cfg.audio_file, stream_id=-1)
         if cfg.parallel_speaker_strategy:
-            streaming_tran, offline_tran, diar_pred_out_stream = launch_parallel_streaming(
+            instance_manager = launch_parallel_streaming(
                 cfg=cfg,
                 asr_model=asr_model,
                 diar_model=diar_model,
                 streaming_buffer=streaming_buffer,
                 pad_and_drop_preencoded=cfg.pad_and_drop_preencoded,       
-                # rttms=rttms if cfg.spk_supervision == "rttm" else None,
             )
+
         else:
-            streaming_tran, offline_tran, diar_pred_out_stream = launch_serial_streaming(
+            instance_manager = launch_serial_streaming(
                 cfg=cfg,
                 asr_model=asr_model,
                 diar_model=diar_model,
@@ -447,8 +448,6 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
 
         logging.info(f"Loaded {len(samples)} from the manifest at {cfg.manifest_file}.")
 
-        start_time = time.time()
-        all_streaming_tran = []
         streaming_buffer = CacheAwareStreamingAudioBuffer(
             model=asr_model,
             online_normalization=online_normalization,
@@ -473,11 +472,6 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
                         streaming_buffer=streaming_buffer,
                         pad_and_drop_preencoded=cfg.pad_and_drop_preencoded,       
                     )
-                    for asr_state in instance_manager.batch_asr_states:
-                        all_streaming_tran.append(
-                            [hyp.text for hyp in asr_state.previous_hypothesis if hyp is not None]
-                        )
-
                     streaming_buffer.reset_buffer() 
                 else:
                     instance_manager = launch_serial_streaming(
@@ -488,6 +482,10 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
                     )
 
     if cfg.parallel_speaker_strategy and cfg.output_path is not None:
+        for asr_state in instance_manager.batch_asr_states:
+            all_streaming_tran.append(
+                [hyp.text for hyp in asr_state.previous_hypothesis if hyp is not None]
+            )
         write_to_json(all_streaming_tran, samples, cfg.output_path)
 
 def write_to_json(all_texts, samples, output_path):
@@ -496,15 +494,13 @@ def write_to_json(all_texts, samples, output_path):
         if texts == []:
             continue
         audio_filepath = samples[i]["audio_filepath"]
-        uniq_id = audio_filepath.split('/')[-1].split('.')[0]
+        uniq_id = os.path.basename(audio_filepath).split('.')[0]
         record = [
             {
                 "audio_filepath": audio_filepath,
                 "session_id": uniq_id,
                 "speaker": j,
                 "words": text,
-                # "start_time": hyp['start_time'],
-                # "end_time": hyp['end_time']
             } for j, text in enumerate(texts)
         ]
 
