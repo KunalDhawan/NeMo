@@ -80,6 +80,7 @@ ALLOWED_NEMO_SUBMODULE_PREFIXES = [
     "nemo.collections.common.parts",
     "nemo.collections.asr.modules",
     "nemo.collections.asr.parts",
+    "nemo.collections.audio.parts",
 ]
 
 
