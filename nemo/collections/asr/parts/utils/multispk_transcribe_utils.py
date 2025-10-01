@@ -34,6 +34,7 @@ from nemo.core.config import hydra_runner
 from nemo.collections.asr.parts.utils.speaker_utils import (
 audio_rttm_map as get_audio_rttm_map,
 rttm_to_labels,
+get_uniqname_from_filepath,
 )
 # from examples.asr.asr_cache_aware_streaming.start_words import COMMON_SENTENCE_STARTS
 from nemo.collections.asr.parts.utils.diarization_utils import (
@@ -83,8 +84,8 @@ def measure_eta(func):
         return result  # Return the original function's result
     return wrapper
 
-def get_multi_talker_samples_from_manifest(cfg, manifest_file):
-    samples, all_refs_text, rttms_mask_mats = [], [], []
+def get_multi_talker_samples_from_manifest(cfg, manifest_file: str, feat_per_sec: float, max_spks: int):
+    samples, rttms_mask_mats = [], []
     with open(manifest_file, 'r') as f:
         for line in f:
             item = json.loads(line)
@@ -93,8 +94,15 @@ def get_multi_talker_samples_from_manifest(cfg, manifest_file):
             if cfg.spk_supervision == "rttm":
                 with open(samples[-1]['rttm_filepath'], 'r') as f:
                     rttm_lines = f.readlines()
-                rttm_timestamps, sess_to_global_spkids = extract_frame_info_from_rttm(0, samples[-1]['duration'], rttm_lines)
-                rttm_mat = get_frame_targets_from_rttm(rttm_timestamps, 0, samples[-1]['duration'], 3, 12.5, 4)
+                rttm_timestamps, _ = extract_frame_info_from_rttm(0, samples[-1]['duration'], rttm_lines)
+                rttm_mat = get_frame_targets_from_rttm(
+                    rttm_timestamps=rttm_timestamps,
+                    offset=0,
+                    duration=samples[-1]['duration'],
+                    round_digits=3,
+                    feat_per_sec=round(float(1 / feat_per_sec), 2),
+                    max_spks=max_spks,
+                )
                 rttms_mask_mats.append(rttm_mat)
             samples[-1]['duration'] = None
             if 'offset' not in item:
@@ -104,7 +112,7 @@ def get_multi_talker_samples_from_manifest(cfg, manifest_file):
         rttms_mask_mats = collate_matrices(rttms_mask_mats)
     else:
         rttms_mask_mats = None
-    return samples, all_refs_text, rttms_mask_mats
+    return samples, rttms_mask_mats
 
 
 def setup_diarization_model(cfg: DictConfig, map_location: Optional[str] = None) -> SortformerEncLabelModel:
@@ -462,8 +470,12 @@ class SpeakerTaggedASR:
         self.cfg = cfg
         if self.cfg.manifest_file:
             self.test_manifest_dict = get_audio_rttm_map(self.cfg.manifest_file)
+        elif self.cfg.audio_file is not None:
+            uniq_id = get_uniqname_from_filepath(filepath=self.cfg.audio_file)
+            self.test_manifest_dict = {uniq_id: {'audio_filepath': self.cfg.audio_file, 'seglst_filepath': None, 'rttm_filepath': None}}
         else:
-            self.test_manifest_dict = {}
+            raise ValueError("One of the audio_file and manifest_file should be non-empty!")
+            
         self.asr_model = asr_model
         self.diar_model = diar_model
         
@@ -1037,8 +1049,7 @@ class SpeakerTaggedASR:
 
         transcribed_speaker_texts = [None] * len(self.test_manifest_dict)
         for idx, (uniq_id, _) in enumerate(self.test_manifest_dict.items()): 
-            # import ipdb; ipdb.set_trace()
-            if not (len( previous_hypotheses[idx].text) == 0 and step_num <= self._initial_steps):
+            if not (len(previous_hypotheses[idx].text) == 0 and step_num <= self._initial_steps):
                 # Get the word-level dictionaries for each word in the chunk
                 self._word_and_ts_seq[idx] = self.get_frame_and_words_online(uniq_id=uniq_id,
                                                                             step_num=step_num, 

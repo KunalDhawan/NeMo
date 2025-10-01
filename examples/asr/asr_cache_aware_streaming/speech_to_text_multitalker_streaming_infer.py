@@ -274,7 +274,6 @@ def launch_parallel_streaming(
                         is_buffer_empty=streaming_buffer.is_buffer_empty(),
                         drop_extra_pre_encoded=drop_extra_pre_encoded,
                     )
-        
     return multispk_asr_streamer.instance_manager
 
 
@@ -332,7 +331,6 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     diar_model._cfg.test_ds.num_workers = cfg.num_workers
     diar_model.setup_test_data(test_data_config=diar_model._cfg.test_ds)    
     diar_model = diar_model.eval()
-    
     
     # Steaming mode setup
     diar_model.streaming_mode = cfg.streaming_mode
@@ -413,7 +411,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     else:
         online_normalization = False
     
-    all_streaming_tran = []
+    all_streaming_tran, instance_manager = [], None
     if cfg.audio_file is not None:
         # stream a single audio file
         samples = [{'audio_filepath': cfg.audio_file,}]
@@ -422,6 +420,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
             online_normalization=online_normalization,
             pad_and_drop_preencoded=cfg.pad_and_drop_preencoded,
         )
+        cfg.batch_size = len(samples)
         streaming_buffer.append_audio_file(audio_filepath=cfg.audio_file, stream_id=-1)
         if cfg.parallel_speaker_strategy:
             instance_manager = launch_parallel_streaming(
@@ -441,7 +440,9 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
             )
     else:
         # stream audio files in a manifest file in batched mode
-        samples, all_refs_text, rttms_mask_mats = get_multi_talker_samples_from_manifest(cfg, manifest_file=cfg.manifest_file)
+        feat_per_sec = round(asr_model.cfg.preprocessor.window_stride * asr_model.cfg.encoder.subsampling_factor, 2)
+        samples, rttms_mask_mats = get_multi_talker_samples_from_manifest(cfg, manifest_file=cfg.manifest_file, feat_per_sec=feat_per_sec, max_spks=4)
+        cfg.batch_size = len(samples)
         # Note: rttms_mask_mats contains PyTorch tensors, so we pass it directly instead of storing in config
         if cfg.spk_supervision == "rttm":
             diar_model.add_rttms_mask_mats(rttms_mask_mats, device=asr_model.device)
@@ -455,11 +456,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         )
         
         for sample_idx, sample in enumerate(samples):
-            processed_signal, processed_signal_length, stream_id = streaming_buffer.append_audio_file(
-                sample['audio_filepath'], stream_id=-1
-            )
-            if "text" in sample:
-                all_refs_text.append(sample["text"])
+            streaming_buffer.append_audio_file(sample['audio_filepath'], stream_id=-1)
             logging.info(f'Added this sample to the buffer: {sample["audio_filepath"]}')
 
             if (sample_idx + 1) % cfg.batch_size == 0 or sample_idx == len(samples) - 1:
@@ -481,7 +478,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
                         streaming_buffer=streaming_buffer,
                     )
 
-    if cfg.parallel_speaker_strategy and cfg.output_path is not None:
+    if cfg.parallel_speaker_strategy and cfg.output_path is not None and instance_manager is not None:
         for asr_state in instance_manager.batch_asr_states:
             all_streaming_tran.append(
                 [hyp.text for hyp in asr_state.previous_hypothesis if hyp is not None]
