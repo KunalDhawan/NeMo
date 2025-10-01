@@ -136,19 +136,6 @@ def write_seglst(output_filepath, seglst_list):
     with open(output_filepath, "w") as f:
         f.write(json.dumps(seglst_list, indent=2) + "\n")
 
-def extract_transcriptions(hyps):
-    """
-    The transcribed_texts returned by CTC and RNNT models are different.
-    This method would extract and return the text section of the hypothesis.
-    """
-    if isinstance(hyps[0], Hypothesis):
-        transcriptions = []
-        for hyp in hyps:
-            transcriptions.append(hyp.text)
-    else:
-        transcriptions = hyps
-    return transcriptions
-
 
 def calc_drop_extra_pre_encoded(asr_model, step_num, pad_and_drop_preencoded):
     # for the first step there is no need to drop any tokens after the downsampling as no caching is being used
@@ -296,6 +283,7 @@ def get_word_dict_content_online(
         word (str): The word being processed.
         word_index (int): Index of the word in the sequence.
         diar_pred_out_stream (torch.Tensor): Diarization prediction output stream.
+            Dimensions: (num_frames, num_speakers)
         token_group (List[str]): Group of tokens associated with the word.
         frame_inds_seq (List[int]): Sequence of frame indices.
         time_step_local_offset (int): Local time step offset.
@@ -313,7 +301,7 @@ def get_word_dict_content_online(
     # Edge Cases: Sometimes, repeated token indexs can lead to incorrect frame and speaker assignment.
     if frame_stt == frame_end:
         if frame_stt >= diar_pred_out_stream.shape[0] - 1:
-            frame_stt, frame_end = (diar_pred_out_stream.shape[1] - 1, diar_pred_out_stream.shape[0])
+            frame_stt, frame_end = (diar_pred_out_stream.shape[0] - 1, diar_pred_out_stream.shape[0])
         else:
             frame_end = frame_stt + 1
     
@@ -739,7 +727,6 @@ class SpeakerTaggedASR:
                                                                       word_idx_offset=word_idx_offset, 
                                                                       word_and_ts_seq=word_and_ts_seq, 
                                                                       word_dict=word_dict)
-        
             if self.cfg.fix_speaker_assignments:     
                 word_and_ts_seq = correct_speaker_assignments(word_and_ts_seq=word_and_ts_seq, 
                                                                 sentence_render_length=self._sentence_render_length)
@@ -831,6 +818,17 @@ class SpeakerTaggedASR:
                 return text.replace(self._prev_history_speaker_texts[spk_idx], "")
             else:
                 return text.strip()
+    
+    def generate_seglst_dicts(self):
+        for _, word_ts_and_seq in enumerate(self._word_and_ts_seq):
+            for sentence_dict in word_ts_and_seq['sentences']:
+                seglst_dict = {}
+                seglst_dict["session_id"] = word_ts_and_seq['uniq_id']
+                seglst_dict["speaker"] = sentence_dict['speaker']
+                seglst_dict["words"] = sentence_dict["words"]
+                seglst_dict["start_time"] = float(sentence_dict['start_time'])
+                seglst_dict["end_time"] = float(sentence_dict['end_time'])
+                self.instance_manager.seglst_dict_list.append(seglst_dict)
 
     def _update_last_sentence(self, spk_idx, end_time, diff_text):
         self._speaker_wise_sentences[spk_idx][-1]['end_time'] = end_time
@@ -1191,7 +1189,7 @@ class SpeakerTaggedASR:
                 transcribed_speaker_texts = print_sentences(sentences=all_sentences, 
                                 color_palette=get_color_palette(), 
                                 params=self.cfg)
-                write_txt(f'{self.cfg.print_path}', transcribed_speaker_texts.strip()) 
+                write_txt(f'{self.cfg.print_path.replace(".sh", f"_{batch_idx}.sh")}', transcribed_speaker_texts.strip()) 
 
 
 class MultiTalkerInstanceManager:
@@ -1284,6 +1282,7 @@ class MultiTalkerInstanceManager:
 
         # ASR state bank
         self.batch_asr_states = [self.ASRState(self.num_speakers) for _ in range(self.batch_size)]
+        self.seglst_dict_list = []
 
         # Diar states
         self.diar_states = None
