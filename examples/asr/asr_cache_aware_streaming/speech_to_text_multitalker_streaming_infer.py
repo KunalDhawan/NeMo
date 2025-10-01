@@ -165,10 +165,8 @@ def add_seglst_dicts(spk_tagger):
             seglst_dict["session_id"] = word_ts_and_seq['uniq_id']
             seglst_dict["speaker"] = sentence_dict['speaker']
             seglst_dict["words"] = sentence_dict["words"]
-            seglst_dict["start_time"] = f"{sentence_dict['start_time']:.2f}"
-            seglst_dict["end_time"] = f"{sentence_dict['end_time']:.2f}"
-            duration = f"{sentence_dict['end_time'] - sentence_dict['start_time']:.2f}"
-            seglst_dict["duration"] = duration
+            seglst_dict["start_time"] = float(sentence_dict['start_time'])
+            seglst_dict["end_time"] = float(sentence_dict['end_time'])
             spk_tagger.seglst_dict_list.append(seglst_dict)
 
 def write_seglst_file(seglst_dict_list, output_path):
@@ -180,61 +178,32 @@ def launch_serial_streaming(
     asr_model, 
     diar_model, 
     streaming_buffer, 
+    pad_and_drop_preencoded=False,
     debug_mode=False):
     batch_size = len(streaming_buffer.streams_length)
     final_offline_tran = None
 
-    cache_last_channel, cache_last_time, cache_last_channel_len = asr_model.encoder.get_initial_cache_state(
-        batch_size=batch_size
-    )
-
-    previous_hypotheses = None
     streaming_buffer_iter = iter(streaming_buffer)
-    asr_pred_out_stream, diar_pred_out_stream  = None, None
-    mem_last_time, fifo_last_time = None, None
-    left_offset, right_offset = 0, 0
 
     multispk_asr_streamer = SpeakerTaggedASR(cfg, asr_model, diar_model)
     feat_frame_count = 0
     
-    streaming_state = diar_model.sortformer_modules.init_streaming_state(
-            batch_size = cfg.batch_size,
-            async_streaming = True,
-            device = diar_model.device
-        )
-    
     session_start_time = time.time()
     for step_num, (chunk_audio, chunk_lengths) in enumerate(streaming_buffer_iter):
+        drop_extra_pre_encoded = calc_drop_extra_pre_encoded(asr_model, step_num, pad_and_drop_preencoded)
         loop_start_time = time.time()
         with torch.inference_mode():
             with autocast:
                 with torch.no_grad(): 
-                    (transcribed_speaker_texts,
-                    transcribed_texts,
-                    asr_pred_out_stream,
-                    transcribed_texts,
-                    cache_last_channel,
-                    cache_last_time,
-                    cache_last_channel_len,
-                    previous_hypotheses,
-                    streaming_state,
-                    diar_pred_out_stream) = multispk_asr_streamer.perform_serial_streaming_stt_spk(
+                    multispk_asr_streamer.perform_serial_streaming_stt_spk(
                         step_num=step_num,
                         chunk_audio=chunk_audio,
                         chunk_lengths=chunk_lengths,
-                        cache_last_channel=cache_last_channel,
-                        cache_last_time=cache_last_time,
-                        cache_last_channel_len=cache_last_channel_len,
                         is_buffer_empty=streaming_buffer.is_buffer_empty(),
-                        previous_hypotheses=previous_hypotheses,
-                        asr_pred_out_stream=asr_pred_out_stream,
-                        diar_pred_out_stream=diar_pred_out_stream,
-                        streaming_state=streaming_state,
-                        left_offset=left_offset,
-                        right_offset=right_offset,
-                        pad_and_drop_preencoded=False,
+                        drop_extra_pre_encoded=drop_extra_pre_encoded,
                     )
 
+        transcribed_texts = [asr_state.previous_hypothesis[0] for asr_state in multispk_asr_streamer.instance_manager.batch_asr_states]
         if debug_mode:
             logging.info(f"Streaming transcriptions: {extract_transcriptions(transcribed_texts)}")
         loop_end_time = time.time()

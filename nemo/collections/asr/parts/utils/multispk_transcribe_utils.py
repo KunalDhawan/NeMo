@@ -974,21 +974,18 @@ class SpeakerTaggedASR:
         step_num,
         chunk_audio,
         chunk_lengths,
-        cache_last_channel,
-        cache_last_time,
-        cache_last_channel_len,
-        previous_hypotheses,
-        asr_pred_out_stream,
-        diar_pred_out_stream,
-        streaming_state,
-        left_offset,
-        right_offset,
         is_buffer_empty,
-        pad_and_drop_preencoded,
+        drop_extra_pre_encoded,
     ):
         if step_num == 0:
             self.instance_manager.reset(batch_size=chunk_audio.shape[0])
             self.instance_manager.to(chunk_audio.device)
+
+        self.instance_manager.get_active_speakers_info(
+            active_speakers=[[0]*chunk_audio.shape[0]], 
+            chunk_audio=chunk_audio, 
+            chunk_lengths=chunk_lengths, 
+        )
          
         (
             asr_pred_out_stream,
@@ -1000,40 +997,33 @@ class SpeakerTaggedASR:
         ) = self.asr_model.conformer_stream_step(
             processed_signal=chunk_audio,
             processed_signal_length=chunk_lengths,
-            cache_last_channel=cache_last_channel,
-            cache_last_time=cache_last_time,
-            cache_last_channel_len=cache_last_channel_len,
+            cache_last_channel=self.instance_manager.active_cache_last_channel,
+            cache_last_time=self.instance_manager.active_cache_last_time,
+            cache_last_channel_len=self.instance_manager.active_cache_last_channel_len,
+            previous_hypotheses=self.instance_manager.active_previous_hypotheses,
+            previous_pred_out=self.instance_manager.active_asr_pred_out_stream,
             keep_all_outputs=is_buffer_empty,
-            previous_hypotheses=previous_hypotheses,
-            previous_pred_out=asr_pred_out_stream,
-            drop_extra_pre_encoded=calc_drop_extra_pre_encoded(
-                self.asr_model, step_num, pad_and_drop_preencoded
-            ),
+            drop_extra_pre_encoded=drop_extra_pre_encoded,
             return_transcription=True,
         )
 
+        if self.diar_model.rttms_mask_mats is None:
 
-        if diar_pred_out_stream is None:
-            diar_pred_out_stream = torch.zeros((chunk_audio.shape[0], 0, self.diar_model.sortformer_modules.n_spk), device=chunk_audio.device)
-
-        if step_num > 0:
-            left_offset = 8
-            chunk_audio = chunk_audio[..., 1:]
-            chunk_lengths -= 1
-
-        streaming_state, diar_pred_out_stream = self.diar_model.forward_streaming_step(
-            processed_signal=chunk_audio.transpose(1, 2),
-            processed_signal_length=chunk_lengths,
-            streaming_state=streaming_state,
-            total_preds=diar_pred_out_stream,
-            left_offset=left_offset,
-            right_offset=right_offset,
-        )
-        
-        if self.diar_model.rttms_mask_mats is not None:
+            new_streaming_state, diar_pred_out_stream = self.diar_model.forward_streaming_step(
+                processed_signal=chunk_audio.transpose(1, 2),
+                processed_signal_length=chunk_lengths,
+                streaming_state=self.instance_manager.diar_states.streaming_state,
+                total_preds=self.instance_manager.diar_states.diar_pred_out_stream,
+                drop_extra_pre_encoded=drop_extra_pre_encoded
+            )
+            self.instance_manager.update_diar_state(
+                diar_pred_out_stream=diar_pred_out_stream,
+                previous_chunk_preds=diar_pred_out_stream[:, -self._nframes_per_chunk:],
+                diar_streaming_state=new_streaming_state
+            )
+        else:
             _, new_chunk_preds = self.get_diar_pred_out_stream(step_num)
             diar_pred_out_stream = new_chunk_preds
-
 
         transcribed_speaker_texts = [None] * len(self.test_manifest_dict)
         for idx, (uniq_id, _) in enumerate(self.test_manifest_dict.items()): 
@@ -1056,17 +1046,18 @@ class SpeakerTaggedASR:
                             params=self.cfg)
                         write_txt(f'{self.cfg.print_path}'.replace(".sh", f"_{idx}.sh"), 
                                   transcribed_speaker_texts[idx].strip())
-            
-        return (transcribed_speaker_texts,
-                transcribed_texts,
-                asr_pred_out_stream,
-                transcribed_texts,
-                cache_last_channel,
-                cache_last_time,
-                cache_last_channel_len,
-                previous_hypotheses,
-                streaming_state,
-                diar_pred_out_stream)
+        
+        for batch_idx in range(chunk_audio.shape[0]):
+            self.instance_manager.update_asr_state(
+                batch_idx,
+                speaker_id=0,
+                cache_last_channel=cache_last_channel[:, batch_idx],
+                cache_last_time=cache_last_time[:, batch_idx],
+                cache_last_channel_len=cache_last_channel_len[batch_idx],
+                previous_hypotheses=previous_hypotheses[batch_idx],
+                previous_pred_out=asr_pred_out_stream[batch_idx]
+            )
+        
 
     @measure_eta 
     def perform_parallel_streaming_stt_spk(
@@ -1083,7 +1074,7 @@ class SpeakerTaggedASR:
 
         # Step 2: diarize or get GT rttms
         if self.diar_model.rttms_mask_mats is None:
-            _, new_diar_pred_out_stream = self.diar_model.forward_streaming_step(
+            new_streaming_state, new_diar_pred_out_stream = self.diar_model.forward_streaming_step(
                 processed_signal=chunk_audio.transpose(1, 2),
                 processed_signal_length=chunk_lengths,
                 streaming_state=self.instance_manager.diar_states.streaming_state,
@@ -1091,16 +1082,15 @@ class SpeakerTaggedASR:
                 drop_extra_pre_encoded=drop_extra_pre_encoded
             )
             new_chunk_preds = new_diar_pred_out_stream[:, -self._nframes_per_chunk:]
+            # Step 3: update diar states
+            self.instance_manager.update_diar_state(
+                diar_pred_out_stream=new_diar_pred_out_stream,
+                previous_chunk_preds=new_chunk_preds,
+                diar_streaming_state=new_streaming_state
+            )
         else:
             new_diar_pred_out_stream, new_chunk_preds = self.get_diar_pred_out_stream(step_num)
 
-        # Step 3: update diar states
-        self.instance_manager.update_diar_state(
-            diar_pred_out_stream=new_diar_pred_out_stream,
-            previous_chunk_preds=new_chunk_preds,
-            diar_streaming_state=self.instance_manager.diar_states.streaming_state
-        )
-        
         # Step 4: find active speakers
         diar_chunk_preds = new_diar_pred_out_stream[:, -self._nframes_per_chunk*self._cache_gating_buffer_size:]
         if self._cache_gating:
@@ -1361,7 +1351,7 @@ class MultiTalkerInstanceManager:
         cache_last_channel,
         cache_last_time,
         cache_last_channel_len,
-        previous_hypothesis,
+        previous_hypotheses,
         previous_pred_out
     ):
         self.batch_asr_states[batch_idx].update_asr_state(
@@ -1369,7 +1359,7 @@ class MultiTalkerInstanceManager:
             cache_last_channel, 
             cache_last_time, 
             cache_last_channel_len, 
-            previous_hypothesis, 
+            previous_hypotheses, 
             previous_pred_out
         )
      

@@ -25,14 +25,14 @@ from nemo.collections.asr.parts.mixins import (
     TranscribeConfig,
     TranscriptionReturnType,
 )
-from nemo.collections.asr.parts.mixins.multitalker_asr_mixins import SpeakerKernelMixin, MultiTalkerASRMixin
+from nemo.collections.asr.parts.mixins.multitalker_asr_mixins import SpeakerKernelMixin
 
 from nemo.collections.asr.models.rnnt_bpe_models import EncDecRNNTBPEModel
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
 
 
-class EncDecMultiTalkerRNNTBPEModel(EncDecRNNTBPEModel, SpeakerKernelMixin, MultiTalkerASRMixin):
+class EncDecMultiTalkerRNNTBPEModel(EncDecRNNTBPEModel, SpeakerKernelMixin):
     """Base class for encoder decoder RNNT-based models with subword tokenization."""
 
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
