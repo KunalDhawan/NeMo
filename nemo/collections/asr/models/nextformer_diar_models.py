@@ -310,7 +310,9 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         encoder_mask = self.nextformer_modules.length_to_mask(emb_seq_length, emb_seq.shape[1])
         trans_emb_seq = self.transformer_encoder(encoder_states=emb_seq, encoder_mask=encoder_mask)
         encoder_query_mask = encoder_mask.unsqueeze(1).expand(-1, self.query_encoder.num_latents, -1)
-        spk_queries = self.query_encoder(encoder_states=trans_emb_seq, encoder_mask=encoder_query_mask, hidden_states=None, hidden_mask=None)
+        spk_queries = self.query_encoder(
+            encoder_states=trans_emb_seq, encoder_mask=encoder_query_mask, latent_states=None, latent_mask=None
+        )
         logits = self.nextformer_modules.forward_spk_logits(trans_emb_seq, spk_queries)
         query_logits = self.nextformer_modules.forward_query_logits(spk_queries)
         return logits, query_logits
@@ -591,7 +593,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         ats_loss = loss_scale_factor * self.loss(logits=logits, labels=targets_ats, target_lens=target_lens)
         cls_loss = self.cls_loss(query_logits, targets_cls)
 
-        loss = self.ats_weight * ats_loss + self.pil_weight * pil_loss + self.cls_weight * cls_loss
+        loss = self.ats_weight * ats_loss + self.pil_weight * pil_loss + self.cls_weight * loss_scale_factor * cls_loss
 
         self._accuracy_train(preds, targets_pil, target_lens)
         train_f1_acc, train_precision, train_recall = self._accuracy_train.compute()
@@ -689,7 +691,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         val_ats_loss = loss_scale_factor * self.loss(logits=logits, labels=targets_ats, target_lens=target_lens)
         val_cls_loss = self.cls_loss(query_logits, targets_cls)
 
-        val_loss = self.ats_weight * val_ats_loss + self.pil_weight * val_pil_loss + self.cls_weight * val_cls_loss
+        val_loss = self.ats_weight * val_ats_loss + self.pil_weight * val_pil_loss + self.cls_weight * loss_scale_factor * val_cls_loss
 
         self._accuracy_valid(preds, targets_pil, target_lens)
         val_f1_acc, val_precision, val_recall = self._accuracy_valid.compute()
