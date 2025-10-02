@@ -127,7 +127,6 @@ class DiarizationConfig:
     right_frame_shift: int = 0
     min_sigmoid_val: float = 1e-2
     discarded_frames: int = 8
-    limit_max_spks: int = 2
     print_time: bool = True
     print_sample_indices: List[int] = field(default_factory=lambda: [0])
     colored_text: bool = True
@@ -140,7 +139,7 @@ class DiarizationConfig:
     feat_len_sec: float = 0.01
     finetune_realtime_ratio: float = 0.01
 
-    mix: int = 2
+    mix: int = 4
     spk_supervision: str = "diar"
     binary_diar_preds: bool = False
 
@@ -440,7 +439,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     else:
         # stream audio files in a manifest file in batched mode
         feat_per_sec = round(asr_model.cfg.preprocessor.window_stride * asr_model.cfg.encoder.subsampling_factor, 2)
-        samples, rttms_mask_mats = get_multi_talker_samples_from_manifest(cfg, manifest_file=cfg.manifest_file, feat_per_sec=feat_per_sec, max_spks=4)
+        samples, rttms_mask_mats = get_multi_talker_samples_from_manifest(cfg, manifest_file=cfg.manifest_file, feat_per_sec=feat_per_sec, max_spks=cfg.mix)
         cfg.batch_size = len(samples)
         # Note: rttms_mask_mats contains PyTorch tensors, so we pass it directly instead of storing in config
         if cfg.spk_supervision == "rttm":

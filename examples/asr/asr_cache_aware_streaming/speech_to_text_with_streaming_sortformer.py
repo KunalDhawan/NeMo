@@ -182,7 +182,6 @@ def perform_streaming(
     previous_hypotheses = None
     streaming_buffer_iter = iter(streaming_buffer)
     asr_pred_out_stream, diar_pred_out_stream  = None, None
-    mem_last_time, fifo_last_time = None, None
     left_offset, right_offset = 0, 0
 
     multispk_asr_streamer = SpeakerTaggedASR(cfg, asr_model, diar_model)
@@ -287,7 +286,6 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         diar_model = SortformerEncLabelModel.restore_from(restore_path=cfg.diar_model_path, 
                                                           map_location=map_location)
     else:
-        import ipdb; ipdb.set_trace()
         raise ValueError("cfg.diar_model_path must end with.ckpt or.nemo!")
     trainer = pl.Trainer(devices=device, accelerator=accelerator)
     diar_model.set_trainer(trainer)
@@ -397,8 +395,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         )
     else:
         # stream audio files in a manifest file in batched mode
-        samples = []
-        all_refs_text = []
+        samples, all_refs_text = []
 
         with open(args.manifest_file, 'r') as f:
             for line in f:
@@ -409,7 +406,6 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         args.batch_size = len(samples)
         logging.info(f"Loaded {len(samples)} from the manifest at {args.manifest_file}.")
 
-        start_time = time.time()
         for sample_idx, sample in enumerate(samples):
             processed_signal, processed_signal_length, stream_id = streaming_buffer.append_audio_file(
                 sample['audio_filepath'], offset=sample['offset'], duration=sample['duration'], stream_id=-1, 

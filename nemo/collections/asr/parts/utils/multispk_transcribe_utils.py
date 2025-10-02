@@ -74,6 +74,15 @@ from functools import wraps
 import math
 
 def measure_eta(func):
+    """ 
+    Measure the time taken to execute the function and print the ETA.
+    
+    Args:
+        func (callable): The function to measure the ETA of.
+
+    Returns:
+        callable: The wrapped function.
+    """
     @wraps(func)
     def wrapper(*args, **kwargs):
         start_time = time.time()  # Record the start time
@@ -85,11 +94,24 @@ def measure_eta(func):
     return wrapper
 
 def get_multi_talker_samples_from_manifest(cfg, manifest_file: str, feat_per_sec: float, max_spks: int):
+    """
+    Get the multi-talker samples from the manifest file and save it to a list named 'samples'.
+    Also, save the rttm mask matrix to a list named 'rttms_mask_mats'.
+    
+    Args:
+        cfg (DictConfig): The configuration object.
+        manifest_file (str): The path to the manifest file.
+        feat_per_sec (float): The number of features per second.
+        max_spks (int): The maximum number of speakers.
+
+    Returns:
+        samples (list): The list of samples.
+        rttms_mask_mats (list): The list of rttm mask matrices.
+    """
     samples, rttms_mask_mats = [], []
     with open(manifest_file, 'r') as f:
         for line in f:
             item = json.loads(line)
-            # item['duration'] = None
             samples.append(item)
             if cfg.spk_supervision == "rttm":
                 with open(samples[-1]['rttm_filepath'], 'r') as f:
@@ -108,7 +130,7 @@ def get_multi_talker_samples_from_manifest(cfg, manifest_file: str, feat_per_sec
             if 'offset' not in item:
                 samples[-1]['offset'] = 0
     
-    if rttms_mask_mats != []:
+    if len(rttms_mask_mats) > 0:
         rttms_mask_mats = collate_matrices(rttms_mask_mats)
     else:
         rttms_mask_mats = None
@@ -132,12 +154,30 @@ def setup_diarization_model(cfg: DictConfig, map_location: Optional[str] = None)
         raise ValueError("cfg.diar_model_path must end with.ckpt or.nemo!")
     return diar_model, model_name
 
-def write_seglst(output_filepath, seglst_list):
+def write_seglst(output_filepath: str, seglst_list: list) -> None:
+    """
+    Write the segmentation list to a file.
+    
+    Args:
+        output_filepath (str): The path to the output file.
+        seglst_list (list): The list of segmentation lists.
+    """
     with open(output_filepath, "w") as f:
         f.write(json.dumps(seglst_list, indent=2) + "\n")
 
 
-def calc_drop_extra_pre_encoded(asr_model, step_num, pad_and_drop_preencoded):
+def calc_drop_extra_pre_encoded(asr_model, step_num: int, pad_and_drop_preencoded: bool) -> int:
+    """
+    Calculate the number of extra tokens to drop after the downsampling.
+    
+    Args:
+        asr_model (SortformerEncLabelModel): The ASR model.
+        step_num (int): The step number.
+        pad_and_drop_preencoded (bool): Whether to pad and drop the extra pre-encoded tokens.
+
+    Returns:
+        int: The number of extra tokens to drop.
+    """
     # for the first step there is no need to drop any tokens after the downsampling as no caching is being used
     if step_num == 0 and not pad_and_drop_preencoded:
         return 0
@@ -188,11 +228,20 @@ def fix_frame_time_step(
     return frame_inds_seq
 
 def get_simulated_softmax(cfg, speaker_sigmoid: torch.Tensor) -> torch.Tensor:
-    """Simulate the softmax operation for speaker diarization."""
+    """
+    Simulate the softmax operation for speaker diarization.
+
+    Args:
+        cfg (Any): Configuration object containing diarization settings.
+        speaker_sigmoid (torch.Tensor): Speaker sigmoid values.
+
+    Returns:
+        speaker_softmax (torch.Tensor): Speaker softmax values.
+    """
     speaker_sigmoid = torch.clamp(speaker_sigmoid, min=cfg.min_sigmoid_val, max=1) 
     speaker_softmax = speaker_sigmoid / speaker_sigmoid.sum()
     speaker_softmax = speaker_softmax.cpu()
-    speaker_softmax[cfg.limit_max_spks:] = 0.0 
+    speaker_softmax[cfg.mix:] = 0.0 
     return speaker_softmax
 
 def get_speaker_turn_flags(word: str, stt_words: List[str]) -> Tuple[bool, bool]:
@@ -226,6 +275,8 @@ def get_word_dict_content_offline(
         word_index (int): Index of the word in the sequence.
         diar_pred_out (torch.Tensor): Diarization prediction output stream.
         time_stt_end_tuple (int): Local time step offset.
+        stt_words (List[str]): List of 'Start of Sentence' words.
+            
         frame_len (float, optional): Length of each frame in seconds. Defaults to 0.08.
 
     Returns:
@@ -245,7 +296,7 @@ def get_word_dict_content_offline(
     speaker_sigmoid = diar_pred_out[stt_p:end_p, :].mean(dim=0)
     speaker_softmax = get_simulated_softmax(cfg, speaker_sigmoid)
 
-    speaker_softmax[cfg.limit_max_spks:] = 0.0
+    speaker_softmax[cfg.mix:] = 0.0
     spk_id = speaker_softmax.argmax().item()
     stt_sec, end_sec = frame_stt * frame_len, frame_end * frame_len
     is_stt_speaker_turn, is_end_speaker_turn = get_speaker_turn_flags(word, stt_words=stt_words)
@@ -287,11 +338,12 @@ def get_word_dict_content_online(
         token_group (List[str]): Group of tokens associated with the word.
         frame_inds_seq (List[int]): Sequence of frame indices.
         time_step_local_offset (int): Local time step offset.
+        stt_words (List[str]): List of 'Start of Sentence' words.
         frame_len (float, optional): Length of each frame in seconds. Defaults to 0.08.
 
     Returns:
         Dict[str, Any]: A dictionary containing word information and diarization results.
-    """    
+    """
     _stt, _end = time_step_local_offset, time_step_local_offset + len(token_group) - 1
     if len(token_group) == 1:
         frame_stt, frame_end = frame_inds_seq[_stt], frame_inds_seq[_stt] + 1
@@ -310,7 +362,7 @@ def get_word_dict_content_online(
     speaker_sigmoid = diar_pred_out_stream[stt_p:end_p, :].mean(dim=0)
     speaker_softmax = get_simulated_softmax(cfg, speaker_sigmoid)
 
-    speaker_softmax[cfg.limit_max_spks:] = 0.0
+    speaker_softmax[cfg.mix:] = 0.0
     spk_id = speaker_softmax.argmax().item()
     stt_sec, end_sec = frame_stt * frame_len, frame_end * frame_len
     is_stt_speaker_turn, is_end_speaker_turn = get_speaker_turn_flags(word, stt_words=stt_words)
@@ -359,7 +411,6 @@ def get_multitoken_words(
                 if cfg.verbose:
                     logging.info(f"[Replacing Multi-token Word]: {saved_word} with {prev_word}")
                 word_and_ts_seq["words"][-fix_prev_words_count + ct]["word"] = prev_word
-    
     return word_and_ts_seq
   
 def correct_speaker_assignments(word_and_ts_seq: dict, sentence_render_length: int = None) -> dict:
@@ -409,7 +460,6 @@ def correct_speaker_assignments(word_and_ts_seq: dict, sentence_render_length: i
                 word_and_ts_seq['words'][idx-1]['speaker'] == \
                 word_and_ts_seq['words'][idx+1]['speaker']:
                 word_and_ts_seq['words'][idx]['speaker'] = word_and_ts_seq['words'][idx-1]['speaker'] 
-                
     return word_and_ts_seq 
    
 def append_word_and_ts_seq(
@@ -494,7 +544,6 @@ class SpeakerTaggedASR:
         self._cache_gating_buffer_size = cfg.get("cache_gating_buffer_size", 2)
         self._binary_diar_preds = cfg.binary_diar_preds
         
-        # self._rttms = rttms
         self._masked_asr = cfg.get("masked_asr", True)
         self._use_mask_preencode = cfg.get("mask_preencode", False)
         self._single_speaker_model = cfg.get("single_speaker_model", False)
@@ -509,7 +558,7 @@ class SpeakerTaggedASR:
     
     def _init_evaluator(self):  
         self.online_evaluators, self._word_and_ts_seq = [], []
-        for idx, (uniq_id, data_dict) in enumerate(self.test_manifest_dict.items()):
+        for _, (_, data_dict) in enumerate(self.test_manifest_dict.items()):
             self._word_and_ts_seq.append({"words": [],
                                     "buffered_words": [],
                                     "token_frame_index": [], 
@@ -625,7 +674,19 @@ class SpeakerTaggedASR:
         session_trans_dict['sentences'] = sentences
         return session_trans_dict 
     
-    def merge_transcript_and_speakers(self, test_manifest_dict, asr_hypotheses, diar_pred_out):
+    def merge_transcript_and_speakers(self, test_manifest_dict: dict, asr_hypotheses: List[Hypothesis], diar_pred_out: torch.Tensor) -> Tuple[List[str], List[Dict[str, Any]]]:
+        """
+        Merge the transcript and speakers and generate real-time scripts if the config is set.
+        
+        Args:
+            test_manifest_dict (Dict): Dictionary containing test manifest data.
+            asr_hypotheses (List[Hypothesis]): List of ASR hypotheses.
+            diar_pred_out (torch.Tensor): Diarization prediction output stream.
+
+        Returns:
+            transcribed_speaker_texts (List[str]): List of transcribed speaker texts.
+            self._word_and_ts_seq (List[Dict[str, Any]]): List of word-level dictionaries.
+        """
         transcribed_speaker_texts = [None] * len(test_manifest_dict)
         
         for idx, (uniq_id, data_dict) in enumerate(test_manifest_dict.items()):
@@ -654,7 +715,19 @@ class SpeakerTaggedASR:
         diar_pred_out, 
         asr_hypothesis,
         word_and_ts_seq,
-    ):        
+    ):
+        """ 
+        Get the frame and words for each word in the chunk.
+        
+        Args:
+            uniq_id (str): The unique id of the chunk.
+            diar_pred_out (torch.Tensor): Diarization prediction output stream.
+            asr_hypothesis (Hypothesis): ASR hypothesis.
+            word_and_ts_seq (Dict[str, Any]): Pre-existing word-level dictionaries.
+
+        Returns:
+            word_and_ts_seq (Dict[str, Any]): The updated word-level dictionaries with new words.
+        """
         word_and_ts_seq['uniq_id'] = uniq_id
 
         for word_index, hyp_word_dict in enumerate(asr_hypothesis.timestamp['word']):
@@ -733,20 +806,28 @@ class SpeakerTaggedASR:
         return word_and_ts_seq
         
 
-    def _add_speaker_transcriptions(self, transcriptions: list, speaker_transcriptions: List[str], word_and_ts_seq: List[Dict[str, Any]]) -> Tuple[List[Hypothesis], List[Hypothesis]]:
+    def _add_speaker_transcriptions(
+        self,
+        transcriptions: list,
+        speaker_transcriptions: List[str],
+        word_and_ts_seq: List[Dict[str, Any]]
+    ) -> Tuple[List[Hypothesis], List[Hypothesis]]:
         """ 
         Add speaker tagging into the transcriptions generated from an ASR model.
         
         Args:
-            transcriptions:
-            speaker_transcriptions (List[str]): List of speaker transcriptions.
-            word_and_ts_seq (List[Dict[str, Any]]): List of word-level dictionaries.
+            transcriptions (Tuple[List[Hypothesis], List[Hypothesis]]): 
+                Tuple containing the transcriptions and n-best transcriptions.
+            speaker_transcriptions (List[str]): 
+                List of speaker transcriptions.
+            word_and_ts_seq (List[Dict[str, Any]]): 
+                List of word-level dictionaries.
             
         Returns:
             Tuple[List[Hypothesis], List[Hypothesis]]: Tuple containing the updated transcriptions with speaker tags.
         """
-        trans_hyp, nbest_hyp = transcriptions
-        for sess_idx, hypothesis in enumerate(trans_hyp):
+        trans_hyp, _ = transcriptions
+        for sess_idx, _ in enumerate(trans_hyp):
             if speaker_transcriptions[sess_idx] is not None:
                 trans_hyp[sess_idx].text = speaker_transcriptions[sess_idx]
             speaker_added_word_dicts = [] 
@@ -790,7 +871,7 @@ class SpeakerTaggedASR:
             audio=self.cfg.dataset_manifest,
             override_config=override_cfg,
         )
-        best_hyp, nbest_hyp = transcriptions
+        best_hyp, _ = transcriptions
         _, pred_tensors = self.diar_model.diarize(audio=self.cfg.manifest_file, 
                                                                include_tensor_outputs=True)
         speaker_transcriptions, word_and_ts_seq = self.merge_transcript_and_speakers(
@@ -992,14 +1073,14 @@ class SpeakerTaggedASR:
             self.instance_manager.to(chunk_audio.device)
 
         self.instance_manager.get_active_speakers_info(
-            active_speakers=[[0]*chunk_audio.shape[0]], 
+            active_speakers=[[0] for _ in range(chunk_audio.shape[0])], 
             chunk_audio=chunk_audio, 
             chunk_lengths=chunk_lengths, 
         )
          
         (
             asr_pred_out_stream,
-            transcribed_texts,
+            _,
             cache_last_channel,
             cache_last_time,
             cache_last_channel_len,
@@ -1034,7 +1115,7 @@ class SpeakerTaggedASR:
         else:
             _, new_chunk_preds = self.get_diar_pred_out_stream(step_num)
             diar_pred_out_stream = new_chunk_preds
-
+        
         transcribed_speaker_texts = [None] * len(self.test_manifest_dict)
         for idx, (uniq_id, _) in enumerate(self.test_manifest_dict.items()): 
             if not (len(previous_hypotheses[idx].text) == 0 and step_num <= self._initial_steps):
