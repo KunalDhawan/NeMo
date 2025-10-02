@@ -179,28 +179,6 @@ def write_seglst_file(seglst_dict_list, output_path):
         f.write(json.dumps(seglst_dict_list, indent=4) + '\n')
     logging.info(f"Saved the transcriptions of the streaming inference in {output_path}")
 
-def write_to_json(all_texts, samples, output_path):
-    records = []
-    for session_idx, texts in enumerate(all_texts):
-        if texts == []:
-            continue
-        audio_filepath = samples[session_idx]["audio_filepath"]
-        uniq_id = os.path.basename(audio_filepath).split('.')[0]
-        record = [
-            {
-                "audio_filepath": audio_filepath,
-                "session_id": uniq_id,
-                "speaker": spk_id,
-                "words": text,
-            } for spk_id, text in enumerate(texts)
-        ]
-
-        records.extend(record)
-                
-    with open(output_path, 'w') as out_f:
-        json.dump(records, out_f, indent=4)
-    logging.info(f"Saved the transcriptions of the streaming inference in {output_path}.")
-
 def launch_serial_streaming(
     cfg, 
     asr_model, 
@@ -252,6 +230,7 @@ def launch_parallel_streaming(
     ):
     streaming_buffer_iter = iter(streaming_buffer)
     multispk_asr_streamer = SpeakerTaggedASR(cfg, asr_model, diar_model)
+
     for step_num, (chunk_audio, chunk_lengths) in enumerate(streaming_buffer_iter):
         # logging.info(f"Step ID: {step_num}")
         with torch.inference_mode():
@@ -477,12 +456,23 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
                 streaming_buffer.reset_buffer() 
 
     if cfg.parallel_speaker_strategy and cfg.output_path is not None and instance_manager is not None:
-        for asr_state in instance_manager.batch_asr_states:
-            all_streaming_tran.append(
-                [hyp.text for hyp in asr_state.previous_hypothesis if hyp is not None]
-            )
-        write_to_json(all_streaming_tran, samples, cfg.output_path)
-
+        instance_manager.previous_asr_states.extend(instance_manager.batch_asr_states)
+        total_seglsts = []
+        for sample, asr_state in zip(samples, instance_manager.previous_asr_states):
+            audio_filepath = sample["audio_filepath"]
+            uniq_id = os.path.basename(audio_filepath).split('.')[0]
+            seglsts = [
+                {
+                    "session_id": uniq_id,
+                    "speaker": seg['speaker'],
+                    "words": seg['text'],
+                    "start_time": seg['start_time'],
+                    "end_time": seg['end_time'],
+                } for seg in asr_state.seglsts
+            ]
+            seglsts = sorted(seglsts, key=lambda x: x['start_time'])
+            total_seglsts.extend(seglsts)
+        write_seglst_file(seglst_dict_list=total_seglsts, output_path=cfg.output_path)
 
 if __name__ == '__main__':
     main()

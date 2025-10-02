@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os, json
+import copy
 from dataclasses import dataclass, is_dataclass
 from typing import Optional, Union, List, Tuple, Dict, Any
 
@@ -164,6 +165,14 @@ def write_seglst(output_filepath: str, seglst_list: list) -> None:
     """
     with open(output_filepath, "w") as f:
         f.write(json.dumps(seglst_list, indent=2) + "\n")
+
+def get_new_sentence_dict(speaker, start_time, end_time, text):
+    return {
+        'speaker': speaker,
+        'start_time': start_time,
+        'end_time': end_time,
+        'text': text
+    }
 
 
 def calc_drop_extra_pre_encoded(asr_model, step_num: int, pad_and_drop_preencoded: bool) -> int:
@@ -882,23 +891,9 @@ class SpeakerTaggedASR:
         transcriptions = self._add_speaker_transcriptions(transcriptions, speaker_transcriptions, word_and_ts_seq)
         return transcriptions
     
-    def _get_new_sentence_dict(self, speaker, start_time, end_time, text):
-        return {
-            'speaker': speaker,
-            'start_time': start_time,
-            'end_time': end_time,
-            'text': text
-        }
     
-    def _is_new_text(self, spk_idx, text):
-        if text is None or text == self._prev_history_speaker_texts[spk_idx]:
-            return None
-        else:
-            # Get the difference between the current text and the previous text
-            if self._prev_history_speaker_texts[spk_idx] in text:
-                return text.replace(self._prev_history_speaker_texts[spk_idx], "")
-            else:
-                return text.strip()
+    
+    
     
     def generate_seglst_dicts(self):
         for _, word_ts_and_seq in enumerate(self._word_and_ts_seq):
@@ -915,7 +910,7 @@ class SpeakerTaggedASR:
         self._speaker_wise_sentences[spk_idx][-1]['end_time'] = end_time
         self._speaker_wise_sentences[spk_idx][-1]['text'] += diff_text
 
-    def get_multi_thread_sentences_values(self, step_num, speaker_mapping, previous_hypotheses, chunk_length):
+    def get_multi_thread_sentences_values(self, speaker2hyp, chunk_length):
         """ 
         Get the sentences values for the given step number for writing and displaying the sentences.
 
@@ -928,8 +923,7 @@ class SpeakerTaggedASR:
         Returns:
             sentences (List[Dict[str, Any]]): the sentences values
         """
-        for prev_hyp_idx, spk_idx in speaker_mapping.items():
-            hypothesis = previous_hypotheses[prev_hyp_idx]
+        for spk_idx, hypothesis in speaker2hyp.items():
 
             if spk_idx not in self._speaker_wise_sentences:
                 self._speaker_wise_sentences[spk_idx] = []
@@ -1069,8 +1063,11 @@ class SpeakerTaggedASR:
         drop_extra_pre_encoded,
     ):
         if step_num == 0:
+            # if len(self.instance_manager.seglst_dict_list) > 0:
+            #     self.seglst_dict_list.extend(self.instance_manager.seglst_dict_list)
             self.instance_manager.reset(batch_size=chunk_audio.shape[0])
             self.instance_manager.to(chunk_audio.device)
+            
 
         self.instance_manager.get_active_speakers_info(
             active_speakers=[[0] for _ in range(chunk_audio.shape[0])], 
@@ -1159,8 +1156,10 @@ class SpeakerTaggedASR:
         drop_extra_pre_encoded,
     ):
         if step_num == 0:
+            self._offset_chunk_start_time = 0
             self.instance_manager.reset(batch_size=chunk_audio.shape[0])
             self.instance_manager.to(chunk_audio.device)
+        
 
         # Step 2: diarize or get GT rttms
         if self.diar_model.rttms_mask_mats is None:
@@ -1172,15 +1171,17 @@ class SpeakerTaggedASR:
                 drop_extra_pre_encoded=drop_extra_pre_encoded
             )
             new_chunk_preds = new_diar_pred_out_stream[:, -self._nframes_per_chunk:]
-            # Step 3: update diar states
-            self.instance_manager.update_diar_state(
-                diar_pred_out_stream=new_diar_pred_out_stream,
-                previous_chunk_preds=new_chunk_preds,
-                diar_streaming_state=new_streaming_state
-            )
+            
         else:
             new_diar_pred_out_stream, new_chunk_preds = self.get_diar_pred_out_stream(step_num)
+            new_streaming_state = self.instance_manager.diar_states.streaming_state
 
+        # Step 3: update diar states
+        self.instance_manager.update_diar_state(
+            diar_pred_out_stream=new_diar_pred_out_stream,
+            previous_chunk_preds=new_chunk_preds,
+            diar_streaming_state=new_streaming_state
+        )
         # Step 4: find active speakers
         diar_chunk_preds = new_diar_pred_out_stream[:, -self._nframes_per_chunk*self._cache_gating_buffer_size:]
         if self._cache_gating:
@@ -1206,11 +1207,13 @@ class SpeakerTaggedASR:
             chunk_audio=chunk_audio, 
             chunk_lengths=chunk_lengths, 
         )
-
+        
+        # skip current chunk if no active speakers are found
         if active_chunk_audio is None:
             return
-        # Step 6: mask the non-active speakers for masked ASR
-        # set speaker targets for multitalker ASR
+        # Step 6: 
+        # 1. mask the non-active speakers for masked ASR
+        # 2. set speaker targets for multitalker ASR
         if self._masked_asr:
             if self._use_mask_preencode:
                 active_chunk_audio = self.mask_preencode(chunk_audio=active_chunk_audio, mask=active_speaker_targets)
@@ -1221,7 +1224,7 @@ class SpeakerTaggedASR:
                 active_speaker_targets = (active_speaker_targets > 0.5).float()
                 inactive_speaker_targets = (inactive_speaker_targets > 0.5).float()
             self.asr_model.set_speaker_targets(active_speaker_targets, inactive_speaker_targets)
-            
+
         # Step 7: ASR forward pass for active speakers
         (
             pred_out_stream,
@@ -1245,11 +1248,10 @@ class SpeakerTaggedASR:
             )
         # Step 8: update ASR states
         active_id = 0
-        batch_speaker_mapping = []
         for batch_idx, speaker_ids in enumerate(active_speakers):
-            speaker_mapping = {}
+            speaker2hyp = {}
             for speaker_id in speaker_ids:
-                speaker_mapping[active_id] = speaker_id
+                speaker2hyp[speaker_id] = previous_hypotheses[active_id]
                 self.instance_manager.update_asr_state(
                     batch_idx,
                     speaker_id,
@@ -1260,18 +1262,19 @@ class SpeakerTaggedASR:
                     pred_out_stream[active_id]
                 )
                 active_id += 1
-            batch_speaker_mapping.append(speaker_mapping)
+        
+        # Step 9: update seglsts with timestamps
+        self.instance_manager.update_seglsts(offset=self._offset_chunk_start_time)
+        self._offset_chunk_start_time += self._nframes_per_chunk * self._frame_len_sec
 
-            if batch_idx in self.cfg.print_sample_indices and self.cfg.generate_scripts:
-                all_sentences = self.get_multi_thread_sentences_values(step_num=step_num, 
-                                                                    speaker_mapping=batch_speaker_mapping[0],
-                                                                    previous_hypotheses=previous_hypotheses, 
-                                                                    chunk_length=chunk_lengths[0].item() )
-                transcribed_speaker_texts = print_sentences(sentences=all_sentences, 
+        if batch_idx in self.cfg.print_sample_indices and self.cfg.generate_scripts:
+            for idx in self.cfg.print_sample_indices:
+                asr_state = self.instance_manager.batch_asr_states[idx]
+                transcribed_speaker_texts = print_sentences(sentences=asr_state.seglsts, 
                                 color_palette=get_color_palette(), 
                                 params=self.cfg)
                 write_txt(f'{self.cfg.print_path.replace(".sh", f"_{batch_idx}.sh")}', transcribed_speaker_texts.strip()) 
-
+        
 
 class MultiTalkerInstanceManager:
     """
@@ -1290,13 +1293,24 @@ class MultiTalkerInstanceManager:
             self.cache_last_channel_len = None
             self.previous_hypothesis = None
             self.previous_pred_out = None
+
             self.num_speakers: int= num_speakers
+
+            self._frame_len_sec = 0.08
+            self._sent_break_sec = 1.5
+
+            self.seglsts = []
+            self._speaker_wise_sentences = {}
+            self._prev_history_speaker_texts = [ "" for _ in range(self.num_speakers) ]
 
         def reset(self, asr_cache_state: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]):
             self.speakers = [0]
             self.cache_last_channel, self.cache_last_time, self.cache_last_channel_len = asr_cache_state
             self.previous_hypothesis = [None] 
             self.previous_pred_out = [None] 
+            self.seglsts = []
+            self._speaker_wise_sentences = {}
+            self._prev_history_speaker_texts = [ "" for _ in range(self.num_speakers) ]
         
         def update_asr_state(self, 
             speaker_id, 
@@ -1328,6 +1342,68 @@ class MultiTalkerInstanceManager:
             self.cache_last_channel_len = torch.cat([self.cache_last_channel_len, cache_last_channel_len], dim=0)
             self.previous_hypothesis.append(None)
             self.previous_pred_out.append(None)
+
+        def _update_last_sentence(self, spk_idx, end_time, diff_text):
+            self._speaker_wise_sentences[spk_idx][-1]['end_time'] = end_time
+            self._speaker_wise_sentences[spk_idx][-1]['text'] += diff_text
+
+        def _is_new_text(self, spk_idx, text):
+            if text is None or text == self._prev_history_speaker_texts[spk_idx]:
+                return None
+            else:
+                # Get the difference between the current text and the previous text
+                if self._prev_history_speaker_texts[spk_idx] in text:
+                    return text.replace(self._prev_history_speaker_texts[spk_idx], "")
+                else:
+                    return text.strip()
+
+        def update_seglsts(self, offset):
+            valid_speakers = set()
+            for spk_idx in self.get_speakers():
+                hypothesis = self.previous_hypothesis[spk_idx]
+                if hypothesis is None:
+                    continue
+                valid_speakers.add(spk_idx)
+
+                if spk_idx not in self._speaker_wise_sentences:
+                    self._speaker_wise_sentences[spk_idx] = []
+
+                diff_text = self._is_new_text(spk_idx=spk_idx, text=hypothesis.text) 
+                if diff_text is not None:
+
+                    sep_flag = False
+                    if len(hypothesis.timestamp) > 0:
+                        start_time = offset + (hypothesis.timestamp[0]) * self._frame_len_sec
+                        end_time = offset + (hypothesis.timestamp[-1] + 1) * self._frame_len_sec
+                    else:
+                        start_time = offset 
+                        end_time = offset +  hypothesis.length.item() * self._frame_len_sec
+                        sep_flag = True
+
+                    # Get the last end time of the previous sentence or None if no sentences are present
+                    if len(self._speaker_wise_sentences[spk_idx]) > 0:
+                        last_end_time = self._speaker_wise_sentences[spk_idx][-1]['end_time']   
+                    else:
+                        last_end_time = 0.0
+
+                    # Case 1 - If start_tiime is greater than end_time + sent_break_sec, then we need to add the sentence
+                    if sep_flag or (last_end_time == 0.0 or start_time > last_end_time + self._sent_break_sec):
+                        self._speaker_wise_sentences[spk_idx].append(get_new_sentence_dict(speaker=f"speaker_{spk_idx}", 
+                                                                                                start_time=start_time, 
+                                                                                                end_time=end_time, 
+                                                                                                text=diff_text))
+                    # Case 2 - If start_time is less than end_time + sent_break_sec, then we need to update the end_time
+                    else:
+                        self._update_last_sentence(spk_idx=spk_idx, end_time=end_time, diff_text=diff_text)
+
+                # Update the previous history of the speaker text
+                if hypothesis.text is not None:
+                    self._prev_history_speaker_texts[spk_idx] = hypothesis.text
+            
+            ### Merge all sentences for each speaker but sort by start_time
+            self.seglsts = []
+            for spk_idx in valid_speakers:
+                self.seglsts.extend(self._speaker_wise_sentences[spk_idx])
     
     class DiarState:
         def __init__(self, batch_size: int=1, num_speakers: int=4):
@@ -1362,8 +1438,8 @@ class MultiTalkerInstanceManager:
         self.real_batch_size = batch_size * num_speakers
 
         # ASR state bank
-        self.batch_asr_states = [self.ASRState(self.num_speakers) for _ in range(self.batch_size)]
-        self.seglst_dict_list = []
+        self.batch_asr_states = []
+        self.previous_asr_states = []
 
         # Diar states
         self.diar_states = None
@@ -1386,8 +1462,6 @@ class MultiTalkerInstanceManager:
         self.active_cache_last_time: Optional[torch.Tensor] = None
         self.active_cache_last_channel_len: Optional[torch.Tensor] = None
 
-        self.reset()
-
     def _reset_active_speaker_buffers(self):
         """ 
         Reset the active speaker buffers need to update the active speaker information.
@@ -1408,15 +1482,24 @@ class MultiTalkerInstanceManager:
             self.batch_size = batch_size
         if num_speakers is not None:
             self.num_speakers = num_speakers
+
+        if len(self.batch_asr_states) > 0:
+            self.previous_asr_states.extend(copy.deepcopy(self.batch_asr_states))
+        self.batch_asr_states = [self.ASRState(self.num_speakers) for _ in range(self.batch_size)]
         for i in range(self.batch_size):
             self.batch_asr_states[i].reset(self.asr_model.encoder.get_initial_cache_state(batch_size=1))
+        
         self.diar_states = self.DiarState(batch_size=self.batch_size, num_speakers=self.num_speakers)
         self.diar_states.reset(self.diar_model.sortformer_modules.init_streaming_state(batch_size=self.batch_size))
 
-    def add_speaker(self, batch_idx, speaker_id):
-        if speaker_id not in self.batch_asr_states[batch_idx].get_speakers():
-            self.batch_asr_states[batch_idx].add_speaker(speaker_id, self.asr_model.encoder.get_initial_cache_state(batch_size=1))
+        self.seglst_dict_list = []
 
+    def add_speaker(self, batch_idx, speaker_id):
+        speakers = self.batch_asr_states[batch_idx].get_speakers()
+        for i in range(0, speaker_id+1):
+            if i not in speakers:
+                self.batch_asr_states[batch_idx].add_speaker(i, self.asr_model.encoder.get_initial_cache_state(batch_size=1))
+        
     def get_speakers(self, batch_idx):
         return self.batch_asr_states[batch_idx].get_speakers()
     
@@ -1487,3 +1570,7 @@ class MultiTalkerInstanceManager:
         self.active_cache_last_time = torch.stack(self._active_cache_last_time).transpose(0, 1)
         self.active_cache_last_channel_len = torch.stack(self._active_cache_last_channel_len)
         return active_chunk_audio, active_chunk_lengths, active_speaker_targets, inactive_speaker_targets
+
+    def update_seglsts(self, offset):
+        for asr_state in self.batch_asr_states:
+            asr_state.update_seglsts(offset=offset)
