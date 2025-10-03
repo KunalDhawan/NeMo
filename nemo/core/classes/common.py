@@ -82,6 +82,7 @@ ALLOWED_NEMO_SUBMODULE_PREFIXES = [
     "nemo.collections.asr.parts",
     "nemo.collections.audio.parts",
     "nemo.lightning",
+    "megatron.core",
     "tests.collections.llm.common",
 ]
 
