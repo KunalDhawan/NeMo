@@ -63,7 +63,7 @@ class DiarizationConfig:
     diar_model_path: Optional[str] = None  # Path to a .nemo file
     diar_pretrained_name: Optional[str] = None  # Name of a pretrained model
     audio_dir: Optional[str] = None  # Path to a directory which contains audio files
-    num_speakers: Optional[int] = 4
+    max_num_of_spks: Optional[int] = 4
     parallel_speaker_strategy: bool = False
     
     audio_key: str = 'audio_filepath'  # Used to override the default audio key in dataset_manifest
@@ -116,7 +116,7 @@ class DiarizationConfig:
     pad_and_drop_preencoded: bool = False
     set_decoder: Optional[str] = None # ["ctc", "rnnt"]
     att_context_size: Optional[list] = None
-    generate_scripts: bool = True
+    generate_realtime_scripts: bool = True
     
     word_window: int = 50
     fix_speaker_assignments: bool = False
@@ -139,8 +139,7 @@ class DiarizationConfig:
     feat_len_sec: float = 0.01
     finetune_realtime_ratio: float = 0.01
 
-    mix: int = 4
-    spk_supervision: str = "diar"
+    spk_supervision: str = "diar" # ["diar", "rttm"]
     binary_diar_preds: bool = False
 
 
@@ -177,7 +176,7 @@ def write_seglst_file(seglst_dict_list, output_path):
         raise ValueError("seglst_dict_list is empty. No transcriptions were generated.")
     with open(output_path, 'w') as f:
         f.write(json.dumps(seglst_dict_list, indent=4) + '\n')
-    logging.info(f"Saved the transcriptions of the streaming inference in {output_path}")
+    logging.info(f"Saved the transcriptions of the streaming inference in\n:{output_path}")
 
 def launch_serial_streaming(
     cfg, 
@@ -215,11 +214,7 @@ def launch_serial_streaming(
                                     loop_end_time=time.time(),
                                     loop_start_time=loop_start_time
                                 )
-
-    multispk_asr_streamer.generate_seglst_dicts()
-    write_seglst_file(seglst_dict_list=multispk_asr_streamer.instance_manager.seglst_dict_list, output_path=cfg.output_path)
-    return multispk_asr_streamer.instance_manager
-
+    return multispk_asr_streamer
 
 def launch_parallel_streaming(
     cfg, 
@@ -244,7 +239,7 @@ def launch_parallel_streaming(
                         is_buffer_empty=streaming_buffer.is_buffer_empty(),
                         drop_extra_pre_encoded=drop_extra_pre_encoded,
                     )
-    return multispk_asr_streamer.instance_manager
+    return multispk_asr_streamer
 
 
 @hydra_runner(config_name="DiarizationConfig", schema=DiarizationConfig)
@@ -346,6 +341,9 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
 
     global autocast
     autocast = torch.amp.autocast(asr_model.device.type, enabled=cfg.use_amp)
+    
+    # Initialize to avoid "possibly used before assignment" error
+    multispk_asr_streamer = None
 
     # configure the decoding config
     decoding_cfg = asr_model.cfg.decoding
@@ -388,9 +386,8 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     else:
         online_normalization = False
     
-    all_streaming_tran, instance_manager = [], None
     if cfg.audio_file is not None:
-        # stream a single audio file
+        # Stream a single audio file
         samples = [{'audio_filepath': cfg.audio_file,}]
         streaming_buffer = CacheAwareStreamingAudioBuffer(
             model=asr_model,
@@ -400,7 +397,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         cfg.batch_size = len(samples)
         streaming_buffer.append_audio_file(audio_filepath=cfg.audio_file, stream_id=-1)
         if cfg.parallel_speaker_strategy:
-            instance_manager = launch_parallel_streaming(
+            multispk_asr_streamer = launch_serial_streaming(
                 cfg=cfg,
                 asr_model=asr_model,
                 diar_model=diar_model,
@@ -409,16 +406,16 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
             )
 
         else:
-            instance_manager = launch_serial_streaming(
+            multispk_asr_streamer = launch_serial_streaming(
                 cfg=cfg,
                 asr_model=asr_model,
                 diar_model=diar_model,
                 streaming_buffer=streaming_buffer,
             )
     else:
-        # stream audio files in a manifest file in batched mode
+        # Stream audio files in a manifest file in batched mode
         feat_per_sec = round(asr_model.cfg.preprocessor.window_stride * asr_model.cfg.encoder.subsampling_factor, 2)
-        samples, rttms_mask_mats = get_multi_talker_samples_from_manifest(cfg, manifest_file=cfg.manifest_file, feat_per_sec=feat_per_sec, max_spks=cfg.mix)
+        samples, rttms_mask_mats = get_multi_talker_samples_from_manifest(cfg, manifest_file=cfg.manifest_file, feat_per_sec=feat_per_sec, max_spks=cfg.max_num_of_spks)
         cfg.batch_size = len(samples)
         # Note: rttms_mask_mats contains PyTorch tensors, so we pass it directly instead of storing in config
         if cfg.spk_supervision == "rttm":
@@ -439,15 +436,15 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
             if (sample_idx + 1) % cfg.batch_size == 0 or sample_idx == len(samples) - 1:
                 logging.info(f"Starting to stream samples {sample_idx - len(streaming_buffer) + 1} to {sample_idx}...")
                 if cfg.parallel_speaker_strategy:
-                    instance_manager = launch_parallel_streaming(
+                    multispk_asr_streamer = launch_parallel_streaming(
                         cfg=cfg,
                         asr_model=asr_model,
                         diar_model=diar_model,
                         streaming_buffer=streaming_buffer,
-                        pad_and_drop_preencoded=cfg.pad_and_drop_preencoded,       
+                        pad_and_drop_preencoded=cfg.pad_and_drop_preencoded,
                     )
                 else:
-                    instance_manager = launch_serial_streaming(
+                    multispk_asr_streamer = launch_serial_streaming(
                         cfg=cfg,
                         asr_model=asr_model,
                         diar_model=diar_model,
@@ -455,24 +452,15 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
                     )
                 streaming_buffer.reset_buffer() 
 
-    if cfg.parallel_speaker_strategy and cfg.output_path is not None and instance_manager is not None:
-        instance_manager.previous_asr_states.extend(instance_manager.batch_asr_states)
-        total_seglsts = []
-        for sample, asr_state in zip(samples, instance_manager.previous_asr_states):
-            audio_filepath = sample["audio_filepath"]
-            uniq_id = os.path.basename(audio_filepath).split('.')[0]
-            seglsts = [
-                {
-                    "session_id": uniq_id,
-                    "speaker": seg['speaker'],
-                    "words": seg['text'],
-                    "start_time": seg['start_time'],
-                    "end_time": seg['end_time'],
-                } for seg in asr_state.seglsts
-            ]
-            seglsts = sorted(seglsts, key=lambda x: x['start_time'])
-            total_seglsts.extend(seglsts)
-        write_seglst_file(seglst_dict_list=total_seglsts, output_path=cfg.output_path)
+    if cfg.output_path is not None and multispk_asr_streamer is not None:
+        if cfg.parallel_speaker_strategy:
+            multispk_asr_streamer.generate_seglst_dicts_from_parallel_streaming(samples=samples)
+            write_seglst_file(seglst_dict_list=multispk_asr_streamer.instance_manager.seglst_dict_list, 
+                              output_path=cfg.output_path)
+        else:
+            multispk_asr_streamer.generate_seglst_dicts_from_serial_streaming(samples=samples)
+            write_seglst_file(seglst_dict_list=multispk_asr_streamer.instance_manager.seglst_dict_list, 
+                              output_path=cfg.output_path)
 
 if __name__ == '__main__':
     main()
