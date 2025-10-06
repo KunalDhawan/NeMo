@@ -65,25 +65,25 @@ class DiarizationConfig:
     audio_dir: Optional[str] = None  # Path to a directory which contains audio files
     max_num_of_spks: Optional[int] = 4
     parallel_speaker_strategy: bool = False
-    
+
     audio_key: str = 'audio_filepath'  # Used to override the default audio key in dataset_manifest
     postprocessing_yaml: Optional[str] = None  # Path to a yaml file for postprocessing configurations
     eval_mode: bool = False
     no_der: bool = False
     out_rttm_dir: Optional[str] = None
     opt_style: Optional[str] = None
-    
+
     # General configs
     session_len_sec: float = -1 # End-to-end diarization session length in seconds
     num_workers: int = 8
     random_seed: Optional[int] = None  # seed number going to be used in seed_everything()
     bypass_postprocessing: bool = True # If True, postprocessing will be bypassed
     log: bool = True # If True, log will be printed
-    
+
     # Eval Settings: (0.25, False) should be default setting for sortformer eval.
     collar: float = 0.25 # Collar in seconds for DER calculation
     ignore_overlap: bool = False # If True, DER will be calculated only for non-overlapping segments
-    
+
     # Streaming diarization configs
     streaming_mode: bool = True # If True, streaming diarization will be used.
     spkcache_len: int = 188
@@ -117,7 +117,7 @@ class DiarizationConfig:
     set_decoder: Optional[str] = None # ["ctc", "rnnt"]
     att_context_size: Optional[list] = None
     generate_realtime_scripts: bool = True
-    
+
     word_window: int = 50
     fix_speaker_assignments: bool = False
     sentence_break_threshold_in_sec: float = 10000.0
@@ -156,18 +156,18 @@ def calc_drop_extra_pre_encoded(asr_model, step_num, pad_and_drop_preencoded):
         return asr_model.encoder.streaming_cfg.drop_extra_pre_encoded
 
 def add_delay_for_real_time(cfg, chunk_audio, session_start_time, feat_frame_count, loop_end_time, loop_start_time):
-    """ 
-    Add artificial delay for real-time mode by calculating the time difference between 
+    """
+    Add artificial delay for real-time mode by calculating the time difference between
     the current time and the session start time..
 
     Args:
-        cfg (DiarizationConfig): The configuration object. 
+        cfg (DiarizationConfig): The configuration object.
     """
     time_diff = max(0, (time.time() - session_start_time) - feat_frame_count * cfg.feat_len_sec)
     eta_min_sec = format_time(time.time() - session_start_time)
     logging.info(f"[   REAL TIME MODE   ] min:sec - {eta_min_sec} "
                     f"Time difference for real-time mode: {time_diff:.4f} seconds")
-    time.sleep(max(0, (chunk_audio.shape[-1] - cfg.discarded_frames)*cfg.feat_len_sec - 
+    time.sleep(max(0, (chunk_audio.shape[-1] - cfg.discarded_frames)*cfg.feat_len_sec -
                     (loop_end_time - loop_start_time) - time_diff * cfg.finetune_realtime_ratio))
 
 
@@ -179,24 +179,24 @@ def write_seglst_file(seglst_dict_list, output_path):
     logging.info(f"Saved the transcriptions of the streaming inference in\n:{output_path}")
 
 def launch_serial_streaming(
-    cfg, 
-    asr_model, 
-    diar_model, 
-    streaming_buffer, 
+    cfg,
+    asr_model,
+    diar_model,
+    streaming_buffer,
     pad_and_drop_preencoded=False,
 ):
     streaming_buffer_iter = iter(streaming_buffer)
 
     multispk_asr_streamer = SpeakerTaggedASR(cfg, asr_model, diar_model)
     feat_frame_count = 0
-    
+
     session_start_time = time.time()
     for step_num, (chunk_audio, chunk_lengths) in enumerate(streaming_buffer_iter):
         drop_extra_pre_encoded = calc_drop_extra_pre_encoded(asr_model, step_num, pad_and_drop_preencoded)
         loop_start_time = time.time()
         with torch.inference_mode():
             with autocast:
-                with torch.no_grad(): 
+                with torch.no_grad():
                     multispk_asr_streamer.perform_serial_streaming_stt_spk(
                         step_num=step_num,
                         chunk_audio=chunk_audio,
@@ -207,7 +207,7 @@ def launch_serial_streaming(
 
         feat_frame_count += (chunk_audio.shape[-1] - cfg.discarded_frames)
         if cfg.real_time_mode:
-            add_delay_for_real_time(cfg, 
+            add_delay_for_real_time(cfg,
                                     chunk_audio=chunk_audio,
                                     session_start_time=session_start_time,
                                     feat_frame_count=feat_frame_count,
@@ -217,10 +217,10 @@ def launch_serial_streaming(
     return multispk_asr_streamer
 
 def launch_parallel_streaming(
-    cfg, 
-    asr_model, 
-    diar_model, 
-    streaming_buffer, 
+    cfg,
+    asr_model,
+    diar_model,
+    streaming_buffer,
     pad_and_drop_preencoded=False,
     ):
     streaming_buffer_iter = iter(streaming_buffer)
@@ -230,7 +230,7 @@ def launch_parallel_streaming(
         # logging.info(f"Step ID: {step_num}")
         with torch.inference_mode():
             with autocast:
-                with torch.no_grad(): 
+                with torch.no_grad():
                     drop_extra_pre_encoded = calc_drop_extra_pre_encoded(asr_model, step_num, pad_and_drop_preencoded)
                     multispk_asr_streamer.perform_parallel_streaming_stt_spk(
                         step_num=step_num,
@@ -252,7 +252,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
 
     if cfg.random_seed:
         pl.seed_everything(cfg.random_seed)
-        
+
     if cfg.diar_model_path is None and cfg.diar_pretrained_name is None:
         raise ValueError("Both cfg.diar_model_path and cfg.pretrained_name cannot be None!")
     if cfg.audio_file is None and cfg.manifest_file is None:
@@ -279,24 +279,24 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         map_location = torch.device(f'cuda:{cfg.cuda}')
 
     if cfg.diar_model_path.endswith(".ckpt"):
-        diar_model = SortformerEncLabelModel.load_from_checkpoint(checkpoint_path=cfg.diar_model_path, 
+        diar_model = SortformerEncLabelModel.load_from_checkpoint(checkpoint_path=cfg.diar_model_path,
                                                                   map_location=map_location, strict=False)
     elif cfg.diar_model_path.endswith(".nemo"):
-        diar_model = SortformerEncLabelModel.restore_from(restore_path=cfg.diar_model_path, 
+        diar_model = SortformerEncLabelModel.restore_from(restore_path=cfg.diar_model_path,
                                                           map_location=map_location)
     else:
         raise ValueError("cfg.diar_model_path must end with.ckpt or.nemo!")
-    
-    # Model setup for inference 
+
+    # Model setup for inference
     trainer = pl.Trainer(devices=device, accelerator=accelerator)
     diar_model.set_trainer(trainer)
     diar_model._cfg.test_ds.session_len_sec = cfg.session_len_sec
     diar_model._cfg.test_ds.manifest_filepath = cfg.manifest_file
     diar_model._cfg.test_ds.batch_size = cfg.batch_size
     diar_model._cfg.test_ds.num_workers = cfg.num_workers
-    diar_model.setup_test_data(test_data_config=diar_model._cfg.test_ds)    
+    diar_model.setup_test_data(test_data_config=diar_model._cfg.test_ds)
     diar_model = diar_model.eval()
-    
+
     # Steaming mode setup
     diar_model.streaming_mode = cfg.streaming_mode
     diar_model.sortformer_modules.chunk_len = cfg.chunk_len
@@ -306,7 +306,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     diar_model.sortformer_modules.fifo_len = cfg.fifo_len
     diar_model.sortformer_modules.log = cfg.log
     diar_model.sortformer_modules.spkcache_refresh_rate = cfg.spkcache_refresh_rate
-    
+
     if cfg.audio_file is not None and cfg.manifest_file is not None:
         logging.warning("Both audio_file and manifest_file are specified. audio_file will be used with top priority.")
         input_type = "audio_file"
@@ -341,7 +341,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
 
     global autocast
     autocast = torch.amp.autocast(asr_model.device.type, enabled=cfg.use_amp)
-    
+
     # Initialize to avoid "possibly used before assignment" error
     multispk_asr_streamer = None
 
@@ -358,7 +358,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     asr_model = asr_model.to(cfg.device)
     asr_model.eval()
 
-    # chunk_size is set automatically for models trained for streaming. 
+    # chunk_size is set automatically for models trained for streaming.
     # For models trained for offline mode with full context, we need to pass the chunk_size explicitly.
     if cfg.chunk_size > 0:
         if cfg.shift_size < 0:
@@ -369,9 +369,9 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
             chunk_size=cfg.chunk_size, left_chunks=cfg.left_chunks, shift_size=shift_size
         )
 
-    # In streaming, offline normalization is not feasible as we don't have access to the 
-    # whole audio at the beginning When online_normalization is enabled, the normalization 
-    # of the input features (mel-spectrograms) are done per step It is suggested to train 
+    # In streaming, offline normalization is not feasible as we don't have access to the
+    # whole audio at the beginning When online_normalization is enabled, the normalization
+    # of the input features (mel-spectrograms) are done per step It is suggested to train
     # the streaming models without any normalization in the input features.
     if cfg.online_normalization:
         if asr_model.cfg.preprocessor.normalize not in ["per_feature", "all_feature"]:
@@ -385,7 +385,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
 
     else:
         online_normalization = False
-    
+
     if cfg.audio_file is not None:
         # Stream a single audio file
         samples = [{'audio_filepath': cfg.audio_file,}]
@@ -402,7 +402,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
                 asr_model=asr_model,
                 diar_model=diar_model,
                 streaming_buffer=streaming_buffer,
-                pad_and_drop_preencoded=cfg.pad_and_drop_preencoded,       
+                pad_and_drop_preencoded=cfg.pad_and_drop_preencoded,
             )
 
         else:
@@ -428,7 +428,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
             online_normalization=online_normalization,
             pad_and_drop_preencoded=cfg.pad_and_drop_preencoded,
         )
-        
+
         for sample_idx, sample in enumerate(samples):
             streaming_buffer.append_audio_file(sample['audio_filepath'], stream_id=-1)
             logging.info(f'Added this sample to the buffer: {sample["audio_filepath"]}')
@@ -450,16 +450,16 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
                         diar_model=diar_model,
                         streaming_buffer=streaming_buffer,
                     )
-                streaming_buffer.reset_buffer() 
+                streaming_buffer.reset_buffer()
 
     if cfg.output_path is not None and multispk_asr_streamer is not None:
         if cfg.parallel_speaker_strategy:
             multispk_asr_streamer.generate_seglst_dicts_from_parallel_streaming(samples=samples)
-            write_seglst_file(seglst_dict_list=multispk_asr_streamer.instance_manager.seglst_dict_list, 
+            write_seglst_file(seglst_dict_list=multispk_asr_streamer.instance_manager.seglst_dict_list,
                               output_path=cfg.output_path)
         else:
             multispk_asr_streamer.generate_seglst_dicts_from_serial_streaming(samples=samples)
-            write_seglst_file(seglst_dict_list=multispk_asr_streamer.instance_manager.seglst_dict_list, 
+            write_seglst_file(seglst_dict_list=multispk_asr_streamer.instance_manager.seglst_dict_list,
                               output_path=cfg.output_path)
 
 if __name__ == '__main__':
