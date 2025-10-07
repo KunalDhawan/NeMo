@@ -485,7 +485,7 @@ class SpeakerTaggedASR:
         # Multi-instance configs
         self._max_num_of_spks = cfg.get("max_num_of_spks", 4)
         self._offset_chunk_start_time = 0.0
-        self._sent_break_sec = cfg.get("sent_break_sec", 1.5)
+        self._sent_break_sec = cfg.get("sent_break_sec", 5.0)
 
         self._att_context_size = cfg.att_context_size
         self._nframes_per_chunk = self._att_context_size[1] + 1
@@ -501,6 +501,7 @@ class SpeakerTaggedASR:
             diar_model=self.diar_model,
             max_num_of_spks=self.diar_model._cfg.max_num_of_spks,
             batch_size=cfg.batch_size,
+            sent_break_sec=self._sent_break_sec,
         )
         self.n_active_speakers_per_stream = self.cfg.max_num_of_spks
 
@@ -1291,7 +1292,7 @@ class MultiTalkerInstanceManager:
             self,
             max_num_of_spks: int = 4,
             frame_len_sec: float = 0.08,
-            sent_break_sec: float = 1.5
+            sent_break_sec: float = 5.0
         ):
             """
             Initialize the ASR-State class with the initial parameters.
@@ -1415,7 +1416,8 @@ class MultiTalkerInstanceManager:
             """
             if end_time is not None:
                 self._speaker_wise_sentences[spk_idx][-1]['end_time'] = end_time
-            self._speaker_wise_sentences[spk_idx][-1]['words'] += diff_text
+            new_words = self._speaker_wise_sentences[spk_idx][-1]['words'] + diff_text
+            self._speaker_wise_sentences[spk_idx][-1]['words'] = new_words.strip()
 
         def _is_new_text(self, spk_idx: int, text: str):
             """
@@ -1568,6 +1570,7 @@ class MultiTalkerInstanceManager:
         diar_model=None,
         batch_size: int=1,
         max_num_of_spks: int=4,
+        sent_break_sec: float=5.0,
     ):
         """
         Initialize the MultiTalkerInstanceManager class with the initial parameters.
@@ -1586,6 +1589,7 @@ class MultiTalkerInstanceManager:
 
         self.batch_size = batch_size
         self.max_num_of_spks = max_num_of_spks
+        self._sent_break_sec = sent_break_sec
 
         # ASR state bank
         self.batch_asr_states = []
@@ -1645,7 +1649,7 @@ class MultiTalkerInstanceManager:
 
         if len(self.batch_asr_states) > 0:
             self.previous_asr_states.extend(deepcopy(self.batch_asr_states))
-        self.batch_asr_states = [self.ASRState(self.max_num_of_spks) for _ in range(self.batch_size)]
+        self.batch_asr_states = [self.ASRState(self.max_num_of_spks, sent_break_sec=self._sent_break_sec) for _ in range(self.batch_size)]
 
         for i in range(self.batch_size):
             self.batch_asr_states[i].reset(self.asr_model.encoder.get_initial_cache_state(batch_size=1))

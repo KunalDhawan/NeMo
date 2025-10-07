@@ -62,27 +62,14 @@ class DiarizationConfig:
     # Required configs
     diar_model_path: Optional[str] = None  # Path to a .nemo file
     diar_pretrained_name: Optional[str] = None  # Name of a pretrained model
-    audio_dir: Optional[str] = None  # Path to a directory which contains audio files
     max_num_of_spks: Optional[int] = 4
-    parallel_speaker_strategy: bool = False
-
-    audio_key: str = 'audio_filepath'  # Used to override the default audio key in dataset_manifest
-    postprocessing_yaml: Optional[str] = None  # Path to a yaml file for postprocessing configurations
-    eval_mode: bool = False
-    no_der: bool = False
-    out_rttm_dir: Optional[str] = None
-    opt_style: Optional[str] = None
+    parallel_speaker_strategy: bool = True
 
     # General configs
     session_len_sec: float = -1 # End-to-end diarization session length in seconds
     num_workers: int = 8
     random_seed: Optional[int] = None  # seed number going to be used in seed_everything()
-    bypass_postprocessing: bool = True # If True, postprocessing will be bypassed
     log: bool = True # If True, log will be printed
-
-    # Eval Settings: (0.25, False) should be default setting for sortformer eval.
-    collar: float = 0.25 # Collar in seconds for DER calculation
-    ignore_overlap: bool = False # If True, DER will be calculated only for non-overlapping segments
 
     # Streaming diarization configs
     streaming_mode: bool = True # If True, streaming diarization will be used.
@@ -100,13 +87,11 @@ class DiarizationConfig:
 
     # ASR Configs
     asr_model: Optional[str] = None
-    diar_model: Optional[str] = None
     device: str = 'cuda'
     audio_file: Optional[str] = None
     manifest_file: Optional[str] = None
     use_amp: bool = True
     debug_mode: bool = False
-    compare_vs_offline: bool = False
     batch_size: int = 32
     chunk_size: int = -1
     shift_size: int = -1
@@ -119,9 +104,7 @@ class DiarizationConfig:
     generate_realtime_scripts: bool = True
 
     word_window: int = 50
-    fix_speaker_assignments: bool = False
-    sentence_break_threshold_in_sec: float = 10000.0
-    sent_break_sec: float = 1.5
+    sent_break_sec: float = 30.0
     fix_prev_words_count: int = 5
     update_prev_words_sentence: int = 5
     left_frame_shift: int = -1
