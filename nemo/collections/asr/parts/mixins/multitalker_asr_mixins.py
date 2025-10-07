@@ -47,8 +47,6 @@ class SpeakerKernelMixin:
     Models using this mixin should have the following config parameters:
     - spk_kernel_type: Type of speaker kernel ('mask', 'concat', 'sinusoidal')
     - spk_kernel_layers: List of layer indices where to apply speaker kernels
-    - spk_kernel_mask_original: Whether to mask original features
-    - spk_kernel_residual: Whether to use residual connections
     - add_bg_spk_kernel: Whether to add background speaker kernels
     """
     
@@ -62,13 +60,12 @@ class SpeakerKernelMixin:
         # Speaker kernel config
         self.spk_kernel_type = cfg.get('spk_kernel_type', None)
         self.spk_kernel_layers = cfg.get('spk_kernel_layers', [])
-        self.spk_kernel_mask_original = cfg.get('spk_kernel_mask_original', True)
-        self.spk_kernel_residual = cfg.get('spk_kernel_residual', True)
         self.add_bg_spk_kernel = cfg.get('add_bg_spk_kernel', False)
         
         # Initialize speaker target containers
         self.spk_targets = None
-        self.bg_spk_targets = None
+        if self.add_bg_spk_kernel:  
+            self.bg_spk_targets = None
         
         # Initialize speaker kernels
         self._init_spk_kernel()
@@ -83,7 +80,8 @@ class SpeakerKernelMixin:
         # Initialize speaker kernels for each specified layer
         hidden_size = self.cfg.model_defaults.enc_hidden
         self.spk_kernels = torch.nn.ModuleDict()
-        self.bg_spk_kernels = torch.nn.ModuleDict()
+        if self.add_bg_spk_kernel:
+            self.bg_spk_kernels = torch.nn.ModuleDict()
     
         # Create kernel for each layer index
         for layer_idx in self.spk_kernel_layers:
@@ -110,7 +108,7 @@ class SpeakerKernelMixin:
     def _attach_spk_kernel_hooks(self):
         """
         Attach speaker kernel hooks to encoder layers.
-        Following NeMo pattern of separating hook attachment logic.
+        Speaker kernels will inject the speaker information into the encoder layers.
         """
         # Only attach hooks if not already attached
         if hasattr(self, 'encoder_hooks'):
@@ -151,17 +149,21 @@ class SpeakerKernelMixin:
             if 'x' in kwargs:
                 x = kwargs['x']
                 x_spk = self.spk_kernels[layer_idx](self.mask_with_speaker_targets(x, self.spk_targets))
-                x_bg_spk = self.bg_spk_kernels[layer_idx](self.mask_with_speaker_targets(x, self.bg_spk_targets))
                 # residual connection
-                x = x + x_spk + x_bg_spk
+                x = x + x_spk
+                if self.add_bg_spk_kernel:
+                    x_bg_spk = self.bg_spk_kernels[layer_idx](self.mask_with_speaker_targets(x, self.bg_spk_targets))
+                    x = x + x_bg_spk
                 kwargs['x'] = x
             elif args:
                 # Fallback in case the call signature ever changes
                 x, *rest = args
                 x_spk = self.spk_kernels[layer_idx](self.mask_with_speaker_targets(x, self.spk_targets))
-                x_bg_spk = self.bg_spk_kernels[layer_idx](self.mask_with_speaker_targets(x, self.bg_spk_targets))
                 # residual connection
-                x = x + x_spk + x_bg_spk
+                x = x + x_spk
+                if self.add_bg_spk_kernel:
+                    x_bg_spk = self.bg_spk_kernels[layer_idx](self.mask_with_speaker_targets(x, self.bg_spk_targets))
+                    x = x + x_bg_spk
                 args = (x, *rest)
 
             return args, kwargs
@@ -188,9 +190,12 @@ class SpeakerKernelMixin:
                 x = output
 
             x_spk = self.spk_kernels[layer_idx](self.mask_with_speaker_targets(x, self.spk_targets))
-            x_bg_spk = self.bg_spk_kernels[layer_idx](self.mask_with_speaker_targets(x, self.bg_spk_targets))
             # residual connection
-            x = x + x_spk + x_bg_spk
+            x = x + x_spk
+
+            if self.add_bg_spk_kernel:
+                x_bg_spk = self.bg_spk_kernels[layer_idx](self.mask_with_speaker_targets(x, self.bg_spk_targets))
+                x = x + x_bg_spk
 
             if isinstance(output, tuple):
                 return (x, *cache)
@@ -222,19 +227,22 @@ class SpeakerKernelMixin:
             bg_spk_targets: Background speaker targets tensor
         """
         self.spk_targets = spk_targets
-        self.bg_spk_targets = bg_spk_targets
+        if self.add_bg_spk_kernel:
+            self.bg_spk_targets = bg_spk_targets
 
     def clear_speaker_targets(self):
         """Clear speaker targets."""
         self.spk_targets = None
-        self.bg_spk_targets = None
+        if self.add_bg_spk_kernel:
+            self.bg_spk_targets = None
     
-    def solve_length_mismatch(self, x, mask):
+    def solve_length_mismatch(self, x: torch.Tensor, mask: torch.Tensor):
         """
         Solve length mismatch between x and mask.
         """
         if mask is None:
             mask = torch.ones_like(x[:, :, 0])
+            logging.warning(f"Mask is None, triggering single speaker mode and assigning all ones with shape: {mask.shape}")
 
         if mask.shape[1] < x.shape[1]:
             # pad zero to the left
@@ -245,7 +253,7 @@ class SpeakerKernelMixin:
 
         return mask
 
-    def mask_with_speaker_targets(self, x, spk_targets):
+    def mask_with_speaker_targets(self, x: torch.Tensor, spk_targets: torch.Tensor):
         """
         Mask the input with speaker targets.
         """
@@ -253,7 +261,7 @@ class SpeakerKernelMixin:
         x_spk = x * mask.unsqueeze(2)
         return x_spk
 
-    def concat_with_speaker_targets(self, x, spk_targets):
+    def concat_with_speaker_targets(self, x: torch.Tensor, spk_targets: torch.Tensor):
         """
         Concatenate the input with speaker targets.
         """

@@ -535,20 +535,6 @@ def get_hidden_length_from_sample_length(
     hidden_length = math.ceil(mel_frame_count / num_mel_frame_per_asr_frame)
     return int(hidden_length)
     
-import numpy as np
-import matplotlib.pyplot as plt
-
-def save_numpy_array_as_png(np_array_source: np.ndarray, output_filepath: str):
-    """
-    Save a NumPy array as a PNG image.
-
-    Args:
-        np_array_source (np.ndarray): The image data (2D or 3D).
-        output_filepath (str): File path where the image will be saved (e.g., "image.png").
-    """
-    expanded_array = np.repeat(np_array_source, 100, axis=1)
-    expanded_array = expanded_array.T  # Transpose the array
-    plt.imsave(output_filepath, expanded_array)
 
 def speaker_to_target(
     a_cut,
@@ -682,20 +668,12 @@ class MultiSpeakerMixtureGenerator():
     def __init__(
         self, 
         manifest_filepath,
-        rir_manifest,
         sample_rate,
-        background_manifest,
         simulator_type,
         min_duration=0.1,
         max_duration=50.0,
         min_delay=0.5,
-        output_dir=None,
-        rir_ratio_range=None,
-        rir_perturb_prob_range=None,
-        rir_variance=None,
-        noise_ratio_range=None,
         random_seed=42,
-        session_config=None, 
         num_speakers=2,
         global_rank=0,
         world_size=1,
@@ -723,40 +701,22 @@ class MultiSpeakerMixtureGenerator():
 
         self.manifest_filepath = manifest_filepath 
         self.manifests = list(LazyJsonlIterator(manifest_filepath))
-        self.background_manifest = background_manifest
-        self.rir_manifest = rir_manifest
         self.sample_rate = sample_rate
-        self.rir_manifest_list = read_rir_manifest(rir_manifest=self.rir_manifest) if self.rir_manifest else None
-        self.rir_ratio_range = rir_ratio_range
-        self.rir_perturb_prob_range = rir_perturb_prob_range
-        self.rir_variance = rir_variance
-        self.noise_ratio_range = noise_ratio_range
         
         self.min_duration = min_duration
         self.max_duration = max_duration
         self.min_delay = min_delay
         self.simulator_type = simulator_type
-        self.output_dir = output_dir
-        self.session_config = session_config
         self.max_speakers = num_speakers
 
-        self.global_rank_offset = 1000
-        
         print("======  simulator_type", simulator_type)
 
         type2simulator = {
             'lsmix': self.LibriSpeechMixSimulator,
-            'audiomix': self.AudioMixtureSimulator,
-            'channel_separated_audio_mixer': self.ChannelSeparatedAudioMixer,
-            'mixture_loader': self.MultiSpeakerMixtureLoader,
-            'meeting': self.MeetingSimulator,
-            'conversation': self.ConversationSimulator
+            'mixture_loader': self.MultiSpeakerMixtureLoader
         }
 
         self.simulator = type2simulator[simulator_type]
-
-        if simulator_type == 'audiomix':
-            self._init_audiomix_simulator()
 
         if simulator_type == 'lsmix':
             self.spk2manifests = groupby(lambda x: x["speaker_id"], self.manifests)
@@ -764,215 +724,12 @@ class MultiSpeakerMixtureGenerator():
 
         self.count = 0
 
-    def _init_audiomix_simulator(self):
-        """ 
-        Initialize the NeMo MultiSpeakerSimulator. An instance of MultiSpeakerSimulator is created 
-        under self.nemo_ms_simulator.
-        """
-        cfg = OmegaConf.structured(MultiSpeakerSimulatorConfig())
-        cfg.data_simulator.manifest_filepath = self.manifest_filepath
-        cfg.data_simulator.outputs.output_dir = self.output_dir
-        cfg.data_simulator.session_config.num_sessions = self.session_config.get("num_sessions", 1)
-        cfg.data_simulator.session_config.num_speakers = self.session_config.get("num_speakers", 2)
-        cfg.data_simulator.session_config.session_length = self.session_config.get("session_length", 45)
-        cfg.data_simulator.session_config.session_length_range = self.session_config.get("session_length_range", [10, 40])
-        cfg.data_simulator.background_noise.background_manifest = self.background_manifest
-        self.nemo_ms_simulator = MultiSpeakerSimulator(cfg=cfg)
-
     def __iter__(self):
         return self
     
     def __next__(self):
         self.count += 1
         return self.simulator()
-
-    def _get_custom_dict(self, additional_info=None, speaker_id=None):
-        custom = {
-            'pnc': 'no',
-            'source_lang': 'en',
-            'target_lang': 'en',
-            'task': 'asr',
-            'speaker_id': speaker_id,
-        }
-        if additional_info:
-            custom.update(additional_info)
-        return custom
-
-    def _save_audio_and_annotation(self, mixed_cut, uniq_id):
-        # self._init_audiomix_simulator()
-        # uniq_folder_name = f"{uniq_id}_test_an_rir_v6_ro{str(self.nemo_ms_simulator._params.data_simulator.session_params.random_offset)}_{self.session_config.num_speakers}spk"
-        uniq_folder_name = uniq_id
-        bs_true = speaker_to_target(mixed_cut, boundary_segments=True, is_audio_mix_sim=True)
-        bs_false = speaker_to_target(mixed_cut, boundary_segments=False, is_audio_mix_sim=True)
-        os.makedirs(f"{self.output_dir}/{uniq_folder_name}", exist_ok=True)
-        save_numpy_array_as_png(bs_true, f"{self.output_dir}/{uniq_folder_name}/bs_true.png")
-        save_numpy_array_as_png(bs_false, f"{self.output_dir}/{uniq_folder_name}/bs_false.png")
-        ### loaded_audio = mixed_cut.load_audio().squeeze(0)
-        loaded_audio = mixed_cut.load_audio().squeeze(0)
-        ### Normalize the audio array
-
-        package_path = f"{self.output_dir}/{uniq_folder_name}"
-        os.makedirs(package_path, exist_ok=True)
-        # sf.write(os.path.join(package_path, uniq_id + '.wav'), array, self.nemo_ms_simulator._params.data_simulator.sr)
-        sf.write(os.path.join(package_path, uniq_id + '_lhotse.wav'), loaded_audio, self.sample_rate)
-
-        self.nemo_ms_simulator.annotator.write_annotation_rttm_and_ctm(
-            basepath=package_path,
-            filename=uniq_id,
-        )
-
-    def _random_seed(self, session_seed):
-        random.seed(session_seed)
-        np.random.seed(session_seed)
-        torch.manual_seed(session_seed)
-        torch.cuda.manual_seed(session_seed)
-        torch.cuda.manual_seed_all(session_seed)
-
-    def _get_sample_seed(self):
-        """ 
-        Change the random seed for the sample.
-        To avoid duplicated seeds, we multiply the global_rank_offset by the global_rank and add the count.
-        """
-        return self.global_rank_offset * self.global_rank + self.count
-    
-    def _get_noise_variations(self):
-        """
-        Get the perturb variations for the audio.
-        Sample the noise ratio and rir ratio from the ranges.
-        """
-        noise_json_list = self.nemo_ms_simulator.annotator.annote_lists['noise']
-        noise_ratio = random.uniform(self.noise_ratio_range[0], self.noise_ratio_range[1])
-        return noise_ratio, noise_json_list
-
-    def _get_rir_variations(self, num_speakers):
-        """
-        Get the perturb variations for the audio.
-        """
-        # Sample the noise ratio and rir ratio from the ranges
-        rir_ratio = random.uniform(self.rir_ratio_range[0], self.rir_ratio_range[1])
-        if self.rir_perturb_prob_range is not None:
-            try:
-                rir_perturb_prob = random.uniform(self.rir_perturb_prob_range[0], self.rir_perturb_prob_range[1])
-            except:
-                import ipdb; ipdb.set_trace()
-        else:
-            rir_perturb_prob = 0.0
-
-        # load RIR
-        selected_rir_paths = random.sample(self.rir_manifest_list, num_speakers)
-        reverb_rirs = [Recording.from_file(rir_path['audio_filepath']) for rir_path in selected_rir_paths]
-        return rir_ratio, rir_perturb_prob, reverb_rirs
-    
-    def _get_rir_ratio_varied(self, rir_ratio):
-        """
-        Get the perturbed RIR ratio to simulate the head-movement of the speakers in the room.
-        """
-        if self.rir_variance is not None: 
-            if isinstance(self.rir_variance, float):
-                rir_ratio_varied = random.uniform(rir_ratio - self.rir_variance, rir_ratio + self.rir_variance)
-            else:
-                raise ValueError(f"RIR variance must be a float, but got {type(self.rir_variance)}")
-        else:
-            rir_ratio_varied = rir_ratio
-        return rir_ratio_varied
-
-    def _set_session_length(self):
-        """
-        If session_length_range is set, set the session length to a random value within the range.
-        """
-        if self.session_config.session_length_range is not None:
-            self.nemo_ms_simulator._params.data_simulator.session_config.session_length = random.randint(self.session_config.session_length_range[0], self.session_config.session_length_range[1])
-        else:
-            self.nemo_ms_simulator._params.data_simulator.session_config.session_length = self.session_config.session_length
-        print(f"-[ Session Length Set! ]----->>> session_length: {self.nemo_ms_simulator._params.data_simulator.session_config.session_length}")
-
-    def AudioMixtureSimulator(self):
-        """
-        NeMo MultiSpeaker Speech Simulator
-        """
-        sample_seed = self._get_sample_seed()
-        self.nemo_ms_simulator.update_random_seed(sample_seed)
-
-        self._set_session_length()
-        manifest_json_list, uniq_id, mix_array, speaker_ids = self.nemo_ms_simulator.generate_single_session(random_seed=sample_seed, sess_idx=self.count)
-        spk_mapping = {spk_id: spk_idx for spk_idx, spk_id in enumerate(speaker_ids)}
-        uniq_id = f"audiomix_{self.count}_nspk{len(spk_mapping.keys())}"
-
-        noise_ratio, noise_json_list = self._get_noise_variations()
-        rir_ratio, rir_perturb_prob, reverb_rirs = self._get_rir_variations(self.session_config.num_speakers)
-
-        # Speech Cuts added
-        mono_cuts = []
-        for manifest in manifest_json_list:
-            mono_cuts.append(self.json_to_cut(json_dict=manifest))
-            mono_cuts[-1].supervisions.append(
-                SupervisionSegment(
-                    id=uuid4(),
-                    recording_id=uuid4(),
-                    start=manifest['offset'],
-                    duration=manifest['duration'],
-                    text=' '.join(manifest['words']), # TODO: fix it for text
-                    speaker=manifest['speaker_id']
-                )
-            )
-
-        speaker_tracks, speaker_rir_mapping = {}, {}
-        # print(f"-[ RIR IF STATEMENT ]----->>> self.rir_manifest: {self.rir_manifest}, rir_ratio: {rir_ratio}, rir_perturb_prob: {rir_perturb_prob}")
-        for mono_cut in mono_cuts:
-            speaker_id=mono_cut.supervisions[0].speaker
-            if self.rir_manifest is None or random.random() > rir_perturb_prob:
-                cln_mix_track = MixTrack(cut=deepcopy(mono_cut), 
-                                    type=type(mono_cut), 
-                                    offset=mono_cut.custom['mixed_cut_offset']
-                                    )
-                speaker_tracks.setdefault(speaker_id, []).append(cln_mix_track)
-            else:
-                if speaker_id not in speaker_rir_mapping:
-                    speaker_rir_mapping[speaker_id] = reverb_rirs[len(speaker_rir_mapping.keys())]
-                speaker_rir_recording = speaker_rir_mapping[speaker_id]
-                mono_cut.custom.update(self._get_custom_dict(speaker_id=speaker_id))
-                rir_ratio_varied = self._get_rir_ratio_varied(rir_ratio)
-                # print(f"-[ RIR Perturbed ]----->>> rir_ratio: {rir_ratio}, rir_ratio_varied: {rir_ratio_varied}, rir_perturb_prob: {rir_perturb_prob}")
-                rir_mono_cut = mono_cut.reverb_rir(speaker_rir_recording).perturb_volume(rir_ratio_varied)
-                cln_mono_cut = mono_cut.perturb_volume(1-rir_ratio_varied)
-                cln_mix_track = MixTrack(cut=deepcopy(cln_mono_cut), 
-                                    type=type(cln_mono_cut), 
-                                    offset=cln_mono_cut.custom['mixed_cut_offset']
-                                    )
-                rir_mix_track = MixTrack(cut=deepcopy(rir_mono_cut), 
-                                    type=type(rir_mono_cut), 
-                                    offset=rir_mono_cut.custom['mixed_cut_offset']
-                                    )
-                # clear the supervisions of the rir_mix_track
-                # to avoid the rir_mix_track has the same supervisions as the cln_mix_track
-                # to avoid repeated supervisions in the mixed_cut
-                rir_mix_track.cut.supervisions = []
-                if speaker_id not in speaker_tracks:
-                    speaker_tracks[speaker_id] = [cln_mix_track, rir_mix_track]
-                else:
-                    speaker_tracks[speaker_id].extend([cln_mix_track, rir_mix_track])
-
-        # Noise Cuts added
-        noise_cuts = []
-        for noise_manifest in noise_json_list:
-            noise_cuts.append(self.json_to_cut(noise_manifest))
-        
-        noise_tracks = []
-        for noise_cut in noise_cuts:
-            noise_cut.custom.update(self._get_custom_dict())
-            noise_cut = noise_cut.perturb_volume(noise_ratio)
-            noise_tracks.append(MixTrack(cut=deepcopy(noise_cut), type=type(noise_cut), offset=noise_cut.custom['mixed_cut_offset']))
-
-        # Merge all speaker tracks into a list 
-        all_spk_tracks = []
-        for spk_id, tracks in speaker_tracks.items():
-            all_spk_tracks.extend(tracks)
-
-        # mixed_cut = MixedCut(id=uniq_id, tracks=all_spk_tracks) 
-        mixed_cut = MixedCut(id=uniq_id, tracks=all_spk_tracks + noise_tracks)
-        mixed_cut.id = uniq_id
-
-        return mixed_cut
 
     def LibriSpeechMixSimulator(self):
         """
@@ -987,7 +744,7 @@ class MultiSpeakerMixtureGenerator():
         mono_cuts = []
         for speaker_id in sampled_speaker_ids:
             manifest = random.choice(self.spk2manifests[speaker_id])
-            mono_cuts.append(self.json_to_cut(manifest))
+            mono_cuts.append(self._json_to_cut(manifest))
             mono_cuts[-1].supervisions.append(
                 SupervisionSegment(
                     id=uuid4(),
@@ -1009,78 +766,6 @@ class MultiSpeakerMixtureGenerator():
 
         return mixed_cut
 
-    def ChannelSeparatedAudioMixer(self):
-        """
-        This function simulates a channel-separated audio mixer.
-        """
-
-        # basic info for both channels
-        manifest = random.choice(self.manifests)
-        audio_filepath_list = manifest['audio_filepath']
-        seglst_filepath_list = manifest['seglst_filepath']
-        channel_list = manifest['channels']
-
-        all_supervisions = []
-        for i_ch in channel_list:
-            seglst_filepath = seglst_filepath_list[i_ch]
-            supervisions = read_seglst(seglst_filepath, session_id=manifest['session_id'])
-            all_supervisions.append(supervisions)
-            
-        sorted_supervisions = sorted(list(itertools.chain.from_iterable(all_supervisions)), key=lambda x: x.start)
-        # find the start and the end of the segment
-        segment_offset, segment_duration = self._get_offset_and_duration(sorted_supervisions)
-        
-        tracks = []
-        if self.rir_manifest is not None:
-            rir_ratio, rir_perturb_prob, reverb_rirs = self._get_rir_variations(num_speakers=len(channel_list))
-            speaker_rir_mapping = { x: reverb_rirs[i] for i, x in enumerate(channel_list) }
-
-        for i_ch in channel_list:
-            audio_filepath = audio_filepath_list[i_ch]
-            seglst_filepath = seglst_filepath_list[i_ch]
-            supervisions = all_supervisions[i_ch]
-            
-            json_dict = {
-                'audio_filepath': audio_filepath,
-                'duration': segment_duration,
-                'offset': segment_offset,
-                'speaker_id': supervisions[0].speaker,
-                'supervisions': find_segments_from_rttm(recording_id=supervisions[0].recording_id, rttms=SupervisionSet(supervisions), start_after=segment_offset, end_before=segment_offset + segment_duration, adjust_offset=False)
-            }
-            cut = self.json_to_cut(json_dict)
-            cut.custom = self._get_custom_dict()
-
-            # print(f"-[ RIR IF STATEMENT ]----->>> self.rir_manifest: {self.rir_manifest}, rir_ratio: {rir_ratio}, rir_perturb_prob: {rir_perturb_prob}")
-            if (self.rir_manifest is None or self.rir_manifest == "") or random.random() > rir_perturb_prob:
-                cln_mix_track = MixTrack(cut=deepcopy(cut), type=type(cut), offset=0)
-                # speaker_tracks.setdefault(speaker_id, []).append(cln_mix_track)
-                tracks.append(cln_mix_track)
-            else:
-                speaker_rir_recording = speaker_rir_mapping[i_ch]
-                cut.custom.update(self._get_custom_dict(speaker_id=i_ch))
-                rir_ratio_varied = self._get_rir_ratio_varied(rir_ratio)
-                # print(f"-[ RIR Perturbed ]----->>> rir_ratio: {rir_ratio}, rir_ratio_varied: {rir_ratio_varied}, rir_perturb_prob: {rir_perturb_prob}")
-
-                rir_mono_cut = cut.reverb_rir(speaker_rir_recording).perturb_volume(rir_ratio_varied)
-                cln_mono_cut = cut.perturb_volume(1-rir_ratio_varied)
-                cln_mix_track = MixTrack(cut=deepcopy(cln_mono_cut), 
-                                    type=type(cln_mono_cut), 
-                                    offset=0,
-                                    )
-                rir_mix_track = MixTrack(cut=deepcopy(rir_mono_cut), 
-                                    type=type(rir_mono_cut), 
-                                    offset=0,
-                                    )
-                rir_mix_track.cut.supervisions = []
-                tracks.extend([cln_mix_track, rir_mix_track])
-
-        uniq_id = 'channel_separated_audio_mixer_' + '_'.join([track.cut.id for track in tracks]) + '_' + str(uuid4())
-        mixed_cut = MixedCut(
-            id=uniq_id, 
-            tracks=tracks)
-
-        return mixed_cut
-
     def MultiSpeakerMixtureLoader(self):
 
         manifest = random.choice(self.manifests)
@@ -1098,15 +783,9 @@ class MultiSpeakerMixtureGenerator():
             'offset': segment_offset,
             'supervisions': find_segments_from_rttm(recording_id=supervisions[0].recording_id, rttms=SupervisionSet(supervisions), start_after=segment_offset, end_before=segment_offset + segment_duration, adjust_offset=False)
         }
-        cut = self.json_to_cut(json_dict)
+        cut = self._json_to_cut(json_dict)
 
         return cut
-
-    def MeetingSimulator(self):
-        raise NotImplementedError("MeetingSimulator is not implemented yet.")   
-
-    def ConversationSimulator(self):
-        raise NotImplementedError("ConversationSimulator is not implemented yet.")
 
     def _get_offset_and_duration(self, supervisions):
         """
@@ -1143,7 +822,7 @@ class MultiSpeakerMixtureGenerator():
                 max_end = max(max_end, supervisions[i].end)
         return non_overlap_supervisions_indices
     
-    def json_to_cut(self, json_dict, speaker_index: Union[int, None] = None):
+    def _json_to_cut(self, json_dict):
         """
         Convert a json dictionary to a Cut instance.
         """
