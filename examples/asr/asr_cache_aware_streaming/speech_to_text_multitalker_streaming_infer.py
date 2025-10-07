@@ -121,6 +121,7 @@ class DiarizationConfig:
     word_window: int = 50
     fix_speaker_assignments: bool = False
     sentence_break_threshold_in_sec: float = 10000.0
+    sent_break_sec: float = 1.5
     fix_prev_words_count: int = 5
     update_prev_words_sentence: int = 5
     left_frame_shift: int = -1

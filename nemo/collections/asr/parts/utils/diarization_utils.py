@@ -500,7 +500,12 @@ def print_sentences(sentences: List[Dict[str, float]],
         speaker = sentence['speaker']
         start_point = sentence['start_time']
         end_point = sentence['end_time']
-        text = sentence['text']
+        if 'text' in sentence:
+            text = sentence['text']
+        elif 'words' in sentence:
+            text = sentence['words']
+        else:
+            raise ValueError(f"text or words not in sentence: {sentence}")
 
         if params.get('colored_text', False):
             color = color_palette.get(speaker, '\033[0;37m')

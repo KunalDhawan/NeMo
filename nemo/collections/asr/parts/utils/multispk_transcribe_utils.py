@@ -83,7 +83,7 @@ def get_multi_talker_samples_from_manifest(cfg, manifest_file: str, feat_per_sec
         rttms_mask_mats (list): The list of rttm mask matrices.
     """
     samples, rttms_mask_mats = [], []
-    with open(manifest_file, 'r') as f:
+    with open(manifest_file, 'r', encoding='utf-8') as f:
         for line_num, line in enumerate(f):
             item = json.loads(line)
             if 'audio_filepath' not in item:
@@ -98,7 +98,7 @@ def get_multi_talker_samples_from_manifest(cfg, manifest_file: str, feat_per_sec
                 if not os.path.exists(rttm_path):
                     raise FileNotFoundError(f"Line {line_num}: RTTM file not found: {rttm_path}")
 
-                with open(rttm_path, 'r') as f:
+                with open(rttm_path, 'r', encoding='utf-8') as f:
                     rttm_lines = f.readlines()
                 rttm_timestamps, _ = extract_frame_info_from_rttm(0, samples[-1]['duration'], rttm_lines)
                 rttm_mat = get_frame_targets_from_rttm(
@@ -173,7 +173,7 @@ def get_new_sentence_dict(
         'speaker': speaker,
         'start_time': start_time,
         'end_time': end_time,
-        'words': text,
+        'words': text.lstrip(),
         'session_id': session_id,
     }
 
@@ -485,7 +485,7 @@ class SpeakerTaggedASR:
         # Multi-instance configs
         self._max_num_of_spks = cfg.get("max_num_of_spks", 4)
         self._offset_chunk_start_time = 0.0
-        self._sent_break_sec = cfg.get("sent_break_sec", 2.5)
+        self._sent_break_sec = cfg.get("sent_break_sec", 1.5)
 
         self._att_context_size = cfg.att_context_size
         self._nframes_per_chunk = self._att_context_size[1] + 1
@@ -560,7 +560,6 @@ class SpeakerTaggedASR:
                 'speaker': word_dict['speaker'],
                 'start_time': word_dict['start_time'],
                 'end_time': word_dict['end_time'],
-                'text': f"{word_dict['word']} ",
                 'words': f"{word_dict['word']} "}
 
     def _get_sentence(self, word_dict: Dict[str, Any]) -> Dict[str, Any]:
@@ -573,7 +572,7 @@ class SpeakerTaggedASR:
         return {'speaker': word_dict['speaker'],
                 'start_time':  word_dict['start_time'],
                 'end_time': word_dict['end_time'],
-                'text': ''}
+                'words': ''}
 
     def get_sentences_values(self, session_trans_dict: dict, sentence_render_length: int):
         """
@@ -605,18 +604,18 @@ class SpeakerTaggedASR:
             word_dict = session_trans_dict['words'][word_idx]
             word, end_point = word_dict['word'], word_dict['end_time']
             if word_dict['speaker'] != prev_speaker:
-                sentence['text'] = sentence['text'].strip()
+                sentence['words'] = sentence['words'].strip()
                 sentences.append(sentence)
                 sentence = self._get_sentence(word_dict=session_trans_dict['words'][word_idx])
             else:
                 sentence['end_time'] = end_point
-            sentence['text'] += word.strip() + ' '
-            sentence['words'] = sentence['text']
+            sentence['words'] += word.strip() + ' '
+            sentence['words'] = sentence['words']
             sentence['session_id'] = session_trans_dict['uniq_id']
             session_trans_dict['last_word_index'] = word_idx
             prev_speaker = word_dict['speaker']
             session_trans_dict['sentence_memory'][word_idx] = (deepcopy(sentences), deepcopy(sentence), prev_speaker)
-        sentence['text'] = sentence['text'].strip()
+        sentence['words'] = sentence['words'].strip()
         sentences.append(sentence)
         session_trans_dict['sentences'] = sentences
         return session_trans_dict
@@ -888,7 +887,7 @@ class SpeakerTaggedASR:
                     speaker=seg['speaker'],
                     start_time=seg['start_time'],
                     end_time=seg['end_time'],
-                    text=seg['text'],
+                    text=seg['words'],
                     session_id=uniq_id
                 ) for seg in asr_state.seglsts
             ]
@@ -1206,6 +1205,7 @@ class SpeakerTaggedASR:
         # skip current chunk if no active speakers are found
         if active_chunk_audio is None:
             return
+        
         # Step 6:
         # 1. mask the non-active speakers for masked ASR
         # 2. set speaker targets for multitalker ASR
@@ -1241,6 +1241,7 @@ class SpeakerTaggedASR:
                 return_transcription=True,
                 bypass_pre_encode=bypass_pre_encode
             )
+        
         # Step 8: update ASR states
         active_id = 0
         for batch_idx, speaker_ids in enumerate(active_speakers):
@@ -1412,8 +1413,9 @@ class MultiTalkerInstanceManager:
                 end_time (float): The end time of the last sentence.
                 diff_text (str): The difference text.
             """
-            self._speaker_wise_sentences[spk_idx][-1]['end_time'] = end_time
-            self._speaker_wise_sentences[spk_idx][-1]['text'] += diff_text
+            if end_time is not None:
+                self._speaker_wise_sentences[spk_idx][-1]['end_time'] = end_time
+            self._speaker_wise_sentences[spk_idx][-1]['words'] += diff_text
 
         def _is_new_text(self, spk_idx: int, text: str):
             """
@@ -1471,9 +1473,10 @@ class MultiTalkerInstanceManager:
 
             return start_time, end_time, sep_flag
 
-        def update_seglsts(self, offset: float):
+        def update_sessionwise_seglsts_for_parallel(self, offset: float):
             """
-            Update the seglsts for the ASR state.
+            Update the seglsts for the parallel mode streaming.
+            Note that this function is NOT used for serial mode streaming.
 
             Args:
                 offset (float): The offset in seconds.
@@ -1505,6 +1508,10 @@ class MultiTalkerInstanceManager:
 
                     # Case 1 - If start_tiime is greater than end_time + sent_break_sec, then we need to add the sentence
                     if sep_flag or (last_end_time == 0.0 or start_time > last_end_time + self._sent_break_sec):
+                        if len(diff_text) > 0 and diff_text.strip()[0] in ['.', ',', '?', '!']:
+                            # This handles the case where the first character should be assigned to the previous sentence.
+                            the_first_char, diff_text = diff_text.strip()[0], diff_text.strip()[1:]
+                            self._update_last_sentence(spk_idx=spk_idx, end_time=None, diff_text=the_first_char)
                         self._speaker_wise_sentences[spk_idx].append(get_new_sentence_dict(speaker=f"speaker_{spk_idx}",
                                                                                            start_time=start_time,
                                                                                            end_time=end_time,
@@ -1517,10 +1524,14 @@ class MultiTalkerInstanceManager:
                 if hypothesis.text is not None:
                     self._prev_history_speaker_texts[spk_idx] = hypothesis.text
 
-            # Merge all sentences for each speaker but sort by start_time
             self.seglsts = []
+
+            # Merge all sentences for each speaker but sort by start_time
             for spk_idx in valid_speakers:
                 self.seglsts.extend(self._speaker_wise_sentences[spk_idx])
+
+            # Finally, sort the seglsts by start_time
+            self.seglsts = sorted(self.seglsts, key=lambda x: x['start_time'])
 
     class DiarState:
         """
@@ -1788,4 +1799,4 @@ class MultiTalkerInstanceManager:
             offset (int): The offset of the chunk.
         """
         for asr_state in self.batch_asr_states:
-            asr_state.update_seglsts(offset=offset)
+            asr_state.update_sessionwise_seglsts_for_parallel(offset=offset)
