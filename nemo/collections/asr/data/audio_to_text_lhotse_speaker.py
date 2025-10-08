@@ -71,54 +71,21 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, cuts) -> Tuple[torch.Tensor, ...]:
 
-        # import time
-        # start_time = time.time()
         audio, audio_lens, cuts = self.load_audio(cuts)
-        # end_time = time.time()
-        # print(f"====[  Audio Loading Time ] ==== time taken: {end_time - start_time:.3f} seconds")
 
         tokens = []
         spk_targets = []
         bg_spk_targets = []
 
         if self.inference_mode:
-            
             speaker_targets = [speaker_to_target(cut, self.num_speakers, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame, self.spk_tar_all_zero) for cut in cuts]
             spk_targets = collate_matrices(speaker_targets, padding_value=0)
             return audio, audio_lens, None, None, spk_targets
 
         for idx, cut in enumerate(cuts):
-            non_padding_cuts = []
-            if isinstance(cut, MonoCut):
-                non_padding_cuts.append(cut)
-            elif isinstance(cut, MixedCut):
-                if len(cut.tracks) == 2 and isinstance(cut.tracks[1].cut, PaddingCut):
-                    non_padding_cuts.append(cut.tracks[0].cut)
-                else:
-                    for track in cut.tracks:
-                        if isinstance(track.cut, MonoCut):
-                            non_padding_cuts.append(track.cut)
 
-            if "audiomix" in cut.id and isinstance(cut, MixedCut):
-                num_speakers_in_cut = int(cut.id.split("nspk")[-1])
-                texts = ['' for _ in range(num_speakers_in_cut)]
-                for track in cut.tracks:
-                    if len(track.cut.supervisions) > 0 and track.cut.supervisions[0].speaker is not None:
-                        texts[track.cut.supervisions[0].speaker] += f"{track.cut.supervisions[0].text} "
-                texts = [text.strip() for text in texts]
-                speaker_targets = speaker_to_target(cut, self.num_speakers, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame, self.spk_tar_all_zero)
-                speaker_targets = speaker_targets.transpose(0, 1)[:len(texts)]
-            else:
-                if hasattr(non_padding_cuts[0], 'text') and '<|spltoken0|>' in non_padding_cuts[0].text:
-                    # the previous data style with speaker tokens
-                    texts = self.split_text(non_padding_cuts[0].custom['text'])
-                    speaker_targets = speaker_to_target(cut, self.num_speakers, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame, self.spk_tar_all_zero)
-                else:
-                    # new channel
-                    speaker_targets, texts = speaker_to_target(cut, self.num_speakers, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame, self.spk_tar_all_zero, return_text=True)
-                    # speaker_targets = torch.stack(speaker_targets)
-                    #texts = [non_padding_cut.custom['text'] for non_padding_cut in non_padding_cuts if hasattr(non_padding_cut, 'text')]
-                speaker_targets = speaker_targets.transpose(0, 1)[:len(texts)]
+            speaker_targets, texts = speaker_to_target(cut, self.num_speakers, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame, self.spk_tar_all_zero, return_text=True)
+            speaker_targets = speaker_targets.transpose(0, 1)[:len(texts)]
 
             target_speaker_id = random.choice(range(len(texts)))
             non_target_speaker_ids = [i for i in range(len(texts)) if i != target_speaker_id]
@@ -136,35 +103,3 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
         bg_spk_targets = collate_vectors(bg_spk_targets, padding_value=0)
         
         return audio, audio_lens, tokens, token_lens, spk_targets, bg_spk_targets
-
-    def split_text(self, text, speaker_token='<|spltoken*|>'):
-        """
-        Split text by speaker tokens and group text from the same speaker.
-        
-        Args:
-            text (str): Input text with speaker tokens
-            speaker_token (str): Base speaker token pattern, where * will be replaced with numbers
-        
-        Returns:
-            list[str]: List of concatenated text for each speaker. Returns [text] if no speaker tokens found.
-        """
-        # Replace * with a digit in the pattern
-        pattern = speaker_token.replace('*', r'\d+').replace('|', '\\|')
-        # pattern = '(<\|spltoken\d+\|>)'
-        
-        # Split text by speaker tokens
-        segments = re.split(rf'({pattern})', text.strip())
-
-        spks = []
-        spk2text = {}
-        
-        for i in range(1, len(segments), 2):  # Step by 2 to skip over text between speaker tags
-            speaker_tag = segments[i]
-            words = segments[i + 1]
-            if speaker_tag not in spks:
-                spk2text[speaker_tag] = words.strip()
-                spks.append(speaker_tag)
-            else:
-                spk2text[speaker_tag] += ' ' + words.strip()
-            
-        return [spk2text[spk] for spk in spks]

@@ -767,6 +767,22 @@ class MultiSpeakerMixtureGenerator():
         return mixed_cut
 
     def MultiSpeakerMixtureLoader(self):
+        """
+        Load a multi-speaker mixture from the manifest,
+          and generate a mixed cut with a random duration.
+        The timestamps and transcript are from the seglst file,
+        where the format is:
+            {
+                "session_id": "session_id",
+                "speaker": "speaker_id",
+                "words": "transcript",
+                "start_time": "start_time",
+                "end_time": "end_time",
+                "duration": "duration"
+                ...
+            }
+        Supervisions are generated from the seglst file and sorted by start time.
+        """
 
         manifest = random.choice(self.manifests)
         audio_filepath = manifest['audio_filepath']
@@ -789,7 +805,7 @@ class MultiSpeakerMixtureGenerator():
 
     def _get_offset_and_duration(self, supervisions):
         """
-        Get the offset and duration of the segment.
+        Get a random offset and duration of the segment.
         supervisions should be sorted by start time
         """
         non_overlap_supervisions_indices = self._get_non_overlap_supervisions_indices(supervisions)

@@ -65,7 +65,6 @@ class EncDecMultiTalkerRNNTBPEModel(EncDecRNNTBPEModel, SpeakerKernelMixin):
 
         return super().training_step(batch, batch_nb)
 
-
     def validation_pass(self, batch, batch_idx, dataloader_idx=0):
         """Validation pass with speaker targets."""
         signal, signal_len, transcript, transcript_len, *additional_args = batch
