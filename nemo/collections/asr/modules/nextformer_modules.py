@@ -47,16 +47,23 @@ class NextformerModules(NeuralModule, Exportable):
         fc_d_model: int = 512,
         tf_d_model: int = 192,
         subsampling_factor: int = 8,
+        local_num_spks: int = 4,
+        pred_score_threshold: float = 0.25,
     ):
         super().__init__()
         # General params
         self.subsampling_factor = subsampling_factor
         self.fc_d_model = fc_d_model
         self.tf_d_model = tf_d_model
+        self.local_num_spks = local_num_spks
+        self.pred_score_threshold = pred_score_threshold
 
         self.encoder_proj = nn.Linear(self.fc_d_model, self.tf_d_model)
         self.query_classifier = nn.Linear(self.tf_d_model, 1)
-        self.ff = PositionWiseFF(hidden_size=self.tf_d_model, inner_size=4*self.tf_d_model, ffn_dropout=ff_dropout_rate)
+        self.ff = PositionWiseFF(hidden_size=self.tf_d_model, inner_size=4 * self.tf_d_model, ffn_dropout=ff_dropout_rate)
+        self.first_hidden_to_hidden = nn.Linear(self.tf_d_model, self.tf_d_model)
+        self.single_hidden_to_spks = nn.Linear(self.tf_d_model, self.local_num_spks)
+        self.dropout = nn.Dropout(ff_dropout_rate)
         self.log = False
 
     @staticmethod
@@ -76,6 +83,75 @@ class NextformerModules(NeuralModule, Exportable):
         arange = torch.arange(max_length, device=lengths.device)
         mask = arange.expand(batch_size, max_length) < lengths.unsqueeze(1)
         return mask
+
+    def forward_local_spk_logits(self, emb_seq):
+        """
+        The final layer that outputs local speaker logits
+
+        Args:
+            emb_seq (torch.Tensor): Tensor containing hidden states from the encoder
+                Shape: (batch_size, n_frames, emb_dim)
+
+        Returns:
+            local_logits (torch.Tensor): Tensor containing local speaker logits computed using
+                Shape: (batch_size, n_frames, n_spk)
+        """
+        emb_seq_ = self.dropout(F.relu(emb_seq))
+        emb_seq_ = self.first_hidden_to_hidden(emb_seq_)
+        emb_seq_ = self.dropout(F.relu(emb_seq_))
+        local_logits = self.single_hidden_to_spks(emb_seq_)
+        return local_logits
+
+    def get_init_queries(self, preds, emb_seq):
+        """
+        Get initial queries as a weighted average of encoder embeddings.
+        Predictions with values lower than 0.5 are excluded.
+        Args:
+            preds (torch.Tensor): Tensor containing speaker predictions (weights).
+                Shape: (batch_size, n_frames, n_spk)
+            emb_seq (torch.Tensor): Tensor containing hidden states from the encoder.
+                Shape: (batch_size, n_frames, emb_dim)
+        Returns:
+            init_queries (torch.Tensor): Tensor containing initial speaker queries.
+                Shape: (batch_size, n_spk, emb_dim)
+        """
+        scores = self._get_log_pred_scores(preds)
+        is_speech = preds > 0.5
+        scores = torch.where(is_speech, scores, torch.tensor(float('-inf')))
+        weights = torch.where(scores > 0, preds, torch.tensor(0.0, device=preds.device))
+
+        # Fallback for speakers with no positive scores
+        no_pos_scores_mask = (weights.sum(dim=1) == 0) & (preds.max(dim=1)[0] > 0.5)  # Shape: (B, N_spk)
+        if no_pos_scores_mask.any():
+            logging.info(f"Fallback! no_pos_scores_mask: {no_pos_scores_mask}")
+            fallback_weights = torch.where(preds > 0.5, preds, torch.tensor(0.0, device=preds.device))
+            expanded_mask = no_pos_scores_mask.unsqueeze(1).expand_as(weights)
+            weights = torch.where(expanded_mask, fallback_weights, weights)
+
+        init_queries_sum = torch.matmul(weights.transpose(1, 2), emb_seq)
+        sum_weights = weights.sum(dim=1)
+        logging.info(f"sum_weights: {sum_weights}")
+        init_queries = init_queries_sum / (sum_weights.unsqueeze(-1) + 1e-8)
+        return init_queries
+
+    def _get_log_pred_scores(self, preds):
+        """
+        Get per-frame scores for speakers based on their activity probabilities.
+        Scores are log-based and designed to be high for confident prediction of non-overlapped speech.
+
+        Args:
+            preds (torch.Tensor): Tensor containing speaker activity probabilities
+                Shape: (batch_size, n_frames, n_spk)
+
+        Returns:
+            scores (torch.Tensor): Tensor containing speaker scores
+                Shape: (batch_size, n_frames, n_spk)
+        """
+        log_probs = torch.log(torch.clamp(preds, min=self.pred_score_threshold))
+        log_1_probs = torch.log(torch.clamp(1.0 - preds, min=self.pred_score_threshold))
+        log_1_probs_sum = log_1_probs.sum(dim=2).unsqueeze(-1).expand(-1, -1, self.local_num_spks)
+        scores = log_probs - log_1_probs + log_1_probs_sum - math.log(0.5)
+        return scores
 
     def forward_spk_logits(self, emb_seq, spk_queries):
         """

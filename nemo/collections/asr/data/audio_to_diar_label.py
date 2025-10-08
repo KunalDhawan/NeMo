@@ -1450,7 +1450,10 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         target_len = torch.clamp(target_len, max=self.get_frame_count_from_time_series_length(audio_signal.shape[0]))
         targets = self.get_soft_targets_seg(feat_level_target=frame_level_target, target_len=target_len)
         targets = targets[:target_len, :]
-        logging.info(f"uniq_id: {sample.uniq_id}, targets: {targets.shape}, target_len: {target_len}")
+        actual_n_spk = (targets >= self.soft_label_thres).any(dim=0).sum().item()
+        logging.info(
+            f"uniq_id: {sample.uniq_id}, targets: {targets.shape}, target_len: {target_len}, actual n_spk: {actual_n_spk}"
+        )
         return audio_signal, audio_signal_length, targets, target_len
 
     def __getitem__(self, index):

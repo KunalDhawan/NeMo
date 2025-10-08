@@ -23,12 +23,13 @@ from nemo.collections.asr.modules.transformer.transformer_decoders import Transf
 from nemo.collections.asr.modules.transformer.transformer_encoders import TransformerEncoder
 from nemo.collections.asr.modules.transformer.transformer_modules import (
     AttentionBridge,
-    MultiHeadAttention,
     PositionWiseFF,
 )
-from nemo.collections.asr.parts.submodules.multi_head_attention import MultiHeadAttention as MHA
+from nemo.collections.asr.parts.submodules.multi_head_attention import (
+    MultiHeadAttention,
+    PositionalEncoding,
+)
 from nemo.collections.asr.parts.submodules.adapters.attention_adapter_mixin import AttentionAdapterModuleMixin
-from nemo.collections.asr.parts.submodules.multi_head_attention import PositionalEncoding
 from nemo.collections.common.parts import form_attention_mask
 from nemo.core.classes.mixins import adapter_mixins
 from nemo.utils import logging
@@ -71,14 +72,14 @@ class SimplePerceiverBlock(torch.nn.Module):
         self.pre_ln = pre_ln
         # Cross-attention layer
         self.layer_norm_1 = torch.nn.LayerNorm(hidden_size, eps=1e-5)
-        self.first_sub_layer = MHA(
+        self.first_sub_layer = MultiHeadAttention(
             n_head=num_cross_attention_heads,
             n_feat=hidden_size,
             dropout_rate=cross_attn_dropout,
         )
         # Self-attention layer
         self.layer_norm_2 = torch.nn.LayerNorm(hidden_size, eps=1e-5)
-        self.second_sub_layer = MHA(
+        self.second_sub_layer = MultiHeadAttention(
             n_head=num_self_attention_heads,
             n_feat=hidden_size,
             dropout_rate=self_attn_dropout,
@@ -88,19 +89,41 @@ class SimplePerceiverBlock(torch.nn.Module):
         self.third_sub_layer = PositionWiseFF(hidden_size, inner_size, ffn_dropout, hidden_act)
 
 
-    def forward_preln(self, hidden_states, hidden_mask, encoder_states, encoder_mask):
+    def forward_preln(
+        self, latent_states, latent_mask, encoder_states, encoder_mask, latent_pos_emb=None, encoder_pos_emb=None
+    ):
         """
         Pre-LayerNorm block
         Order of operations: LN -> Cross-Attn -> Residual -> LN -> Self-Attn -> Residual -> LN -> FFN
         """
-        residual = hidden_states
-        hidden_states = self.layer_norm_1(hidden_states)
-        cross_attn_output = self.first_sub_layer(query=hidden_states, key=encoder_states, value=encoder_states, mask=encoder_mask)
+        residual = latent_states
+        latent_states = self.layer_norm_1(latent_states)
+        
+        # Add positional embedding to query for cross-attention
+        cross_query = latent_states
+        if latent_pos_emb is not None:
+            cross_query = latent_states + latent_pos_emb
+
+        if encoder_pos_emb is not None:
+            encoder_key = encoder_states + encoder_pos_emb
+        else:
+            encoder_key = encoder_states
+        cross_attn_output = self.first_sub_layer(
+            query=cross_query, key=encoder_key, value=encoder_states, mask=encoder_mask
+        )
         cross_attn_output += residual
 
         residual = cross_attn_output
         cross_attn_output = self.layer_norm_2(cross_attn_output)
-        self_attn_output = self.second_sub_layer(query=cross_attn_output, key=cross_attn_output, value=cross_attn_output, mask=hidden_mask)
+        
+        # Add positional embedding to query and key for self-attention
+        self_query = cross_attn_output
+        self_key = cross_attn_output
+        if latent_pos_emb is not None:
+            self_query = cross_attn_output + latent_pos_emb
+            self_key = cross_attn_output + latent_pos_emb
+            
+        self_attn_output = self.second_sub_layer(query=self_query, key=self_key, value=cross_attn_output, mask=latent_mask)
         self_attn_output += residual
 
         residual = self_attn_output
@@ -110,28 +133,60 @@ class SimplePerceiverBlock(torch.nn.Module):
 
         return output_states
 
-    def forward_postln(self, hidden_states, hidden_mask, encoder_states, encoder_mask):
+    def forward_postln(
+        self, latent_states, latent_mask, encoder_states, encoder_mask, latent_pos_emb=None, encoder_pos_emb=None
+    ):
         """
         Post-LayerNorm block
         Order of operations: Cross-Attn -> Residual -> LN -> Self-Attn -> Residual -> LN -> FFN -> Residual -> LN
         """
-        cross_attn_output = self.first_sub_layer(query=hidden_states, key=encoder_states, value=encoder_states, mask=encoder_mask)
-        cross_attn_output += hidden_states
+        # Add positional embedding to query for cross-attention
+        cross_query = latent_states
+        logging.info(f"latent_states_before_ca: {latent_states[0, 0:20, 0:3]}")
+        if latent_pos_emb is not None:
+            cross_query = latent_states + latent_pos_emb
+
+        # Add positional embedding to key for cross-attention
+        encoder_key = encoder_states
+        if encoder_pos_emb is not None:
+            encoder_key = encoder_states + encoder_pos_emb
+            
+        cross_attn_output = self.first_sub_layer(
+            query=cross_query, key=encoder_key, value=encoder_states, mask=encoder_mask
+        )
+        logging.info(f"latent_states_ca: {cross_attn_output[0, 0:20, 0:3]}")
+
+        cross_attn_output += latent_states
+        logging.info(f"latent_states_ca_residual: {cross_attn_output[0, 0:20, 0:3]}")
         cross_attn_output = self.layer_norm_1(cross_attn_output)
 
-        self_attn_output = self.second_sub_layer(query=cross_attn_output, key=cross_attn_output, value=cross_attn_output, mask=hidden_mask)
+        # Add positional embedding to query and key for self-attention
+        self_query = cross_attn_output
+        self_key = cross_attn_output
+        if latent_pos_emb is not None:
+            self_query = cross_attn_output + latent_pos_emb
+            self_key = cross_attn_output + latent_pos_emb
+            
+        logging.info(f"latent_states_before_sa: {cross_attn_output[0, 0:20, 0:3]}")
+        self_attn_output = self.second_sub_layer(query=self_query, key=self_key, value=cross_attn_output, mask=latent_mask)
+        logging.info(f"latent_states_sa: {self_attn_output[0, 0:20, 0:3]}")
         self_attn_output += cross_attn_output
+        logging.info(f"latent_states_sa_residual: {self_attn_output[0, 0:20, 0:3]}")
         self_attn_output = self.layer_norm_2(self_attn_output)
 
         output_states = self.third_sub_layer(self_attn_output)
         output_states += self_attn_output
         return self.layer_norm_3(output_states)
 
-    def forward(self, hidden_states, hidden_mask, encoder_states, encoder_mask):
+    def forward(self, latent_states, latent_mask, encoder_states, encoder_mask, latent_pos_emb=None, encoder_pos_emb=None):
         if self.pre_ln:
-            return self.forward_preln(hidden_states, hidden_mask, encoder_states, encoder_mask)
+            return self.forward_preln(
+                latent_states, latent_mask, encoder_states, encoder_mask, latent_pos_emb, encoder_pos_emb
+            )
         else:
-            return self.forward_postln(hidden_states, hidden_mask, encoder_states, encoder_mask)
+            return self.forward_postln(
+                latent_states, latent_mask, encoder_states, encoder_mask, latent_pos_emb, encoder_pos_emb
+            )
 
 class SimplePerceiverEncoder(torch.nn.Module):
     def __init__(
@@ -148,6 +203,9 @@ class SimplePerceiverEncoder(torch.nn.Module):
         hidden_act: str = "relu",
         pre_ln: bool = True,
         pre_ln_final_layer_norm: bool = True,
+        use_latent_pos_emb: bool = False,
+        use_encoder_pos_emb: bool = False,
+        encoder_pos_emb_max_len: int = 5000,
     ):
         super().__init__()
 
@@ -158,9 +216,33 @@ class SimplePerceiverEncoder(torch.nn.Module):
 
         self._num_latents = num_latents
         self._num_layers = num_layers
+        self.use_latent_pos_emb = use_latent_pos_emb
+        self.use_encoder_pos_emb = use_encoder_pos_emb
+
+        if self.use_encoder_pos_emb:
+            self.pos_enc_encoder = PositionalEncoding(
+                d_model=hidden_size,
+                dropout_rate=0.0,
+                max_len=encoder_pos_emb_max_len,
+            )
+        else:
+            self.pos_enc_encoder = None
 
         # learnable initial hidden values
-        self.init_hidden = torch.nn.Parameter(torch.nn.init.xavier_normal_(torch.empty(num_latents, hidden_size)))
+        if self.use_latent_pos_emb:
+            # When using positional embeddings, all latents start the same
+            self.init_latent_states = torch.nn.Parameter(torch.nn.init.xavier_normal_(torch.empty(1, hidden_size)))
+        else:
+            # When not using positional embeddings, each latent can start differently
+            self.init_latent_states = torch.nn.Parameter(
+                torch.nn.init.xavier_normal_(torch.empty(num_latents, hidden_size))
+            )
+
+        # learnable positional embeddings
+        if self.use_latent_pos_emb:
+            self.pos_emb_latent = torch.nn.Parameter(
+                torch.nn.init.xavier_normal_(torch.empty(num_latents, hidden_size))
+            )
 
         layer = SimplePerceiverBlock(
             hidden_size=hidden_size,
@@ -179,36 +261,57 @@ class SimplePerceiverEncoder(torch.nn.Module):
     def num_latents(self):
         return self._num_latents
 
-    def forward(self, encoder_states, encoder_mask, hidden_states=None, hidden_mask=None):
+    def forward(self, encoder_states, encoder_mask, latent_states=None, latent_mask=None):
         """
         Args:
             encoder_states: output of the encoder (B x L_enc x H)
             encoder_mask: encoder inputs mask (B x num_latents x L_enc)
-            hidden_states: optional initial hidden states (B x num_latents x H)
-            hidden_mask: optional initial hidden mask (B x num_latents x num_latents)
+            latent_states: optional initial latent states (B x num_latents x H)
+            latent_mask: optional initial latent mask (B x num_latents x num_latents)
         """
+        encoder_pos_emb = None
+        if self.use_encoder_pos_emb:
+            self.pos_enc_encoder.extend_pe(encoder_states.size(1), encoder_states.device, encoder_states.dtype)
+            encoder_pos_emb = self.pos_enc_encoder.pe[:, : encoder_states.size(1)]
+
         # all hidden values are active
-        if hidden_mask is None:
-            hidden_mask = torch.ones(
+        if latent_mask is None:
+            latent_mask = torch.ones(
                 encoder_states.shape[0], self._num_latents, self._num_latents, dtype=encoder_mask.dtype, device=encoder_mask.device
             )
 
-        # initialize hidden state
-        if hidden_states is None:
-            hidden_states = self.init_hidden.unsqueeze(0).expand(encoder_states.shape[0], -1, -1)
+        # Get positional embedding if enabled
+        pos_emb_latent = None
+        if self.use_latent_pos_emb:
+            pos_emb_latent = self.pos_emb_latent.unsqueeze(0).expand(encoder_states.shape[0], -1, -1)
 
+        # initialize hidden state
+        if latent_states is None:
+            if self.use_latent_pos_emb:
+                # Expand (1, hidden_size) to (batch_size, num_latents, hidden_size)
+                latent_states = (
+                    self.init_latent_states.unsqueeze(0).expand(encoder_states.shape[0], self._num_latents, -1)
+                    + pos_emb_latent
+                )
+            else:
+                # Expand (num_latents, hidden_size) to (batch_size, num_latents, hidden_size)
+                latent_states = self.init_latent_states.unsqueeze(0).expand(encoder_states.shape[0], -1, -1)
+
+        logging.info(f"encoder mask: {encoder_mask.to(int).sum(dim=2)}")
         for layer in self.layers:
-            hidden_states = layer(
-                hidden_states=hidden_states,
-                hidden_mask=hidden_mask,
+            latent_states = layer(
+                latent_states=latent_states,
+                latent_mask=latent_mask,
                 encoder_states=encoder_states,
                 encoder_mask=encoder_mask,
+                latent_pos_emb=pos_emb_latent,
+                encoder_pos_emb=encoder_pos_emb,
             )
 
         if self.final_layer_norm is not None:
-            hidden_states = self.final_layer_norm(hidden_states)
+            latent_states = self.final_layer_norm(latent_states)
 
-        return hidden_states
+        return latent_states
 
 class PerceiverEncoder(torch.nn.Module):
     def __init__(

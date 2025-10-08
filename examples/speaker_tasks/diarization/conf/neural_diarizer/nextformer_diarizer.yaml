@@ -4,13 +4,19 @@ batch_size: 4
 
 model: 
   sample_rate: 16000
-  pil_weight: 1.0 # Weight for Permutation Invariant Loss (PIL) used in training the Nextformer diarizer model
-  ats_weight: 0.0 # Weight for Arrival Time Sort (ATS) loss in training the Nextformer diarizer model
+  pil_weight: 0.5 # Weight for Permutation Invariant Loss (PIL) used in training the Nextformer diarizer model
+  ats_weight: 0.5 # Weight for Arrival Time Sort (ATS) loss in training the Nextformer diarizer model
+  local_pil_weight: 0.5 # Weight for local Permutation Invariant Loss (PIL) loss
+  local_ats_weight: 0.5 # Weight for local Arrival Time Sort (ATS) loss
   cls_weight: 0.4 # Weight for Query Classification loss
+  similarity_weight: 0.5 # Weight for Similarity loss
   cls_threshold: 0.5
+
   pil_metric: "bce" # bce or accuracy or dot_product
   train_mask_inactive_speakers: false # If True, for training, mask out predictions for speaker channels that are never active in the target.
+  local_num_spks: 4 # Number of speakers for local queries
   max_num_of_spks: 8 # Maximum number of speakers per model; currently set to 4
+  mean_init_queries: true # If True, use mean of encoder embeddings as initial queries, otherwise use zeros.
   streaming_mode: False
 
   model_defaults:
@@ -109,6 +115,8 @@ model:
     ff_dropout_rate: 0.5 # Dropout rate
     fc_d_model: ${model.model_defaults.fc_d_model} # Hidden dimension size for Fast Conformer encoder
     tf_d_model: ${model.model_defaults.tf_d_model} # Hidden dimension size for Query encoder
+    local_num_spks: ${model.local_num_spks} # Number of speakers for local queries
+    pred_score_threshold: 0.25 # Threshold for speaker predictions to be used in scoring
 
   encoder:
     _target_: nemo.collections.asr.modules.ConformerEncoder
@@ -149,7 +157,7 @@ model:
   
   transformer_encoder:
     _target_: nemo.collections.asr.modules.transformer.transformer_encoders.TransformerEncoder
-    num_layers: 0
+    num_layers: 18
     hidden_size: ${model.model_defaults.tf_d_model} # Needs to be multiple of num_attention_heads
     inner_size: 768
     num_attention_heads: 8
@@ -174,6 +182,9 @@ model:
     hidden_act: relu
     pre_ln: False
     pre_ln_final_layer_norm: True
+    use_latent_pos_emb: False
+    use_encoder_pos_emb: False
+    encoder_pos_emb_max_len: 5000
 
   loss: 
     _target_: nemo.collections.asr.losses.bce_loss.BCEWithLogitsLoss
@@ -182,6 +193,11 @@ model:
   cls_loss:
     _target_: torch.nn.BCEWithLogitsLoss
     reduction: mean
+
+  similarity_loss:
+    _target_: torch.nn.SmoothL1Loss
+    reduction: mean
+    beta: 0.5
 
   lr: 0.0001
   optim:
