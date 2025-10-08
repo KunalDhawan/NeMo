@@ -53,8 +53,8 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
             'a_sig_length': NeuralType(tuple('B'), LengthsType()),
             'transcripts': NeuralType(('B', 'T'), LabelsType()),
             'transcript_length': NeuralType(tuple('B'), LengthsType()),
-            'spk_tar_id': NeuralType(('B','T'), LabelsType()),
-            'sample_id': NeuralType(tuple('B'), LengthsType(), optional=True),
+            'spk_targets': NeuralType(('B','T'), LabelsType()),
+            'bg_spk_targets': NeuralType(('B','T'), LabelsType()),
         }
 
     def __init__(self, cfg, tokenizer):
@@ -62,7 +62,6 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
         self.tokenizer = TokenizerWrapper(tokenizer)
         self.load_audio = AudioSamples(fault_tolerant=True, num_workers=8)
         self.cfg = cfg
-        self.spk_tar_all_zero = self.cfg.get('spk_tar_all_zero',False)
         self.num_speakers = self.cfg.get('num_speakers', 4)
         self.num_sample_per_mel_frame = self.cfg.get('num_sample_per_mel_frame', 160)
         self.num_mel_frame_per_asr_frame = self.cfg.get('num_mel_frame_per_asr_frame', 8)
@@ -78,13 +77,13 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
         bg_spk_targets = []
 
         if self.inference_mode:
-            speaker_targets = [speaker_to_target(cut, self.num_speakers, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame, self.spk_tar_all_zero) for cut in cuts]
+            speaker_targets = [speaker_to_target(cut, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame) for cut in cuts]
             spk_targets = collate_matrices(speaker_targets, padding_value=0)
             return audio, audio_lens, None, None, spk_targets
 
         for idx, cut in enumerate(cuts):
 
-            speaker_targets, texts = speaker_to_target(cut, self.num_speakers, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame, self.spk_tar_all_zero, return_text=True)
+            speaker_targets, texts = speaker_to_target(cut, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame, return_text=True)
             speaker_targets = speaker_targets.transpose(0, 1)[:len(texts)]
 
             target_speaker_id = random.choice(range(len(texts)))

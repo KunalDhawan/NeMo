@@ -538,15 +538,12 @@ def get_hidden_length_from_sample_length(
 
 def speaker_to_target(
     a_cut,
-    num_speakers: int = 4, 
     num_sample_per_mel_frame: int = 160, 
     num_mel_frame_per_asr_frame: int = 8, 
-    spk_tar_all_zero: bool = False,
     boundary_segments: bool = False,
     soft_label: bool = False,
-    ignore_num_spk_mismatch: bool = True,
     soft_thres: float = 0.5,
-    is_audio_mix_sim: bool = False,
+    ignore_num_spk_mismatch: bool = True,
     return_text: bool = False,
     ):
     '''
@@ -558,10 +555,11 @@ def speaker_to_target(
         num_speakers (int): max number of speakers for all cuts ("mask" dim0), 4 by default
         num_sample_per_mel_frame (int): number of sample per mel frame, sample_rate / 1000 * window_stride, 160 by default (10ms window stride)
         num_mel_frame_per_asr_frame (int): encoder subsampling_factor, 8 by default
-        spk_tar_all_zero (Tensor): set to True gives all zero "mask"
         boundary_segments (bool): set to True to include segments containing the boundary of the cut, False by default for multi-speaker ASR training
         soft_label (bool): set to True to use soft label that enables values in [0, 1] range, False by default and leads to binary labels.
+        soft_thres (float): the threshold for the soft label, 0.5 by default.
         ignore_num_spk_mismatch (bool): This is a temporary solution to handle speaker mismatch. Will be removed in the future.
+        return_text (bool): set to True to return the text of the speakers (if it is available), False by default.
     
     Returns:
         mask (Tensor): speaker mask with shape (num_speaker, hidden_lenght)
@@ -585,7 +583,7 @@ def speaker_to_target(
         elif cut.supervisions:
             rttms = SupervisionSet(cut.supervisions)
         else:
-            # logging.warning(f"No rttm or supervisions found for cut {cut.id}")
+            logging.warning(f"No rttm or supervisions found for cut {cut.id}")
             continue
             
         start = cut.offset if hasattr(cut, 'offset') else cut.start
@@ -615,16 +613,12 @@ def speaker_to_target(
         spk: idx
         for idx, spk in enumerate(speaker_ats)
     }
-    if len(speaker_to_idx_map) > num_speakers and not ignore_num_spk_mismatch:  # raise error if number of speakers
-        raise ValueError(f"Number of speakers {len(speaker_to_idx_map)} is larger than the maximum number of speakers {num_speakers}")
+    num_speakers = len(speaker_ats)
         
     # initialize mask matrices (num_speaker, encoder_hidden_len)
     feat_per_sec = int(a_cut.sampling_rate / num_sample_per_mel_frame) # 100 by default
     num_samples = get_hidden_length_from_sample_length(a_cut.num_samples, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)
-    if spk_tar_all_zero: 
-        frame_mask = torch.zeros((num_samples, num_speakers))
-    else:
-        frame_mask = get_mask_from_segments(segments_total, a_cut, speaker_to_idx_map, num_speakers, feat_per_sec, ignore_num_spk_mismatch)
+    frame_mask = get_mask_from_segments(segments_total, a_cut, speaker_to_idx_map, num_speakers, feat_per_sec, ignore_num_spk_mismatch)
     soft_mask = get_soft_mask(frame_mask, num_samples, num_mel_frame_per_asr_frame)
 
     if soft_label:
@@ -637,8 +631,6 @@ def speaker_to_target(
         for seg in segments_total:
             speaker2text[seg.speaker].append(seg.text)
         texts = [' '.join(speaker2text[speaker]) for speaker in speaker_ats]
-        if len(texts) > num_speakers:
-            texts = texts[:num_speakers]
         return mask, texts
     else:
         return mask
