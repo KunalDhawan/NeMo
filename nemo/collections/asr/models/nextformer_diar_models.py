@@ -309,11 +309,13 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         """
         encoder_mask = self.nextformer_modules.length_to_mask(emb_seq_length, emb_seq.shape[1])
         trans_emb_seq = self.transformer_encoder(encoder_states=emb_seq, encoder_mask=encoder_mask)
-        encoder_query_mask = encoder_mask.unsqueeze(1).expand(-1, self.query_encoder.num_latents, -1)
+        encoder_query_mask = ~encoder_mask.unsqueeze(1).expand(-1, self.query_encoder.num_latents, -1)
         spk_queries = self.query_encoder(
             encoder_states=trans_emb_seq, encoder_mask=encoder_query_mask, latent_states=None, latent_mask=None
         )
         logits = self.nextformer_modules.forward_spk_logits(trans_emb_seq, spk_queries)
+        mask = encoder_mask.unsqueeze(-1)
+        logits = logits.masked_fill(~mask, -1e9)
         query_logits = self.nextformer_modules.forward_query_logits(spk_queries)
         return logits, query_logits
 
@@ -667,16 +669,6 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             targets = targets[:, : logits.shape[1], :]
             target_lens = target_lens.clamp(max=logits.shape[1])
 
-        targets_pil = get_pil_targets_hungarian(labels=targets.clone(), logits=logits, cls_preds=query_probs, cls_preds_weight=self.cls_weight, metric=self.pil_metric)
-        #targets_pil = get_pil_targets_hungarian(labels=targets.clone(), logits=logits, cls_preds=query_probs, cls_preds_weight=0.0, metric=self.pil_metric)
-        targets_ats = targets_pil  # TODO: add ATS loss
-        targets_cls = torch.any(targets_pil > 0.5, dim=1).to(logits.dtype)
-
-        logging.info(f"logits shape: {logits.shape}, targets shape: {targets.shape}, query_probs shape: {query_probs.shape}")
-        logging.info(f"query_probs: {query_probs}")
-        logging.info(f"targets: {targets.sum(dim=1)}")
-        logging.info(f"targets_pil: {targets_pil.sum(dim=1)}")
-        logging.info(f"targets_cls: {targets_cls}")
         # Zero out predictions for speaker channels that are never active in the target.
         preds = torch.sigmoid(logits)
         logging.info(f"preds: {preds.sum(dim=1)}")
@@ -685,6 +677,17 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         logits = logits.masked_fill(~(cls_mask.unsqueeze(1).bool()), -10.0)
         preds = torch.sigmoid(logits)
         logging.info(f"preds after zeroing out: {preds.sum(dim=1)}")
+
+        #targets_pil = get_pil_targets_hungarian(labels=targets.clone(), logits=logits, cls_preds=query_probs, cls_preds_weight=self.cls_weight, metric=self.pil_metric)
+        targets_pil = get_pil_targets_hungarian(labels=targets.clone(), logits=logits, cls_preds=query_probs, cls_preds_weight=0.0, metric=self.pil_metric)
+        targets_ats = targets_pil  # TODO: add ATS loss
+        targets_cls = torch.any(targets_pil > 0.5, dim=1).to(logits.dtype)
+
+        logging.info(f"logits shape: {logits.shape}, targets shape: {targets.shape}, query_probs shape: {query_probs.shape}")
+        logging.info(f"query_probs: {query_probs}")
+        logging.info(f"targets: {targets.sum(dim=1)}")
+        logging.info(f"targets_pil: {targets_pil.sum(dim=1)}")
+        logging.info(f"targets_cls: {targets_cls}")
 
         loss_scale_factor = logits.shape[2] / 4.0
         val_pil_loss = loss_scale_factor * self.loss(logits=logits, labels=targets_pil, target_lens=target_lens)
@@ -826,25 +829,19 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             targets = targets[:, : preds.shape[1], :]
             target_lens = target_lens.clamp(max=preds.shape[1])
 
+        # Zero out predictions based on query_probs threshold during testing
+        cls_mask = (query_probs > self.cls_threshold).to(preds.dtype)
+        logits = logits.masked_fill(~(cls_mask.unsqueeze(1).bool()), -10.0)
+        preds = torch.sigmoid(logits)
+
         targets_pil = get_pil_targets_hungarian(
             labels=targets.clone(),
             logits=logits,
             cls_preds=query_probs,
-            cls_preds_weight=self.cls_weight,
+            cls_preds_weight=0,
             metric=self.pil_metric,
         )
-        #targets_pil = get_pil_targets_hungarian(
-        #    labels=targets.clone(),
-        #    logits=logits,
-        #    cls_preds=query_probs,
-        #    cls_preds_weight=0.0,
-        #    metric=self.pil_metric,
-        #)
         targets_ats = targets_pil  # TODO: add ATS loss
-
-        # Zero out predictions based on query_probs threshold during testing
-        cls_mask = (query_probs > self.cls_threshold).to(preds.dtype)
-        preds = preds * cls_mask.unsqueeze(1)
 
         self._accuracy_test(preds, targets_pil, target_lens)
         f1_acc, precision, recall = self._accuracy_test.compute()
