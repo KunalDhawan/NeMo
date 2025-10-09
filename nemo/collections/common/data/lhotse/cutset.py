@@ -42,6 +42,7 @@ from nemo.collections.common.data.lhotse.text_adapters import (
     TextTurn,
 )
 from nemo.collections.common.parts.preprocessing.manifest import get_full_path
+from nemo.collections.asr.parts.utils.asr_multispeaker_utils import MultiSpeakerMixtureGenerator
 
 
 def read_cutset_from_config(config: Union[DictConfig, dict]) -> Tuple[CutSet, bool]:
@@ -814,6 +815,25 @@ def read_nemo_manifest(config) -> tuple[CutSet, bool]:
         )
     return cuts, is_tarred
 
+
+@data_type_parser("multi_speaker_simulator")
+def read_multi_speaker_simulator(config: DictConfig) -> tuple[CutSet, bool]:
+    multi_speaker_cuts = CutSet(
+        MultiSpeakerMixtureGenerator(
+            manifest_filepath=config.manifest_filepath,
+            simulator_type=config.simulator_type,
+            sample_rate=config.get("sample_rate", 16000),
+            min_delay=config.get("min_delay", 0.5),
+            min_duration=config.get("min_duration", 0.1),
+            max_duration=config.get("max_duration", 60),
+            num_speakers=config.get("num_speakers", 2),
+            global_rank=config.get("global_rank", 0),
+            world_size=config.get("world_size", 1),
+        )
+    )
+    is_tarred = config.get("is_tarred", False)
+    return multi_speaker_cuts, is_tarred
+    
 
 def mux(
     *cutsets: CutSet,

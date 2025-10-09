@@ -318,6 +318,7 @@ def get_background_noise(
     background_noise_snr: float,
     seed: int,
     device: torch.device,
+    sr: float = 16000,
 ):
     """
     Augment with background noise (inserting ambient background noise up to the desired SNR for the full clip).
@@ -343,9 +344,11 @@ def get_background_noise(
         power_array=power_array, snr_min=snr_min, snr_max=snr_max, background_noise_snr=background_noise_snr
     )
     running_len_samples = 0
+    noise_segment_list = []
 
+    last_mixed_cut_offset = 0
+    file_id = np.random.randint(len(noise_samples))
     while running_len_samples < len_array:  # build background audio stream (the same length as the full file)
-        file_id = np.random.randint(len(noise_samples))
         audio_file, sr, audio_manifest = read_audio_from_buffer(
             audio_manifest=noise_samples[file_id],
             buffer_dict=audio_read_buffer_dict,
@@ -353,6 +356,16 @@ def get_background_noise(
             device=device,
             read_subset=False,
         )
+        # noise_segment_list.append(
+        noise_manifest_dict = copy.deepcopy(audio_manifest)
+        noise_manifest_dict['duration'] = float(min(len(audio_file), len_array - running_len_samples-1) / sr)
+        noise_manifest_dict['offset'] = 0 
+        noise_manifest_dict['volume'] = 1.0
+        noise_manifest_dict['mixed_cut_offset'] = last_mixed_cut_offset 
+        last_mixed_cut_offset += noise_manifest_dict['duration']
+
+        noise_segment_list.append(noise_manifest_dict)
+
         if running_len_samples + len(audio_file) < len_array:
             end_audio_file = running_len_samples + len(audio_file)
         else:
@@ -368,7 +381,7 @@ def get_background_noise(
         bg_array[running_len_samples:end_audio_file] = scaled_audio_file
         running_len_samples = end_audio_file
 
-    return bg_array, desired_snr
+    return bg_array, desired_snr, noise_segment_list
 
 
 def get_random_offset_index(
@@ -442,12 +455,15 @@ def get_speaker_ids(sess_idx: int, speaker_samples: dict, permutated_speaker_ind
         speaker_ids (list): List of speaker IDs
     """
     all_speaker_ids = list(speaker_samples.keys())
-    idx_list = permutated_speaker_inds[sess_idx, :]
+    # Measure the length of permutated_speaker_inds and mod the sess_idx number so that 
+    # sess_idx is always less than the length of permutated_speaker_inds
+    sess_idx_circular = sess_idx % permutated_speaker_inds.shape[0]
+    idx_list = permutated_speaker_inds[sess_idx_circular, :]
     speaker_ids = [all_speaker_ids[i] for i in idx_list]
     return speaker_ids
 
 
-def build_speaker_samples_map(manifest: dict) -> dict:
+def build_speaker_samples_map(manifest: dict, tqdm_bar: bool = False) -> dict:
     """
     Build a dictionary for mapping speaker ID to their list of samples
 
@@ -456,8 +472,9 @@ def build_speaker_samples_map(manifest: dict) -> dict:
             Dictionary mapping speaker ID to their list of samples
     """
     speaker_samples = defaultdict(list)
-    logging.info("Building speaker to samples map...")
-    for sample in tqdm(manifest, total=len(manifest)):
+    # logging.info("Building speaker to samples map...")
+    for sample in tqdm(manifest, total=len(manifest), disable=not tqdm_bar):
+    # for sample in manifest:
         speaker_id = sample['speaker_id']
         speaker_samples[speaker_id].append(sample)
     return speaker_samples
@@ -490,6 +507,25 @@ def read_noise_manifest(add_bg: bool, background_manifest: str):
                 f"Noise manifest file is {background_manifest}. Please provide a valid noise manifest file/list if add_bg=True."
             )
     return noise_manifest
+
+
+def read_rir_manifest(rir_manifest: str):
+    """
+    Read the rir manifest file and sample the rir manifest.
+    """
+    # if isinstance(rir_manifest, str):
+    #     rir_manifest_list = [rir_manifest]
+    # elif isinstance(rir_manifest, list):
+    #     rir_manifest_list = rir_manifest
+    rir_manifest_list = [rir_manifest]
+    rir_loaded_list = []
+    for manifest_file in rir_manifest_list:
+        # try:
+        if os.path.exists(manifest_file):
+            rir_loaded_list.extend(read_manifest(manifest_file))
+        # except:
+        #     import ipdb; ipdb.set_trace()
+    return rir_loaded_list
 
 
 def get_speaker_samples(speaker_ids: List[str], speaker_samples: dict) -> Dict[str, list]:
@@ -587,6 +623,7 @@ def get_split_points_in_alignments(
     splits = []
     for i in range(len(words)):
         if words[i] == "" and i != 0 and i != len(words) - 1:
+        # if words[i] == "<sil>" and i != 0 and i != len(words) - 1:
             silence_length = alignments[i] - alignments[i - 1]
             if silence_length > 2 * split_buffer:  # split utterance on silence
                 new_end = alignments[i - 1] + split_buffer
@@ -659,7 +696,7 @@ class DataAnnotator(object):
         Initialize file writing arguments
         """
         self._file_base_str = "synthetic"
-        self._file_types = ["wav", "rttm", "json", "ctm", "txt", "meta"]
+        self._file_types = ["wav", "rttm", "json", "noise", "ctm", "txt", "meta"]
         self._annotation_types = ["rttm", "json", "ctm"]
 
     def _init_filelist_lists(self):
@@ -678,7 +715,7 @@ class DataAnnotator(object):
             self.annote_lists[file_type] = []
 
     def create_new_rttm_entry(
-        self, words: List[str], alignments: List[float], start: int, end: int, speaker_id: int
+        self, words: List[str], alignments: List[float], start: int, end: int, speaker_id: int, add_split_buffer: bool = False
     ) -> List[str]:
 
         """
@@ -703,11 +740,19 @@ class DataAnnotator(object):
                 if (
                     silence_length > 2 * self._params.data_simulator.session_params.split_buffer
                 ):  # split utterance on silence
-                    new_end = start + alignments[i - 1] + self._params.data_simulator.session_params.split_buffer
+                    new_end = start + alignments[i - 1]
+                    silence_duration = alignments[i] - alignments[i - 1]
+                    
+                    # new_end = start + alignments[i - 1] + self._params.data_simulator.session_params.split_buffer
+
+                    # import ipdb; ipdb.set_trace()
+                    # if add_split_buffer:  # add split buffer if specified in config
+                    #     new_end += self._params.data_simulator.session_params.split_buffer
                     t_stt = round(float(new_start), self._params.data_simulator.outputs.output_precision)
                     t_end = round(float(new_end), self._params.data_simulator.outputs.output_precision)
                     rttm_list.append(f"{t_stt} {t_end} {speaker_id}")
-                    new_start = start + alignments[i] - self._params.data_simulator.session_params.split_buffer
+                    new_start = start + alignments[i] 
+                    # new_start = start + alignments[i] - self._params.data_simulator.session_params.split_buffer
 
         t_stt = round(float(new_start), self._params.data_simulator.outputs.output_precision)
         t_end = round(float(end), self._params.data_simulator.outputs.output_precision)
@@ -753,9 +798,9 @@ class DataAnnotator(object):
             "uem_filepath": None,
         }
         return meta
-
-    def create_new_ctm_entry(
-        self, words: List[str], alignments: List[float], session_name: str, speaker_id: int, start: int
+    
+    def create_ctm_entry_from_segment_list(
+        self, source_segment_list, session_name: str, speaker_id: int, start: int
     ) -> List[str]:
         """
         Create new CTM entry (to write to output ctm file)
@@ -772,6 +817,53 @@ class DataAnnotator(object):
         """
         arr = []
         start = float(round(start, self._params.data_simulator.outputs.output_precision))
+
+        for seg_dict in source_segment_list:
+            words = seg_dict["words"]
+            alignments = seg_dict["alignments"]
+            start_offset = seg_dict["mixed_cut_offset"]
+            alignment_offset = alignments[0]
+            for i in range(len(words)):
+                word = words[i]
+                if (
+                    word != ""
+                ):  # note that using the current alignments the first word is always empty, so there is no error from indexing the array with i-1
+                    # prev_align = 0 if i == 0 else alignments[i - 1]
+                    # align1 = round(float(prev_align + start), self._params.data_simulator.outputs.output_precision)
+                    align1 = round(float(start_offset + alignments[i] - alignment_offset), self._params.data_simulator.outputs.output_precision)
+                    align2 = round(float(start_offset + alignments[i+1] - alignment_offset - align1), self._params.data_simulator.outputs.output_precision)
+                    text = get_ctm_line(
+                        source=session_name,
+                        channel=1,
+                        start_time=align1,
+                        duration=align2,
+                        token=word,
+                        conf=None,
+                        type_of_token='lex',
+                        speaker=speaker_id,
+                    )
+                    arr.append((align1, text))
+        return arr
+
+    def create_new_ctm_entry(
+        self, words: List[str], alignments: List[float], session_name: str, speaker_id: int, start: int, 
+    ) -> List[str]:
+        """
+        Create new CTM entry (to write to output ctm file)
+
+        Args:
+            words (list): List of words in the current audio file.
+            alignments (list): List of alignments (timestamps) for the current audio file.
+            session_name (str): Current session name.
+            speaker_id (int): LibriSpeech speaker ID for the current entry.
+            start (int): Current start of the audio file being inserted.
+        
+        Returns:
+            arr (list): List of ctm entries
+        """
+        arr, word_and_ts_list = [], []
+        start = float(round(start, self._params.data_simulator.outputs.output_precision))
+
         for i in range(len(words)):
             word = words[i]
             if (
@@ -779,7 +871,10 @@ class DataAnnotator(object):
             ):  # note that using the current alignments the first word is always empty, so there is no error from indexing the array with i-1
                 prev_align = 0 if i == 0 else alignments[i - 1]
                 align1 = round(float(prev_align + start), self._params.data_simulator.outputs.output_precision)
+                # align1 = round(float(start), self._params.data_simulator.outputs.output_precision)
                 align2 = round(float(alignments[i] - prev_align), self._params.data_simulator.outputs.output_precision)
+                # align2 = round(float(alignments[i+1] - start), self._params.data_simulator.outputs.output_precision)
+                end_time = round(align1 + align2, self._params.data_simulator.outputs.output_precision)
                 text = get_ctm_line(
                     source=session_name,
                     channel=1,
@@ -789,9 +884,13 @@ class DataAnnotator(object):
                     conf=None,
                     type_of_token='lex',
                     speaker=speaker_id,
+                    output_precision=self._params.data_simulator.outputs.output_precision,
                 )
+                # if word == "it" and align1 == 3.169:
+                #     import ipdb; ipdb.set_trace()
+                word_and_ts_list.append((word, align1, end_time))
                 arr.append((align1, text))
-        return arr
+        return arr, word_and_ts_list
 
     def add_to_filename_lists(self, basepath: str, filename: str):
         """
@@ -835,6 +934,20 @@ class DataAnnotator(object):
         write_text(os.path.join(basepath, filename + '.txt'), self.annote_lists['ctm'])
         write_manifest(os.path.join(basepath, filename + '.meta'), [meta_data])
 
+    def write_annotation_rttm_and_ctm(self, basepath: str, filename: str):
+        """
+        Write all annotation files: RTTM, JSON, CTM, TXT, and META.
+
+        Args:
+            basepath (str): Basepath for output files.
+            filename (str): Base filename for all output files.
+            meta_data (dict): Metadata for the current session.
+            rttm_list (list): List of RTTM entries.
+            json_list (list): List of JSON entries.
+            ctm_list (list): List of CTM entries.
+        """
+        labels_to_rttmfile(self.annote_lists['rttm'], os.path.join(basepath, filename), self._params.data_simulator.outputs.output_dir)
+        write_ctm(os.path.join(basepath, filename + '.ctm'), self.annote_lists['ctm'])
 
 class SpeechSampler(object):
     """
