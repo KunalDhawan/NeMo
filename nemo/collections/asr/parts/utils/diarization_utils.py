@@ -16,24 +16,25 @@ import copy
 import csv
 import json
 import os
-from collections import defaultdict, OrderedDict as od
+from collections import OrderedDict as od
+from collections import defaultdict
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from pyannote.metrics.diarization import DiarizationErrorRate
 
-from nemo.collections.asr.metrics.der import concat_perm_word_error_rate, calculate_session_cpWER
+from nemo.collections.asr.metrics.der import calculate_session_cpWER, concat_perm_word_error_rate
 from nemo.collections.asr.metrics.wer import word_error_rate
 from nemo.collections.asr.models import ClusteringDiarizer
 from nemo.collections.asr.parts.utils.speaker_utils import (
     audio_rttm_map,
+    generate_diarization_output_lines,
     get_uniqname_from_filepath,
+    labels_to_pyannote_object,
     labels_to_rttmfile,
     rttm_to_labels,
     write_rttm2manifest,
-    generate_diarization_output_lines,
-    labels_to_pyannote_object,
 )
 from nemo.utils import logging
 
@@ -64,7 +65,6 @@ def get_color_palette() -> Dict[str, str]:
     }
 
 
-
 def dump_json_to_file(file_path: str, session_trans_dict: dict):
     """
     Write a json file from the session_trans_dict dictionary.
@@ -92,6 +92,7 @@ def write_txt(w_path: str, val: str):
     with open(w_path, "w") as output:
         output.write(val + '\n')
 
+
 def init_session_trans_dict(uniq_id: str, n_spk: int):
     """
     Initialize json (in dictionary variable) formats for session level result and Gecko style json.
@@ -110,6 +111,7 @@ def init_session_trans_dict(uniq_id: str, n_spk: int):
         }
     )
 
+
 def init_session_gecko_dict():
     """
     Initialize a dictionary format for Gecko style json.
@@ -119,6 +121,7 @@ def init_session_gecko_dict():
             Gecko style json dictionary.
     """
     return od({'schemaVersion': 2.0, 'monologues': []})
+
 
 def convert_ctm_to_text(ctm_file_path: str) -> Tuple[List[str], str]:
     """
@@ -234,8 +237,7 @@ def convert_word_dict_seq_to_ctm(
         ctm_lines.append(ctm_line_str)
     return ctm_lines
 
-
-    def break_transcript_lines(self, string_out: str, params: Dict[str, str], max_chars_in_line: int = 90) -> str: 
+    def break_transcript_lines(self, string_out: str, params: Dict[str, str], max_chars_in_line: int = 90) -> str:
         """
         Break the lines in the transcript.
 
@@ -267,8 +269,11 @@ def convert_word_dict_seq_to_ctm(
         return_string_out = '\n'.join(return_string_out)
         return return_string_out
 
+
 def get_total_result_dict(
-    der_results: Dict[str, Dict[str, float]], wer_results: Dict[str, Dict[str, float]], csv_columns: List[str],
+    der_results: Dict[str, Dict[str, float]],
+    wer_results: Dict[str, Dict[str, float]],
+    csv_columns: List[str],
 ):
     """
     Merge WER results and DER results into a single dictionary variable.
@@ -338,13 +343,14 @@ def get_num_of_spk_from_labels(labels: List[str]) -> int:
     spk_set = [x.split(' ')[-1].strip() for x in labels]
     return len(set(spk_set))
 
+
 def read_seglst(seglst_filepath, round_digits=3, return_rttm=False, sort_by_start_time=False):
     """
     Read a seglst file and return the speaker & text information dictionary.
 
     Args:
         seglst_filepath: path to the seglst file
-        seglst format: 
+        seglst format:
         [
             {
                 "session_id": "Bed008",
@@ -367,7 +373,7 @@ def read_seglst(seglst_filepath, round_digits=3, return_rttm=False, sort_by_star
     seglst = []
     with open(seglst_filepath, 'r') as f:
         seglst_lines = json.loads(f.read())
-        
+
         for idx, line in enumerate(seglst_lines):
             spk, start, end = line['speaker'], float(line['start_time']), float(line['end_time'])
             dur = round(end - start, round_digits)
@@ -384,12 +390,13 @@ def read_seglst(seglst_filepath, round_digits=3, return_rttm=False, sort_by_star
                     'end_time': end,
                     'duration': dur,
                 }
-            )   
+            )
     if sort_by_start_time:
         seglst = sorted(seglst, key=lambda x: (x['start_time'], x['end_time']))
     if return_rttm:
         return seglst, rttm_lines
     return seglst
+
 
 def convert_seglst(seglst, all_speakers):
     '''
@@ -402,7 +409,7 @@ def convert_seglst(seglst, all_speakers):
         timestamps: (list of list)
             [
             [[st1, et1], [st2, et2]], # timestamps list for speaker 1
-            [[st1, et1], ...], # timestamps list for speaker 2 
+            [[st1, et1], ...], # timestamps list for speaker 2
             ...]
         words (list[[s1], [s2], [s3], [s4]]): list of words for each speaker 1 to 4
     '''
@@ -428,17 +435,15 @@ def get_session_trans_dict(uniq_id, word_dict_seq_list, diar_labels):
     prev_speaker = speaker
 
     sentences, terms_list = [], []
-    sentence = {'speaker': speaker, 'start_time': start_point, 'end_time': end_point, 'text': ''} 
-    
+    sentence = {'speaker': speaker, 'start_time': start_point, 'end_time': end_point, 'text': ''}
+
     for k, word_dict in enumerate(word_dict_seq_list):
         word, speaker = word_dict['word'], word_dict['speaker']
         word_seq_list.append(word)
         start_point, end_point = word_dict['start_time'], word_dict['end_time']
         if speaker != prev_speaker:
             if len(terms_list) != 0:
-                gecko_dict['monologues'].append(
-                    {'speaker': {'name': None, 'id': prev_speaker}, 'terms': terms_list}
-                )
+                gecko_dict['monologues'].append({'speaker': {'name': None, 'id': prev_speaker}, 'terms': terms_list})
                 terms_list = []
 
             # remove trailing space in text
@@ -474,11 +479,9 @@ def get_session_trans_dict(uniq_id, word_dict_seq_list, diar_labels):
     session_trans_dict['sentences'] = sentences
     gecko_dict['monologues'].append({'speaker': {'name': None, 'id': speaker}, 'terms': terms_list})
     return session_trans_dict, gecko_dict, audacity_label_words, sentences
-    
 
-def print_sentences(sentences: List[Dict[str, float]], 
-                    color_palette: Dict[str, str], 
-                    params: Dict[str, bool]) -> None:
+
+def print_sentences(sentences: List[Dict[str, float]], color_palette: Dict[str, str], params: Dict[str, bool]) -> None:
     """
     Print a transcript with speaker labels and timestamps.
 
@@ -494,7 +497,7 @@ def print_sentences(sentences: List[Dict[str, float]],
     string_out = ''
     # time_color = color_palette.get('black', '\033[0;30m')
     time_color = color_palette.get('white', '\033[0;30m')
-    
+
     for sentence in sentences:
         # extract info
         speaker = sentence['speaker']
@@ -533,13 +536,14 @@ def print_sentences(sentences: List[Dict[str, float]],
 
     return string_out
 
+
 def read_seglst(seglst_filepath, round_digits=3, return_rttm=False, sort_by_start_time=False, sort_by_end_time=False):
     """
     Read a seglst file and return the speaker & text information dictionary.
 
     Args:
         seglst_filepath: path to the seglst file
-        seglst format: 
+        seglst format:
         [
             {
                 "session_id": "Bed008",
@@ -562,7 +566,7 @@ def read_seglst(seglst_filepath, round_digits=3, return_rttm=False, sort_by_star
     seglst = []
     with open(seglst_filepath, 'r') as f:
         seglst_lines = json.loads(f.read())
-        
+
         for idx, line in enumerate(seglst_lines):
             spk, start, end = line['speaker'], float(line['start_time']), float(line['end_time'])
             dur = round(end - start, round_digits)
@@ -579,7 +583,7 @@ def read_seglst(seglst_filepath, round_digits=3, return_rttm=False, sort_by_star
                     'end_time': end,
                     'duration': dur,
                 }
-            )   
+            )
     if sort_by_start_time and sort_by_end_time:
         raise ValueError("Cannot sort by both start and end time")
     if sort_by_start_time:
@@ -589,6 +593,7 @@ def read_seglst(seglst_filepath, round_digits=3, return_rttm=False, sort_by_star
     if return_rttm:
         return seglst, rttm_lines
     return seglst
+
 
 def convert_seglst(seglst, all_speakers):
     '''
@@ -601,7 +606,7 @@ def convert_seglst(seglst, all_speakers):
         timestamps: (list of list)
             [
             [[st1, et1], [st2, et2]], # timestamps list for speaker 1
-            [[st1, et1], ...], # timestamps list for speaker 2 
+            [[st1, et1], ...], # timestamps list for speaker 2
             ...]
         words (list[[s1], [s2], [s3], [s4]]): list of words for each speaker 1 to 4
     '''
@@ -617,10 +622,8 @@ def convert_seglst(seglst, all_speakers):
 
     return timestamps, words
 
-def chunk_seglst(
-    seglst : List[Dict],
-    chunk_size: float = 10.0
-):
+
+def chunk_seglst(seglst: List[Dict], chunk_size: float = 10.0):
     '''
     Get chunked timestamps and words for each speaker
 
@@ -636,26 +639,26 @@ def chunk_seglst(
     chunk_id2timestamps = defaultdict(list)
     speakers = set()
     session_ids = set()
-    
+
     for segment in seglst:
         session_id = segment['session_id']
         start_time = segment['start_time']
         end_time = segment['end_time']
-        
+
         # Determine interval bounds
         chunk_start = int(start_time // chunk_size)
         chunk_end = int(end_time // chunk_size)
-        
+
         # Split and assign the segment across overlapping intervals
         words = segment['words']
         for chunk_idx in range(chunk_start, chunk_end + 1):
             chunk_start_time = chunk_idx * chunk_size
             chunk_end_time = (chunk_idx + 1) * chunk_size
-            
+
             # Calculate the adjusted start and end times for the split segment
             segment_start = max(start_time, chunk_start_time)
             segment_end = min(end_time, chunk_end_time)
-            
+
             # Create a split segment and add it to the corresponding interval
             split_segment = {
                 'session_id': session_id,
@@ -676,16 +679,17 @@ def chunk_seglst(
         session_id = None
     else:
         session_id = session_ids.pop()
-    
+
     return chunk_id2timestamps, speakers, session_id
+
 
 # def streaming_evaluation(
 #     ref_seglst: List[Dict],
 #     ref_rttm_labels: List[str],
 #     hyp_seglst: List[Dict],
-#     collar: float = 0.25, 
-#     ignore_overlap: bool = False, 
-#     verbose: bool = True, 
+#     collar: float = 0.25,
+#     ignore_overlap: bool = False,
+#     verbose: bool = True,
 #     chunk_size: float = 10.0,
 # ):
 #     """
@@ -709,7 +713,7 @@ def chunk_seglst(
 #         ref_session_id = hyp_session_id
 
 #     assert ref_session_id == hyp_session_id, "Session IDs of reference and hypothesis should match"
-    
+
 #     # Only care about the sessions in reference only
 #     session_id = ref_session_id
 #     ref_speaker_words = defaultdict(list)
@@ -736,12 +740,12 @@ def chunk_seglst(
 #         hyp_labels = generate_diarization_output_lines(speaker_timestamps=hyp_speaker_timestamps, model_spk_num=len(hyp_speakers))
 #         reference = labels_to_pyannote_object(ref_labels, uniq_name=session_id)
 #         hypothesis = labels_to_pyannote_object(hyp_labels, uniq_name=session_id)
-        
+
 #         for idx, speaker in enumerate(ref_speakers):
 #             ref_speaker_words[idx] += ref_speaker_word[idx]
 #         for idx, speaker in enumerate(hyp_speakers):
 #             hyp_speaker_words[idx] += hyp_speaker_word[idx]
-        
+
 #         der_met = der_metric(reference, hypothesis)
 #         cpWER, min_perm_hyp_trans, ref_trans = cpwer_metric(ref_speaker_words, hyp_speaker_words)
 
@@ -751,8 +755,9 @@ def chunk_seglst(
 
 #         der_list.append(abs(der_metric) * 100)
 #         cpwer_list.append(cpWER)
-        
+
 #     return der_list, cpwer_list
+
 
 class OnlineEvaluation:
     """
@@ -768,16 +773,17 @@ class OnlineEvaluation:
         ignore_overlap (bool):
             Whether to ignore overlapping segments
         verbose (bool):
-            Whether to print verbose output            
+            Whether to print verbose output
     """
 
-    def __init__(self, 
+    def __init__(
+        self,
         ref_seglst: List[Dict],
         ref_rttm_labels: List[str],
         hyp_seglst: Optional[List[Dict]] = None,
-        collar: float = 0.25, 
-        ignore_overlap: bool = False, 
-        verbose: bool = True, 
+        collar: float = 0.25,
+        ignore_overlap: bool = False,
+        verbose: bool = True,
     ):
         self.ref_seglst = ref_seglst
         self.ref_rttm_labels = ref_rttm_labels
@@ -802,8 +808,8 @@ class OnlineEvaluation:
         if end_step_time > self.ref_seglst[self.current_idx]['end_time']:
             self.current_idx += 1
             is_update = True
-            ref_seglst = self.ref_seglst[:self.current_idx]
-            der_cumul, cpwer_cumul= self.evaluate(ref_seglst, hyp_seglst, chunk_size=-1, verbose=False)
+            ref_seglst = self.ref_seglst[: self.current_idx]
+            der_cumul, cpwer_cumul = self.evaluate(ref_seglst, hyp_seglst, chunk_size=-1, verbose=False)
             der, cpwer = der_cumul[-1], cpwer_cumul[-1]
             if self.verbose:
                 logging.info(f"Session ID: {self.ref_seglst[0]['session_id']} from 0.0s to {end_step_time:.3f}s")
@@ -840,12 +846,12 @@ class OnlineEvaluation:
             hyp_session_id = ref_session_id
 
         assert ref_session_id == hyp_session_id, "Session IDs of reference and hypothesis should match"
-        
+
         # Only care about the sessions in reference only
         session_id = ref_session_id
         ref_speaker_words = defaultdict(list)
         hyp_speaker_words = defaultdict(list)
-        
+
         der_metric = DiarizationErrorRate(collar=2 * self.collar, skip_overlap=self.ignore_overlap)
         cpwer_metric = calculate_session_cpWER
         der_list, cpwer_list = [], []
@@ -860,11 +866,15 @@ class OnlineEvaluation:
             hyp_speaker_timestamps, hyp_speaker_word = convert_seglst(hyp_seglst, hyp_speakers)
             ref_speaker_timestamps, ref_speaker_word = convert_seglst(ref_seglst, ref_speakers)
 
-            ref_labels = generate_diarization_output_lines(speaker_timestamps=ref_speaker_timestamps, model_spk_num=len(ref_speakers))
-            hyp_labels = generate_diarization_output_lines(speaker_timestamps=hyp_speaker_timestamps, model_spk_num=len(hyp_speakers))
+            ref_labels = generate_diarization_output_lines(
+                speaker_timestamps=ref_speaker_timestamps, model_spk_num=len(ref_speakers)
+            )
+            hyp_labels = generate_diarization_output_lines(
+                speaker_timestamps=hyp_speaker_timestamps, model_spk_num=len(hyp_speakers)
+            )
             reference = labels_to_pyannote_object(ref_labels, uniq_name=session_id)
             hypothesis = labels_to_pyannote_object(hyp_labels, uniq_name=session_id)
-            
+
             for idx, speaker in enumerate(ref_speakers):
                 ref_speaker_words[idx] += ref_speaker_word[idx]
             for idx, speaker in enumerate(hyp_speakers):
@@ -873,18 +883,23 @@ class OnlineEvaluation:
             der_instance = der_metric(reference, hypothesis)
             # Normalize the text
             for spk_idx in range(len(hyp_speaker_words)):
-                hyp_speaker_words[spk_idx] = hyp_speaker_words[spk_idx].translate(str.maketrans('', '', string.punctuation)).lower()
+                hyp_speaker_words[spk_idx] = (
+                    hyp_speaker_words[spk_idx].translate(str.maketrans('', '', string.punctuation)).lower()
+                )
             cpWER, min_perm_hyp_trans, ref_trans = cpwer_metric(ref_speaker_words, hyp_speaker_words)
 
             if verbose:
-                logging.info(f"Session ID: {session_id} Chunk ID: {chunk_idx} from 0.0s to {(chunk_idx+1)*chunk_size}s")
+                logging.info(
+                    f"Session ID: {session_id} Chunk ID: {chunk_idx} from 0.0s to {(chunk_idx+1)*chunk_size}s"
+                )
                 logging.info(f"DER: {abs(der_metric)*100:.2f}%, cpWER: {cpWER*100:.2f}%")
 
             der_list.append(abs(der_metric) * 100)
             cpwer_list.append(cpWER * 100)
 
         return der_list, cpwer_list
-    
+
+
 class OfflineDiarWithASR:
     """
     A class designed for performing ASR and diarization together.
@@ -1020,7 +1035,8 @@ class OfflineDiarWithASR:
 
     @staticmethod
     def get_speech_labels_from_decoded_prediction(
-        input_word_ts: List[float], nonspeech_threshold: float,
+        input_word_ts: List[float],
+        nonspeech_threshold: float,
     ) -> List[float]:
         """
         Extract speech labels from the ASR output (decoded predictions)
@@ -1222,7 +1238,9 @@ class OfflineDiarWithASR:
         return cursor
 
     def _compensate_word_ts_list(
-        self, audio_file_list: List[str], word_ts_dict: Dict[str, List[float]],
+        self,
+        audio_file_list: List[str],
+        word_ts_dict: Dict[str, List[float]],
     ) -> Dict[str, List[List[float]]]:
         """
         Compensate the word timestamps based on the VAD output.
@@ -1364,7 +1382,7 @@ class OfflineDiarWithASR:
 
                 Example:
                 >>> word_ts = [[0.0, 0.04], [0.64, 0.68], [0.84, 0.88], ...]
-            
+
             word_ts_refined (list):
                 Dictionary containing the refined (end point fixed) word timestamps based on hypothesis
                 word timestamps. Indexed by unique IDs.
@@ -1377,9 +1395,9 @@ class OfflineDiarWithASR:
                 List containing word by word dictionary containing word, timestamps and speaker labels.
 
                 Example:
-                >>> [{'word': 'right', 'start_time': 0.0, 'end_time': 0.04, 'speaker': 'speaker_0'},  
-                     {'word': 'and', 'start_time': 0.64, 'end_time': 0.68, 'speaker': 'speaker_1'},  
-                     {'word': 'i', 'start_time': 0.84, 'end_time': 0.88, 'speaker': 'speaker_1'},  
+                >>> [{'word': 'right', 'start_time': 0.0, 'end_time': 0.04, 'speaker': 'speaker_0'},
+                     {'word': 'and', 'start_time': 0.64, 'end_time': 0.68, 'speaker': 'speaker_1'},
+                     {'word': 'i', 'start_time': 0.84, 'end_time': 0.88, 'speaker': 'speaker_1'},
                      ...]
         """
         if word_rfnd_ts is None:
@@ -1399,7 +1417,10 @@ class OfflineDiarWithASR:
         return word_dict_seq_list
 
     def _make_json_output(
-        self, uniq_id: str, diar_labels: List[str], word_dict_seq_list: List[Dict[str, float]],
+        self,
+        uniq_id: str,
+        diar_labels: List[str],
+        word_dict_seq_list: List[Dict[str, float]],
     ) -> Dict[str, Dict[str, str]]:
         """
         Generate json output files and transcripts from the ASR and diarization results.
@@ -1448,7 +1469,9 @@ class OfflineDiarWithASR:
                     }
         """
         logging.info(f"Creating results for Session: {uniq_id} n_spk: {n_spk} ")
-        session_trans_dict, gecko_dict, audacity_label_words, sentences = get_session_trans_dict(uniq_id, word_dict_seq_list, diar_labels)
+        session_trans_dict, gecko_dict, audacity_label_words, sentences = get_session_trans_dict(
+            uniq_id, word_dict_seq_list, diar_labels
+        )
         self._write_and_log(uniq_id, session_trans_dict, audacity_label_words, gecko_dict, sentences)
         return session_trans_dict
 
@@ -1637,7 +1660,7 @@ class OfflineDiarWithASR:
             wer_results['total']['average_cpWER'] = word_error_rate(hypotheses=hyps_spk, references=refs_spk)
             wer_results['total']['average_WER'] = word_error_rate(hypotheses=mix_hypotheses, references=mix_references)
 
-            for (uniq_id, cpWER, WER) in zip(uniq_id_list, cpWER_values, WER_values):
+            for uniq_id, cpWER, WER in zip(uniq_id_list, cpWER_values, WER_values):
                 # Save session-level cpWER and WER values
                 wer_results[uniq_id] = {}
                 wer_results[uniq_id]['cpWER'] = cpWER
@@ -1690,8 +1713,6 @@ class OfflineDiarWithASR:
                     writer.writerow(data)
         except IOError:
             logging.info("I/O error has occurred while writing a csv file.")
-
-
 
     def _write_and_log(
         self,

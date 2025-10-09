@@ -14,22 +14,18 @@
 #
 import os
 from typing import Any, Dict, List, Optional
+
 import torch
 import torch.nn.functional as F
 from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
 from pytorch_lightning import Trainer
 
 from nemo.collections.asr.data.audio_to_text_lhotse_speaker import LhotseSpeechToTextSpkBpeDataset
-
-from nemo.collections.asr.parts.mixins import (
-    TranscribeConfig,
-    TranscriptionReturnType,
-)
-from nemo.collections.asr.parts.mixins.multitalker_asr_mixins import SpeakerKernelMixin
-
 from nemo.collections.asr.models.rnnt_bpe_models import EncDecRNNTBPEModel
-from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
+from nemo.collections.asr.parts.mixins import TranscribeConfig, TranscriptionReturnType
+from nemo.collections.asr.parts.mixins.multitalker_asr_mixins import SpeakerKernelMixin
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
+from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
 
 
 class EncDecMultiTalkerRNNTBPEModel(EncDecRNNTBPEModel, SpeakerKernelMixin):
@@ -46,12 +42,15 @@ class EncDecMultiTalkerRNNTBPEModel(EncDecRNNTBPEModel, SpeakerKernelMixin):
             with open_dict(config):
                 config.global_rank = self.global_rank
                 config.world_size = self.world_size
-            
+
             return get_lhotse_dataloader_from_config(
                 config,
                 global_rank=self.global_rank,
                 world_size=self.world_size,
-                dataset=LhotseSpeechToTextSpkBpeDataset(cfg = config, tokenizer=self.tokenizer,),
+                dataset=LhotseSpeechToTextSpkBpeDataset(
+                    cfg=config,
+                    tokenizer=self.tokenizer,
+                ),
             )
 
     def training_step(self, batch, batch_nb):
@@ -86,7 +85,7 @@ class EncDecMultiTalkerRNNTBPEModel(EncDecRNNTBPEModel, SpeakerKernelMixin):
         batch = (signal, signal_len, transcript, transcript_len)
 
         return super()._transcribe_forward(batch, trcfg)
-    
+
     def _setup_transcribe_dataloader(self, config: Dict) -> 'torch.utils.data.DataLoader':
         """
         Setup function for a temporary data loader which wraps the provided audio file.
@@ -121,7 +120,7 @@ class EncDecMultiTalkerRNNTBPEModel(EncDecRNNTBPEModel, SpeakerKernelMixin):
             'use_bucketing': False,
             'channel_selector': config.get('channel_selector', None),
             'inference_mode': self.cfg.test_ds.get('inference_mode', True),
-            'fixed_spk_id': config.get('fixed_spk_id', None)
+            'fixed_spk_id': config.get('fixed_spk_id', None),
         }
 
         if config.get("augmentor"):

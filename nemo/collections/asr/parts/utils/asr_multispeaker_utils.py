@@ -11,44 +11,44 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import re
-import math
-import json
-import random
-import logging
 import itertools
-from copy import deepcopy
-from cytoolz import groupby
+import json
+import logging
+import math
+import os
+import random
+import re
 import time
 from collections import defaultdict
+from copy import deepcopy
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import soundfile
-from tqdm import tqdm
-from scipy.stats import norm
-
+import soundfile as sf
 import torch.utils.data
+from cytoolz import groupby
+from lhotse import AudioSource, Recording, SupervisionSegment, SupervisionSet, dill_enabled
+from lhotse.cut import Cut, CutSet, MixedCut, MixTrack, MonoCut
 from lhotse.cut.set import mix
-from lhotse.cut import Cut, CutSet, MixedCut, MonoCut, MixTrack
-from lhotse import SupervisionSet, SupervisionSegment, dill_enabled, AudioSource, Recording
-from lhotse.utils import uuid4, compute_num_samples, ifnone
 from lhotse.lazy import LazyIteratorChain, LazyJsonlIterator
+from lhotse.utils import compute_num_samples, ifnone, uuid4
+from omegaconf import OmegaConf
+from scipy.stats import norm
+from tqdm import tqdm
+
 from nemo.collections.asr.data.data_simulation import MultiSpeakerSimulator
 from nemo.collections.asr.parts.utils.data_simulation_utils import read_rir_manifest
-from typing import Optional, Union, List, Tuple, Dict, Any
 
-from omegaconf import OmegaConf
-from dataclasses import dataclass, field
-from typing import List, Optional
 
-import soundfile as sf
-import os
 @dataclass
 class SessionConfig:
     num_speakers: int = 1
     num_sessions: int = 1
     session_length: int = 15
     session_length_range: List[int] = field(default_factory=lambda: [10, 40])
+
 
 @dataclass
 class SessionParams:
@@ -82,12 +82,14 @@ class SessionParams:
     end_buffer: float = 0.5
     random_offset: bool = True
 
+
 @dataclass
 class OutputConfig:
     output_dir: str = ""
     output_filename: str = "multispeaker_session"
     overwrite_output: bool = True
     output_precision: int = 3
+
 
 @dataclass
 class BackgroundNoise:
@@ -99,12 +101,14 @@ class BackgroundNoise:
     snr_min: Optional[float] = None
     snr_max: Optional[float] = None
 
+
 @dataclass
 class SegmentAugmentor:
     add_seg_aug: bool = False
     gain_prob: float = 0.5
     min_gain_dbfs: float = -10.0
     max_gain_dbfs: float = 10.0
+
 
 @dataclass
 class SessionAugmentor:
@@ -113,10 +117,12 @@ class SessionAugmentor:
     min_white_noise_level: int = -90
     max_white_noise_level: int = -46
 
+
 @dataclass
 class SpeakerEnforcement:
     enforce_num_speakers: bool = True
     enforce_time: List[float] = field(default_factory=lambda: [0.25, 0.75])
+
 
 @dataclass
 class SegmentManifest:
@@ -124,6 +130,7 @@ class SegmentManifest:
     shift: float = 0.25
     step_count: int = 50
     deci: int = 3
+
 
 @dataclass
 class RIRGeneration:
@@ -141,9 +148,11 @@ class RIRGeneration:
     att_diff: float = 15.0
     att_max: float = 60.0
 
+
 @dataclass
 class DataSimConfig:
     """Configuration for data simulation."""
+
     manifest_filepath: str = ""
     sr: int = 16000
     random_seed: int = 42
@@ -159,9 +168,11 @@ class DataSimConfig:
     segment_manifest: SegmentManifest = field(default_factory=SegmentManifest)
     rir_generation: RIRGeneration = field(default_factory=RIRGeneration)
 
+
 @dataclass
 class MultiSpeakerSimulatorConfig:
     data_simulator: DataSimConfig = field(default_factory=DataSimConfig)
+
 
 class Segment:
     def __init__(self, start, end, speaker_id, text):
@@ -169,9 +180,10 @@ class Segment:
         self.end = end
         self.speaker_id = speaker_id
         self.text = text
-    
+
     def __str__(self):
         return f"Segment(start={self.start}, end={self.end}, speaker_id={self.speaker_id}, text=\"{self.text}\")"
+
 
 class SegList:
     def __init__(self, segments: List[Segment] = None, seglst_filepath: str = None):
@@ -181,8 +193,8 @@ class SegList:
             self._load_seglst(seglst_filepath)
         else:
             raise ValueError("Either segments or seglst_filepath must be provided")
-    
-    def _load_seglst(self, seglst_filepath: str|list[str]):
+
+    def _load_seglst(self, seglst_filepath: str | list[str]):
         if isinstance(seglst_filepath, str):
             with open(seglst_filepath, 'r', encoding='utf-8') as f:
                 seglst = json.load(f)
@@ -200,21 +212,21 @@ class SegList:
         else:
             raise ValueError("seglst_filepath must be a string or a list of strings")
         self.sort()
-    
+
     def __len__(self):
         return len(self.segments)
-    
+
     def __getitem__(self, idx):
         return self.segments[idx]
-    
+
     def __iter__(self):
         return iter(self.segments)
-    
+
     def sort(self):
         self.segments.sort(key=lambda x: x.start)
 
     def get_segments(self, min_duration: float, max_duration: float):
-        
+
         duration = random.uniform(min_duration, max_duration)
 
         first_segment_idx = random.randint(0, len(self) - 1)
@@ -226,20 +238,23 @@ class SegList:
                 segments.append(self[i])
             else:
                 break
-        
+
         return segments
-    
-    def get_text_from_segments(self, segments: list[Segment], speaker_token_style='<|spltoken*|>', speaker_token_position='sot'):
+
+    def get_text_from_segments(
+        self, segments: list[Segment], speaker_token_style='<|spltoken*|>', speaker_token_position='sot'
+    ):
         text = ''
         speakers = set([segment.speaker_id for segment in segments])
-        speaker2start = {spk_id: min(segment.start for segment in segments if segment.speaker_id == spk_id) for spk_id in speakers}
+        speaker2start = {
+            spk_id: min(segment.start for segment in segments if segment.speaker_id == spk_id) for spk_id in speakers
+        }
         sorted_speakers = sorted(speakers, key=lambda x: speaker2start[x])
         speaker2token = {spk: speaker_token_style.replace('*', str(i)) for i, spk in enumerate(sorted_speakers)}
         for segment in segments:
             text += f'{speaker2token[segment.speaker_id]} '
             text += segment.text
         return text.strip()
-
 
 
 def find_first_nonzero(mat: torch.Tensor, max_cap_val=-1, thres: float = 0.5) -> torch.Tensor:
@@ -534,18 +549,18 @@ def get_hidden_length_from_sample_length(
     mel_frame_count = math.ceil(num_samples / num_sample_per_mel_frame)
     hidden_length = math.ceil(mel_frame_count / num_mel_frame_per_asr_frame)
     return int(hidden_length)
-    
+
 
 def speaker_to_target(
     a_cut,
-    num_sample_per_mel_frame: int = 160, 
-    num_mel_frame_per_asr_frame: int = 8, 
+    num_sample_per_mel_frame: int = 160,
+    num_mel_frame_per_asr_frame: int = 8,
     boundary_segments: bool = False,
     soft_label: bool = False,
     soft_thres: float = 0.5,
     ignore_num_spk_mismatch: bool = True,
     return_text: bool = False,
-    ):
+):
     '''
     Get rttm samples corresponding to one cut, generate speaker mask numpy.ndarray with shape (num_speaker, hidden_length)
     This function is needed for speaker diarization with ASR model trainings.
@@ -560,7 +575,7 @@ def speaker_to_target(
         soft_thres (float): the threshold for the soft label, 0.5 by default.
         ignore_num_spk_mismatch (bool): This is a temporary solution to handle speaker mismatch. Will be removed in the future.
         return_text (bool): set to True to return the text of the speakers (if it is available), False by default.
-    
+
     Returns:
         mask (Tensor): speaker mask with shape (num_speaker, hidden_lenght)
     '''
@@ -574,7 +589,7 @@ def speaker_to_target(
         offsets = [0]
     else:
         raise ValueError(f"Unsupported cut type type{a_cut}: only MixedCut and MonoCut are supported")
-    
+
     segments_total = []
 
     for i, cut in enumerate(cut_list):
@@ -585,15 +600,19 @@ def speaker_to_target(
         else:
             logging.warning(f"No rttm or supervisions found for cut {cut.id}")
             continue
-            
+
         start = cut.offset if hasattr(cut, 'offset') else cut.start
         end = start + cut.duration
         recording_id = rttms[0].recording_id if len(rttms) > 0 else cut.recording_id
-        if boundary_segments: # segments with seg_start < total_end and seg_end > total_start are included
-            segments_iterator = find_segments_from_rttm(recording_id=recording_id, rttms=rttms, start_after=start, end_before=end, tolerance=0.0)
-        else: # segments with seg_start > total_start and seg_end < total_end are included
-            segments_iterator = rttms.find(recording_id=recording_id, start_after=start, end_before=end, adjust_offset=True) #, tolerance=0.0)
-        
+        if boundary_segments:  # segments with seg_start < total_end and seg_end > total_start are included
+            segments_iterator = find_segments_from_rttm(
+                recording_id=recording_id, rttms=rttms, start_after=start, end_before=end, tolerance=0.0
+            )
+        else:  # segments with seg_start > total_start and seg_end < total_end are included
+            segments_iterator = rttms.find(
+                recording_id=recording_id, start_after=start, end_before=end, adjust_offset=True
+            )  # , tolerance=0.0)
+
         for seg in segments_iterator:
             if seg.start < 0:
                 seg.duration += seg.start
@@ -603,29 +622,30 @@ def speaker_to_target(
             seg.start += offsets[i]
             segments_total.append(seg)
     # apply arrival time sorting to the existing segments
-    segments_total.sort(key = lambda rttm_sup: rttm_sup.start)
+    segments_total.sort(key=lambda rttm_sup: rttm_sup.start)
 
     seen = set()
     seen_add = seen.add
     speaker_ats = [s.speaker for s in segments_total if not (s.speaker in seen or seen_add(s.speaker))]
-     
-    speaker_to_idx_map = {
-        spk: idx
-        for idx, spk in enumerate(speaker_ats)
-    }
+
+    speaker_to_idx_map = {spk: idx for idx, spk in enumerate(speaker_ats)}
     num_speakers = len(speaker_ats)
-        
+
     # initialize mask matrices (num_speaker, encoder_hidden_len)
-    feat_per_sec = int(a_cut.sampling_rate / num_sample_per_mel_frame) # 100 by default
-    num_samples = get_hidden_length_from_sample_length(a_cut.num_samples, num_sample_per_mel_frame, num_mel_frame_per_asr_frame)
-    frame_mask = get_mask_from_segments(segments_total, a_cut, speaker_to_idx_map, num_speakers, feat_per_sec, ignore_num_spk_mismatch)
+    feat_per_sec = int(a_cut.sampling_rate / num_sample_per_mel_frame)  # 100 by default
+    num_samples = get_hidden_length_from_sample_length(
+        a_cut.num_samples, num_sample_per_mel_frame, num_mel_frame_per_asr_frame
+    )
+    frame_mask = get_mask_from_segments(
+        segments_total, a_cut, speaker_to_idx_map, num_speakers, feat_per_sec, ignore_num_spk_mismatch
+    )
     soft_mask = get_soft_mask(frame_mask, num_samples, num_mel_frame_per_asr_frame)
 
     if soft_label:
         mask = soft_mask
     else:
         mask = (soft_mask > soft_thres).float()
-        
+
     if return_text:
         speaker2text = defaultdict(list)
         for seg in segments_total:
@@ -634,6 +654,7 @@ def speaker_to_target(
         return mask, texts
     else:
         return mask
+
 
 def read_seglst(seglst_filepath: str, session_id: Optional[str] = None):
     """
@@ -648,17 +669,20 @@ def read_seglst(seglst_filepath: str, session_id: Optional[str] = None):
                 start=float(seg['start_time']),
                 duration=float(seg['end_time']) - float(seg['start_time']),
                 text=seg['words'],
-                speaker=seg['speaker']
-            ) for i, seg in enumerate(seglst)
+                speaker=seg['speaker'],
+            )
+            for i, seg in enumerate(seglst)
         ]
-        
-class MultiSpeakerMixtureGenerator():
+
+
+class MultiSpeakerMixtureGenerator:
     """
     This class is used to simulate multi-speaker audio data,
     which can be used for multi-speaker ASR and speaker diarization training.
     """
+
     def __init__(
-        self, 
+        self,
         manifest_filepath,
         sample_rate,
         simulator_type,
@@ -673,7 +697,7 @@ class MultiSpeakerMixtureGenerator():
         """
         Args:
             cuts (CutSet): The cutset that contains single-speaker audio cuts.
-                Please make sure that the cuts have the 'speaker_id' attribute.                    
+                Please make sure that the cuts have the 'speaker_id' attribute.
             num_speakers (int): The number of speakers in the simulated audio.
                 We only simulate the samples with the fixed number of speakers.
                 The variation of the number of speakers is controlled by the weights in Lhotse dataloader config.
@@ -691,10 +715,10 @@ class MultiSpeakerMixtureGenerator():
         self.global_rank = global_rank
         self.world_size = world_size
 
-        self.manifest_filepath = manifest_filepath 
+        self.manifest_filepath = manifest_filepath
         self.manifests = list(LazyJsonlIterator(manifest_filepath))
         self.sample_rate = sample_rate
-        
+
         self.min_duration = min_duration
         self.max_duration = max_duration
         self.min_delay = min_delay
@@ -703,10 +727,7 @@ class MultiSpeakerMixtureGenerator():
 
         print("======  simulator_type", simulator_type)
 
-        type2simulator = {
-            'lsmix': self.LibriSpeechMixSimulator,
-            'mixture_loader': self.MultiSpeakerMixtureLoader
-        }
+        type2simulator = {'lsmix': self.LibriSpeechMixSimulator, 'mixture_loader': self.MultiSpeakerMixtureLoader}
 
         self.simulator = type2simulator[simulator_type]
 
@@ -718,7 +739,7 @@ class MultiSpeakerMixtureGenerator():
 
     def __iter__(self):
         return self
-    
+
     def __next__(self):
         self.count += 1
         return self.simulator()
@@ -744,17 +765,19 @@ class MultiSpeakerMixtureGenerator():
                     start=0.0,
                     duration=mono_cuts[-1].duration,
                     text=mono_cuts[-1].custom['text'],
-                    speaker=speaker_id
+                    speaker=speaker_id,
                 )
             )
-            
+
         tracks = []
         offset = 0.0
         for speaker_id, mono_cut in zip(sampled_speaker_ids, mono_cuts):
             tracks.append(MixTrack(cut=deepcopy(mono_cut), type=type(mono_cut), offset=offset))
             offset += random.uniform(self.min_delay, mono_cut.duration)
-    
-        mixed_cut = MixedCut(id='lsmix_' + '_'.join([track.cut.id for track in tracks]) + '_' + str(uuid4()), tracks=tracks)
+
+        mixed_cut = MixedCut(
+            id='lsmix_' + '_'.join([track.cut.id for track in tracks]) + '_' + str(uuid4()), tracks=tracks
+        )
 
         return mixed_cut
 
@@ -784,12 +807,18 @@ class MultiSpeakerMixtureGenerator():
         supervisions = sorted(supervisions, key=lambda x: x.start)
 
         segment_offset, segment_duration = self._get_offset_and_duration(supervisions)
-        
+
         json_dict = {
             'audio_filepath': audio_filepath,
             'duration': segment_duration,
             'offset': segment_offset,
-            'supervisions': find_segments_from_rttm(recording_id=supervisions[0].recording_id, rttms=SupervisionSet(supervisions), start_after=segment_offset, end_before=segment_offset + segment_duration, adjust_offset=False)
+            'supervisions': find_segments_from_rttm(
+                recording_id=supervisions[0].recording_id,
+                rttms=SupervisionSet(supervisions),
+                start_after=segment_offset,
+                end_before=segment_offset + segment_duration,
+                adjust_offset=False,
+            ),
         }
         cut = self._json_to_cut(json_dict)
 
@@ -803,7 +832,7 @@ class MultiSpeakerMixtureGenerator():
         non_overlap_supervisions_indices = self._get_non_overlap_supervisions_indices(supervisions)
         # find the start and the end of the segment
         start_idx = random.choice(non_overlap_supervisions_indices)
-        end_idx = start_idx 
+        end_idx = start_idx
         offset = supervisions[start_idx].start
         for i in range(start_idx + 1, len(supervisions)):
             end_idx = i
@@ -816,7 +845,7 @@ class MultiSpeakerMixtureGenerator():
         segment_duration = supervisions[end_idx].end - offset
 
         return segment_offset, segment_duration
-    
+
     def _get_non_overlap_supervisions_indices(self, supervisions):
         """
         Get the indices of the non-overlapping supervisions.
@@ -829,7 +858,7 @@ class MultiSpeakerMixtureGenerator():
                 non_overlap_supervisions_indices.append(i)
                 max_end = max(max_end, supervisions[i].end)
         return non_overlap_supervisions_indices
-    
+
     def _json_to_cut(self, json_dict):
         """
         Convert a json dictionary to a Cut instance.
@@ -839,7 +868,10 @@ class MultiSpeakerMixtureGenerator():
         offset = json_dict.get("offset", 0.0)
         supervisions = json_dict.get("supervisions", [])
         cut = self._create_cut(
-            audio_path=audio_path, offset=offset, duration=duration, sampling_rate=json_dict.get("sampling_rate", None),
+            audio_path=audio_path,
+            offset=offset,
+            duration=duration,
+            sampling_rate=json_dict.get("sampling_rate", None),
         )
         # Note that start=0 and not start=offset because supervision's start if relative to the
         # start of the cut; and cut.start is already set to offset
@@ -864,7 +896,7 @@ class MultiSpeakerMixtureGenerator():
         sampling_rate: int | None = None,
         channel: int = 0,
     ) -> Cut:
-        
+
         recording = self._create_recording(audio_path, duration, sampling_rate)
         cut = recording.to_cut()
         if isinstance(cut.channel, list) and len(cut.channel) > 1:
@@ -873,7 +905,7 @@ class MultiSpeakerMixtureGenerator():
             cut = cut.truncate(offset=offset, duration=duration, preserve_id=True)
             cut.id = f"{cut.id}-{round(offset * 1e2):06d}-{round(duration * 1e2):06d}"
         return cut
-    
+
     def _create_recording(
         self,
         audio_path: str,

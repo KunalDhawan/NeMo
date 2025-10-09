@@ -12,50 +12,43 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import itertools
 import json
-from dataclasses import dataclass, is_dataclass, field
-from typing import Optional, Union, List, Tuple, Dict, Any
-
-import torch
+import math
 import os
-import pytorch_lightning as pl
-from omegaconf import OmegaConf
-from omegaconf import open_dict
-from lhotse.dataset.collation import collate_matrices
+import time
+from collections import OrderedDict
+from copy import deepcopy
+from dataclasses import dataclass, field, is_dataclass
+from functools import wraps
+from typing import Any, Dict, List, Optional, Tuple, Union
 
+import pytorch_lightning as pl
+import torch
+from lhotse.dataset.collation import collate_matrices
+from omegaconf import OmegaConf, open_dict
 
 import nemo.collections.asr as nemo_asr
+from nemo.collections.asr.data.audio_to_diar_label import extract_frame_info_from_rttm, get_frame_targets_from_rttm
+from nemo.collections.asr.models.sortformer_diar_models import SortformerEncLabelModel
+from nemo.collections.asr.parts.utils.diarization_utils import (
+    OnlineEvaluation,
+    get_color_palette,
+    print_sentences,
+    read_seglst,
+    write_txt,
+)
+from nemo.collections.asr.parts.utils.multispk_transcribe_utils import (
+    SpeakerTaggedASR,
+    get_multi_talker_samples_from_manifest,
+)
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
+from nemo.collections.asr.parts.utils.speaker_utils import audio_rttm_map as get_audio_rttm_map
+from nemo.collections.asr.parts.utils.speaker_utils import rttm_to_labels
 from nemo.collections.asr.parts.utils.streaming_utils import CacheAwareStreamingAudioBuffer
-
-from copy import deepcopy
-from nemo.collections.asr.parts.utils.diarization_utils import read_seglst, OnlineEvaluation
+from nemo.core.config import hydra_runner
 from nemo.utils import logging
 
-from nemo.collections.asr.models.sortformer_diar_models import SortformerEncLabelModel
-from nemo.core.config import hydra_runner
-
-from nemo.collections.asr.parts.utils.multispk_transcribe_utils import SpeakerTaggedASR, get_multi_talker_samples_from_manifest
-from nemo.collections.asr.parts.utils.speaker_utils import (
-audio_rttm_map as get_audio_rttm_map,
-rttm_to_labels,
-)
-from nemo.collections.asr.parts.utils.diarization_utils import (
-print_sentences,
-get_color_palette,
-write_txt,
-)
-from nemo.collections.asr.data.audio_to_diar_label import get_frame_targets_from_rttm, extract_frame_info_from_rttm
-
-
-from typing import List, Optional
-from dataclasses import dataclass
-from collections import OrderedDict
-import itertools
-
-import time
-from functools import wraps
-import math
 
 @dataclass
 class DiarizationConfig:
@@ -66,13 +59,13 @@ class DiarizationConfig:
     parallel_speaker_strategy: bool = True
 
     # General configs
-    session_len_sec: float = -1 # End-to-end diarization session length in seconds
+    session_len_sec: float = -1  # End-to-end diarization session length in seconds
     num_workers: int = 8
     random_seed: Optional[int] = None  # seed number going to be used in seed_everything()
-    log: bool = True # If True, log will be printed
+    log: bool = True  # If True, log will be printed
 
     # Streaming diarization configs
-    streaming_mode: bool = True # If True, streaming diarization will be used.
+    streaming_mode: bool = True  # If True, streaming diarization will be used.
     spkcache_len: int = 188
     spkcache_refresh_rate: int = 0
     fifo_len: int = 188
@@ -99,7 +92,7 @@ class DiarizationConfig:
     online_normalization: bool = False
     output_path: Optional[str] = None
     pad_and_drop_preencoded: bool = False
-    set_decoder: Optional[str] = None # ["ctc", "rnnt"]
+    set_decoder: Optional[str] = None  # ["ctc", "rnnt"]
     att_context_size: Optional[list] = None
     generate_realtime_scripts: bool = True
 
@@ -123,7 +116,7 @@ class DiarizationConfig:
     feat_len_sec: float = 0.01
     finetune_realtime_ratio: float = 0.01
 
-    spk_supervision: str = "diar" # ["diar", "rttm"]
+    spk_supervision: str = "diar"  # ["diar", "rttm"]
     binary_diar_preds: bool = False
 
 
@@ -132,12 +125,14 @@ def format_time(seconds):
     sec = seconds % 60
     return f"{minutes}:{sec:05.2f}"
 
+
 def calc_drop_extra_pre_encoded(asr_model, step_num, pad_and_drop_preencoded):
     # for the first step there is no need to drop any tokens after the downsampling as no caching is being used
     if step_num == 0 and not pad_and_drop_preencoded:
         return 0
     else:
         return asr_model.encoder.streaming_cfg.drop_extra_pre_encoded
+
 
 def add_delay_for_real_time(cfg, chunk_audio, session_start_time, feat_frame_count, loop_end_time, loop_start_time):
     """
@@ -149,10 +144,18 @@ def add_delay_for_real_time(cfg, chunk_audio, session_start_time, feat_frame_cou
     """
     time_diff = max(0, (time.time() - session_start_time) - feat_frame_count * cfg.feat_len_sec)
     eta_min_sec = format_time(time.time() - session_start_time)
-    logging.info(f"[   REAL TIME MODE   ] min:sec - {eta_min_sec} "
-                    f"Time difference for real-time mode: {time_diff:.4f} seconds")
-    time.sleep(max(0, (chunk_audio.shape[-1] - cfg.discarded_frames)*cfg.feat_len_sec -
-                    (loop_end_time - loop_start_time) - time_diff * cfg.finetune_realtime_ratio))
+    logging.info(
+        f"[   REAL TIME MODE   ] min:sec - {eta_min_sec} "
+        f"Time difference for real-time mode: {time_diff:.4f} seconds"
+    )
+    time.sleep(
+        max(
+            0,
+            (chunk_audio.shape[-1] - cfg.discarded_frames) * cfg.feat_len_sec
+            - (loop_end_time - loop_start_time)
+            - time_diff * cfg.finetune_realtime_ratio,
+        )
+    )
 
 
 def write_seglst_file(seglst_dict_list, output_path):
@@ -161,6 +164,7 @@ def write_seglst_file(seglst_dict_list, output_path):
     with open(output_path, 'w') as f:
         f.write(json.dumps(seglst_dict_list, indent=4) + '\n')
     logging.info(f"Saved the transcriptions of the streaming inference in\n:{output_path}")
+
 
 def launch_serial_streaming(
     cfg,
@@ -189,16 +193,18 @@ def launch_serial_streaming(
                         drop_extra_pre_encoded=drop_extra_pre_encoded,
                     )
 
-        feat_frame_count += (chunk_audio.shape[-1] - cfg.discarded_frames)
+        feat_frame_count += chunk_audio.shape[-1] - cfg.discarded_frames
         if cfg.real_time_mode:
-            add_delay_for_real_time(cfg,
-                                    chunk_audio=chunk_audio,
-                                    session_start_time=session_start_time,
-                                    feat_frame_count=feat_frame_count,
-                                    loop_end_time=time.time(),
-                                    loop_start_time=loop_start_time
-                                )
+            add_delay_for_real_time(
+                cfg,
+                chunk_audio=chunk_audio,
+                session_start_time=session_start_time,
+                feat_frame_count=feat_frame_count,
+                loop_end_time=time.time(),
+                loop_start_time=loop_start_time,
+            )
     return multispk_asr_streamer
+
 
 def launch_parallel_streaming(
     cfg,
@@ -206,7 +212,7 @@ def launch_parallel_streaming(
     diar_model,
     streaming_buffer,
     pad_and_drop_preencoded=False,
-    ):
+):
     streaming_buffer_iter = iter(streaming_buffer)
     multispk_asr_streamer = SpeakerTaggedASR(cfg, asr_model, diar_model)
 
@@ -263,11 +269,11 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         map_location = torch.device(f'cuda:{cfg.cuda}')
 
     if cfg.diar_model_path.endswith(".ckpt"):
-        diar_model = SortformerEncLabelModel.load_from_checkpoint(checkpoint_path=cfg.diar_model_path,
-                                                                  map_location=map_location, strict=False)
+        diar_model = SortformerEncLabelModel.load_from_checkpoint(
+            checkpoint_path=cfg.diar_model_path, map_location=map_location, strict=False
+        )
     elif cfg.diar_model_path.endswith(".nemo"):
-        diar_model = SortformerEncLabelModel.restore_from(restore_path=cfg.diar_model_path,
-                                                          map_location=map_location)
+        diar_model = SortformerEncLabelModel.restore_from(restore_path=cfg.diar_model_path, map_location=map_location)
     else:
         raise ValueError("cfg.diar_model_path must end with.ckpt or.nemo!")
 
@@ -372,7 +378,11 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
 
     if cfg.audio_file is not None:
         # Stream a single audio file
-        samples = [{'audio_filepath': cfg.audio_file,}]
+        samples = [
+            {
+                'audio_filepath': cfg.audio_file,
+            }
+        ]
         streaming_buffer = CacheAwareStreamingAudioBuffer(
             model=asr_model,
             online_normalization=online_normalization,
@@ -399,7 +409,9 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     else:
         # Stream audio files in a manifest file in batched mode
         feat_per_sec = round(asr_model.cfg.preprocessor.window_stride * asr_model.cfg.encoder.subsampling_factor, 2)
-        samples, rttms_mask_mats = get_multi_talker_samples_from_manifest(cfg, manifest_file=cfg.manifest_file, feat_per_sec=feat_per_sec, max_spks=cfg.max_num_of_spks)
+        samples, rttms_mask_mats = get_multi_talker_samples_from_manifest(
+            cfg, manifest_file=cfg.manifest_file, feat_per_sec=feat_per_sec, max_spks=cfg.max_num_of_spks
+        )
         cfg.batch_size = len(samples)
         # Note: rttms_mask_mats contains PyTorch tensors, so we pass it directly instead of storing in config
         if cfg.spk_supervision == "rttm":
@@ -439,12 +451,15 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     if cfg.output_path is not None and multispk_asr_streamer is not None:
         if cfg.parallel_speaker_strategy:
             multispk_asr_streamer.generate_seglst_dicts_from_parallel_streaming(samples=samples)
-            write_seglst_file(seglst_dict_list=multispk_asr_streamer.instance_manager.seglst_dict_list,
-                              output_path=cfg.output_path)
+            write_seglst_file(
+                seglst_dict_list=multispk_asr_streamer.instance_manager.seglst_dict_list, output_path=cfg.output_path
+            )
         else:
             multispk_asr_streamer.generate_seglst_dicts_from_serial_streaming(samples=samples)
-            write_seglst_file(seglst_dict_list=multispk_asr_streamer.instance_manager.seglst_dict_list,
-                              output_path=cfg.output_path)
+            write_seglst_file(
+                seglst_dict_list=multispk_asr_streamer.instance_manager.seglst_dict_list, output_path=cfg.output_path
+            )
+
 
 if __name__ == '__main__':
     main()

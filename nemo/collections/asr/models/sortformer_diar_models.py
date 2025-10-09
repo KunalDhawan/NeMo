@@ -128,7 +128,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         self.max_batch_dur = self._cfg.get("max_batch_dur", 20000)
         self.concat_and_pad_script = torch.jit.script(self.sortformer_modules.concat_and_pad)
-        self.rttms_mask_mats: List[torch.Tensor] = None # Used when GT diarization needs to be tested.
+        self.rttms_mask_mats: List[torch.Tensor] = None  # Used when GT diarization needs to be tested.
 
     def add_rttms_mask_mats(self, rttms_mask_mats, device: torch.device):
         """
@@ -140,7 +140,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         if self.rttms_mask_mats is None:
             self.rttms_mask_mats = rttms_mask_mats.to(device)
         else:
-            raise ValueError(f"{self.rttms_mask_mats.shape}: rttms_mask_mats already exist but new one is being added.")
+            raise ValueError(
+                f"{self.rttms_mask_mats.shape}: rttms_mask_mats already exist but new one is being added."
+            )
 
     def _init_loss_weights(self):
         pil_weight = self._cfg.get("pil_weight", 0.0)

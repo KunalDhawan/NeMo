@@ -26,6 +26,7 @@ from lhotse.array import Array, TemporalArray
 from lhotse.cut import Cut, MixedCut, PaddingCut
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
+from nemo.collections.asr.parts.utils.asr_multispeaker_utils import MultiSpeakerMixtureGenerator
 from nemo.collections.common.data.lhotse.nemo_adapters import (
     LazyNeMoIterator,
     LazyNeMoTarredIterator,
@@ -42,7 +43,6 @@ from nemo.collections.common.data.lhotse.text_adapters import (
     TextTurn,
 )
 from nemo.collections.common.parts.preprocessing.manifest import get_full_path
-from nemo.collections.asr.parts.utils.asr_multispeaker_utils import MultiSpeakerMixtureGenerator
 
 
 def read_cutset_from_config(config: Union[DictConfig, dict]) -> Tuple[CutSet, bool]:
@@ -833,7 +833,7 @@ def read_multi_speaker_simulator(config: DictConfig) -> tuple[CutSet, bool]:
     )
     is_tarred = config.get("is_tarred", False)
     return multi_speaker_cuts, is_tarred
-    
+
 
 def mux(
     *cutsets: CutSet,

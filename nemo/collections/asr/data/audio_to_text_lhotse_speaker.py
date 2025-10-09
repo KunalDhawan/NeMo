@@ -12,29 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import re
 import random
+import re
 from typing import Dict, Optional, Tuple
-import soundfile
-
-import torch.utils.data
-from lhotse.cut import MixedCut, MonoCut, MixTrack, PaddingCut
-from lhotse.dataset import AudioSamples
-from lhotse.dataset.collation import collate_vectors, collate_matrices
-from lhotse.utils import compute_num_samples
-from lhotse import SupervisionSet, SupervisionSegment, MonoCut, Recording, CutSet, AudioSource
 
 import numpy as np
+import soundfile
+import torch.utils.data
+from lhotse import AudioSource, CutSet, MonoCut, Recording, SupervisionSegment, SupervisionSet
+from lhotse.cut import MixedCut, MixTrack, MonoCut, PaddingCut
+from lhotse.dataset import AudioSamples
+from lhotse.dataset.collation import collate_matrices, collate_vectors
+from lhotse.utils import compute_num_samples
 
 from nemo.collections.asr.data.audio_to_text_lhotse import TokenizerWrapper
+from nemo.collections.asr.parts.utils.asr_multispeaker_utils import (
+    get_hidden_length_from_sample_length,
+    speaker_to_target,
+)
 from nemo.collections.common.tokenizers.aggregate_tokenizer import AggregateTokenizer
 from nemo.collections.common.tokenizers.tokenizer_spec import TokenizerSpec
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralType
 
-from nemo.collections.asr.parts.utils.asr_multispeaker_utils import (
-    speaker_to_target, 
-    get_hidden_length_from_sample_length, 
-)
 
 class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
     """
@@ -53,8 +52,8 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
             'a_sig_length': NeuralType(tuple('B'), LengthsType()),
             'transcripts': NeuralType(('B', 'T'), LabelsType()),
             'transcript_length': NeuralType(tuple('B'), LengthsType()),
-            'spk_targets': NeuralType(('B','T'), LabelsType()),
-            'bg_spk_targets': NeuralType(('B','T'), LabelsType()),
+            'spk_targets': NeuralType(('B', 'T'), LabelsType()),
+            'bg_spk_targets': NeuralType(('B', 'T'), LabelsType()),
         }
 
     def __init__(self, cfg, tokenizer):
@@ -77,14 +76,18 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
         bg_spk_targets = []
 
         if self.inference_mode:
-            speaker_targets = [speaker_to_target(cut, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame) for cut in cuts]
+            speaker_targets = [
+                speaker_to_target(cut, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame) for cut in cuts
+            ]
             spk_targets = collate_matrices(speaker_targets, padding_value=0)
             return audio, audio_lens, None, None, spk_targets
 
         for idx, cut in enumerate(cuts):
 
-            speaker_targets, texts = speaker_to_target(cut, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame, return_text=True)
-            speaker_targets = speaker_targets.transpose(0, 1)[:len(texts)]
+            speaker_targets, texts = speaker_to_target(
+                cut, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame, return_text=True
+            )
+            speaker_targets = speaker_targets.transpose(0, 1)[: len(texts)]
 
             target_speaker_id = random.choice(range(len(texts)))
             non_target_speaker_ids = [i for i in range(len(texts)) if i != target_speaker_id]
@@ -95,10 +98,10 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
             tokens.append(torch.as_tensor(self.tokenizer(text, cut.supervisions[0].language)))
             spk_targets.append(speaker_target)
             bg_spk_targets.append(bg_speaker_target)
-        
+
         token_lens = torch.tensor([t.size(0) for t in tokens], dtype=torch.long)
         tokens = collate_vectors(tokens, padding_value=0)
         spk_targets = collate_vectors(spk_targets, padding_value=0)
         bg_spk_targets = collate_vectors(bg_spk_targets, padding_value=0)
-        
+
         return audio, audio_lens, tokens, token_lens, spk_targets, bg_spk_targets
