@@ -152,7 +152,9 @@ class SpeakerKernelMixin(ABC):
                 # residual connection
                 x = x + x_spk
                 if self.add_bg_spk_kernel:
-                    x_bg_spk = self.bg_spk_kernels[layer_idx](self.mask_with_speaker_targets(x, self.bg_spk_targets, default_value=0.0))
+                    x_bg_spk = self.bg_spk_kernels[layer_idx](
+                        self.mask_with_speaker_targets(x, self.bg_spk_targets, default_value=0.0)
+                    )
                     x = x + x_bg_spk
                 kwargs['x'] = x
             elif args:
@@ -162,7 +164,9 @@ class SpeakerKernelMixin(ABC):
                 # residual connection
                 x = x + x_spk
                 if self.add_bg_spk_kernel:
-                    x_bg_spk = self.bg_spk_kernels[layer_idx](self.mask_with_speaker_targets(x, self.bg_spk_targets, default_value=0.0))
+                    x_bg_spk = self.bg_spk_kernels[layer_idx](
+                        self.mask_with_speaker_targets(x, self.bg_spk_targets, default_value=0.0)
+                    )
                     x = x + x_bg_spk
                 args = (x, *rest)
 
@@ -195,7 +199,9 @@ class SpeakerKernelMixin(ABC):
             x = x + x_spk
 
             if self.add_bg_spk_kernel:
-                x_bg_spk = self.bg_spk_kernels[layer_idx](self.mask_with_speaker_targets(x, self.bg_spk_targets, default_value=0.0))
+                x_bg_spk = self.bg_spk_kernels[layer_idx](
+                    self.mask_with_speaker_targets(x, self.bg_spk_targets, default_value=0.0)
+                )
                 x = x + x_bg_spk
 
             if isinstance(output, tuple):
