@@ -152,7 +152,7 @@ class SpeakerKernelMixin(ABC):
                 # residual connection
                 x = x + x_spk
                 if self.add_bg_spk_kernel:
-                    x_bg_spk = self.bg_spk_kernels[layer_idx](self.mask_with_speaker_targets(x, self.bg_spk_targets))
+                    x_bg_spk = self.bg_spk_kernels[layer_idx](self.mask_with_speaker_targets(x, self.bg_spk_targets, default_value=0.0))
                     x = x + x_bg_spk
                 kwargs['x'] = x
             elif args:
@@ -162,7 +162,7 @@ class SpeakerKernelMixin(ABC):
                 # residual connection
                 x = x + x_spk
                 if self.add_bg_spk_kernel:
-                    x_bg_spk = self.bg_spk_kernels[layer_idx](self.mask_with_speaker_targets(x, self.bg_spk_targets))
+                    x_bg_spk = self.bg_spk_kernels[layer_idx](self.mask_with_speaker_targets(x, self.bg_spk_targets, default_value=0.0))
                     x = x + x_bg_spk
                 args = (x, *rest)
 
@@ -195,7 +195,7 @@ class SpeakerKernelMixin(ABC):
             x = x + x_spk
 
             if self.add_bg_spk_kernel:
-                x_bg_spk = self.bg_spk_kernels[layer_idx](self.mask_with_speaker_targets(x, self.bg_spk_targets))
+                x_bg_spk = self.bg_spk_kernels[layer_idx](self.mask_with_speaker_targets(x, self.bg_spk_targets, default_value=0.0))
                 x = x + x_bg_spk
 
             if isinstance(output, tuple):
@@ -238,30 +238,30 @@ class SpeakerKernelMixin(ABC):
         if self.add_bg_spk_kernel:
             self.bg_spk_targets = None
 
-    def solve_length_mismatch(self, x: torch.Tensor, mask: torch.Tensor):
+    def solve_length_mismatch(self, x: torch.Tensor, mask: torch.Tensor, default_value: float = 1.0):
         """
         Solve length mismatch between x and mask.
         """
         if mask is None:
-            mask = torch.ones_like(x[:, :, 0])
+            mask = torch.ones_like(x[:, :, 0]) * default_value
             logging.warning(
                 f"Mask is None, triggering single speaker mode and assigning all ones with shape: {mask.shape}"
             )
 
         if mask.shape[1] < x.shape[1]:
             # pad zero to the left
-            mask = torch.nn.functional.pad(mask, (x.shape[1] - mask.shape[1], 0), mode='constant', value=1)
+            mask = torch.nn.functional.pad(mask, (x.shape[1] - mask.shape[1], 0), mode='constant', value=default_value)
 
         if mask.shape[1] > x.shape[1]:
             mask = mask[:, -x.shape[1] :]
 
         return mask
 
-    def mask_with_speaker_targets(self, x: torch.Tensor, spk_targets: torch.Tensor):
+    def mask_with_speaker_targets(self, x: torch.Tensor, spk_targets: torch.Tensor, default_value: float = 1.0):
         """
         Mask the input with speaker targets.
         """
-        mask = self.solve_length_mismatch(x, spk_targets)
+        mask = self.solve_length_mismatch(x, spk_targets, default_value)
         x_spk = x * mask.unsqueeze(2)
         return x_spk
 
