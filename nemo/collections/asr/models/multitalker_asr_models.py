@@ -13,7 +13,7 @@
 # limitations under the License.
 #
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 from omegaconf import DictConfig, open_dict
@@ -24,6 +24,7 @@ from nemo.collections.asr.models.rnnt_bpe_models import EncDecRNNTBPEModel
 from nemo.collections.asr.parts.mixins import TranscribeConfig
 from nemo.collections.asr.parts.mixins.multitalker_asr_mixins import SpeakerKernelMixin
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
+from nemo.core.classes.common import PretrainedModelInfo
 
 
 class EncDecMultiTalkerRNNTBPEModel(EncDecRNNTBPEModel, SpeakerKernelMixin):
@@ -33,6 +34,18 @@ class EncDecMultiTalkerRNNTBPEModel(EncDecRNNTBPEModel, SpeakerKernelMixin):
         super().__init__(cfg=cfg, trainer=trainer)
         # Initialize speaker kernel functionality from mixin
         self._init_speaker_kernel_config(cfg)
+
+    @classmethod
+    def list_available_models(cls) -> List[PretrainedModelInfo]:
+        """
+        This method returns a list of pre-trained model which can be instantiated directly from NVIDIA's NGC cloud.
+
+        Returns:
+            List of available pre-trained models.
+        """
+        results = []
+
+        return results
 
     def _setup_dataloader_from_config(self, config: Optional[Dict]):
         if config.get("use_lhotse"):
@@ -50,6 +63,8 @@ class EncDecMultiTalkerRNNTBPEModel(EncDecRNNTBPEModel, SpeakerKernelMixin):
                     tokenizer=self.tokenizer,
                 ),
             )
+        else:
+            raise ValueError("Only lhotse dataloader is supported for multitalker models")
 
     def training_step(self, batch, batch_nb):
         """Training step with speaker targets."""

@@ -20,6 +20,7 @@ from lhotse.dataset import AudioSamples
 from lhotse.dataset.collation import collate_matrices, collate_vectors
 
 from nemo.collections.asr.data.audio_to_text_lhotse import TokenizerWrapper
+from nemo.collections.common.tokenizers.tokenizer_spec import TokenizerSpec
 from nemo.collections.asr.parts.utils.asr_multispeaker_utils import (
     speaker_to_target,
 )
@@ -47,10 +48,10 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
             'bg_spk_targets': NeuralType(('B', 'T'), LabelsType()),
         }
 
-    def __init__(self, cfg, tokenizer):
+    def __init__(self, cfg, tokenizer: TokenizerSpec):
         super().__init__()
         self.tokenizer = TokenizerWrapper(tokenizer)
-        self.load_audio = AudioSamples(fault_tolerant=True, num_workers=8)
+        self.load_audio = AudioSamples(fault_tolerant=True)
         self.cfg = cfg
         self.num_speakers = self.cfg.get('num_speakers', 4)
         self.num_sample_per_mel_frame = self.cfg.get('num_sample_per_mel_frame', 160)
