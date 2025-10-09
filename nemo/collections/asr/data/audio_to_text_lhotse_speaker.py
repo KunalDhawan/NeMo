@@ -20,10 +20,8 @@ from lhotse.dataset import AudioSamples
 from lhotse.dataset.collation import collate_matrices, collate_vectors
 
 from nemo.collections.asr.data.audio_to_text_lhotse import TokenizerWrapper
+from nemo.collections.asr.parts.utils.asr_multispeaker_utils import speaker_to_target
 from nemo.collections.common.tokenizers.tokenizer_spec import TokenizerSpec
-from nemo.collections.asr.parts.utils.asr_multispeaker_utils import (
-    speaker_to_target,
-)
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralType
 
 
