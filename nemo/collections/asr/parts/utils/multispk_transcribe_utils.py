@@ -736,7 +736,6 @@ class SpeakerTaggedASR:
         new_tokens = list(itertools.chain(*new_token_group))
         frame_inds_seq = (torch.tensor(previous_hypothesis.timestamp) + offset).tolist()
         frame_inds_seq = fix_frame_time_step(self.cfg, new_tokens, new_words, frame_inds_seq)
-        min_len = min(len(new_words), len(frame_inds_seq))
         word_and_ts_seq['uniq_id'] = uniq_id
 
         min_len = min(len(new_words), len(frame_inds_seq))

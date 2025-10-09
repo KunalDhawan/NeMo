@@ -13,18 +13,16 @@
 # limitations under the License.
 #
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import torch
-import torch.nn.functional as F
-from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
+from omegaconf import DictConfig, open_dict
 from pytorch_lightning import Trainer
 
 from nemo.collections.asr.data.audio_to_text_lhotse_speaker import LhotseSpeechToTextSpkBpeDataset
 from nemo.collections.asr.models.rnnt_bpe_models import EncDecRNNTBPEModel
-from nemo.collections.asr.parts.mixins import TranscribeConfig, TranscriptionReturnType
+from nemo.collections.asr.parts.mixins import TranscribeConfig
 from nemo.collections.asr.parts.mixins.multitalker_asr_mixins import SpeakerKernelMixin
-from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
 
 

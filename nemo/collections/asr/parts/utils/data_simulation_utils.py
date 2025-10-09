@@ -521,18 +521,13 @@ def read_rir_manifest(rir_manifest: str):
     """
     Read the rir manifest file and sample the rir manifest.
     """
-    # if isinstance(rir_manifest, str):
-    #     rir_manifest_list = [rir_manifest]
-    # elif isinstance(rir_manifest, list):
-    #     rir_manifest_list = rir_manifest
+
     rir_manifest_list = [rir_manifest]
     rir_loaded_list = []
     for manifest_file in rir_manifest_list:
-        # try:
         if os.path.exists(manifest_file):
             rir_loaded_list.extend(read_manifest(manifest_file))
-        # except:
-        #     import ipdb; ipdb.set_trace()
+
     return rir_loaded_list
 
 

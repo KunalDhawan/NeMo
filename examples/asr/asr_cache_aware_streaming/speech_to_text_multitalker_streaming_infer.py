@@ -12,39 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import itertools
 import json
 import math
-import os
 import time
-from collections import OrderedDict
-from copy import deepcopy
 from dataclasses import dataclass, field, is_dataclass
-from functools import wraps
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import List, Optional, Union
 
 import pytorch_lightning as pl
 import torch
-from lhotse.dataset.collation import collate_matrices
 from omegaconf import OmegaConf, open_dict
 
 import nemo.collections.asr as nemo_asr
-from nemo.collections.asr.data.audio_to_diar_label import extract_frame_info_from_rttm, get_frame_targets_from_rttm
 from nemo.collections.asr.models.sortformer_diar_models import SortformerEncLabelModel
-from nemo.collections.asr.parts.utils.diarization_utils import (
-    OnlineEvaluation,
-    get_color_palette,
-    print_sentences,
-    read_seglst,
-    write_txt,
-)
 from nemo.collections.asr.parts.utils.multispk_transcribe_utils import (
     SpeakerTaggedASR,
     get_multi_talker_samples_from_manifest,
 )
-from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
-from nemo.collections.asr.parts.utils.speaker_utils import audio_rttm_map as get_audio_rttm_map
-from nemo.collections.asr.parts.utils.speaker_utils import rttm_to_labels
 from nemo.collections.asr.parts.utils.streaming_utils import CacheAwareStreamingAudioBuffer
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
@@ -298,14 +281,11 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     diar_model.sortformer_modules.spkcache_refresh_rate = cfg.spkcache_refresh_rate
 
     if cfg.audio_file is not None and cfg.manifest_file is not None:
-        logging.warning("Both audio_file and manifest_file are specified. audio_file will be used with top priority.")
-        input_type = "audio_file"
+        logging.warning("Both audio_file and manifest_file are specified. Audio_file will be used with top priority.")
     elif cfg.audio_file is not None:
         logging.info("audio_file is specified. Using audio_file as input.")
-        input_type = "audio_file"
     elif cfg.manifest_file is not None:
         logging.info("manifest_file is specified. Using manifest_file as input.")
-        input_type = "manifest_file"
     else:
         raise ValueError("One of audio_file or manifest_file must be specified!")
 
