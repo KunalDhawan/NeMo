@@ -16,6 +16,7 @@ import copy
 import csv
 import json
 import os
+import string
 from collections import OrderedDict as od
 from collections import defaultdict
 from datetime import datetime
@@ -31,7 +32,6 @@ from nemo.collections.asr.parts.utils.speaker_utils import (
     audio_rttm_map,
     generate_diarization_output_lines,
     get_uniqname_from_filepath,
-    labels_to_pyannote_object,
     labels_to_rttmfile,
     rttm_to_labels,
     write_rttm2manifest,
@@ -236,38 +236,6 @@ def convert_word_dict_seq_to_ctm(
         ctm_line_str = f"{uniq_id} {spk} {stt} {dur} {word} {confidence}"
         ctm_lines.append(ctm_line_str)
     return ctm_lines
-
-    def break_transcript_lines(self, string_out: str, params: Dict[str, str], max_chars_in_line: int = 90) -> str:
-        """
-        Break the lines in the transcript.
-
-        Args:
-            string_out (str):
-                Input transcript with speaker labels
-            max_chars_in_line (int):
-                Maximum characters in each line
-
-        Returns:
-            return_string_out (str):
-                String variable containing line breaking
-        """
-        color_str_len = len('\033[1;00m') if self.params['colored_text'] else 0
-        split_string_out = string_out.split('\n')
-        return_string_out = []
-        for org_chunk in split_string_out:
-            buffer = []
-            if len(org_chunk) - color_str_len > max_chars_in_line:
-                color_str = org_chunk[:color_str_len] if color_str_len > 0 else ''
-                for i in range(color_str_len, len(org_chunk), max_chars_in_line):
-                    trans_str = org_chunk[i : i + max_chars_in_line]
-                    if len(trans_str.strip()) > 0:
-                        c_trans_str = color_str + trans_str
-                        buffer.append(c_trans_str)
-                return_string_out.extend(buffer)
-            else:
-                return_string_out.append(org_chunk)
-        return_string_out = '\n'.join(return_string_out)
-        return return_string_out
 
 
 def get_total_result_dict(
@@ -866,21 +834,11 @@ class OnlineEvaluation:
             hyp_speaker_timestamps, hyp_speaker_word = convert_seglst(hyp_seglst, hyp_speakers)
             ref_speaker_timestamps, ref_speaker_word = convert_seglst(ref_seglst, ref_speakers)
 
-            ref_labels = generate_diarization_output_lines(
-                speaker_timestamps=ref_speaker_timestamps, model_spk_num=len(ref_speakers)
-            )
-            hyp_labels = generate_diarization_output_lines(
-                speaker_timestamps=hyp_speaker_timestamps, model_spk_num=len(hyp_speakers)
-            )
-            reference = labels_to_pyannote_object(ref_labels, uniq_name=session_id)
-            hypothesis = labels_to_pyannote_object(hyp_labels, uniq_name=session_id)
-
             for idx, speaker in enumerate(ref_speakers):
                 ref_speaker_words[idx] += ref_speaker_word[idx]
             for idx, speaker in enumerate(hyp_speakers):
                 hyp_speaker_words[idx] += hyp_speaker_word[idx]
 
-            der_instance = der_metric(reference, hypothesis)
             # Normalize the text
             for spk_idx in range(len(hyp_speaker_words)):
                 hyp_speaker_words[spk_idx] = (
@@ -1317,7 +1275,7 @@ class OfflineDiarWithASR:
         if self.fix_word_ts_with_VAD:
             if self.frame_VAD == {}:
                 logging.warning(
-                    f"VAD timestamps are not provided. Fixing word timestamps without VAD. Please check the hydra configurations."
+                    "VAD timestamps are not provided. Fixing word timestamps without VAD. Please check the hydra configurations."
                 )
             word_ts_refined = self._compensate_word_ts_list(self.audio_file_list, word_ts_hyp)
         else:
@@ -1468,7 +1426,7 @@ class OfflineDiarWithASR:
                                       ]
                     }
         """
-        logging.info(f"Creating results for Session: {uniq_id} n_spk: {n_spk} ")
+        logging.info(f"Creating results for Session: {uniq_id}")
         session_trans_dict, gecko_dict, audacity_label_words, sentences = get_session_trans_dict(
             uniq_id, word_dict_seq_list, diar_labels
         )
@@ -1740,7 +1698,7 @@ class OfflineDiarWithASR:
         # print the sentences in the .txt output
         string_out = print_sentences(sentences, color_palette=self.color_palette, params=self.params)
         if self.params['break_lines']:
-            string_out = break_transcript_lines(string_out, params=self.params)
+            string_out = self.break_transcript_lines(string_out, params=self.params)
 
         session_trans_dict["status"] = "success"
         ctm_lines_list = convert_word_dict_seq_to_ctm(session_trans_dict['words'])
@@ -1750,6 +1708,40 @@ class OfflineDiarWithASR:
         write_txt(f'{self.root_path}/pred_rttms/{uniq_id}.ctm', '\n'.join(ctm_lines_list))
         write_txt(f'{self.root_path}/pred_rttms/{uniq_id}.txt', string_out.strip())
         write_txt(f'{self.root_path}/pred_rttms/{uniq_id}.w.label', '\n'.join(audacity_label_words))
+
+    def break_transcript_lines(self, string_out: str, params: Dict[str, str], max_chars_in_line: int = 90) -> str:
+        """
+        Break the lines in the transcript.
+
+        Args:
+            string_out (str):
+                Input transcript with speaker labels
+            params (dict):
+                Parameters dictionary
+            max_chars_in_line (int):
+                Maximum characters in each line
+
+        Returns:
+            return_string_out (str):
+                String variable containing line breaking
+        """
+        color_str_len = len('\033[1;00m') if self.params['colored_text'] else 0
+        split_string_out = string_out.split('\n')
+        return_string_out = []
+        for org_chunk in split_string_out:
+            buffer = []
+            if len(org_chunk) - color_str_len > max_chars_in_line:
+                color_str = org_chunk[:color_str_len] if color_str_len > 0 else ''
+                for i in range(color_str_len, len(org_chunk), max_chars_in_line):
+                    trans_str = org_chunk[i : i + max_chars_in_line]
+                    if len(trans_str.strip()) > 0:
+                        c_trans_str = color_str + trans_str
+                        buffer.append(c_trans_str)
+                return_string_out.extend(buffer)
+            else:
+                return_string_out.append(org_chunk)
+        return_string_out = '\n'.join(return_string_out)
+        return return_string_out
 
     @staticmethod
     def print_errors(der_results: Dict[str, Dict[str, float]], wer_results: Dict[str, Dict[str, float]]):

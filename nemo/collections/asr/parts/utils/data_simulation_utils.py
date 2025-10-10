@@ -16,7 +16,7 @@ import copy
 import os
 import shutil
 from collections import defaultdict
-from typing import IO, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -755,7 +755,6 @@ class DataAnnotator(object):
                     silence_length > 2 * self._params.data_simulator.session_params.split_buffer
                 ):  # split utterance on silence
                     new_end = start + alignments[i - 1]
-                    silence_duration = alignments[i] - alignments[i - 1]
 
                     # new_end = start + alignments[i - 1] + self._params.data_simulator.session_params.split_buffer
 
