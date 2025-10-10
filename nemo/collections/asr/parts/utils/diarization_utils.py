@@ -310,6 +310,7 @@ def get_num_of_spk_from_labels(labels: List[str]) -> int:
     spk_set = [x.split(' ')[-1].strip() for x in labels]
     return len(set(spk_set))
 
+
 def convert_seglst(seglst, all_speakers):
     '''
     convert the seglst to a format that can be used for scoring
@@ -579,6 +580,7 @@ def chunk_seglst(seglst: List[Dict], chunk_size: float = 10.0):
         session_id = session_ids.pop()
 
     return chunk_id2timestamps, speakers, session_id
+
 
 class OnlineEvaluation:
     """
