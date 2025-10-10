@@ -15,7 +15,6 @@
 from abc import ABC, abstractmethod
 
 
-
 class StreamingEncoder(ABC):
     @abstractmethod
     def setup_streaming_params(
