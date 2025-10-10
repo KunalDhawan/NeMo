@@ -15,6 +15,7 @@
 import math
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Any
+import copy
 
 import torch
 import torch.nn as nn
@@ -24,8 +25,142 @@ from nemo.core.classes.exportable import Exportable
 from nemo.core.classes.module import NeuralModule
 from nemo.utils import logging
 from nemo.collections.asr.modules.transformer.transformer_modules import PositionWiseFF
+from nemo.collections.asr.modules.transformer.perceiver_encoders import SimplePerceiverBlock
+from nemo.collections.asr.parts.submodules.multi_head_attention import PositionalEncoding
 
-__all__ = ['NextformerModules']
+__all__ = ['NextformerModules', 'MaskedQueryDecoder']
+
+class MaskedQueryDecoder(nn.Module):
+    def __init__(
+        self,
+        num_queries: int,
+        num_layers: int,
+        hidden_size: int,
+        inner_size: int,
+        num_cross_attention_heads: int = 4,
+        num_self_attention_heads: int = 4,
+        cross_attn_dropout: float = 0.0,
+        self_attn_dropout: float = 0.0,
+        ffn_dropout: float = 0.0,
+        hidden_act: str = "relu",
+        pre_ln: bool = True,
+        pre_ln_final_layer_norm: bool = True,
+        use_query_pos_emb: bool = False,
+        use_encoder_pos_emb: bool = False,
+        encoder_pos_emb_max_len: int = 5000,
+        recalc_mask: bool = False,
+    ):
+        super().__init__()
+
+        if pre_ln and pre_ln_final_layer_norm:
+            self.final_layer_norm = torch.nn.LayerNorm(hidden_size, eps=1e-5)
+        else:
+            self.final_layer_norm = None
+
+        self.num_queries = num_queries
+        self.num_layers = num_layers
+        self.use_query_pos_emb = use_query_pos_emb
+        self.use_encoder_pos_emb = use_encoder_pos_emb
+        self.recalc_mask = recalc_mask
+
+        # Absolute positional encoding for input features
+        if self.use_encoder_pos_emb:
+            self.pos_enc_encoder = PositionalEncoding(
+                d_model=hidden_size,
+                dropout_rate=0.0,
+                max_len=encoder_pos_emb_max_len,
+            )
+        else:
+            self.pos_enc_encoder = None
+
+        # learnable positional embeddings for queries
+        if self.use_query_pos_emb:
+            self.query_pos_emb = torch.nn.Parameter(
+                torch.nn.init.xavier_normal_(torch.empty(num_queries, hidden_size))
+            )
+        else:
+            self.query_pos_emb = None
+
+        layer = SimplePerceiverBlock(
+            hidden_size=hidden_size,
+            inner_size=inner_size,
+            num_cross_attention_heads=num_cross_attention_heads,
+            num_self_attention_heads=num_self_attention_heads,
+            cross_attn_dropout=cross_attn_dropout,
+            self_attn_dropout=self_attn_dropout,
+            ffn_dropout=ffn_dropout,
+            hidden_act=hidden_act,
+            pre_ln=pre_ln,
+        )
+        self.layers = torch.nn.ModuleList([copy.deepcopy(layer) for _ in range(self.num_layers)])
+
+        self.mask_head = PositionWiseFF(hidden_size=hidden_size, inner_size=inner_size, ffn_dropout=ffn_dropout)
+
+    def forward(self, encoder_states, encoder_len_mask, encoder_mask=None, query_states=None, query_mask=None):
+        """
+        Args:
+            encoder_states (torch.Tensor): outputs of the encoder
+                Shape: (B, n_frames, hidden_size)
+            encoder_len_mask (torch.Tensor): lengths-based mask of encoder states for cross-attention, True means masking out
+                Shape: (B, n_frames)
+            encoder_mask (torch.Tensor): encoder inputs mask for cross-attention, True means masking out
+                Shape: (B, num_queries, n_frames)
+            query_states (torch.Tensor): optional initial query states
+                Shape: (B, num_queries, hidden_size)    
+            query_mask (torch.Tensor): optional query mask for self-attention, True means masking out
+                Shape: (B, num_queries, num_queries)
+        Returns:
+            query_states (torch.Tensor): final query states
+                Shape: (B, num_queries, hidden_size)
+            intermediate_logits (list of torch.Tensor): list of intermediate mask_logits for all num_layers layers
+                Shape: [(B, n_frames, num_queries)]
+        """
+        encoder_pos_emb = None
+        if self.use_encoder_pos_emb:
+            self.pos_enc_encoder.extend_pe(encoder_states.size(1), encoder_states.device, encoder_states.dtype)
+            encoder_pos_emb = self.pos_enc_encoder.pe[:, : encoder_states.size(1)]
+
+        # Get positional embedding for queries if enabled
+        query_pos_emb = None
+        if self.use_query_pos_emb:
+            query_pos_emb = self.query_pos_emb.unsqueeze(0).expand(encoder_states.shape[0], -1, -1)
+        
+        # initialize query states
+        if query_states is None:
+            if self.use_query_pos_emb:
+                query_states = query_pos_emb
+            else:
+                query_states = torch.zeros((encoder_states.shape[0], self.num_queries, encoder_states.shape[2]), device=encoder_states.device, dtype=encoder_states.dtype)
+        
+        encoder_len_mask_expand = encoder_len_mask.unsqueeze(-1).expand(-1, -1, self.num_queries)
+        logging.info(f"encoder_len_mask: {encoder_len_mask.to(int).sum(dim=1)}")
+
+        if encoder_mask is None:
+            encoder_mask = encoder_len_mask_expand.transpose(1, 2)
+
+        intermediate_logits=[]
+        for i, layer in enumerate(self.layers):
+            logging.info(f"layer {i} encoder_mask: {encoder_mask.to(int).sum(dim=2)}")
+            query_states = layer(
+                latent_states=query_states,
+                latent_mask=query_mask,
+                encoder_states=encoder_states,
+                encoder_mask=encoder_mask,
+                latent_pos_emb=query_pos_emb,
+                encoder_pos_emb=encoder_pos_emb,
+            )
+            query_ff_out = self.mask_head(query_states)
+            mask_logits = torch.matmul(encoder_states, query_ff_out.transpose(1, 2))
+            mask_logits = mask_logits.masked_fill(encoder_len_mask_expand, -1e9)
+            intermediate_logits.append(mask_logits)
+            if self.recalc_mask:
+                encoder_mask = torch.logical_or(torch.sigmoid(mask_logits) <= 0.5, encoder_len_mask_expand)
+                encoder_mask = encoder_mask.transpose(1, 2)
+
+        if self.final_layer_norm is not None:
+            query_states = self.final_layer_norm(query_states)
+
+        return query_states, intermediate_logits
 
 class NextformerModules(NeuralModule, Exportable):
     """
@@ -171,10 +306,10 @@ class NextformerModules(NeuralModule, Exportable):
         logits = torch.matmul(emb_seq, query_ff_out.transpose(1, 2))
         return logits
 
-    def forward_query_logits(self, spk_queries):
+    def forward_cls_logits(self, spk_queries):
         """
         The final layer that outputs query existence logits.
         """
-        query_logits = self.query_classifier(spk_queries).squeeze(-1)
-        return query_logits
+        cls_logits = self.query_classifier(spk_queries).squeeze(-1)
+        return cls_logits
 

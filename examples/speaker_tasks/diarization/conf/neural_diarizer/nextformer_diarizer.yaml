@@ -15,8 +15,9 @@ model:
   pil_metric: "bce" # bce or accuracy or dot_product
   train_mask_inactive_speakers: false # If True, for training, mask out predictions for speaker channels that are never active in the target.
   local_num_spks: 4 # Number of speakers for local queries
-  max_num_of_spks: 8 # Maximum number of speakers per model; currently set to 4
-  mean_init_queries: true # If True, use mean of encoder embeddings as initial queries, otherwise use zeros.
+  max_num_of_spks: 4 # Maximum number of speakers per model; currently set to 4
+  initialize_queries: true # If True, use mean of encoder embeddings over local predictions as initial queries, otherwise use zeros.
+  initialize_mask: true # If True, use local predictions as initial encoder mask, otherwise use. (not recommended setting to False!)
   streaming_mode: False
 
   model_defaults:
@@ -168,12 +169,12 @@ model:
     pre_ln: False
     pre_ln_final_layer_norm: True
 
-  query_encoder:
-    _target_: nemo.collections.asr.modules.transformer.perceiver_encoders.SimplePerceiverEncoder
+  query_decoder:
+    _target_: nemo.collections.asr.modules.nextformer_modules.MaskedQueryDecoder
     num_layers: 4
     hidden_size: ${model.model_defaults.tf_d_model} # Needs to be multiple of num_attention_heads
     inner_size: 768
-    num_latents: ${model.max_num_of_spks}
+    num_queries: ${model.max_num_of_spks}
     num_cross_attention_heads: 4
     num_self_attention_heads: 4
     cross_attn_dropout: 0.0
@@ -182,9 +183,10 @@ model:
     hidden_act: relu
     pre_ln: False
     pre_ln_final_layer_norm: True
-    use_latent_pos_emb: False
+    use_query_pos_emb: False
     use_encoder_pos_emb: False
     encoder_pos_emb_max_len: 5000
+    recalc_mask: False
 
   loss: 
     _target_: nemo.collections.asr.losses.bce_loss.BCEWithLogitsLoss

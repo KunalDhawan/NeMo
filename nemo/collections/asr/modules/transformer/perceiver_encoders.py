@@ -274,12 +274,6 @@ class SimplePerceiverEncoder(torch.nn.Module):
             self.pos_enc_encoder.extend_pe(encoder_states.size(1), encoder_states.device, encoder_states.dtype)
             encoder_pos_emb = self.pos_enc_encoder.pe[:, : encoder_states.size(1)]
 
-        # all hidden values are active
-        if latent_mask is None:
-            latent_mask = torch.ones(
-                encoder_states.shape[0], self._num_latents, self._num_latents, dtype=encoder_mask.dtype, device=encoder_mask.device
-            )
-
         # Get positional embedding if enabled
         pos_emb_latent = None
         if self.use_latent_pos_emb:

@@ -102,7 +102,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             self.spec_augmentation = None
 
         self.encoder = NextformerEncLabelModel.from_config_dict(self._cfg.encoder).to(self.device)
-        self.query_encoder = NextformerEncLabelModel.from_config_dict(self._cfg.query_encoder).to(self.device)
+        self.query_decoder = NextformerEncLabelModel.from_config_dict(self._cfg.query_decoder).to(self.device)
         self.transformer_encoder = NextformerEncLabelModel.from_config_dict(self._cfg.transformer_encoder).to(
             self.device
         )
@@ -122,7 +122,8 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.similarity_loss = instantiate(self._cfg.similarity_loss)
         self.cls_threshold = self._cfg.get("cls_threshold", 0.0)
         self.local_mask_threshold = self._cfg.get("local_mask_threshold", 0.5)
-        self.mean_init_queries = self._cfg.get("mean_init_queries", True)
+        self.initialize_queries = self._cfg.get("initialize_queries", True)
+        self.initialize_mask = self._cfg.get("initialize_mask", True)
 
         self.streaming_mode = self.cfg.get("streaming_mode", False)
         self.save_hyperparameters("cfg")
@@ -342,15 +343,24 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             )
             logits_local = self.forward_local(emb_seq, emb_seq_length)
             preds_local = torch.sigmoid(logits_local)
-            if self.mean_init_queries:
+
+            if self.initialize_queries:
                 init_queries = self.nextformer_modules.get_init_queries(preds_local, emb_seq)
             else:
-                init_queries = torch.zeros((emb_seq.shape[0], self._cfg.max_num_of_spks, emb_seq.shape[2]), device=self.device, dtype=emb_seq.dtype)
-            encoder_query_mask = (preds_local > self.local_mask_threshold).transpose(1, 2)
-            logits, query_logits = self.forward_with_queries(
-                emb_seq, emb_seq_length, init_queries=init_queries, encoder_query_mask=encoder_query_mask
+                init_queries = None
+            
+            if self.initialize_mask:
+                encoder_query_mask = ~(preds_local > self.local_mask_threshold).transpose(1, 2)
+            else:
+                encoder_query_mask = None
+
+            logits_list, cls_logits = self.forward_with_queries(
+                emb_seq=emb_seq,
+                emb_seq_length=emb_seq_length,
+                init_queries=init_queries,
+                encoder_query_mask=encoder_query_mask
             )
-        return logits_local, logits, query_logits, emb_seq
+        return logits_local, logits_list[-1], cls_logits, emb_seq
 
     def forward_local(self, emb_seq, emb_seq_length):
         """
@@ -384,7 +394,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 Shape: (batch_size,)
             init_queries (torch.Tensor): Tensor containing local (initial) queries.
                 Shape: (batch_size, num_speakers, emb_dim)
-            encoder_query_mask (torch.Tensor): Tensor containing mask for encoder queries.
+            encoder_query_mask (torch.Tensor): Tensor containing mask for encoder queries (True means masking out).
                 Shape: (batch_size, num_speakers, diar_frame_count)
                 If None, will be computed based on emb_seq_length.
 
@@ -392,18 +402,17 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             logits (torch.Tensor): Tensor containing speaker logits corresponding to init_queries.
                 Shape: (batch_size, diar_frame_count, num_speakers)
         """
-        encoder_mask = self.nextformer_modules.length_to_mask(emb_seq_length, emb_seq.shape[1])
-        if encoder_query_mask is None:
-            encoder_query_mask = encoder_mask.unsqueeze(1).expand(-1, init_queries.shape[1], -1)
-
-        spk_queries = self.query_encoder(
-            encoder_states=emb_seq, encoder_mask=encoder_query_mask, latent_states=init_queries, latent_mask=None
+        encoder_len_mask = self.nextformer_modules.length_to_mask(emb_seq_length, emb_seq.shape[1])
+        encoder_len_mask = ~encoder_len_mask
+        spk_queries, logits_list = self.query_decoder(
+            encoder_states=emb_seq,
+            encoder_len_mask=encoder_len_mask,
+            encoder_mask=encoder_query_mask,
+            query_states=init_queries,
+            query_mask=None
         )
-        logits = self.nextformer_modules.forward_spk_logits(emb_seq, spk_queries)
-        mask = encoder_mask.unsqueeze(-1)
-        logits = logits.masked_fill(~mask, -1e9)
-        query_logits = self.nextformer_modules.forward_query_logits(spk_queries)
-        return logits, query_logits
+        cls_logits = self.nextformer_modules.forward_cls_logits(spk_queries)
+        return logits_list, cls_logits
 
     def _diarize_forward(self, batch: Any):
         """
