@@ -67,12 +67,14 @@ class LhotseAudioToSpeechE2ESpkDiarDataset(torch.utils.data.Dataset):
                 boundary_segments=True,
             )
             speaker_activities.append(speaker_activity)
-        targets = collate_matrices(speaker_activities).to(audio.dtype) # (B, T, N)
+        targets = collate_matrices(speaker_activities).to(audio.dtype)  # (B, T, N)
 
         if targets.shape[2] > self.num_speakers:
-            targets = targets[:, :, :self.num_speakers]
+            targets = targets[:, :, : self.num_speakers]
         elif targets.shape[2] < self.num_speakers:
-            targets = torch.nn.functional.pad(targets, (0, self.num_speakers - targets.shape[2]), mode='constant', value=0)
+            targets = torch.nn.functional.pad(
+                targets, (0, self.num_speakers - targets.shape[2]), mode='constant', value=0
+            )
 
         target_lens_list = []
         for audio_len in audio_lens:

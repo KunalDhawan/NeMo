@@ -397,9 +397,7 @@ def speaker_to_target(
     num_samples = get_hidden_length_from_sample_length(
         a_cut.num_samples, num_sample_per_mel_frame, num_mel_frame_per_asr_frame
     )
-    frame_mask = get_mask_from_segments(
-        segments_total, a_cut, speaker_to_idx_map, num_speakers, feat_per_sec
-    )
+    frame_mask = get_mask_from_segments(segments_total, a_cut, speaker_to_idx_map, num_speakers, feat_per_sec)
     soft_mask = get_soft_mask(frame_mask, num_samples, num_mel_frame_per_asr_frame)
 
     if soft_label:

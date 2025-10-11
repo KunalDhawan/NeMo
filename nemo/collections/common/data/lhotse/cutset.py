@@ -819,7 +819,7 @@ def read_nemo_manifest(config) -> tuple[CutSet, bool]:
 def read_multi_speaker_simulator(config: DictConfig) -> tuple[CutSet, bool]:
     # Import here to avoid circular dependency
     from nemo.collections.asr.parts.utils.asr_multispeaker_utils import MultiSpeakerMixtureGenerator
-    
+
     multi_speaker_cuts = CutSet(
         MultiSpeakerMixtureGenerator(
             manifest_filepath=config.manifest_filepath,

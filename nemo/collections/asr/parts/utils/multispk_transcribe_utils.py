@@ -1194,13 +1194,15 @@ class SpeakerTaggedASR:
             diar_streaming_state=new_streaming_state,
         )
 
-        # For a session, if no second speaker is detected, 
+        # For a session, if no second speaker is detected,
         # the spk_targets will be set to all ones in the single speaker mode
         if self._single_speaker_model:
             if self._max_num_of_spks == 1:
                 is_single_speaker = [True] * chunk_audio.shape[0]
             else:
-                is_single_speaker = (new_diar_pred_out_stream[:,:,:self._max_num_of_spks] > 0.5).any(1).sum(-1) <= 1.0
+                is_single_speaker = (new_diar_pred_out_stream[:, :, : self._max_num_of_spks] > 0.5).any(1).sum(
+                    -1
+                ) <= 1.0
             for i in range(chunk_audio.shape[0]):
                 if is_single_speaker[i]:
                     new_diar_pred_out_stream[i, :, 0] = 1.0

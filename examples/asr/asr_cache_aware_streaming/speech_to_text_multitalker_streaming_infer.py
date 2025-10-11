@@ -105,6 +105,7 @@ class DiarizationConfig:
     spk_supervision: str = "diar"  # ["diar", "rttm"]
     binary_diar_preds: bool = False
 
+
 def format_time(seconds):
     minutes = math.floor(seconds / 60)
     sec = seconds % 60
