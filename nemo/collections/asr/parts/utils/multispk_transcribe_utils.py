@@ -494,6 +494,7 @@ class SpeakerTaggedASR:
 
         self._masked_asr = cfg.get("masked_asr", True)
         self._use_mask_preencode = cfg.get("mask_preencode", False)
+        self._single_speaker_model = cfg.get("single_speaker_model", False)
 
         self.instance_manager = MultiTalkerInstanceManager(
             asr_model=self.asr_model,
@@ -1192,6 +1193,19 @@ class SpeakerTaggedASR:
             previous_chunk_preds=new_chunk_preds,
             diar_streaming_state=new_streaming_state,
         )
+
+        # For a session, if no second speaker is detected, 
+        # the spk_targets will be set to all ones in the single speaker mode
+        if self._single_speaker_model:
+            if self._max_num_of_spks == 1:
+                is_single_speaker = [True] * chunk_audio.shape[0]
+            else:
+                is_single_speaker = (new_diar_pred_out_stream[:,:,:self._max_num_of_spks] > 0.5).any(1).sum(-1) <= 1.0
+            for i in range(chunk_audio.shape[0]):
+                if is_single_speaker[i]:
+                    new_diar_pred_out_stream[i, :, 0] = 1.0
+                    new_diar_pred_out_stream[i, :, 1:] = 0.0
+
         # Step 4: find active speakers
         diar_chunk_preds = new_diar_pred_out_stream[:, -self._nframes_per_chunk * self._cache_gating_buffer_size :]
         if self._cache_gating:
@@ -1224,8 +1238,8 @@ class SpeakerTaggedASR:
             return
 
         # Step 6:
-        # 1. mask the non-active speakers for masked ASR
-        # 2. set speaker targets for multitalker ASR
+        # 1) mask the non-active speakers for masked ASR; or
+        # 2) set speaker targets for multitalker ASR
         if self._masked_asr:
             if self._use_mask_preencode:
                 active_chunk_audio = self.mask_preencode(chunk_audio=active_chunk_audio, mask=active_speaker_targets)

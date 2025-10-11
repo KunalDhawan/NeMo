@@ -226,7 +226,6 @@ def get_mask_from_segments(
     speaker_to_idx_map: torch.Tensor,
     num_speakers: int = 4,
     feat_per_sec: int = 100,
-    ignore_num_spk_mismatch: bool = False,
 ):
     """
     Generate mask matrix from segments list.
@@ -238,8 +237,6 @@ def get_mask_from_segments(
         speaker_to_idx_map (dict): A dictionary mapping speaker names to indices.
         num_speakers (int): max number of speakers for all cuts ("mask" dim0), 4 by default
         feat_per_sec (int): number of frames per second, 100 by default, 0.01s frame rate
-        ignore_num_spk_mismatch (bool): This is a temporary solution to handle speaker mismatch.
-                                        Will be removed in the future.
 
     Returns:
         mask (Tensor): A numpy array of shape (num_speakers, encoder_hidden_len).
@@ -250,11 +247,7 @@ def get_mask_from_segments(
     mask = torch.zeros((num_samples, num_speakers))
     for rttm_sup in segments:
         speaker_idx = speaker_to_idx_map[rttm_sup.speaker]
-        if speaker_idx >= num_speakers:
-            if ignore_num_spk_mismatch:
-                continue
-            else:
-                raise ValueError(f"Speaker Index {speaker_idx} exceeds the max index: {num_speakers-1}")
+
         stt = max(rttm_sup.start, 0)
         ent = min(rttm_sup.end, a_cut.duration)
         stf = int(stt * feat_per_sec)
@@ -328,7 +321,6 @@ def speaker_to_target(
     boundary_segments: bool = False,
     soft_label: bool = False,
     soft_thres: float = 0.5,
-    ignore_num_spk_mismatch: bool = True,
     return_text: bool = False,
 ):
     '''
@@ -343,7 +335,6 @@ def speaker_to_target(
         boundary_segments (bool): set to True to include segments containing the boundary of the cut, False by default for multi-speaker ASR training
         soft_label (bool): set to True to use soft label that enables values in [0, 1] range, False by default and leads to binary labels.
         soft_thres (float): the threshold for the soft label, 0.5 by default.
-        ignore_num_spk_mismatch (bool): This is a temporary solution to handle speaker mismatch. Will be removed in the future.
         return_text (bool): set to True to return the text of the speakers (if it is available), False by default.
 
     Returns:
@@ -407,7 +398,7 @@ def speaker_to_target(
         a_cut.num_samples, num_sample_per_mel_frame, num_mel_frame_per_asr_frame
     )
     frame_mask = get_mask_from_segments(
-        segments_total, a_cut, speaker_to_idx_map, num_speakers, feat_per_sec, ignore_num_spk_mismatch
+        segments_total, a_cut, speaker_to_idx_map, num_speakers, feat_per_sec
     )
     soft_mask = get_soft_mask(frame_mask, num_samples, num_mel_frame_per_asr_frame)
 
@@ -428,7 +419,7 @@ def speaker_to_target(
 
 def read_seglst(seglst_filepath: str, session_id: Optional[str] = None):
     """
-    Read the seglst file and return a list of segments.
+    Read the seglst file and return a list of SupervisionSegment.
     """
     with open(seglst_filepath, 'r', encoding='utf-8') as f:
         seglst = json.load(f)

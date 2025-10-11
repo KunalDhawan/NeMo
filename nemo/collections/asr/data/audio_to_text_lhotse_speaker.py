@@ -70,7 +70,7 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
                 speaker_to_target(cut, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame) for cut in cuts
             ]
             spk_targets = collate_matrices(speaker_targets, padding_value=0)
-            return audio, audio_lens, None, None, spk_targets
+            return audio, audio_lens, None, None, None, None
 
         for idx, cut in enumerate(cuts):
 

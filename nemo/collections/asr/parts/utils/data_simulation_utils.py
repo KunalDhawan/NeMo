@@ -895,9 +895,7 @@ class DataAnnotator(object):
             ):  # note that using the current alignments the first word is always empty, so there is no error from indexing the array with i-1
                 prev_align = 0 if i == 0 else alignments[i - 1]
                 align1 = round(float(prev_align + start), self._params.data_simulator.outputs.output_precision)
-                # align1 = round(float(start), self._params.data_simulator.outputs.output_precision)
                 align2 = round(float(alignments[i] - prev_align), self._params.data_simulator.outputs.output_precision)
-                # align2 = round(float(alignments[i+1] - start), self._params.data_simulator.outputs.output_precision)
                 end_time = round(align1 + align2, self._params.data_simulator.outputs.output_precision)
                 text = get_ctm_line(
                     source=session_name,
@@ -910,8 +908,6 @@ class DataAnnotator(object):
                     speaker=speaker_id,
                     output_precision=self._params.data_simulator.outputs.output_precision,
                 )
-                # if word == "it" and align1 == 3.169:
-                #     import ipdb; ipdb.set_trace()
                 word_and_ts_list.append((word, align1, end_time))
                 arr.append((align1, text))
         return arr, word_and_ts_list

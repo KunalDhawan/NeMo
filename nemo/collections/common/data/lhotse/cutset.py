@@ -27,7 +27,6 @@ from lhotse.cut import Cut, MixedCut, PaddingCut
 from lhotse.serialization import load_yaml
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
-from nemo.collections.asr.parts.utils.asr_multispeaker_utils import MultiSpeakerMixtureGenerator
 from nemo.collections.common.data.lhotse.nemo_adapters import (
     LazyNeMoIterator,
     LazyNeMoTarredIterator,
@@ -818,6 +817,9 @@ def read_nemo_manifest(config) -> tuple[CutSet, bool]:
 
 @data_type_parser("multi_speaker_simulator")
 def read_multi_speaker_simulator(config: DictConfig) -> tuple[CutSet, bool]:
+    # Import here to avoid circular dependency
+    from nemo.collections.asr.parts.utils.asr_multispeaker_utils import MultiSpeakerMixtureGenerator
+    
     multi_speaker_cuts = CutSet(
         MultiSpeakerMixtureGenerator(
             manifest_filepath=config.manifest_filepath,

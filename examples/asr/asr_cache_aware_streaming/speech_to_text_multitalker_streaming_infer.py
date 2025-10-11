@@ -40,6 +40,9 @@ class DiarizationConfig:
     diar_pretrained_name: Optional[str] = None  # Name of a pretrained model
     max_num_of_spks: Optional[int] = 4
     parallel_speaker_strategy: bool = True
+    masked_asr: bool = True
+    mask_preencode: bool = False
+    single_speaker_model: bool = False
 
     # General configs
     session_len_sec: float = -1  # End-to-end diarization session length in seconds
@@ -101,7 +104,6 @@ class DiarizationConfig:
 
     spk_supervision: str = "diar"  # ["diar", "rttm"]
     binary_diar_preds: bool = False
-
 
 def format_time(seconds):
     minutes = math.floor(seconds / 60)
