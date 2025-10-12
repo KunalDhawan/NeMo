@@ -29,10 +29,9 @@ def get_spk_kernel_class(spk_kernel_type, input_size, d_model, dropout=0.5):
         return nn.Sequential(
             nn.Linear(input_size, d_model), nn.ReLU(), nn.Dropout(dropout), nn.Linear(d_model, input_size)
         )
-    elif spk_kernel_type == 'conv2d':
-        return
-    elif spk_kernel_type == 'mha':
-        return
+    else:
+        raise ValueError(f"Invalid speaker kernel type: {spk_kernel_type}")
+    # TODO: conv2d and mha speaker kernel classes
 
 
 class SpeakerKernelMixin(ABC):
