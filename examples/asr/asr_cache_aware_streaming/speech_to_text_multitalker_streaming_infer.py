@@ -439,13 +439,9 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
 
     if cfg.output_path is not None and multispk_asr_streamer is not None:
         if cfg.parallel_speaker_strategy:
-            write_seglst_file(
-                seglst_dict_list=seglst_dict_list, output_path=cfg.output_path
-            )
+            write_seglst_file(seglst_dict_list=seglst_dict_list, output_path=cfg.output_path)
         else:
-            write_seglst_file(
-                seglst_dict_list=seglst_dict_list, output_path=cfg.output_path
-            )
+            write_seglst_file(seglst_dict_list=seglst_dict_list, output_path=cfg.output_path)
 
 
 if __name__ == '__main__':
