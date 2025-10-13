@@ -629,7 +629,7 @@ class MultiSpeakerSimulator(object):
         if num_missing != 0:
             warnings.warn(
                 f"{self._params.data_simulator.session_config.num_speakers - num_missing}"
-                f"speakers were included in the clip instead of the requested amount of "
+                "speakers were included in the clip instead of the requested amount of "
                 f"{self._params.data_simulator.session_config.num_speakers}"
             )
 
