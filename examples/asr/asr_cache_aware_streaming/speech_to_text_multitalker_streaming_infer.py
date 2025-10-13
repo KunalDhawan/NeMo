@@ -395,7 +395,6 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         samples, rttms_mask_mats = get_multi_talker_samples_from_manifest(
             cfg, manifest_file=cfg.manifest_file, feat_per_sec=feat_per_sec, max_spks=cfg.max_num_of_spks
         )
-        cfg.batch_size = len(samples)
         # Note: rttms_mask_mats contains PyTorch tensors, so we pass it directly instead of storing in config
         if cfg.spk_supervision == "rttm":
             diar_model.add_rttms_mask_mats(rttms_mask_mats, device=asr_model.device)
@@ -408,7 +407,10 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
             pad_and_drop_preencoded=cfg.pad_and_drop_preencoded,
         )
 
+        seglst_dict_list = []
+        batch_samples = []
         for sample_idx, sample in enumerate(samples):
+            batch_samples.append(sample)
             streaming_buffer.append_audio_file(sample['audio_filepath'], stream_id=-1)
             logging.info(f'Added this sample to the buffer: {sample["audio_filepath"]}')
 
@@ -422,6 +424,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
                         streaming_buffer=streaming_buffer,
                         pad_and_drop_preencoded=cfg.pad_and_drop_preencoded,
                     )
+                    multispk_asr_streamer.generate_seglst_dicts_from_parallel_streaming(samples=batch_samples)
                 else:
                     multispk_asr_streamer = launch_serial_streaming(
                         cfg=cfg,
@@ -429,18 +432,19 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
                         diar_model=diar_model,
                         streaming_buffer=streaming_buffer,
                     )
+                    multispk_asr_streamer.generate_seglst_dicts_from_serial_streaming(samples=batch_samples)
+                seglst_dict_list.extend(multispk_asr_streamer.instance_manager.seglst_dict_list)
                 streaming_buffer.reset_buffer()
+                batch_samples = []
 
     if cfg.output_path is not None and multispk_asr_streamer is not None:
         if cfg.parallel_speaker_strategy:
-            multispk_asr_streamer.generate_seglst_dicts_from_parallel_streaming(samples=samples)
             write_seglst_file(
-                seglst_dict_list=multispk_asr_streamer.instance_manager.seglst_dict_list, output_path=cfg.output_path
+                seglst_dict_list=seglst_dict_list, output_path=cfg.output_path
             )
         else:
-            multispk_asr_streamer.generate_seglst_dicts_from_serial_streaming(samples=samples)
             write_seglst_file(
-                seglst_dict_list=multispk_asr_streamer.instance_manager.seglst_dict_list, output_path=cfg.output_path
+                seglst_dict_list=seglst_dict_list, output_path=cfg.output_path
             )
 
 

@@ -1117,7 +1117,7 @@ class MultiSpeakerSimulator(object):
             )
             self.annotator.annote_lists['json'].append(new_json_entry)
 
-            new_ctm_entries = self.annotator.create_new_ctm_entry(
+            new_ctm_entries, _ = self.annotator.create_new_ctm_entry(
                 words=self._words,
                 alignments=self._alignments,
                 session_name=filename,
@@ -1643,7 +1643,7 @@ class RIRMultiSpeakerSimulator(MultiSpeakerSimulator):
             )
             self.annotator.annote_lists['json'].append(new_json_entry)
 
-            new_ctm_entries = self.annotator.create_new_ctm_entry(
+            new_ctm_entries, _ = self.annotator.create_new_ctm_entry(
                 filename, speaker_ids[speaker_turn], start / self._params.data_simulator.sr
             )
             self.annotator.annote_lists['ctm'].extend(new_ctm_entries)
