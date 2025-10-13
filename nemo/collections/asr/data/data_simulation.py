@@ -1190,7 +1190,7 @@ class MultiSpeakerSimulator(object):
         Args:
             random_seed (int): random seed for reproducibility
         """
-        logging.info(f"Generating Diarization Sessions")
+        logging.info("Generating Diarization Sessions")
         if random_seed is None:
             random_seed = self._params.data_simulator.random_seed
         np.random.seed(random_seed)
