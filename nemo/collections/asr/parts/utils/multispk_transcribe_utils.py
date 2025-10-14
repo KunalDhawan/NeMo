@@ -16,6 +16,7 @@ import itertools
 import json
 import os
 import time
+import math
 from collections import OrderedDict
 from copy import deepcopy
 from functools import wraps
@@ -51,7 +52,6 @@ def measure_eta(func):
     Returns:
         callable: The wrapped function.
     """
-
     @wraps(func)
     def wrapper(*args, **kwargs):
         start_time = time.time()  # Record the start time
@@ -62,6 +62,81 @@ def measure_eta(func):
         return result  # Return the original function's result
 
     return wrapper
+
+
+
+def format_time(seconds: float) -> str:
+    """ 
+    Format the time in minutes and seconds.
+
+    Args:
+        seconds (float): The time in seconds.
+
+    Returns:
+        str: The time in minutes and seconds.
+    """
+    minutes = math.floor(seconds / 60)
+    sec = seconds % 60
+    return f"{minutes}:{sec:05.2f}"
+
+def add_delay_for_real_time(
+    cfg: Any,
+    chunk_audio: torch.Tensor,
+    session_start_time: float,
+    feat_frame_count: int,
+    loop_end_time: float,
+    loop_start_time: float
+):
+    """
+    Add artificial delay for real-time mode by calculating the time difference between
+    the current time and the session start time..
+
+    Args:
+        cfg (Any): The configuration object containing the parameters for the delay calculation.
+        chunk_audio (torch.Tensor): The chunk audio tensor containing time-series audio data.
+        session_start_time (float): The session start time in seconds.
+        feat_frame_count (int): The number of features per second.
+        loop_end_time (float): The loop end time in seconds.
+        loop_start_time (float): The loop start time in seconds.
+    """
+    time_diff = max(0, (time.time() - session_start_time) - feat_frame_count * cfg.feat_len_sec)
+    eta_min_sec = format_time(time.time() - session_start_time)
+    logging.info(
+        f"[   REAL TIME MODE   ] min:sec - {eta_min_sec} "
+        f"Time difference for real-time mode: {time_diff:.4f} seconds"
+    )
+    time.sleep(
+        max(
+            0,
+            (chunk_audio.shape[-1] - cfg.discarded_frames) * cfg.feat_len_sec
+            - (loop_end_time - loop_start_time)
+            - time_diff * cfg.finetune_realtime_ratio,
+        )
+    )
+
+def write_seglst_file(seglst_dict_list: List[Dict[str, Any]], output_path: str):
+    """ 
+    Write a seglst file from the seglst dictionary list.
+
+    Args:
+        seglst_dict_list (List[Dict[str, Any]]): The list of seglst dictionaries.
+            Example:
+            [
+                {
+                    "session_id": "session_001",
+                    "speaker": "speaker_1",
+                    "words": "Write this to a SegLST file.",
+                    "start_time": 12.34,
+                    "end_time": 23.45,
+                }, ...
+            ]
+        output_path (str): The path to the output file.
+    """
+    if len(seglst_dict_list) == 0:
+        raise ValueError("seglst_dict_list is empty. No transcriptions were generated.")
+    with open(output_path, 'w') as f:
+        f.write(json.dumps(seglst_dict_list, indent=4) + '\n')
+    logging.info(f"Saved the transcriptions of the streaming inference in\n:{output_path}")
 
 
 def get_multi_talker_samples_from_manifest(cfg, manifest_file: str, feat_per_sec: float, max_spks: int):
@@ -175,27 +250,6 @@ def get_new_sentence_dict(
         'words': text.lstrip(),
         'session_id': session_id,
     }
-
-
-def calc_drop_extra_pre_encoded(asr_model: SortformerEncLabelModel, step_num: int, pad_and_drop_preencoded: bool):
-    """
-    Calculate the number of extra tokens to drop after the downsampling.
-
-    Args:
-        asr_model (SortformerEncLabelModel): The ASR model.
-        step_num (int): The step number.
-        pad_and_drop_preencoded (bool): Whether to pad and drop the extra pre-encoded tokens.
-
-    Returns:
-        int: The number of extra tokens to drop.
-    """
-    # for the first step there is no need to drop any tokens
-    # after the downsampling as no caching is being used
-    if step_num == 0 and not pad_and_drop_preencoded:
-        return 0
-    else:
-        return asr_model.encoder.streaming_cfg.drop_extra_pre_encoded
-
 
 def fix_frame_time_step(cfg: Any, new_tokens: List[str], new_words: List[str], frame_inds_seq: List[int]) -> List[int]:
     """
@@ -1144,7 +1198,7 @@ class SpeakerTaggedASR:
                 previous_hypotheses=previous_hypotheses[batch_idx],
                 previous_pred_out=asr_pred_out_stream[batch_idx],
             )
-
+        
     @measure_eta
     def perform_parallel_streaming_stt_spk(
         self,
