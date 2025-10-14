@@ -1588,9 +1588,10 @@ class MultiTalkerInstanceManager:
 
                     # Case 1 - If start_tiime is greater than end_time + sent_break_sec, then we need to add the sentence
                     if sep_flag or (last_end_time == 0.0 or start_time > last_end_time + self._sent_break_sec):
-                        if len(diff_text) > 0 and diff_text.strip()[0] in ['.', ',', '?', '!']:
+                        stripped_text = diff_text.strip()
+                        if len(stripped_text) > 0 and stripped_text[0] in ['.', ',', '?', '!']:
                             # This handles the case where the first character should be assigned to the previous sentence.
-                            the_first_char, diff_text = diff_text.strip()[0], diff_text.strip()[1:]
+                            the_first_char, diff_text = stripped_text[0], stripped_text[1:]
                             self._update_last_sentence(spk_idx=spk_idx, end_time=None, diff_text=the_first_char)
                         self._speaker_wise_sentences[spk_idx].append(
                             get_new_sentence_dict(
