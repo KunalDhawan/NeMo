@@ -85,7 +85,7 @@ def get_unaligned_files(unaligned_path: str) -> List[str]:
     return skip_files
 
 
-def create_new_ctm_entry(session_name, speaker_id, wordlist, alignments, output_precision=3):
+def get_new_ctm_lines_from_alignments(session_name, speaker_id, wordlist, alignments, output_precision=3) -> List[str]:
     """
     Create new CTM entry (to write to output ctm file)
 
@@ -96,14 +96,13 @@ def create_new_ctm_entry(session_name, speaker_id, wordlist, alignments, output_
         alignments (list): List of alignments
         output_precision (int): Precision for CTM outputs
     Returns:
-        arr (list): List of ctm entries
+        arr (list): List of ctm entries, each entry is a tuple of (start_time, text)    
     """
     arr = []
     for i in range(len(wordlist)):
         word = wordlist[i]
         if word != "":
             # note that using the current alignments the first word is always empty, so there is no error from indexing the array with i-1
-            align1 = float(round(alignments[i - 1], output_precision))
             align2 = float(round(alignments[i] - alignments[i - 1], output_precision,))
             text = get_ctm_line(
                 source=session_name,
@@ -193,8 +192,7 @@ def create_librispeech_ctm_alignments(
         words, end_times = alignment_data[file_id]
         words = words.replace('\"', '').lower().split(',')
         end_times = [float(e) for e in end_times.replace('\"', '').split(',')]
-
-        ctm_list = create_new_ctm_entry(file_id, speaker_id, words, end_times)
+        ctm_list = get_new_ctm_lines_from_alignments(file_id, speaker_id, words, end_times)
         write_ctm(os.path.join(ctm_output_directory, file_id + '.ctm'), ctm_list)
 
 
