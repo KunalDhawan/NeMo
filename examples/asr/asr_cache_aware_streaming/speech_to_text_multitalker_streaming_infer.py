@@ -36,13 +36,15 @@ from nemo.utils import logging
 @dataclass
 class DiarizationConfig:
     # Required configs
-    diar_model_path: Optional[str] = None  # Path to a .nemo file
+    diar_model: Optional[str] = None  # Path to a .nemo file
     diar_pretrained_name: Optional[str] = None  # Name of a pretrained model
-    max_num_of_spks: Optional[int] = 4
-    parallel_speaker_strategy: bool = True
-    masked_asr: bool = True
-    mask_preencode: bool = False
-    single_speaker_model: bool = False
+    max_num_of_spks: Optional[int] = 4 # maximum number of speakers
+    parallel_speaker_strategy: bool = True # whether to use parallel speaker strategy
+    masked_asr: bool = True # whether to use masked ASR
+    mask_preencode: bool = False # whether to mask preencode or mask features
+    cache_gating: bool = True # whether to use cache gating
+    cache_gating_buffer_size: int = 2 # buffer size for cache gating
+    single_speaker_mode: bool = False # whether to use single speaker mode
 
     # General configs
     session_len_sec: float = -1  # End-to-end diarization session length in seconds
@@ -229,8 +231,8 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     if cfg.random_seed:
         pl.seed_everything(cfg.random_seed)
 
-    if cfg.diar_model_path is None and cfg.diar_pretrained_name is None:
-        raise ValueError("Both cfg.diar_model_path and cfg.pretrained_name cannot be None!")
+    if cfg.diar_model is None and cfg.diar_pretrained_name is None:
+        raise ValueError("Both cfg.diar_model and cfg.pretrained_name cannot be None!")
     if cfg.audio_file is None and cfg.manifest_file is None:
         raise ValueError("Both cfg.audio_file and cfg.manifest_file cannot be None!")
 
@@ -254,14 +256,14 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         accelerator = 'gpu'
         map_location = torch.device(f'cuda:{cfg.cuda}')
 
-    if cfg.diar_model_path.endswith(".ckpt"):
+    if cfg.diar_model.endswith(".ckpt"):
         diar_model = SortformerEncLabelModel.load_from_checkpoint(
-            checkpoint_path=cfg.diar_model_path, map_location=map_location, strict=False
+            checkpoint_path=cfg.diar_model, map_location=map_location, strict=False
         )
-    elif cfg.diar_model_path.endswith(".nemo"):
-        diar_model = SortformerEncLabelModel.restore_from(restore_path=cfg.diar_model_path, map_location=map_location)
+    elif cfg.diar_model.endswith(".nemo"):
+        diar_model = SortformerEncLabelModel.restore_from(restore_path=cfg.diar_model, map_location=map_location)
     else:
-        raise ValueError("cfg.diar_model_path must end with.ckpt or.nemo!")
+        raise ValueError("cfg.diar_model must end with.ckpt or.nemo!")
 
     # Model setup for inference
     trainer = pl.Trainer(devices=device, accelerator=accelerator)
