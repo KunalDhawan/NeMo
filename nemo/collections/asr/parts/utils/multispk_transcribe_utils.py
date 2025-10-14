@@ -1200,9 +1200,7 @@ class SpeakerTaggedASR:
             if self._max_num_of_spks == 1:
                 is_single_speaker = [True] * chunk_audio.shape[0]
             else:
-                is_single_speaker = (
-                    new_diar_pred_out_stream > 0.5
-                ).any(1).sum(-1) <= 1.0 
+                is_single_speaker = (new_diar_pred_out_stream > 0.5).any(1).sum(-1) <= 1.0
             for i in range(chunk_audio.shape[0]):
                 if is_single_speaker[i]:
                     new_diar_pred_out_stream[i, :, 0] = 1.0
