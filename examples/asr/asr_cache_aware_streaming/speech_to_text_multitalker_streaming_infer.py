@@ -24,8 +24,8 @@ import nemo.collections.asr as nemo_asr
 from nemo.collections.asr.models.sortformer_diar_models import SortformerEncLabelModel
 from nemo.collections.asr.parts.utils.multispk_transcribe_utils import (
     SpeakerTaggedASR,
-    get_multi_talker_samples_from_manifest,
     add_delay_for_real_time,
+    get_multi_talker_samples_from_manifest,
     write_seglst_file,
 )
 from nemo.collections.asr.parts.utils.streaming_utils import CacheAwareStreamingAudioBuffer
@@ -38,6 +38,7 @@ class MultitalkerTranscriptionConfig:
     """
     Configuration for Multi-talker transcription with an ASR model and a diarization model.
     """
+
     # Required configs
     diar_model: Optional[str] = None  # Path to a .nemo file
     diar_pretrained_name: Optional[str] = None  # Name of a pretrained model
@@ -110,6 +111,7 @@ class MultitalkerTranscriptionConfig:
     spk_supervision: str = "diar"  # ["diar", "rttm"]
     binary_diar_preds: bool = False
 
+
 def launch_serial_streaming(
     cfg,
     asr_model,
@@ -117,7 +119,7 @@ def launch_serial_streaming(
     streaming_buffer,
     pad_and_drop_preencoded=False,
 ):
-    """ 
+    """
     Launch the serial streaming inference with ASR model and diarization model.
 
     Args:
@@ -133,8 +135,11 @@ def launch_serial_streaming(
     feat_frame_count = 0
     session_start_time = time.time()
     for step_num, (chunk_audio, chunk_lengths) in enumerate(streaming_buffer_iter):
-        drop_extra_pre_encoded = (0 if step_num == 0 and not pad_and_drop_preencoded
-                                  else asr_model.encoder.streaming_cfg.drop_extra_pre_encoded)
+        drop_extra_pre_encoded = (
+            0
+            if step_num == 0 and not pad_and_drop_preencoded
+            else asr_model.encoder.streaming_cfg.drop_extra_pre_encoded
+        )
         loop_start_time = time.time()
         with torch.inference_mode():
             with autocast:
@@ -171,8 +176,11 @@ def launch_parallel_streaming(
     feat_frame_count = 0
     session_start_time = time.time()
     for step_num, (chunk_audio, chunk_lengths) in enumerate(streaming_buffer_iter):
-        drop_extra_pre_encoded = (0 if step_num == 0 and not pad_and_drop_preencoded
-                                 else asr_model.encoder.streaming_cfg.drop_extra_pre_encoded)                    
+        drop_extra_pre_encoded = (
+            0
+            if step_num == 0 and not pad_and_drop_preencoded
+            else asr_model.encoder.streaming_cfg.drop_extra_pre_encoded
+        )
         loop_start_time = time.time()
         with torch.inference_mode():
             with autocast:

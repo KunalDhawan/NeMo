@@ -14,9 +14,9 @@
 
 import itertools
 import json
+import math
 import os
 import time
-import math
 from collections import OrderedDict
 from copy import deepcopy
 from functools import wraps
@@ -52,6 +52,7 @@ def measure_eta(func):
     Returns:
         callable: The wrapped function.
     """
+
     @wraps(func)
     def wrapper(*args, **kwargs):
         start_time = time.time()  # Record the start time
@@ -64,9 +65,8 @@ def measure_eta(func):
     return wrapper
 
 
-
 def format_time(seconds: float) -> str:
-    """ 
+    """
     Format the time in minutes and seconds.
 
     Args:
@@ -79,13 +79,14 @@ def format_time(seconds: float) -> str:
     sec = seconds % 60
     return f"{minutes}:{sec:05.2f}"
 
+
 def add_delay_for_real_time(
     cfg: Any,
     chunk_audio: torch.Tensor,
     session_start_time: float,
     feat_frame_count: int,
     loop_end_time: float,
-    loop_start_time: float
+    loop_start_time: float,
 ):
     """
     Add artificial delay for real-time mode by calculating the time difference between
@@ -114,8 +115,9 @@ def add_delay_for_real_time(
         )
     )
 
+
 def write_seglst_file(seglst_dict_list: List[Dict[str, Any]], output_path: str):
-    """ 
+    """
     Write a seglst file from the seglst dictionary list.
 
     Args:
@@ -250,6 +252,7 @@ def get_new_sentence_dict(
         'words': text.lstrip(),
         'session_id': session_id,
     }
+
 
 def fix_frame_time_step(cfg: Any, new_tokens: List[str], new_words: List[str], frame_inds_seq: List[int]) -> List[int]:
     """
@@ -1198,7 +1201,7 @@ class SpeakerTaggedASR:
                 previous_hypotheses=previous_hypotheses[batch_idx],
                 previous_pred_out=asr_pred_out_stream[batch_idx],
             )
-        
+
     @measure_eta
     def perform_parallel_streaming_stt_spk(
         self,
