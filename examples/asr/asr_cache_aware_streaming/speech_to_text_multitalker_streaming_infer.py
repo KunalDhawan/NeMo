@@ -38,13 +38,13 @@ class DiarizationConfig:
     # Required configs
     diar_model: Optional[str] = None  # Path to a .nemo file
     diar_pretrained_name: Optional[str] = None  # Name of a pretrained model
-    max_num_of_spks: Optional[int] = 4 # maximum number of speakers
-    parallel_speaker_strategy: bool = True # whether to use parallel speaker strategy
-    masked_asr: bool = True # whether to use masked ASR
-    mask_preencode: bool = False # whether to mask preencode or mask features
-    cache_gating: bool = True # whether to use cache gating
-    cache_gating_buffer_size: int = 2 # buffer size for cache gating
-    single_speaker_mode: bool = False # whether to use single speaker mode
+    max_num_of_spks: Optional[int] = 4  # maximum number of speakers
+    parallel_speaker_strategy: bool = True  # whether to use parallel speaker strategy
+    masked_asr: bool = True  # whether to use masked ASR
+    mask_preencode: bool = False  # whether to mask preencode or mask features
+    cache_gating: bool = True  # whether to use cache gating
+    cache_gating_buffer_size: int = 2  # buffer size for cache gating
+    single_speaker_mode: bool = False  # whether to use single speaker mode
 
     # General configs
     session_len_sec: float = -1  # End-to-end diarization session length in seconds
