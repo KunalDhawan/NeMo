@@ -16,8 +16,6 @@ import os
 
 import pytest
 import torch
-from lhotse import CutSet
-from lhotse.testing.dummies import DummyManifest
 from omegaconf import DictConfig
 
 from nemo.collections.asr.models.multitalker_asr_models import EncDecMultiTalkerRNNTBPEModel

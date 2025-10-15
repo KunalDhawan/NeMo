@@ -18,7 +18,6 @@ from tests.collections.speaker_tasks.test_diar_sortformer_models import sortform
 from nemo.collections.asr.models.configs.asr_models_config import CacheAwareStreamingConfig
 from nemo.collections.asr.parts.utils.multispk_transcribe_utils import MultiTalkerInstanceManager
 
-import importlib
 import pytest
 import torch
 
