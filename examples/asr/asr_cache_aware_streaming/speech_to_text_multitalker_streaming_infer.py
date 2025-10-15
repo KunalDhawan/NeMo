@@ -426,7 +426,7 @@ def main(cfg: MultitalkerTranscriptionConfig) -> Union[MultitalkerTranscriptionC
                 seglst_dict_list.extend(multispk_asr_streamer.instance_manager.seglst_dict_list)
                 streaming_buffer.reset_buffer()
                 batch_samples = []
-    
+
     if len(seglst_dict_list) == 0:
         logging.warning("No segmentation list dictionary found.")
         return

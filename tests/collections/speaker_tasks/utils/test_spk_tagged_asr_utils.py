@@ -12,28 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from tests.collections.asr.test_asr_rnnt_encoder_model_bpe import asr_model as offline_asr_model
-from tests.collections.speaker_tasks.test_diar_sortformer_models import sortformer_model as diar_model
+import json
+
+import pytest
+import torch
+from examples.asr.asr_cache_aware_streaming.speech_to_text_multitalker_streaming_infer import (
+    MultitalkerTranscriptionConfig,
+)
+from omegaconf import OmegaConf
 
 from nemo.collections.asr.models.configs.asr_models_config import CacheAwareStreamingConfig
 from nemo.collections.asr.parts.utils.multispk_transcribe_utils import (
-    get_new_sentence_dict,
+    MultiTalkerInstanceManager,
+    SpeakerTaggedASR,
+    append_word_and_ts_seq,
     fix_frame_time_step,
+    get_multi_talker_samples_from_manifest,
+    get_multitoken_words,
+    get_new_sentence_dict,
     get_simulated_softmax,
     get_word_dict_content_offline,
     get_word_dict_content_online,
-    get_multitoken_words,
-    append_word_and_ts_seq,
-    SpeakerTaggedASR,
     write_seglst,
-    get_multi_talker_samples_from_manifest,
-    MultiTalkerInstanceManager,
 )
-from examples.asr.asr_cache_aware_streaming.speech_to_text_multitalker_streaming_infer import MultitalkerTranscriptionConfig
-import json
-import pytest
-import torch
-from omegaconf import OmegaConf
+from tests.collections.asr.test_asr_rnnt_encoder_model_bpe import asr_model as offline_asr_model
+from tests.collections.speaker_tasks.test_diar_sortformer_models import sortformer_model as diar_model
+
 
 @pytest.fixture()
 def asr_model(offline_asr_model):
@@ -51,7 +55,7 @@ def asr_model(offline_asr_model):
         last_time_num=0,
     )
     offline_asr_model.encoder.streaming_cfg = streaming_cfg
-    
+
     # Mock get_initial_cache_state method for MultiTalkerInstanceManager tests
     def get_initial_cache_state(batch_size=1):
         """Mock method to return initial cache state for streaming"""
@@ -60,9 +64,9 @@ def asr_model(offline_asr_model):
         cache_last_time = torch.zeros(2, batch_size, 64)
         cache_last_channel_len = torch.zeros(batch_size)
         return (cache_last_channel, cache_last_time, cache_last_channel_len)
-    
+
     offline_asr_model.encoder.get_initial_cache_state = get_initial_cache_state
-    
+
     return offline_asr_model
 
 
@@ -127,7 +131,9 @@ class TestGetSimulatedSoftmax:
         ],
     )
     def test_valid_softmax_behavior(self, vec, min_sigmoid_val, max_num_of_spks, expected_prefix):
-        cfg = OmegaConf.structured(MultitalkerTranscriptionConfig(min_sigmoid_val=min_sigmoid_val, max_num_of_spks=max_num_of_spks))
+        cfg = OmegaConf.structured(
+            MultitalkerTranscriptionConfig(min_sigmoid_val=min_sigmoid_val, max_num_of_spks=max_num_of_spks)
+        )
         out = get_simulated_softmax(cfg, torch.tensor(vec))
         assert out.shape[0] == len(vec)
         # Tail past max_num_of_spks is zero
@@ -145,7 +151,11 @@ class TestWordDictContentOffline:
         T, N = 6, 3
         diar_pred_out = torch.zeros((T, N))
         diar_pred_out[2:5, 2] = 10.0
-        cfg = OmegaConf.structured(MultitalkerTranscriptionConfig(left_frame_shift=0, right_frame_shift=0, max_num_of_spks=3, min_sigmoid_val=0.0))
+        cfg = OmegaConf.structured(
+            MultitalkerTranscriptionConfig(
+                left_frame_shift=0, right_frame_shift=0, max_num_of_spks=3, min_sigmoid_val=0.0
+            )
+        )
         word = "hello"
         res = get_word_dict_content_offline(
             cfg=cfg,
@@ -174,11 +184,17 @@ class TestWordDictContentOnline:
             (["t1", "t2", "t3"], [8], 0, 8, 9),
         ],
     )
-    def test_get_word_dict_content_online(self, token_group, frame_inds_seq, time_step_local_offset, expected_stt, expected_end):
+    def test_get_word_dict_content_online(
+        self, token_group, frame_inds_seq, time_step_local_offset, expected_stt, expected_end
+    ):
         T, N = 12, 4
         diar_pred_out_stream = torch.zeros((T, N))
         diar_pred_out_stream[expected_stt:expected_end, 1] = 5.0  # Make speaker 1 dominant in the window
-        cfg = OmegaConf.structured(MultitalkerTranscriptionConfig(left_frame_shift=0, right_frame_shift=0, max_num_of_spks=4, min_sigmoid_val=0.0))
+        cfg = OmegaConf.structured(
+            MultitalkerTranscriptionConfig(
+                left_frame_shift=0, right_frame_shift=0, max_num_of_spks=4, min_sigmoid_val=0.0
+            )
+        )
 
         res = get_word_dict_content_online(
             cfg=cfg,
@@ -308,7 +324,7 @@ class TestSpeakerTaggedASRInit:
         """Test initialization with default config values using .get() from MultitalkerTranscriptionConfig"""
         audio_path = tmp_path / "test.wav"
         audio_path.touch()
-        
+
         cfg = MultitalkerTranscriptionConfig(
             manifest_file=None,
             audio_file=str(audio_path),
@@ -328,16 +344,18 @@ class TestSpeakerTaggedASRInit:
         )
         # Convert to OmegaConf to support .get() method
         cfg = OmegaConf.structured(cfg)
-        
+
         speaker_tagged_asr = SpeakerTaggedASR(cfg, asr_model, diar_model)
-        
+
         # Verify values from .get() calls are properly set
         # pylint: disable=protected-access
         assert speaker_tagged_asr._max_num_of_spks == 3  # From cfg.get("max_num_of_spks", 4)
         assert speaker_tagged_asr._sent_break_sec == 30.0  # From cfg
         # cache_gating and cache_gating_buffer_size use defaults via cfg.get() since they're not in MultitalkerTranscriptionConfig
         assert speaker_tagged_asr._cache_gating is False  # Default value from cfg.get("cache_gating", False)
-        assert speaker_tagged_asr._cache_gating_buffer_size == 2  # Default value from cfg.get("cache_gating_buffer_size", 2)
+        assert (
+            speaker_tagged_asr._cache_gating_buffer_size == 2
+        )  # Default value from cfg.get("cache_gating_buffer_size", 2)
         assert speaker_tagged_asr._masked_asr is True  # From cfg
         assert speaker_tagged_asr._use_mask_preencode is False  # From cfg
         assert speaker_tagged_asr._single_speaker_mode is False  # From cfg
@@ -348,7 +366,7 @@ class TestSpeakerTaggedASRInit:
         """Test that instance_manager is properly created during initialization"""
         audio_path = tmp_path / "test.wav"
         audio_path.touch()
-        
+
         cfg = MultitalkerTranscriptionConfig(
             manifest_file=None,
             audio_file=str(audio_path),
@@ -363,9 +381,9 @@ class TestSpeakerTaggedASRInit:
         )
         # Convert to OmegaConf to support .get() method
         cfg = OmegaConf.structured(cfg)
-        
+
         speaker_tagged_asr = SpeakerTaggedASR(cfg, asr_model, diar_model)
-        
+
         # Verify instance_manager is created and has correct attributes
         assert speaker_tagged_asr.instance_manager is not None
         assert isinstance(speaker_tagged_asr.instance_manager, MultiTalkerInstanceManager)
@@ -383,7 +401,7 @@ class TestSpeakerTaggedASRMethods:
         """Test _get_offset_sentence method"""
         audio_path = tmp_path / "test.wav"
         audio_path.touch()
-        
+
         cfg = MultitalkerTranscriptionConfig(
             manifest_file=None,
             audio_file=str(audio_path),
@@ -397,22 +415,22 @@ class TestSpeakerTaggedASRMethods:
             generate_realtime_scripts=False,
         )
         cfg = OmegaConf.structured(cfg)
-        
+
         speaker_tagged_asr = SpeakerTaggedASR(cfg, asr_model, diar_model)
-        
+
         # Create a mock session_trans_dict
         session_trans_dict = {
             'uniq_id': 'session_1',
             'words': [
                 {'speaker': 'speaker_0', 'start_time': 0.0, 'end_time': 0.5, 'word': 'hello'},
                 {'speaker': 'speaker_0', 'start_time': 0.5, 'end_time': 1.0, 'word': 'world'},
-            ]
+            ],
         }
-        
+
         # pylint: disable=protected-access
         result = speaker_tagged_asr._get_offset_sentence(session_trans_dict, 0)
         # pylint: enable=protected-access
-        
+
         assert result['session_id'] == 'session_1'
         assert result['speaker'] == 'speaker_0'
         assert result['start_time'] == 0.0
@@ -424,7 +442,7 @@ class TestSpeakerTaggedASRMethods:
         """Test _find_active_speakers with valid inputs"""
         audio_path = tmp_path / "test.wav"
         audio_path.touch()
-        
+
         cfg = MultitalkerTranscriptionConfig(
             manifest_file=None,
             audio_file=str(audio_path),
@@ -438,9 +456,9 @@ class TestSpeakerTaggedASRMethods:
             generate_realtime_scripts=False,
         )
         cfg = OmegaConf.structured(cfg)
-        
+
         speaker_tagged_asr = SpeakerTaggedASR(cfg, asr_model, diar_model)
-        
+
         # Create mock diar predictions: (B=2, T=10, N=4)
         diar_preds = torch.zeros(2, 10, 4)
         # First batch: speakers 0 and 2 are active (high values)
@@ -448,11 +466,11 @@ class TestSpeakerTaggedASRMethods:
         diar_preds[0, :, 2] = 0.9
         # Second batch: speaker 1 is active
         diar_preds[1, :, 1] = 0.7
-        
+
         # pylint: disable=protected-access
         result = speaker_tagged_asr._find_active_speakers(diar_preds, n_active_speakers_per_stream=2)
         # pylint: enable=protected-access
-        
+
         assert len(result) == 2
         assert 0 in result[0] and 2 in result[0]
         assert 1 in result[1]
@@ -462,7 +480,7 @@ class TestSpeakerTaggedASRMethods:
         """Test mask_features with valid inputs"""
         audio_path = tmp_path / "test.wav"
         audio_path.touch()
-        
+
         cfg = MultitalkerTranscriptionConfig(
             manifest_file=None,
             audio_file=str(audio_path),
@@ -476,17 +494,17 @@ class TestSpeakerTaggedASRMethods:
             generate_realtime_scripts=False,
         )
         cfg = OmegaConf.structured(cfg)
-        
+
         speaker_tagged_asr = SpeakerTaggedASR(cfg, asr_model, diar_model)
-        
+
         # Create mock audio: (B=2, C=80, T=100)
         chunk_audio = torch.randn(2, 80, 100)
         # Create mask: (B=2, T=12) - will be expanded to match T=100
         mask = torch.zeros(2, 12)
         mask[0, :5] = 0.8  # First batch: first 5 frames active
         mask[1, 5:] = 0.9  # Second batch: last 7 frames active
-        
+
         result = speaker_tagged_asr.mask_features(chunk_audio, mask, threshold=0.5, mask_value=-16.6355)
-        
+
         assert result.shape == chunk_audio.shape
         assert result.dtype == chunk_audio.dtype
