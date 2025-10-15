@@ -12,14 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from tests.collections.asr.test_asr_rnnt_encoder_model_bpe import asr_model as offline_asr_model
-from tests.collections.speaker_tasks.test_diar_sortformer_models import sortformer_model as diar_model
+import pytest
+import torch
 
 from nemo.collections.asr.models.configs.asr_models_config import CacheAwareStreamingConfig
 from nemo.collections.asr.parts.utils.multispk_transcribe_utils import MultiTalkerInstanceManager
-
-import pytest
-import torch
+from tests.collections.asr.test_asr_rnnt_encoder_model_bpe import asr_model as offline_asr_model
+from tests.collections.speaker_tasks.test_diar_sortformer_models import sortformer_model as diar_model
 
 
 @pytest.fixture()
@@ -38,7 +37,7 @@ def asr_model(offline_asr_model):
         last_time_num=0,
     )
     offline_asr_model.encoder.streaming_cfg = streaming_cfg
-    
+
     # Mock get_initial_cache_state method for MultiTalkerInstanceManager tests
     def get_initial_cache_state(batch_size=1):
         """Mock method to return initial cache state for streaming"""
@@ -47,9 +46,9 @@ def asr_model(offline_asr_model):
         cache_last_time = torch.zeros(2, batch_size, 64)
         cache_last_channel_len = torch.zeros(batch_size)
         return (cache_last_channel, cache_last_time, cache_last_channel_len)
-    
+
     offline_asr_model.encoder.get_initial_cache_state = get_initial_cache_state
-    
+
     return offline_asr_model
 
 
@@ -66,16 +65,16 @@ class TestMultiTalkerInstanceManagerMethods:
             max_num_of_spks=4,
             sent_break_sec=5.0,
         )
-        
+
         # Populate some buffers first
         # pylint: disable=protected-access
         instance_manager._active_chunk_audio = [torch.randn(100)]
         instance_manager._active_chunk_lengths = [torch.tensor(100)]
         instance_manager._active_speaker_targets = [torch.randn(10)]
-        
+
         # Reset the buffers
         instance_manager._reset_active_speaker_buffers()
-        
+
         # Verify all buffers are empty
         assert len(instance_manager._active_chunk_audio) == 0
         assert len(instance_manager._active_chunk_lengths) == 0
@@ -98,10 +97,10 @@ class TestMultiTalkerInstanceManagerMethods:
             max_num_of_spks=4,
             sent_break_sec=5.0,
         )
-        
+
         # Reset with new parameters
         instance_manager.reset(batch_size=3, max_num_of_spks=6)
-        
+
         # Verify new parameters are applied
         assert instance_manager.batch_size == 3
         assert instance_manager.max_num_of_spks == 6
@@ -118,14 +117,14 @@ class TestMultiTalkerInstanceManagerMethods:
             sent_break_sec=5.0,
         )
         instance_manager.reset()
-        
+
         # Initially, batch 0 should have speaker [0]
         speakers_before = instance_manager.get_speakers(batch_idx=0)
         assert 0 in speakers_before
-        
+
         # Add speaker 1
         instance_manager.add_speaker(batch_idx=0, speaker_id=1)
-        
+
         # Verify speaker 1 is added
         speakers_after = instance_manager.get_speakers(batch_idx=0)
         assert 0 in speakers_after
@@ -142,21 +141,21 @@ class TestMultiTalkerInstanceManagerMethods:
             sent_break_sec=5.0,
         )
         instance_manager.reset()
-        
+
         # Create mock diarization data
         diar_pred_out_stream = torch.randn(2, 20, 4)
         previous_chunk_preds = torch.randn(2, 10, 4)
-        
+
         # Get initial streaming state from diar_model
         diar_streaming_state = diar_model.sortformer_modules.init_streaming_state(batch_size=2)
-        
+
         # Update diar state
         instance_manager.update_diar_state(
             diar_pred_out_stream=diar_pred_out_stream,
             previous_chunk_preds=previous_chunk_preds,
             diar_streaming_state=diar_streaming_state,
         )
-        
+
         # Verify diar state is updated
         assert torch.equal(instance_manager.diar_states.diar_pred_out_stream, diar_pred_out_stream)
         assert torch.equal(instance_manager.diar_states.previous_chunk_preds, previous_chunk_preds)
@@ -173,23 +172,24 @@ class TestMultiTalkerInstanceManagerMethods:
             sent_break_sec=5.0,
         )
         instance_manager.reset()
-        
+
         # Get the initial cache state structure
         asr_state = instance_manager.batch_asr_states[0]
-        
+
         # Create mock ASR cache data with correct shapes
         cache_shape = asr_state.cache_last_channel.shape
         time_shape = asr_state.cache_last_time.shape
-        
+
         cache_last_channel = torch.randn(cache_shape[0], cache_shape[2])  # Remove speaker dimension
         cache_last_time = torch.randn(time_shape[0], time_shape[2])
         cache_last_channel_len = torch.tensor([10])
-        
+
         # Create a simple mock hypothesis
         from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
+
         previous_hypothesis = Hypothesis(score=0.0, y_sequence=[], text="test")
         previous_pred_out = torch.randn(1, 10, 128)
-        
+
         # Update ASR state for batch 0, speaker 0
         instance_manager.update_asr_state(
             batch_idx=0,
@@ -200,7 +200,7 @@ class TestMultiTalkerInstanceManagerMethods:
             previous_hypotheses=previous_hypothesis,
             previous_pred_out=previous_pred_out,
         )
-        
+
         # Verify the state was updated
         updated_asr_state = instance_manager.batch_asr_states[0]
         assert updated_asr_state.previous_hypothesis[0] is previous_hypothesis
@@ -217,26 +217,26 @@ class TestMultiTalkerInstanceManagerMethods:
             sent_break_sec=5.0,
         )
         instance_manager.reset()
-        
+
         # Set up diar state with mock data
         previous_chunk_preds = torch.randn(2, 10, 4)
         instance_manager.diar_states.previous_chunk_preds = previous_chunk_preds
-        
+
         # Test 1: No active speakers - should return None
         active_speakers_empty = [[], []]
         chunk_audio = torch.randn(2, 1600)
         chunk_lengths = torch.tensor([1600, 1600])
-        
+
         result = instance_manager.get_active_speakers_info(active_speakers_empty, chunk_audio, chunk_lengths)
         assert result == (None, None, None, None)
-        
+
         # Test 2: Active speakers - batch 0 has speaker 0, batch 1 has speakers 0 and 1
         active_speakers = [[0], [0, 1]]
-        
+
         active_chunk_audio, active_chunk_lengths, active_speaker_targets, inactive_speaker_targets = (
             instance_manager.get_active_speakers_info(active_speakers, chunk_audio, chunk_lengths)
         )
-        
+
         # Should have 3 active speakers total (1 from batch 0, 2 from batch 1)
         assert active_chunk_audio is not None
         assert active_chunk_audio.shape[0] == 3
@@ -255,12 +255,11 @@ class TestMultiTalkerInstanceManagerMethods:
             sent_break_sec=5.0,
         )
         instance_manager.reset()
-        
+
         # Call update_seglsts (should not raise an error)
         offset = 0.0
         instance_manager.update_seglsts(offset=offset)
-        
+
         # Verify seglsts are updated in each ASR state
         for asr_state in instance_manager.batch_asr_states:
             assert isinstance(asr_state.seglsts, list)
-

@@ -33,7 +33,7 @@ def get_seg_info_from_ctm_line(
     Get time stamp information and speaker labels from CTM lines.
     This is following CTM format appeared in `Rich Transcription Meeting Eval Plan: RT09` document.
 
-    CTM Format: 
+    CTM Format:
         <SOURCE>< <CHANNEL> <BEG-TIME> <DURATION> <TOKEN> <CONF> <TYPE> <SPEAKER>
 
     Args:
@@ -96,14 +96,19 @@ def get_new_ctm_lines_from_alignments(session_name, speaker_id, wordlist, alignm
         alignments (list): List of alignments
         output_precision (int): Precision for CTM outputs
     Returns:
-        arr (list): List of ctm entries, each entry is a tuple of (start_time, text)    
+        arr (list): List of ctm entries, each entry is a tuple of (start_time, text)
     """
     arr = []
     for i in range(len(wordlist)):
         word = wordlist[i]
         if word != "":
             # note that using the current alignments the first word is always empty, so there is no error from indexing the array with i-1
-            align2 = float(round(alignments[i] - alignments[i - 1], output_precision,))
+            align2 = float(
+                round(
+                    alignments[i] - alignments[i - 1],
+                    output_precision,
+                )
+            )
             text = get_ctm_line(
                 source=session_name,
                 channel=speaker_id,
@@ -122,7 +127,7 @@ def get_new_ctm_lines_from_alignments(session_name, speaker_id, wordlist, alignm
 def load_librispeech_alignment(alignment_filepath: str) -> dict:
     """
     Load alignment data for librispeech
-    
+
     Args:
         alignment_filepath (str): Path to the file containing alignments
     Returns:
@@ -143,7 +148,7 @@ def create_librispeech_ctm_alignments(
     input_manifest_filepath, base_alignment_path, ctm_output_directory, libri_dataset_split
 ):
     """
-    Create new CTM alignments using input LibriSpeech word alignments. 
+    Create new CTM alignments using input LibriSpeech word alignments.
 
     Args:
         input_manifest_filepath (str): Path to the input LibriSpeech manifest file
@@ -332,9 +337,9 @@ if __name__ == "__main__":
 
     Args:
         input_manifest_filepath (str): Path to input manifest file
-        base_alignment_path (str): Path to the base directory for the LibriSpeech alignment dataset 
-                                   (specifically to the LibriSpeech-Alignments directory containing 
-                                   both the LibriSpeech folder as well as the unaligned.txt file) 
+        base_alignment_path (str): Path to the base directory for the LibriSpeech alignment dataset
+                                   (specifically to the LibriSpeech-Alignments directory containing
+                                   both the LibriSpeech folder as well as the unaligned.txt file)
                                    or to a directory containing the requisite CTM files
         output_manifest_filepath (str): Path to output manifest file
         ctm_output_directory (str): Path to output CTM directory (only used for LibriSpeech)

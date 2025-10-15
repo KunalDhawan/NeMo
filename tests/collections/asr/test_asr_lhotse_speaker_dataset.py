@@ -40,8 +40,12 @@ def test_lhotse_asr_speaker_dataset(tokenizer):
 
     # cuts[1]: audio + two supervisions
     cuts[1].supervisions = [
-        SupervisionSegment(id="cuts1-sup0", recording_id=cuts[1].recording_id, start=0, duration=0.5, text="first", speaker="0"),
-        SupervisionSegment(id="cuts1-sup1", recording_id=cuts[1].recording_id, start=0.5, duration=0.5, text="second", speaker="1"),
+        SupervisionSegment(
+            id="cuts1-sup0", recording_id=cuts[1].recording_id, start=0, duration=0.5, text="first", speaker="0"
+        ),
+        SupervisionSegment(
+            id="cuts1-sup1", recording_id=cuts[1].recording_id, start=0.5, duration=0.5, text="second", speaker="1"
+        ),
     ]
 
     dataset = LhotseSpeechToTextSpkBpeDataset(cfg={}, tokenizer=tokenizer)
@@ -58,15 +62,27 @@ def test_lhotse_asr_speaker_dataset(tokenizer):
 
     assert tokens.shape == (2, 11)
     assert tokens[0].tolist() == [1, 10, 19, 19, 6, 13, 6, 23, 2, 15, 21]
-    assert tokens[1].tolist() == [ 1, 20,  6,  4, 16, 15,  5,  0,  0,  0,  0] or tokens[1].tolist() == [1, 7, 10, 19, 20, 21, 0, 0, 0, 0, 0]
+    assert tokens[1].tolist() == [1, 20, 6, 4, 16, 15, 5, 0, 0, 0, 0] or tokens[1].tolist() == [
+        1,
+        7,
+        10,
+        19,
+        20,
+        21,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ]
     assert token_lens.tolist() == [11, 7] or token_lens.tolist() == [11, 6]
 
     assert spk_targets.shape == (2, 13)
-    assert spk_targets[0].long().tolist() == [1]*13
+    assert spk_targets[0].long().tolist() == [1] * 13
     assert spk_targets[1].long().sum().item() in [6, 7]
 
     assert bg_spk_targets.shape == (2, 13)
-    assert bg_spk_targets[0].long().tolist() == [0]*13
+    assert bg_spk_targets[0].long().tolist() == [0] * 13
     assert bg_spk_targets[1].long().sum().item() in [6, 7]
 
-    assert (spk_targets[1] + bg_spk_targets[1]).long().tolist() == [1]*13
+    assert (spk_targets[1] + bg_spk_targets[1]).long().tolist() == [1] * 13

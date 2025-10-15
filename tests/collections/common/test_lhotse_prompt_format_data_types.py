@@ -101,10 +101,10 @@ def nemo_sft_example(tmp_path_factory):
 @pytest.fixture
 def multi_speaker_simulator_example(tmp_path_factory):
     tmp_path = tmp_path_factory.getbasetemp()
-    
+
     # 1. Generate a wav file using lhotse dummy_recording with actual audio data
     wav_path = tmp_path / "wav.wav"
-    
+
     # Create dummy recordings with actual audio data and save to wav files
     dummy_recording(0, duration=2.0, with_data=True).to_cut().save_audio(wav_path)
 
@@ -134,7 +134,7 @@ def multi_speaker_simulator_example(tmp_path_factory):
     # For type mixture_loader
     # Generate corresponding seglst files (segment list files)
     mixture_seglst_path = tmp_path / "mixture_seglst.json"
-    
+
     # Create seglst files with segment information
     mixture_seglst_data = [
         {
@@ -142,20 +142,20 @@ def multi_speaker_simulator_example(tmp_path_factory):
             "start_time": "0.0",
             "end_time": "1.0",
             "speaker": "speaker1",
-            "words": "session1 speaker1 dummy text"
+            "words": "session1 speaker1 dummy text",
         },
         {
             "session_id": "session1",
             "start_time": "0.5",
             "end_time": "2.0",
             "speaker": "speaker2",
-            "words": "session1 speaker2 dummy text"
-        }
+            "words": "session1 speaker2 dummy text",
+        },
     ]
     with open(mixture_seglst_path, 'w') as f:
         f.write(json.dumps(mixture_seglst_data))
-    
-    # Generate manifest file 
+
+    # Generate manifest file
     mixture_manifest_path = tmp_path / "mixture_manifest.jsonl"
     mixture_manifest_data = [
         {
@@ -163,15 +163,15 @@ def multi_speaker_simulator_example(tmp_path_factory):
             "session_id": "session1",
             "offset": 0.0,
             "duration": 2.0,
-            "seglst_filepath": str(mixture_seglst_path)
+            "seglst_filepath": str(mixture_seglst_path),
         },
     ]
-    
+
     with open(mixture_manifest_path, 'w') as f:
         for item in mixture_manifest_data:
             f.write(json.dumps(item) + '\n')
-    
-    return [lsmix_manifest_path, mixture_manifest_path]    
+
+    return [lsmix_manifest_path, mixture_manifest_path]
 
 
 class Identity:
@@ -373,18 +373,21 @@ def test_prompt_format_nemo_sft_filtered_out(nemo_sft_example, tokenizer):
     with pytest.raises(StopIteration):
         batch = next(iter(dl))
 
+
 def test_prompt_format_multi_speaker_simulator(multi_speaker_simulator_example, tokenizer):
     lsmix_manifest_path, mixture_manifest_path = multi_speaker_simulator_example
     # For type lsmix
     dl = get_lhotse_dataloader_from_config(
         {
-            "input_cfg": [{
-                "type": "multi_speaker_simulator", 
-                "manifest_filepath": lsmix_manifest_path,
-                "simulator_type": "lsmix",
-                "num_speakers": 2,
-                "min_delay": 0.5,
-            }],
+            "input_cfg": [
+                {
+                    "type": "multi_speaker_simulator",
+                    "manifest_filepath": lsmix_manifest_path,
+                    "simulator_type": "lsmix",
+                    "num_speakers": 2,
+                    "min_delay": 0.5,
+                }
+            ],
             "batch_size": 1,
             "min_duration": 0,
             "max_duration": 10,
@@ -404,11 +407,13 @@ def test_prompt_format_multi_speaker_simulator(multi_speaker_simulator_example, 
     # For type mixture_loader
     dl = get_lhotse_dataloader_from_config(
         {
-            "input_cfg": [{
-                "type": "multi_speaker_simulator", 
-                "manifest_filepath": mixture_manifest_path,
-                "simulator_type": "mixture_loader",
-            }],
+            "input_cfg": [
+                {
+                    "type": "multi_speaker_simulator",
+                    "manifest_filepath": mixture_manifest_path,
+                    "simulator_type": "mixture_loader",
+                }
+            ],
             "batch_size": 1,
             "min_duration": 0,
             "max_duration": 10,

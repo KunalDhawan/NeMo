@@ -104,25 +104,25 @@ class TestEncDecMultiTalkerRNNTBPEModel:
     def test_constructor(self, asr_model):
         """Test model constructor and speaker kernel initialization."""
         asr_model.train()
-        
+
         # Check that it's the correct type
         assert isinstance(asr_model, EncDecMultiTalkerRNNTBPEModel)
-        
+
         # Check speaker kernel configuration
         assert hasattr(asr_model, 'spk_kernel_type')
         assert hasattr(asr_model, 'spk_kernel_layers')
         assert hasattr(asr_model, 'add_bg_spk_kernel')
-        
+
         # Check speaker kernel initialization
         assert asr_model.spk_kernel_type == "ff"
         assert asr_model.spk_kernel_layers == [0]
         assert asr_model.add_bg_spk_kernel is True
-        
+
         # Check speaker kernels exist
         assert hasattr(asr_model, 'spk_kernels')
         if asr_model.add_bg_spk_kernel:
             assert hasattr(asr_model, 'bg_spk_kernels')
-        
+
         # Test config dict conversion
         confdict = asr_model.to_config_dict()
         instance2 = EncDecMultiTalkerRNNTBPEModel.from_config_dict(confdict)
@@ -150,7 +150,7 @@ class TestEncDecMultiTalkerRNNTBPEModel:
         target_length = 32  # Typical encoder output length for test
         spk_targets = torch.randint(0, 2, (batch_size, target_length), dtype=torch.float32)
         bg_spk_targets = torch.randint(0, 2, (batch_size, target_length), dtype=torch.float32)
-        
+
         # Set speaker targets
         asr_model.set_speaker_targets(spk_targets, bg_spk_targets)
 
@@ -159,7 +159,7 @@ class TestEncDecMultiTalkerRNNTBPEModel:
             logprobs_instance = []
             for i in range(input_signal.size(0)):
                 # Set individual speaker targets for each sample
-                asr_model.set_speaker_targets(spk_targets[i:i+1], bg_spk_targets[i:i+1])
+                asr_model.set_speaker_targets(spk_targets[i : i + 1], bg_spk_targets[i : i + 1])
                 logprobs_ins, _ = asr_model.forward(
                     input_signal=input_signal[i : i + 1], input_signal_length=length[i : i + 1]
                 )
@@ -176,22 +176,21 @@ class TestEncDecMultiTalkerRNNTBPEModel:
         diff = torch.max(torch.abs(logits_instance - logprobs_batch))
         assert diff <= 1e-5
 
-
     @pytest.mark.unit
     def test_speaker_target_setting(self, asr_model):
         """Test speaker target setting functionality."""
         batch_size = 2
         target_length = 32
-        
+
         spk_targets = torch.randint(0, 2, (batch_size, target_length), dtype=torch.float32)
         bg_spk_targets = torch.randint(0, 2, (batch_size, target_length), dtype=torch.float32)
-        
+
         # Test setting speaker targets
         asr_model.set_speaker_targets(spk_targets, bg_spk_targets)
         assert torch.equal(asr_model.spk_targets, spk_targets)
         if asr_model.add_bg_spk_kernel:
             assert torch.equal(asr_model.bg_spk_targets, bg_spk_targets)
-        
+
         # Test clearing speaker targets
         asr_model.set_speaker_targets(None, None)
         assert asr_model.spk_targets is None
