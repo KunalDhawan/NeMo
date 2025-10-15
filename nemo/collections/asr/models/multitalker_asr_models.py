@@ -63,8 +63,6 @@ class EncDecMultiTalkerRNNTBPEModel(EncDecRNNTBPEModel, SpeakerKernelMixin):
                     tokenizer=self.tokenizer,
                 ),
             )
-        else:
-            raise ValueError("Only lhotse dataloader is supported for multitalker models")
 
     def training_step(self, batch, batch_nb):
         """Training step with speaker targets."""
