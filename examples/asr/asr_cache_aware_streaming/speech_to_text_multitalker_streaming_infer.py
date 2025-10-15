@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
-import math
 import time
 from dataclasses import dataclass, field, is_dataclass
 from typing import List, Optional, Union
@@ -26,7 +24,9 @@ import nemo.collections.asr as nemo_asr
 from nemo.collections.asr.models.sortformer_diar_models import SortformerEncLabelModel
 from nemo.collections.asr.parts.utils.multispk_transcribe_utils import (
     SpeakerTaggedASR,
+    add_delay_for_real_time,
     get_multi_talker_samples_from_manifest,
+    write_seglst_file,
 )
 from nemo.collections.asr.parts.utils.streaming_utils import CacheAwareStreamingAudioBuffer
 from nemo.core.config import hydra_runner
@@ -34,15 +34,21 @@ from nemo.utils import logging
 
 
 @dataclass
-class DiarizationConfig:
+class MultitalkerTranscriptionConfig:
+    """
+    Configuration for Multi-talker transcription with an ASR model and a diarization model.
+    """
+
     # Required configs
-    diar_model_path: Optional[str] = None  # Path to a .nemo file
+    diar_model: Optional[str] = None  # Path to a .nemo file
     diar_pretrained_name: Optional[str] = None  # Name of a pretrained model
-    max_num_of_spks: Optional[int] = 4
-    parallel_speaker_strategy: bool = True
-    masked_asr: bool = True
-    mask_preencode: bool = False
-    single_speaker_model: bool = False
+    max_num_of_spks: Optional[int] = 4  # maximum number of speakers
+    parallel_speaker_strategy: bool = True  # whether to use parallel speaker strategy
+    masked_asr: bool = True  # whether to use masked ASR
+    mask_preencode: bool = False  # whether to mask preencode or mask features
+    cache_gating: bool = True  # whether to use cache gating
+    cache_gating_buffer_size: int = 2  # buffer size for cache gating
+    single_speaker_mode: bool = False  # whether to use single speaker mode
 
     # General configs
     session_len_sec: float = -1  # End-to-end diarization session length in seconds
@@ -106,52 +112,6 @@ class DiarizationConfig:
     binary_diar_preds: bool = False
 
 
-def format_time(seconds):
-    minutes = math.floor(seconds / 60)
-    sec = seconds % 60
-    return f"{minutes}:{sec:05.2f}"
-
-
-def calc_drop_extra_pre_encoded(asr_model, step_num, pad_and_drop_preencoded):
-    # for the first step there is no need to drop any tokens after the downsampling as no caching is being used
-    if step_num == 0 and not pad_and_drop_preencoded:
-        return 0
-    else:
-        return asr_model.encoder.streaming_cfg.drop_extra_pre_encoded
-
-
-def add_delay_for_real_time(cfg, chunk_audio, session_start_time, feat_frame_count, loop_end_time, loop_start_time):
-    """
-    Add artificial delay for real-time mode by calculating the time difference between
-    the current time and the session start time..
-
-    Args:
-        cfg (DiarizationConfig): The configuration object.
-    """
-    time_diff = max(0, (time.time() - session_start_time) - feat_frame_count * cfg.feat_len_sec)
-    eta_min_sec = format_time(time.time() - session_start_time)
-    logging.info(
-        f"[   REAL TIME MODE   ] min:sec - {eta_min_sec} "
-        f"Time difference for real-time mode: {time_diff:.4f} seconds"
-    )
-    time.sleep(
-        max(
-            0,
-            (chunk_audio.shape[-1] - cfg.discarded_frames) * cfg.feat_len_sec
-            - (loop_end_time - loop_start_time)
-            - time_diff * cfg.finetune_realtime_ratio,
-        )
-    )
-
-
-def write_seglst_file(seglst_dict_list, output_path):
-    if len(seglst_dict_list) == 0:
-        raise ValueError("seglst_dict_list is empty. No transcriptions were generated.")
-    with open(output_path, 'w') as f:
-        f.write(json.dumps(seglst_dict_list, indent=4) + '\n')
-    logging.info(f"Saved the transcriptions of the streaming inference in\n:{output_path}")
-
-
 def launch_serial_streaming(
     cfg,
     asr_model,
@@ -159,14 +119,27 @@ def launch_serial_streaming(
     streaming_buffer,
     pad_and_drop_preencoded=False,
 ):
+    """
+    Launch the serial streaming inference with ASR model and diarization model.
+
+    Args:
+        cfg (Any): The configuration object containing the parameters for the streaming inference.
+        asr_model (Any): The ASR model loaded from the path provided in MultitalkerTranscriptionConfig.
+        diar_model (Any): The diarization model loadded from the path provided in MultitalkerTranscriptionConfig.
+        streaming_buffer: An iterator that yields chunks of audio data and their lengths.
+        pad_and_drop_preencoded: A boolean flag indicating whether to pad and drop the extra pre-encoded tokens.
+    """
     streaming_buffer_iter = iter(streaming_buffer)
 
     multispk_asr_streamer = SpeakerTaggedASR(cfg, asr_model, diar_model)
     feat_frame_count = 0
-
     session_start_time = time.time()
     for step_num, (chunk_audio, chunk_lengths) in enumerate(streaming_buffer_iter):
-        drop_extra_pre_encoded = calc_drop_extra_pre_encoded(asr_model, step_num, pad_and_drop_preencoded)
+        drop_extra_pre_encoded = (
+            0
+            if step_num == 0 and not pad_and_drop_preencoded
+            else asr_model.encoder.streaming_cfg.drop_extra_pre_encoded
+        )
         loop_start_time = time.time()
         with torch.inference_mode():
             with autocast:
@@ -178,17 +151,16 @@ def launch_serial_streaming(
                         is_buffer_empty=streaming_buffer.is_buffer_empty(),
                         drop_extra_pre_encoded=drop_extra_pre_encoded,
                     )
-
-        feat_frame_count += chunk_audio.shape[-1] - cfg.discarded_frames
         if cfg.real_time_mode:
             add_delay_for_real_time(
-                cfg,
+                cfg=cfg,
                 chunk_audio=chunk_audio,
                 session_start_time=session_start_time,
                 feat_frame_count=feat_frame_count,
                 loop_end_time=time.time(),
                 loop_start_time=loop_start_time,
             )
+        feat_frame_count += chunk_audio.shape[-1] - cfg.discarded_frames
     return multispk_asr_streamer
 
 
@@ -201,13 +173,18 @@ def launch_parallel_streaming(
 ):
     streaming_buffer_iter = iter(streaming_buffer)
     multispk_asr_streamer = SpeakerTaggedASR(cfg, asr_model, diar_model)
-
+    feat_frame_count = 0
+    session_start_time = time.time()
     for step_num, (chunk_audio, chunk_lengths) in enumerate(streaming_buffer_iter):
-        # logging.info(f"Step ID: {step_num}")
+        drop_extra_pre_encoded = (
+            0
+            if step_num == 0 and not pad_and_drop_preencoded
+            else asr_model.encoder.streaming_cfg.drop_extra_pre_encoded
+        )
+        loop_start_time = time.time()
         with torch.inference_mode():
             with autocast:
                 with torch.no_grad():
-                    drop_extra_pre_encoded = calc_drop_extra_pre_encoded(asr_model, step_num, pad_and_drop_preencoded)
                     multispk_asr_streamer.perform_parallel_streaming_stt_spk(
                         step_num=step_num,
                         chunk_audio=chunk_audio,
@@ -215,11 +192,21 @@ def launch_parallel_streaming(
                         is_buffer_empty=streaming_buffer.is_buffer_empty(),
                         drop_extra_pre_encoded=drop_extra_pre_encoded,
                     )
+        if cfg.real_time_mode:
+            add_delay_for_real_time(
+                cfg=cfg,
+                chunk_audio=chunk_audio,
+                session_start_time=session_start_time,
+                feat_frame_count=feat_frame_count,
+                loop_end_time=time.time(),
+                loop_start_time=loop_start_time,
+            )
+        feat_frame_count += chunk_audio.shape[-1] - cfg.discarded_frames
     return multispk_asr_streamer
 
 
-@hydra_runner(config_name="DiarizationConfig", schema=DiarizationConfig)
-def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
+@hydra_runner(config_name="MultitalkerTranscriptionConfig", schema=MultitalkerTranscriptionConfig)
+def main(cfg: MultitalkerTranscriptionConfig) -> Union[MultitalkerTranscriptionConfig]:
     for key in cfg:
         cfg[key] = None if cfg[key] == 'None' else cfg[key]
 
@@ -229,8 +216,8 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     if cfg.random_seed:
         pl.seed_everything(cfg.random_seed)
 
-    if cfg.diar_model_path is None and cfg.diar_pretrained_name is None:
-        raise ValueError("Both cfg.diar_model_path and cfg.pretrained_name cannot be None!")
+    if cfg.diar_model is None and cfg.diar_pretrained_name is None:
+        raise ValueError("Both cfg.diar_model and cfg.pretrained_name cannot be None!")
     if cfg.audio_file is None and cfg.manifest_file is None:
         raise ValueError("Both cfg.audio_file and cfg.manifest_file cannot be None!")
 
@@ -254,14 +241,14 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         accelerator = 'gpu'
         map_location = torch.device(f'cuda:{cfg.cuda}')
 
-    if cfg.diar_model_path.endswith(".ckpt"):
+    if cfg.diar_model.endswith(".ckpt"):
         diar_model = SortformerEncLabelModel.load_from_checkpoint(
-            checkpoint_path=cfg.diar_model_path, map_location=map_location, strict=False
+            checkpoint_path=cfg.diar_model, map_location=map_location, strict=False
         )
-    elif cfg.diar_model_path.endswith(".nemo"):
-        diar_model = SortformerEncLabelModel.restore_from(restore_path=cfg.diar_model_path, map_location=map_location)
+    elif cfg.diar_model.endswith(".nemo"):
+        diar_model = SortformerEncLabelModel.restore_from(restore_path=cfg.diar_model, map_location=map_location)
     else:
-        raise ValueError("cfg.diar_model_path must end with.ckpt or.nemo!")
+        raise ValueError("cfg.diar_model must end with.ckpt or.nemo!")
 
     # Model setup for inference
     trainer = pl.Trainer(devices=device, accelerator=accelerator)
@@ -359,6 +346,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     else:
         online_normalization = False
 
+    seglst_dict_list = []
     if cfg.audio_file is not None:
         # Stream a single audio file
         samples = [
@@ -374,14 +362,14 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         cfg.batch_size = len(samples)
         streaming_buffer.append_audio_file(audio_filepath=cfg.audio_file, stream_id=-1)
         if cfg.parallel_speaker_strategy:
-            multispk_asr_streamer = launch_serial_streaming(
+            multispk_asr_streamer = launch_parallel_streaming(
                 cfg=cfg,
                 asr_model=asr_model,
                 diar_model=diar_model,
                 streaming_buffer=streaming_buffer,
                 pad_and_drop_preencoded=cfg.pad_and_drop_preencoded,
             )
-
+            multispk_asr_streamer.generate_seglst_dicts_from_parallel_streaming(samples=samples)
         else:
             multispk_asr_streamer = launch_serial_streaming(
                 cfg=cfg,
@@ -389,6 +377,9 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
                 diar_model=diar_model,
                 streaming_buffer=streaming_buffer,
             )
+            multispk_asr_streamer.generate_seglst_dicts_from_serial_streaming(samples=samples)
+        seglst_dict_list.extend(multispk_asr_streamer.instance_manager.seglst_dict_list)
+
     else:
         # Stream audio files in a manifest file in batched mode
         feat_per_sec = round(asr_model.cfg.preprocessor.window_stride * asr_model.cfg.encoder.subsampling_factor, 2)
@@ -407,7 +398,6 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
             pad_and_drop_preencoded=cfg.pad_and_drop_preencoded,
         )
 
-        seglst_dict_list = []
         batch_samples = []
         for sample_idx, sample in enumerate(samples):
             batch_samples.append(sample)

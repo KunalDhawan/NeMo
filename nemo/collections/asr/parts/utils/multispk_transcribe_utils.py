@@ -14,6 +14,7 @@
 
 import itertools
 import json
+import math
 import os
 import time
 from collections import OrderedDict
@@ -62,6 +63,82 @@ def measure_eta(func):
         return result  # Return the original function's result
 
     return wrapper
+
+
+def format_time(seconds: float) -> str:
+    """
+    Format the time in minutes and seconds.
+
+    Args:
+        seconds (float): The time in seconds.
+
+    Returns:
+        str: The time in minutes and seconds.
+    """
+    minutes = math.floor(seconds / 60)
+    sec = seconds % 60
+    return f"{minutes}:{sec:05.2f}"
+
+
+def add_delay_for_real_time(
+    cfg: Any,
+    chunk_audio: torch.Tensor,
+    session_start_time: float,
+    feat_frame_count: int,
+    loop_end_time: float,
+    loop_start_time: float,
+):
+    """
+    Add artificial delay for real-time mode by calculating the time difference between
+    the current time and the session start time..
+
+    Args:
+        cfg (Any): The configuration object containing the parameters for the delay calculation.
+        chunk_audio (torch.Tensor): The chunk audio tensor containing time-series audio data.
+        session_start_time (float): The session start time in seconds.
+        feat_frame_count (int): The number of features per second.
+        loop_end_time (float): The loop end time in seconds.
+        loop_start_time (float): The loop start time in seconds.
+    """
+    time_diff = max(0, (time.time() - session_start_time) - feat_frame_count * cfg.feat_len_sec)
+    eta_min_sec = format_time(time.time() - session_start_time)
+    logging.info(
+        f"[   REAL TIME MODE   ] min:sec - {eta_min_sec} "
+        f"Time difference for real-time mode: {time_diff:.4f} seconds"
+    )
+    time.sleep(
+        max(
+            0,
+            (chunk_audio.shape[-1] - cfg.discarded_frames) * cfg.feat_len_sec
+            - (loop_end_time - loop_start_time)
+            - time_diff * cfg.finetune_realtime_ratio,
+        )
+    )
+
+
+def write_seglst_file(seglst_dict_list: List[Dict[str, Any]], output_path: str):
+    """
+    Write a seglst file from the seglst dictionary list.
+
+    Args:
+        seglst_dict_list (List[Dict[str, Any]]): The list of seglst dictionaries.
+            Example:
+            [
+                {
+                    "session_id": "session_001",
+                    "speaker": "speaker_1",
+                    "words": "Write this to a SegLST file.",
+                    "start_time": 12.34,
+                    "end_time": 23.45,
+                }, ...
+            ]
+        output_path (str): The path to the output file.
+    """
+    if len(seglst_dict_list) == 0:
+        raise ValueError("seglst_dict_list is empty. No transcriptions were generated.")
+    with open(output_path, 'w') as f:
+        f.write(json.dumps(seglst_dict_list, indent=4) + '\n')
+    logging.info(f"Saved the transcriptions of the streaming inference in\n:{output_path}")
 
 
 def get_multi_talker_samples_from_manifest(cfg, manifest_file: str, feat_per_sec: float, max_spks: int):
@@ -175,26 +252,6 @@ def get_new_sentence_dict(
         'words': text.lstrip(),
         'session_id': session_id,
     }
-
-
-def calc_drop_extra_pre_encoded(asr_model: SortformerEncLabelModel, step_num: int, pad_and_drop_preencoded: bool):
-    """
-    Calculate the number of extra tokens to drop after the downsampling.
-
-    Args:
-        asr_model (SortformerEncLabelModel): The ASR model.
-        step_num (int): The step number.
-        pad_and_drop_preencoded (bool): Whether to pad and drop the extra pre-encoded tokens.
-
-    Returns:
-        int: The number of extra tokens to drop.
-    """
-    # for the first step there is no need to drop any tokens
-    # after the downsampling as no caching is being used
-    if step_num == 0 and not pad_and_drop_preencoded:
-        return 0
-    else:
-        return asr_model.encoder.streaming_cfg.drop_extra_pre_encoded
 
 
 def fix_frame_time_step(cfg: Any, new_tokens: List[str], new_words: List[str], frame_inds_seq: List[int]) -> List[int]:
@@ -494,7 +551,7 @@ class SpeakerTaggedASR:
 
         self._masked_asr = cfg.get("masked_asr", True)
         self._use_mask_preencode = cfg.get("mask_preencode", False)
-        self._single_speaker_model = cfg.get("single_speaker_model", False)
+        self._single_speaker_mode = cfg.get("single_speaker_mode", False)
 
         self.instance_manager = MultiTalkerInstanceManager(
             asr_model=self.asr_model,
@@ -1196,13 +1253,11 @@ class SpeakerTaggedASR:
 
         # For a session, if no second speaker is detected,
         # the spk_targets will be set to all ones in the single speaker mode
-        if self._single_speaker_model:
+        if self._single_speaker_mode:
             if self._max_num_of_spks == 1:
                 is_single_speaker = [True] * chunk_audio.shape[0]
             else:
-                is_single_speaker = (new_diar_pred_out_stream[:, :, : self._max_num_of_spks] > 0.5).any(1).sum(
-                    -1
-                ) <= 1.0
+                is_single_speaker = (new_diar_pred_out_stream > 0.5).any(1).sum(-1) <= 1.0
             for i in range(chunk_audio.shape[0]):
                 if is_single_speaker[i]:
                     new_diar_pred_out_stream[i, :, 0] = 1.0
@@ -1536,9 +1591,10 @@ class MultiTalkerInstanceManager:
 
                     # Case 1 - If start_tiime is greater than end_time + sent_break_sec, then we need to add the sentence
                     if sep_flag or (last_end_time == 0.0 or start_time > last_end_time + self._sent_break_sec):
-                        if len(diff_text) > 0 and diff_text.strip()[0] in ['.', ',', '?', '!']:
+                        stripped_text = diff_text.strip()
+                        if len(stripped_text) > 0 and stripped_text[0] in ['.', ',', '?', '!']:
                             # This handles the case where the first character should be assigned to the previous sentence.
-                            the_first_char, diff_text = diff_text.strip()[0], diff_text.strip()[1:]
+                            the_first_char, diff_text = stripped_text[0], stripped_text[1:]
                             self._update_last_sentence(spk_idx=spk_idx, end_time=None, diff_text=the_first_char)
                         self._speaker_wise_sentences[spk_idx].append(
                             get_new_sentence_dict(
