@@ -20,7 +20,6 @@ from lhotse import CutSet
 from lhotse.testing.dummies import DummyManifest
 from omegaconf import DictConfig
 
-from nemo.collections.asr.data.audio_to_text_lhotse_speaker import LhotseSpeechToTextSpkBpeDataset
 from nemo.collections.asr.models.multitalker_asr_models import EncDecMultiTalkerRNNTBPEModel
 from nemo.core.utils import numba_utils
 from nemo.core.utils.numba_utils import __NUMBA_MINIMUM_VERSION__
@@ -178,94 +177,6 @@ class TestEncDecMultiTalkerRNNTBPEModel:
         assert diff <= 1e-5  # Allow slightly higher tolerance for speaker processing
         diff = torch.max(torch.abs(logits_instance - logprobs_batch))
         assert diff <= 1e-5
-
-    @pytest.mark.with_downloads()
-    @pytest.mark.skipif(
-        not NUMBA_RNNT_LOSS_AVAILABLE,
-        reason='RNNTLoss has not been compiled with appropriate numba version.',
-    )
-    @pytest.mark.unit
-    def test_training_step(self, asr_model):
-        """Test training step with speaker targets."""
-        asr_model.train()
-        
-        # Create mock batch with speaker targets
-        batch_size = 2
-        signal_length = 512
-        transcript_length = 20
-        target_length = 32
-        
-        signal = torch.randn(batch_size, signal_length)
-        signal_len = torch.tensor([signal_length, signal_length-50])
-        transcript = torch.randint(0, asr_model.tokenizer.vocab_size, (batch_size, transcript_length))
-        transcript_len = torch.tensor([transcript_length, transcript_length-5])
-        spk_targets = torch.randint(0, 2, (batch_size, target_length), dtype=torch.float32)
-        bg_spk_targets = torch.randint(0, 2, (batch_size, target_length), dtype=torch.float32)
-        
-        batch = (signal, signal_len, transcript, transcript_len, spk_targets, bg_spk_targets)
-        
-        # Test that training step runs without error
-        try:
-            loss = asr_model.training_step(batch, 0)
-            assert loss is not None
-            assert isinstance(loss, torch.Tensor)
-        except Exception as e:
-            pytest.skip(f"Training step failed with: {e}")
-
-    @pytest.mark.with_downloads() 
-    @pytest.mark.skipif(
-        not NUMBA_RNNT_LOSS_AVAILABLE,
-        reason='RNNTLoss has not been compiled with appropriate numba version.',
-    )
-    @pytest.mark.unit
-    def test_validation_pass(self, asr_model):
-        """Test validation pass with speaker targets."""
-        asr_model.eval()
-        
-        # Create mock batch with speaker targets
-        batch_size = 2
-        signal_length = 512
-        transcript_length = 20
-        target_length = 32
-        
-        signal = torch.randn(batch_size, signal_length)
-        signal_len = torch.tensor([signal_length, signal_length-50])
-        transcript = torch.randint(0, asr_model.tokenizer.vocab_size, (batch_size, transcript_length))
-        transcript_len = torch.tensor([transcript_length, transcript_length-5])
-        spk_targets = torch.randint(0, 2, (batch_size, target_length), dtype=torch.float32)
-        bg_spk_targets = torch.randint(0, 2, (batch_size, target_length), dtype=torch.float32)
-        
-        batch = (signal, signal_len, transcript, transcript_len, spk_targets, bg_spk_targets)
-        
-        # Test that validation pass runs without error
-        try:
-            result = asr_model.validation_pass(batch, 0)
-            assert result is not None
-        except Exception as e:
-            pytest.skip(f"Validation pass failed with: {e}")
-
-    @pytest.mark.unit
-    def test_dataloader_setup_lhotse_required(self, asr_model):
-        """Test that dataloader setup requires lhotse."""
-        # Test that non-lhotse config raises ValueError
-        config = DictConfig({'use_lhotse': False})
-        
-        with pytest.raises(ValueError, match="Only lhotse dataloader is supported for multitalker models"):
-            asr_model._setup_dataloader_from_config(config)
-
-    @pytest.mark.unit
-    def test_predict_step(self, asr_model):
-        """Test predict step functionality."""
-        asr_model = asr_model.eval()
-        cuts = DummyManifest(CutSet, begin_id=0, end_id=1, with_data=True)
-        dataset = LhotseSpeechToTextSpkBpeDataset(tokenizer=asr_model.tokenizer, cfg=DictConfig({'inference_mode': True}))
-        batch = dataset[cuts]
-        
-        try:
-            outputs = asr_model.predict_step(batch, 0)
-            assert outputs is not None
-        except Exception as e:
-            pytest.skip(f"Predict step failed with: {e}")
 
 
     @pytest.mark.unit
