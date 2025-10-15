@@ -12,21 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
-import json
-import importlib
-
-pytest = importlib.import_module("pytest")
-torch = importlib.import_module("torch")
-from omegaconf import OmegaConf
-
 from tests.collections.asr.test_asr_rnnt_encoder_model_bpe import asr_model as offline_asr_model
 from tests.collections.speaker_tasks.test_diar_sortformer_models import sortformer_model as diar_model
 
 from nemo.collections.asr.models.configs.asr_models_config import CacheAwareStreamingConfig
 from nemo.collections.asr.parts.utils.multispk_transcribe_utils import (
     get_new_sentence_dict,
-    calc_drop_extra_pre_encoded,
     fix_frame_time_step,
     get_simulated_softmax,
     get_word_dict_content_offline,
@@ -38,7 +29,11 @@ from nemo.collections.asr.parts.utils.multispk_transcribe_utils import (
     get_multi_talker_samples_from_manifest,
     MultiTalkerInstanceManager,
 )
-from examples.asr.asr_cache_aware_streaming.speech_to_text_multitalker_streaming_infer import DiarizationConfig
+from examples.asr.asr_cache_aware_streaming.speech_to_text_multitalker_streaming_infer import MultitalkerTranscriptionConfig
+import json
+import pytest
+import torch
+from omegaconf import OmegaConf
 
 @pytest.fixture()
 def asr_model(offline_asr_model):
@@ -91,19 +86,6 @@ class TestGetNewSentenceDict:
         assert result["session_id"] == session_id
 
 
-class TestCalcDropExtraPreEncoded:
-    @pytest.mark.unit
-    @pytest.mark.parametrize(
-        "step_num,pad_and_drop,expected",
-        [
-            (0, False, 0),
-            (5, True, 7),
-        ],
-    )
-    def test_calc_drop_extra_pre_encoded(self, asr_model, step_num, pad_and_drop, expected):
-        assert calc_drop_extra_pre_encoded(asr_model, step_num, pad_and_drop) == expected
-
-
 class TestFixFrameTimeStep:
     @pytest.mark.unit
     @pytest.mark.parametrize(
@@ -116,7 +98,7 @@ class TestFixFrameTimeStep:
         ],
     )
     def test_fix_frame_time_step_shapes(self, new_tokens, new_words, frame_inds_seq, expected):
-        cfg = OmegaConf.structured(DiarizationConfig(log=False))
+        cfg = OmegaConf.structured(MultitalkerTranscriptionConfig(log=False))
         out = fix_frame_time_step(cfg, new_tokens, new_words, frame_inds_seq)
         assert out == expected
 
@@ -124,13 +106,13 @@ class TestFixFrameTimeStep:
 class TestGetSimulatedSoftmax:
     @pytest.mark.unit
     def test_invalid_dims(self):
-        cfg = OmegaConf.structured(DiarizationConfig(min_sigmoid_val=0.0, max_num_of_spks=2))
+        cfg = OmegaConf.structured(MultitalkerTranscriptionConfig(min_sigmoid_val=0.0, max_num_of_spks=2))
         with pytest.raises(ValueError):
             get_simulated_softmax(cfg, torch.zeros((2, 3)))
 
     @pytest.mark.unit
     def test_invalid_length_vs_maxspks(self):
-        cfg = OmegaConf.structured(DiarizationConfig(min_sigmoid_val=0.0, max_num_of_spks=4))
+        cfg = OmegaConf.structured(MultitalkerTranscriptionConfig(min_sigmoid_val=0.0, max_num_of_spks=4))
         with pytest.raises(ValueError):
             get_simulated_softmax(cfg, torch.zeros(3))
 
@@ -145,7 +127,7 @@ class TestGetSimulatedSoftmax:
         ],
     )
     def test_valid_softmax_behavior(self, vec, min_sigmoid_val, max_num_of_spks, expected_prefix):
-        cfg = OmegaConf.structured(DiarizationConfig(min_sigmoid_val=min_sigmoid_val, max_num_of_spks=max_num_of_spks))
+        cfg = OmegaConf.structured(MultitalkerTranscriptionConfig(min_sigmoid_val=min_sigmoid_val, max_num_of_spks=max_num_of_spks))
         out = get_simulated_softmax(cfg, torch.tensor(vec))
         assert out.shape[0] == len(vec)
         # Tail past max_num_of_spks is zero
@@ -163,7 +145,7 @@ class TestWordDictContentOffline:
         T, N = 6, 3
         diar_pred_out = torch.zeros((T, N))
         diar_pred_out[2:5, 2] = 10.0
-        cfg = OmegaConf.structured(DiarizationConfig(left_frame_shift=0, right_frame_shift=0, max_num_of_spks=3, min_sigmoid_val=0.0))
+        cfg = OmegaConf.structured(MultitalkerTranscriptionConfig(left_frame_shift=0, right_frame_shift=0, max_num_of_spks=3, min_sigmoid_val=0.0))
         word = "hello"
         res = get_word_dict_content_offline(
             cfg=cfg,
@@ -196,7 +178,7 @@ class TestWordDictContentOnline:
         T, N = 12, 4
         diar_pred_out_stream = torch.zeros((T, N))
         diar_pred_out_stream[expected_stt:expected_end, 1] = 5.0  # Make speaker 1 dominant in the window
-        cfg = OmegaConf.structured(DiarizationConfig(left_frame_shift=0, right_frame_shift=0, max_num_of_spks=4, min_sigmoid_val=0.0))
+        cfg = OmegaConf.structured(MultitalkerTranscriptionConfig(left_frame_shift=0, right_frame_shift=0, max_num_of_spks=4, min_sigmoid_val=0.0))
 
         res = get_word_dict_content_online(
             cfg=cfg,
@@ -217,7 +199,7 @@ class TestGetMultitokenWords:
     @pytest.mark.unit
     @pytest.mark.parametrize("verbose", [True, False])
     def test_get_multitoken_words_replaces_shorter_saved(self, verbose):
-        cfg = OmegaConf.structured(DiarizationConfig(verbose=verbose))
+        cfg = OmegaConf.structured(MultitalkerTranscriptionConfig(verbose=verbose))
         word_and_ts_seq = {
             "words": [{"word": "hello"}, {"word": "multi"}, {"word": "world"}],
             "buffered_words": [],
@@ -233,7 +215,7 @@ class TestGetMultitokenWords:
 class TestAppendWordAndTsSeq:
     @pytest.mark.unit
     def test_append_and_fifo_pop(self):
-        cfg = OmegaConf.structured(DiarizationConfig(word_window=2))
+        cfg = OmegaConf.structured(MultitalkerTranscriptionConfig(word_window=2))
         word_and_ts_seq = {
             "words": [{"word": "a", "speaker": "speaker_0"}, {"word": "b", "speaker": "speaker_1"}],
             "buffered_words": [{"word": "a", "speaker": "speaker_0"}, {"word": "b", "speaker": "speaker_1"}],
@@ -299,7 +281,7 @@ class TestGetMultiTalkerSamplesFromManifest:
     def test_missing_audio_filepath(self, tmp_path):
         mpath = tmp_path / "manifest.jsonl"
         mpath.write_text(json.dumps({}) + "\n", encoding="utf-8")
-        cfg = OmegaConf.structured(DiarizationConfig(spk_supervision="none"))
+        cfg = OmegaConf.structured(MultitalkerTranscriptionConfig(spk_supervision="none"))
         with pytest.raises(KeyError):
             get_multi_talker_samples_from_manifest(cfg, str(mpath), feat_per_sec=100.0, max_spks=2)
 
@@ -313,7 +295,7 @@ class TestGetMultiTalkerSamplesFromManifest:
             "rttm_filepath": missing_rttm,
         }
         mpath.write_text(json.dumps(line) + "\n", encoding="utf-8")
-        cfg = OmegaConf.structured(DiarizationConfig(spk_supervision="rttm"))
+        cfg = OmegaConf.structured(MultitalkerTranscriptionConfig(spk_supervision="rttm"))
         with pytest.raises(FileNotFoundError):
             get_multi_talker_samples_from_manifest(cfg, str(mpath), feat_per_sec=100.0, max_spks=2)
 
@@ -323,11 +305,11 @@ class TestSpeakerTaggedASRInit:
 
     @pytest.mark.unit
     def test_init_default_config_values(self, asr_model, diar_model, tmp_path):
-        """Test initialization with default config values using .get() from DiarizationConfig"""
+        """Test initialization with default config values using .get() from MultitalkerTranscriptionConfig"""
         audio_path = tmp_path / "test.wav"
         audio_path.touch()
         
-        cfg = DiarizationConfig(
+        cfg = MultitalkerTranscriptionConfig(
             manifest_file=None,
             audio_file=str(audio_path),
             fix_prev_words_count=5,
@@ -339,8 +321,9 @@ class TestSpeakerTaggedASRInit:
             batch_size=1,
             sent_break_sec=30.0,  # Explicit value
             masked_asr=True,  # Explicit value
+            cache_gating=False,  # Explicit value
             mask_preencode=False,  # Explicit value
-            single_speaker_model=False,  # Explicit value
+            single_speaker_mode=False,  # Explicit value
             generate_realtime_scripts=False,
         )
         # Convert to OmegaConf to support .get() method
@@ -352,12 +335,12 @@ class TestSpeakerTaggedASRInit:
         # pylint: disable=protected-access
         assert speaker_tagged_asr._max_num_of_spks == 3  # From cfg.get("max_num_of_spks", 4)
         assert speaker_tagged_asr._sent_break_sec == 30.0  # From cfg
-        # cache_gating and cache_gating_buffer_size use defaults via cfg.get() since they're not in DiarizationConfig
+        # cache_gating and cache_gating_buffer_size use defaults via cfg.get() since they're not in MultitalkerTranscriptionConfig
         assert speaker_tagged_asr._cache_gating is False  # Default value from cfg.get("cache_gating", False)
         assert speaker_tagged_asr._cache_gating_buffer_size == 2  # Default value from cfg.get("cache_gating_buffer_size", 2)
         assert speaker_tagged_asr._masked_asr is True  # From cfg
         assert speaker_tagged_asr._use_mask_preencode is False  # From cfg
-        assert speaker_tagged_asr._single_speaker_model is False  # From cfg
+        assert speaker_tagged_asr._single_speaker_mode is False  # From cfg
         # pylint: enable=protected-access
 
     @pytest.mark.unit
@@ -366,7 +349,7 @@ class TestSpeakerTaggedASRInit:
         audio_path = tmp_path / "test.wav"
         audio_path.touch()
         
-        cfg = DiarizationConfig(
+        cfg = MultitalkerTranscriptionConfig(
             manifest_file=None,
             audio_file=str(audio_path),
             fix_prev_words_count=5,
@@ -401,7 +384,7 @@ class TestSpeakerTaggedASRMethods:
         audio_path = tmp_path / "test.wav"
         audio_path.touch()
         
-        cfg = DiarizationConfig(
+        cfg = MultitalkerTranscriptionConfig(
             manifest_file=None,
             audio_file=str(audio_path),
             fix_prev_words_count=5,
@@ -442,7 +425,7 @@ class TestSpeakerTaggedASRMethods:
         audio_path = tmp_path / "test.wav"
         audio_path.touch()
         
-        cfg = DiarizationConfig(
+        cfg = MultitalkerTranscriptionConfig(
             manifest_file=None,
             audio_file=str(audio_path),
             fix_prev_words_count=5,
@@ -480,7 +463,7 @@ class TestSpeakerTaggedASRMethods:
         audio_path = tmp_path / "test.wav"
         audio_path.touch()
         
-        cfg = DiarizationConfig(
+        cfg = MultitalkerTranscriptionConfig(
             manifest_file=None,
             audio_file=str(audio_path),
             fix_prev_words_count=5,

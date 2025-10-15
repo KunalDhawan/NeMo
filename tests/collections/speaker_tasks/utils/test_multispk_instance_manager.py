@@ -12,17 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
-import importlib
-
-pytest = importlib.import_module("pytest")
-torch = importlib.import_module("torch")
-
 from tests.collections.asr.test_asr_rnnt_encoder_model_bpe import asr_model as offline_asr_model
 from tests.collections.speaker_tasks.test_diar_sortformer_models import sortformer_model as diar_model
 
 from nemo.collections.asr.models.configs.asr_models_config import CacheAwareStreamingConfig
 from nemo.collections.asr.parts.utils.multispk_transcribe_utils import MultiTalkerInstanceManager
+
+import importlib
+import pytest
+import torch
+
 
 @pytest.fixture()
 def asr_model(offline_asr_model):
