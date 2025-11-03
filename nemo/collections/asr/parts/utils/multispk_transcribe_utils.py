@@ -135,7 +135,7 @@ def write_seglst_file(seglst_dict_list: List[Dict[str, Any]], output_path: str):
         output_path (str): The path to the output file.
     """
     if len(seglst_dict_list) == 0:
-        raise ValueError("seglst_dict_list is empty. No transcriptions were generated.")
+        raise ValueError("seglst_dict_list is empty. No transcriptions were generated.") 
     with open(output_path, 'w') as f:
         f.write(json.dumps(seglst_dict_list, indent=4) + '\n')
     logging.info(f"Saved the transcriptions of the streaming inference in\n:{output_path}")
@@ -231,6 +231,7 @@ def get_new_sentence_dict(
     end_time: float,
     text: str,
     session_id: Optional[str] = None,
+    decimal: int = 3,
 ) -> dict:
     """
     Get a new SegLST style sentence dictionary variable.
@@ -245,10 +246,15 @@ def get_new_sentence_dict(
     Returns:
         Dict[str, Any]: A new SegLST style sentence dictionary variable.
     """
+    # If start_time or end_time is a torch tensor, convert it to a float and round it to 3 decimal places
+    if isinstance(start_time, torch.Tensor):
+        start_time = start_time.item()
+    if isinstance(end_time, torch.Tensor):
+        end_time = end_time.item()
     return {
         'speaker': speaker,
-        'start_time': start_time,
-        'end_time': end_time,
+        'start_time': round(start_time, decimal),
+        'end_time': round(end_time, decimal),
         'words': text.lstrip(),
         'session_id': session_id,
     }
@@ -528,7 +534,6 @@ class SpeakerTaggedASR:
 
         self.asr_model = asr_model
         self.diar_model = diar_model
-
         # ASR speaker tagging configs
         self._fix_prev_words_count = cfg.fix_prev_words_count
         self._sentence_render_length = int(self._fix_prev_words_count + cfg.update_prev_words_sentence)
@@ -547,6 +552,7 @@ class SpeakerTaggedASR:
         self._nframes_per_chunk = self._att_context_size[1] + 1
         self._cache_gating = cfg.get("cache_gating", False)
         self._cache_gating_buffer_size = cfg.get("cache_gating_buffer_size", 2)
+
         self._binary_diar_preds = cfg.binary_diar_preds
 
         self._masked_asr = cfg.get("masked_asr", True)
@@ -934,6 +940,7 @@ class SpeakerTaggedASR:
                     session_id=session_id,
                 )
                 self.instance_manager.seglst_dict_list.append(seglst_dict)
+        return self.instance_manager.seglst_dict_list
 
     def generate_seglst_dicts_from_parallel_streaming(self, samples: List[Dict[str, Any]]):
         """
@@ -960,6 +967,7 @@ class SpeakerTaggedASR:
             ]
             seglsts = sorted(seglsts, key=lambda x: x['start_time'])
             self.instance_manager.seglst_dict_list.extend(seglsts)
+        return self.instance_manager.seglst_dict_list
 
     def _find_active_speakers(self, diar_preds: torch.Tensor, n_active_speakers_per_stream: int) -> List[List[int]]:
         """
