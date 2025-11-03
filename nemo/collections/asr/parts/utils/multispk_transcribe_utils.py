@@ -135,7 +135,7 @@ def write_seglst_file(seglst_dict_list: List[Dict[str, Any]], output_path: str):
         output_path (str): The path to the output file.
     """
     if len(seglst_dict_list) == 0:
-        raise ValueError("seglst_dict_list is empty. No transcriptions were generated.") 
+        raise ValueError("seglst_dict_list is empty. No transcriptions were generated.")
     with open(output_path, 'w') as f:
         f.write(json.dumps(seglst_dict_list, indent=4) + '\n')
     logging.info(f"Saved the transcriptions of the streaming inference in\n:{output_path}")
