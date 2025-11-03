@@ -462,7 +462,6 @@ Usage Examples
     transcriptions = asr_model.transcribe(
         paths2audio_files=["audio1.wav", "audio2.wav"],
         target_lang="en-US",  # Specify target language
-
     )
 
 
