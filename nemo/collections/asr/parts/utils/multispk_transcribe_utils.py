@@ -307,7 +307,9 @@ def get_simulated_softmax(cfg, speaker_sigmoid: torch.Tensor) -> torch.Tensor:
     if speaker_sigmoid.ndim != 1:
         raise ValueError(f"Expected 1D tensor for speaker_sigmoid, got shape {speaker_sigmoid.shape}")
     if speaker_sigmoid.shape[0] < cfg.get("max_num_of_spks", 4):
-        raise ValueError(f"speaker_sigmoid size {speaker_sigmoid.shape[0]} < max_num_of_spks {cfg.get('max_num_of_spks', 4)}")
+        raise ValueError(
+            f"speaker_sigmoid size {speaker_sigmoid.shape[0]} < max_num_of_spks {cfg.get('max_num_of_spks', 4)}"
+        )
 
     speaker_sigmoid = torch.clamp(speaker_sigmoid, min=cfg.get("min_sigmoid_val", 1e-2), max=1)
     sigmoid_sum = speaker_sigmoid.sum()
@@ -528,13 +530,17 @@ class SpeakerTaggedASR:
                 raise ValueError("One of the audio_file and manifest_file should be non-empty!")
         else:
             self.test_manifest_dict = {
-                "streaming_session": {'audio_filepath': 'streaming_session.wav', 'seglst_filepath': None, 'rttm_filepath': None}
+                "streaming_session": {
+                    'audio_filepath': 'streaming_session.wav',
+                    'seglst_filepath': None,
+                    'rttm_filepath': None,
+                }
             }
         self.transcribed_speaker_texts = [None] * len(self.test_manifest_dict)
 
         self.asr_model = asr_model
         self.diar_model = diar_model
-        
+
         # ASR speaker tagging configs
         self._fix_prev_words_count = cfg.fix_prev_words_count
         self._sentence_render_length = int(self._fix_prev_words_count + cfg.update_prev_words_sentence)
@@ -1347,7 +1353,8 @@ class SpeakerTaggedASR:
                 )
                 if not self.cfg.get("deploy_mode", False):
                     write_txt(
-                        f'{self.cfg.get("print_path", "./print_script.sh").replace(".sh", f"_{session_idx}.sh")}', self.transcribed_speaker_texts[session_idx].strip()
+                        f'{self.cfg.get("print_path", "./print_script.sh").replace(".sh", f"_{session_idx}.sh")}',
+                        self.transcribed_speaker_texts[session_idx].strip(),
                     )
         return self.transcribed_speaker_texts
 
