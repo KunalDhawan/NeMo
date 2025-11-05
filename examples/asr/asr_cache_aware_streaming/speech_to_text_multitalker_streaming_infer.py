@@ -76,6 +76,7 @@ class MultitalkerTranscriptionConfig:
     manifest_file: Optional[str] = None
     use_amp: bool = True
     debug_mode: bool = False
+    deploy_mode: bool = False
     batch_size: int = 32
     chunk_size: int = -1
     shift_size: int = -1
@@ -149,7 +150,7 @@ def launch_serial_streaming(
                         is_buffer_empty=streaming_buffer.is_buffer_empty(),
                         drop_extra_pre_encoded=drop_extra_pre_encoded,
                     )
-        if cfg.real_time_mode:
+        if cfg.get("real_time_mode", False):
             add_delay_for_real_time(
                 cfg=cfg,
                 chunk_audio=chunk_audio,
@@ -190,7 +191,7 @@ def launch_parallel_streaming(
                         is_buffer_empty=streaming_buffer.is_buffer_empty(),
                         drop_extra_pre_encoded=drop_extra_pre_encoded,
                     )
-        if cfg.real_time_mode:
+        if cfg.get("real_time_mode", False):
             add_delay_for_real_time(
                 cfg=cfg,
                 chunk_audio=chunk_audio,

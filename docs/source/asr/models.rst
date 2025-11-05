@@ -317,6 +317,7 @@ For an individual audio file:
             output_path="/path/to/example_output.json"
 
 If you want to simulate the system on multiple files, use NeMo manifest:
+
 .. code-block:: bash
 
     python <NeMo_git_root>/examples/asr/asr_cache_aware_streaming/speech_to_text_multitalker_streaming_infer.py \
