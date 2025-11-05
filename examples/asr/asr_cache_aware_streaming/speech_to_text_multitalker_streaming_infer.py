@@ -38,6 +38,7 @@ class MultitalkerTranscriptionConfig:
     """
     Configuration for Multi-talker transcription with an ASR model and a diarization model.
     """
+
     # Required configs
     diar_model: Optional[str] = None  # Path to a .nemo file
     diar_pretrained_name: Optional[str] = None  # Name of a pretrained model
@@ -110,6 +111,7 @@ class MultitalkerTranscriptionConfig:
 
     spk_supervision: str = "diar"  # ["diar", "rttm"]
     binary_diar_preds: bool = False
+
 
 def launch_serial_streaming(
     cfg,
@@ -341,7 +343,7 @@ def main(cfg: MultitalkerTranscriptionConfig) -> Union[MultitalkerTranscriptionC
                 streaming_buffer=streaming_buffer,
                 pad_and_drop_preencoded=cfg.pad_and_drop_preencoded,
             )
-            batch_seglst_list =multispk_asr_streamer.generate_seglst_dicts_from_parallel_streaming(samples=samples)
+            batch_seglst_list = multispk_asr_streamer.generate_seglst_dicts_from_parallel_streaming(samples=samples)
         else:
             multispk_asr_streamer = launch_serial_streaming(
                 cfg=cfg,
@@ -386,7 +388,9 @@ def main(cfg: MultitalkerTranscriptionConfig) -> Union[MultitalkerTranscriptionC
                         streaming_buffer=streaming_buffer,
                         pad_and_drop_preencoded=cfg.pad_and_drop_preencoded,
                     )
-                    batch_seglst_list = multispk_asr_streamer.generate_seglst_dicts_from_parallel_streaming(samples=batch_samples)
+                    batch_seglst_list = multispk_asr_streamer.generate_seglst_dicts_from_parallel_streaming(
+                        samples=batch_samples
+                    )
                 else:
                     multispk_asr_streamer = launch_serial_streaming(
                         cfg=cfg,
@@ -394,7 +398,9 @@ def main(cfg: MultitalkerTranscriptionConfig) -> Union[MultitalkerTranscriptionC
                         diar_model=diar_model,
                         streaming_buffer=streaming_buffer,
                     )
-                    batch_seglst_list = multispk_asr_streamer.generate_seglst_dicts_from_serial_streaming(samples=batch_samples)
+                    batch_seglst_list = multispk_asr_streamer.generate_seglst_dicts_from_serial_streaming(
+                        samples=batch_samples
+                    )
                 seglst_dict_list.extend(batch_seglst_list)
                 streaming_buffer.reset_buffer()
                 batch_samples = []

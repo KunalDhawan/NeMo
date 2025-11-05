@@ -264,7 +264,11 @@ Or, if ``<NeMo_git_root>/scripts/export.py`` is being used:
 Multitalker Cache-aware Streaming FastConformer 
 -----------------------------------------------
 
-This model is a streaming multitalker ASR model based on the Cache-aware Streaming FastConformer architecture. The model only takes the speaker diarization outputs as external information and eliminates the need for explicit speaker queries or enrollment audio :cite:`asr-models-wang25y_interspeech`. Unlike conventional target-speaker ASR approaches that require speaker embeddings, this model dynamically adapts to individual speakers through speaker-wise speech activity prediction.
+This model is a streaming multitalker ASR model based on the :ref:`Cache-aware Streaming FastConformer <Cache-aware Streaming Conformer>` architecture. The model only takes the speaker diarization outputs as external information and eliminates the need for explicit speaker queries or enrollment audio :cite:`asr-models-wang25y_interspeech`. Unlike conventional target-speaker ASR approaches that require speaker embeddings, this model dynamically adapts to individual speakers through speaker-wise speech activity prediction.
+
+
+Self-Speaker Adaptation Technique
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ 
 
 The key innovation involves injecting learnable speaker kernels into the pre-encode layer of the FastConformer encoder :cite:`asr-models-rekesh2023fastconformer`. These speaker kernels are generated via speaker supervision activations, enabling instantaneous adaptation to target speakers. This approach leverages the inherent tendency of streaming ASR systems to prioritize specific speakers, repurposing this mechanism to achieve robust speaker-focused recognition.
 
@@ -272,12 +276,10 @@ The model architecture requires deploying one model instance per speaker, meanin
 
 This self-speaker adaptation approach offers several advantages over traditional multitalker ASR methods:
 
-#. No Speaker Enrollment: Unlike target-speaker ASR systems that require pre-enrollment audio or speaker embeddings, this model only needs speaker activity information from diarization
-#. Handles Severe Overlap: Each instance focuses on a single speaker, enabling accurate transcription even during fully overlapped speech
-#. Streaming Capable: Designed for real-time streaming scenarios with configurable latency-accuracy tradeoffs
-#. Leverages Single-Speaker Models: Can be fine-tuned from strong pre-trained single-speaker ASR models, and single speaker ASR performance is also preserved
-
-
+* |  No Speaker Enrollment: Unlike target-speaker ASR systems that require pre-enrollment audio or speaker embeddings, this model only needs speaker activity information from diarization
+* |  Handles Severe Overlap: Each instance focuses on a single speaker, enabling accurate transcription even during fully overlapped speech
+* | Streaming Capable: Designed for real-time streaming scenarios with configurable latency-accuracy tradeoffs
+* | Leverages Single-Speaker Models: Can be fine-tuned from strong pre-trained single-speaker ASR models, and single speaker ASR performance is also preserved
 
 Speaker Kernel Injection
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -289,13 +291,14 @@ The speaker kernels are generated through speaker supervision activations that d
 Multi-Instance Architecture
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The model is based on the Parakeet architecture and consists of a NeMo Encoder for Speech Tasks (NEST) :cite:`asr-models-park2024nest` which is based on FastConformer :cite:`asr-models-badlani2023fastconformer` encoder. The key architectural innovation is the **multi-instance approach**, where one model instance is deployed per speaker.
+The model is based on the Parakeet architecture and consists of a NeMo Encoder for Speech Tasks (NEST) :cite:`asr-models-huang2025nest` which is based on FastConformer :cite:`asr-models-rekesh2023fastconformer` encoder. The key architectural park2024nestinnovation is the **multi-instance approach**, where one model instance is deployed per speaker.
 
-Each model instance:
-- Receives the same mixed audio input
-- Injects speaker-specific kernels at the pre-encode layer
-- Produces transcription output specific to its target speaker
-- Operates independently and can run in parallel with other instances
+Each model instance has the following characteristics: 
+
+* | Receives the identical speaker-mixed audio input.
+* | Injects speaker-specific kernels at the pre-encode layer.
+* | Produces transcription output specific to its target speaker.
+* | Operates independently and can run in parallel with other instances.
 
 This architecture enables the model to handle severe speech overlap by having each instance focus exclusively on one speaker, eliminating the permutation problem that affects other multitalker ASR approaches.
 Find more details in the :cite:`asr-models-wang25y_interspeech` paper.
@@ -307,28 +310,28 @@ Try real-time multitalker ASR with the tutorial notebook: `Streaming Multitalker
 You can simulate the streaming audio stream and streaming multitalker ASR with the script:
 ``<NeMo_git_root>/examples/asr/asr_cache_aware_streaming/speech_to_text_multitalker_streaming_infer.py``
 
-For an individual audio file:
-.. code-block:: bash
-
-    python <NeMo_git_root>/examples/asr/asr_cache_aware_streaming/speech_to_text_multitalker_streaming_infer.py \
-            asr_model="/path/to/your/multitalker-parakeet-streaming-0.6b-v1.nemo" \
-            diar_model="/path/to/your/nvidia/diar_streaming_sortformer_4spk-v2.nemo" \
-            audio_file="/path/to/example.wav" \
-            output_path="/path/to/example_output.json"
-
-If you want to simulate the system on multiple files, use NeMo manifest:
+For an individual audio file:  
 
 .. code-block:: bash
 
     python <NeMo_git_root>/examples/asr/asr_cache_aware_streaming/speech_to_text_multitalker_streaming_infer.py \
-            asr_model="/path/to/your/multitalker-parakeet-streaming-0.6b-v1.nemo" \
-            diar_model="/path/to/your/nvidia/diar_streaming_sortformer_4spk-v2.nemo" \
-            manifest_file="example_manifest.json" \
-            output_path="/path/to/example_output.json"
+            asr_model="/path/to/multitalker-parakeet-streaming-0.6b-v1.nemo" \
+            diar_model="/path/to/nvidia/diar_streaming_sortformer_4spk-v2.nemo" \
+            audio_file="/path/to/your/example.wav" \
+            output_path="/path/to/your/example_output.json"
+
+If you want to simulate the system on multiple files, use NeMo manifest:  
+
+.. code-block:: bash
+
+    python <NeMo_git_root>/examples/asr/asr_cache_aware_streaming/speech_to_text_multitalker_streaming_infer.py \
+            asr_model="/path/to/multitalker-parakeet-streaming-0.6b-v1.nemo" \
+            diar_model="/path/to/nvidia/diar_streaming_sortformer_4spk-v2.nemo" \
+            manifest_file="/path/to/your/example_manifest.json" \
+            output_path="/path/to/your/example_output.json"
 
 
-Download model checkpoint and more details can be found on Huggingface model card:
-* `Multitalker Parakeet (Cache-aware FastConformer) Streaming <https://huggingface.co/nvidia/multitalker-parakeet-streaming-0.6b-v1>`__ model card
+Download model checkpoint and more details can be found on Huggingface model card: `Multitalker Parakeet (Cache-aware FastConformer) Streaming <https://huggingface.co/nvidia/multitalker-parakeet-streaming-0.6b-v1>`__.
 
 
 
@@ -458,7 +461,6 @@ Usage Examples
     transcriptions = asr_model.transcribe(
         paths2audio_files=["audio1.wav", "audio2.wav"],
         target_lang="en-US",  # Specify target language
-
     )
 
 
