@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from gettext import lngettext
 import json
 import logging
 import math
@@ -316,6 +317,7 @@ def get_hidden_length_from_sample_length(
 
 def speaker_to_target(
     a_cut,
+    num_speakers: Optional[int] = None,
     num_sample_per_mel_frame: int = 160,
     num_mel_frame_per_asr_frame: int = 8,
     boundary_segments: bool = False,
@@ -390,14 +392,22 @@ def speaker_to_target(
     speaker_ats = [s.speaker for s in segments_total if not (s.speaker in seen or seen_add(s.speaker))]
 
     speaker_to_idx_map = {spk: idx for idx, spk in enumerate(speaker_ats)}
-    num_speakers = len(speaker_ats)
-
+    
+    if num_speakers is None:
+        num_speakers_dim = len(speaker_ats)
+    else:
+        if len(speaker_ats) > num_speakers:
+            logging.warning("Number of speakers in the target %s is greater than "
+                            "the maximum number of speakers %s. Truncating extra speakers. "
+                            "Set the `num_speakers` to higher value to avoid this warning.",
+                            len(speaker_ats), num_speakers)
+        num_speakers_dim = max(len(speaker_ats), num_speakers)
     # initialize mask matrices (num_speaker, encoder_hidden_len)
     feat_per_sec = int(a_cut.sampling_rate / num_sample_per_mel_frame)  # 100 by default
     num_samples = get_hidden_length_from_sample_length(
         a_cut.num_samples, num_sample_per_mel_frame, num_mel_frame_per_asr_frame
     )
-    frame_mask = get_mask_from_segments(segments_total, a_cut, speaker_to_idx_map, num_speakers, feat_per_sec)
+    frame_mask = get_mask_from_segments(segments_total, a_cut, speaker_to_idx_map, num_speakers_dim, feat_per_sec)
     soft_mask = get_soft_mask(frame_mask, num_samples, num_mel_frame_per_asr_frame)
 
     if soft_label:

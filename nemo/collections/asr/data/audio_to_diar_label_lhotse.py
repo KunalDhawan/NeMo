@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from re import A
 from typing import Dict, Optional, Tuple
+import logging
 
 import torch.utils.data
 from lhotse.dataset import AudioSamples
@@ -62,10 +64,18 @@ class LhotseAudioToSpeechE2ESpkDiarDataset(torch.utils.data.Dataset):
         for cut in cuts:
             speaker_activity = speaker_to_target(
                 a_cut=cut,
+                num_speakers=self.num_speakers,
                 num_sample_per_mel_frame=self.num_sample_per_mel_frame,
                 num_mel_frame_per_asr_frame=self.num_mel_frame_per_target_frame,
                 boundary_segments=True,
             )
+            # This line prevents dimension mismatch error in the collate_matrices function.
+            if speaker_activity.shape[1] > self.num_speakers:
+                logging.warning("Number of speakers in the target %s is greater than "
+                                "the maximum number of speakers %s. Truncating extra speakers. "
+                                "Set the `num_speakers` to higher value to avoid this warning.",
+                                speaker_activity.shape[1], self.num_speakers)
+                speaker_activity = speaker_activity[:, :self.num_speakers]
             speaker_activities.append(speaker_activity)
         targets = collate_matrices(speaker_activities).to(audio.dtype)  # (B, T, N)
 
