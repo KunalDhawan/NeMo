@@ -906,7 +906,6 @@ class SpeakerTaggedASR:
         Args:
             samples (List[Dict[str, Any]]): List of samples.
         """
-        # for _, word_ts_and_seq in enumerate(self._word_and_ts_seq):
         for sample in samples:
             uniq_id = get_uniqname_from_filepath(sample['audio_filepath']).split('.')[0]
             word_ts_and_seq_dict = self._word_and_ts_seq[uniq_id]
@@ -947,6 +946,7 @@ class SpeakerTaggedASR:
             ]
             seglsts = sorted(seglsts, key=lambda x: x['start_time'])
             self.instance_manager.seglst_dict_list.extend(seglsts)
+        return self.instance_manager.seglst_dict_list
 
     def _find_active_speakers(self, diar_preds: torch.Tensor, n_active_speakers_per_stream: int) -> List[List[int]]:
         """
