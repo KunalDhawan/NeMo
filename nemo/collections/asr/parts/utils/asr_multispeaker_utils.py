@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from gettext import lngettext
 import json
 import logging
 import math
@@ -343,7 +342,6 @@ def speaker_to_target(
         mask (Tensor): speaker mask with shape (num_speaker, hidden_lenght)
     '''
     # get cut-related segments from rttms
-    # basename = os.path.basename(a_cut.rttm_filepath).replace('.rttm', '')
     if isinstance(a_cut, MixedCut):
         cut_list = [track.cut for track in a_cut.tracks if isinstance(track.cut, MonoCut)]
         offsets = [track.offset for track in a_cut.tracks if isinstance(track.cut, MonoCut)]
