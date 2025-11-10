@@ -4,21 +4,21 @@ batch_size: 4
 
 model: 
   sample_rate: 16000
+  oracle_mode: False
   pil_weight: 0.5 # Weight for Permutation Invariant Loss (PIL) used in training the Nextformer diarizer model
   ats_weight: 0.5 # Weight for Arrival Time Sort (ATS) loss in training the Nextformer diarizer model
-  local_pil_weight: 0.5 # Weight for local Permutation Invariant Loss (PIL) loss
-  local_ats_weight: 0.5 # Weight for local Arrival Time Sort (ATS) loss
-  cls_weight: 0.4 # Weight for Query Classification loss
-  similarity_weight: 0.5 # Weight for Similarity loss
-  cls_threshold: 0.5
+  q_sim_weight: 0.0 # Weight for Query Similarity loss
+  emb_sim_weight: 0.0 # Weight for Embedding Similarity loss
+  q_contrastive_weight: 0.0 # Weight for Contrastive Query Similarity loss
+  q_contrastive_temperature: 0.1 # Temperature for Contrastive Query Similarity loss
+  q_contrastive_extra_positive: false # Use an explicit 0.5 margin in contrastive loss
 
-  pil_metric: "bce" # bce or accuracy or dot_product
-  train_mask_inactive_speakers: false # If True, for training, mask out predictions for speaker channels that are never active in the target.
   local_num_spks: 4 # Number of speakers for local queries
-  max_num_of_spks: 4 # Maximum number of speakers per model; currently set to 4
+  max_num_spks: 8 # Maximum number of speakers per model; currently set to 8
   initialize_queries: true # If True, use mean of encoder embeddings over local predictions as initial queries, otherwise use zeros.
   initialize_mask: true # If True, use local predictions as initial encoder mask, otherwise use. (not recommended setting to False!)
   streaming_mode: False
+  pil_metric: "dot_product"
 
   model_defaults:
     fc_d_model: 512 # Hidden dimension size of the Fast-conformer Encoder
@@ -117,7 +117,13 @@ model:
     fc_d_model: ${model.model_defaults.fc_d_model} # Hidden dimension size for Fast Conformer encoder
     tf_d_model: ${model.model_defaults.tf_d_model} # Hidden dimension size for Query encoder
     local_num_spks: ${model.local_num_spks} # Number of speakers for local queries
+    max_num_spks: ${model.max_num_spks} # Maximum number of speakers per model
     pred_score_threshold: 0.25 # Threshold for speaker predictions to be used in scoring
+    chunk_len: 125 # Length of each chunk
+    chunk_left_context: 62 # Left context for each chunk
+    chunk_right_context: 1 # Right context for each chunk
+    causal_attn_rate: 0 # Causal attention rate
+    causal_attn_rc: 7 # Causal attention radius
 
   encoder:
     _target_: nemo.collections.asr.modules.ConformerEncoder
@@ -172,9 +178,9 @@ model:
   query_decoder:
     _target_: nemo.collections.asr.modules.nextformer_modules.MaskedQueryDecoder
     num_layers: 4
-    hidden_size: ${model.model_defaults.tf_d_model} # Needs to be multiple of num_attention_heads
-    inner_size: 768
-    num_queries: ${model.max_num_of_spks}
+    hidden_size: ${model.model_defaults.fc_d_model} # Needs to be multiple of num_attention_heads
+    inner_size: 2048
+    num_queries: ${model.local_num_spks}
     num_cross_attention_heads: 4
     num_self_attention_heads: 4
     cross_attn_dropout: 0.0
@@ -186,20 +192,20 @@ model:
     use_query_pos_emb: False
     use_encoder_pos_emb: False
     encoder_pos_emb_max_len: 5000
-    recalc_mask: False
 
   loss: 
     _target_: nemo.collections.asr.losses.bce_loss.BCEWithLogitsLoss
     reduction: mean
 
-  cls_loss:
-    _target_: torch.nn.BCEWithLogitsLoss
-    reduction: mean
-
-  similarity_loss:
+  emb_sim_loss:
     _target_: torch.nn.SmoothL1Loss
     reduction: mean
     beta: 0.5
+
+  q_sim_loss:
+    _target_: torch.nn.CosineEmbeddingLoss
+    margin: 0.0
+    reduction: 'mean'
 
   lr: 0.0001
   optim:

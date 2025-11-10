@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import math
-from typing import Optional, Union
+from typing import Optional, Union, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -183,8 +183,8 @@ def get_pil_targets_hungarian(
     logits: torch.Tensor,
     cls_preds: Optional[torch.Tensor] = None,
     cls_preds_weight: float = 1.0,
-    metric: str = 'bce',
-) -> torch.Tensor:
+    metric: str = 'dot_product',
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Calculates permutation-invariant training (PIT) targets using the Hungarian algorithm.
     This function finds the optimal permutation of labels to match the predictions by maximizing
@@ -194,23 +194,23 @@ def get_pil_targets_hungarian(
         labels (torch.Tensor): Ground truth labels of shape (B, T, S), where B is the batch size,
             T is the number of frames, and S is the number of speakers in labels.
         logits (torch.Tensor): Predicted speaker logits of shape (B, T, N), where N is the
-            number of speakers in predictions. It is assumed that N >= S.
+            number of speakers in predictions.
         cls_preds (torch.Tensor, optional): Predicted speaker existence probabilities of shape (B, N).
             If provided, these probabilities are added to the match score to bias the assignment.
             Defaults to None.
         cls_preds_weight (float): Weight for the `cls_preds` contribution. Defaults to 1.0.
-        metric (str): Metric to use for the match score. Can be 'accuracy' or 'bce'.
-            If 'accuracy' is used, sigmoid is applied to logits. Defaults to 'bce'.
+        metric (str): Metric to use for the match score. Can be 'accuracy', 'dot_product' or 'bce'.
+            If 'accuracy' or 'dot_product' is used, sigmoid is applied to logits. Defaults to 'dot_product'.
     Returns:
-        torch.Tensor: The permuted labels that best match the predictions, of shape (B, T, N).
+        Tuple[torch.Tensor, torch.Tensor]: 
+            - reconstructed_labels: The permuted labels that best match the predictions, of shape (B, T, N).
+            - spk_indices: Speaker indices mapping of shape (B, N), where spk_indices[b, n] is the 
+              original label speaker index that prediction column n corresponds to, or -1 if unmatched.
     """
     batch_size, _num_frames, num_speakers_labels = labels.shape
     _batch_size, _num_frames, num_speakers_preds = logits.shape
 
-    if num_speakers_labels > num_speakers_preds:
-        raise ValueError(
-            f"Number of speakers in labels ({num_speakers_labels}) should not be greater than in predictions ({num_speakers_preds})."
-        )
+    # Allow rectangular assignment when num_speakers_labels > num_speakers_preds (N < S)
 
     # Expand dimensions to calculate the pair-wise match score
     # logits_expanded: (B, T, N) -> (B, T, 1, N) -> (B, T, S, N)
@@ -243,8 +243,17 @@ def get_pil_targets_hungarian(
         match_score_matrix = match_score_matrix + cls_preds_weight * cls_preds.unsqueeze(1)
         
     #logging.info(f"match_score_matrix: {match_score_matrix}")
-    # Only consider active speakers for the match score
-    match_score_matrix = match_score_matrix * active_speaker_mask.unsqueeze(2).to(match_score_matrix.dtype)
+    # Set inactive speakers to have very low match scores (high cost) so they won't be matched
+    # unless absolutely necessary (e.g., when N >= S and all speakers must be matched)
+    inactive_speaker_mask = (~active_speaker_mask).unsqueeze(2)  # (B, S, 1) - boolean mask
+    # Use a very large negative value (becomes very large positive cost) to discourage matching inactive speakers
+    # Using -1e6 ensures inactive speakers have very high cost without risking overflow
+    large_negative_value = -1e6
+    match_score_matrix = torch.where(
+        inactive_speaker_mask.expand_as(match_score_matrix),
+        torch.full_like(match_score_matrix, large_negative_value),
+        match_score_matrix
+    )
     #logging.info(f"match_score_matrix after active speaker mask: {match_score_matrix}")
 
     # linear_sum_assignment minimizes the cost, so we use the negative of the score for maximization.
@@ -252,20 +261,44 @@ def get_pil_targets_hungarian(
     cost_matrix_np = -match_score_matrix.detach().cpu().to(torch.float32).numpy()
 
     # Find the best permutation using the Hungarian algorithm for each item in the batch
+    batch_row_ind = []
     batch_col_ind = []
     for i in range(batch_size):
-        _row_ind, col_ind = linear_sum_assignment(cost_matrix_np[i])
+        row_ind, col_ind = linear_sum_assignment(cost_matrix_np[i])
+        batch_row_ind.append(torch.from_numpy(row_ind).to(labels.device))
         batch_col_ind.append(torch.from_numpy(col_ind).to(labels.device))
 
-    batch_col_ind = torch.stack(batch_col_ind)
+    batch_row_ind = torch.stack(batch_row_ind)  # (B, K), K = min(S, N)
+    batch_col_ind = torch.stack(batch_col_ind)  # (B, K)
 
-    # Create a permutation matrix P of shape (B, S, N) by one-hot encoding the column indices
-    # found by the Hungarian algorithm.
-    P = torch.nn.functional.one_hot(batch_col_ind, num_classes=num_speakers_preds).float()
+    # Create a permutation matrix P of shape (B, S, N) with ones at matched (row, col) pairs
+    P = torch.zeros(batch_size, num_speakers_labels, num_speakers_preds, device=labels.device, dtype=labels.dtype)
+    b_idx = torch.arange(batch_size, device=labels.device).unsqueeze(1).expand_as(batch_col_ind)
+    P[b_idx, batch_row_ind, batch_col_ind] = 1.0
 
-    # Reconstruct labels with the best permutation
+    # Reconstruct labels with the best permutation; output shape is always (B, T, N)
     reconstructed_labels = torch.matmul(labels, P)
-    return reconstructed_labels
+    
+    # Create speaker indices mapping: (B, N) where spk_indices[b, n] is the original speaker index
+    # that prediction column n corresponds to, or -1 if unmatched or if the speaker has no activity
+    spk_indices = torch.full(
+        (batch_size, num_speakers_preds), 
+        -1, 
+        device=labels.device, 
+        dtype=torch.long
+    )
+    # Fill in the matched pairs, but only if the speaker has activity
+    b_idx_expanded = torch.arange(batch_size, device=labels.device).unsqueeze(1).expand_as(batch_col_ind)
+    # Check if matched speakers are active, if not, keep -1
+    matched_speaker_active = active_speaker_mask[b_idx_expanded, batch_row_ind]  # (B, K)
+    # Only assign speaker indices for active speakers
+    spk_indices[b_idx_expanded, batch_col_ind] = torch.where(
+        matched_speaker_active,
+        batch_row_ind,
+        torch.full_like(batch_row_ind, -1)
+    )
+    
+    return reconstructed_labels, spk_indices
 
 
 def find_segments_from_rttm(

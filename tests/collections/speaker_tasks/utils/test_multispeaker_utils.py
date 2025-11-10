@@ -22,6 +22,7 @@ from nemo.collections.asr.parts.utils.asr_multispeaker_utils import (
     get_ats_targets,
     get_hidden_length_from_sample_length,
     get_pil_targets,
+    get_pil_targets_hungarian,
     reconstruct_labels,
 )
 
@@ -350,3 +351,98 @@ class TestGetHiddenLengthFromSampleLength:
         assert get_hidden_length_from_sample_length(158879) == 125
         assert get_hidden_length_from_sample_length(1600) == 2
         assert get_hidden_length_from_sample_length(1599) == 2
+
+
+class TestGetPILTargetsHungarian:
+
+    @pytest.mark.unit
+    def test_always_returns_B_T_N_when_N_lt_S(self):
+        # B=1, T=3, S=3, N=2: drop one speaker (the least matching)
+        labels = torch.tensor([[[1.0, 0.0, 0.0],
+                                [0.0, 1.0, 0.0],
+                                [0.0, 0.0, 1.0]]])  # (1, 3, 3)
+        # Design logits to strongly match speaker 0 -> col0 and speaker 2 -> col1
+        logits = torch.tensor([[[10.0, -10.0],
+                                [-10.0, -10.0],
+                                [-10.0, 10.0]]])  # (1, 3, 2)
+
+        out, spk_indices = get_pil_targets_hungarian(labels, logits)  # (1, 3, 2)
+        expected = torch.tensor([[[1.0, 0.0],
+                                   [0.0, 0.0],
+                                   [0.0, 1.0]]])
+        expected_spk_indices = torch.tensor([[0, 2]])  # col0 -> speaker 0, col1 -> speaker 2
+
+        assert out.shape == (1, 3, 2)
+        assert torch.allclose(out, expected)
+        assert spk_indices.shape == (1, 2)
+        assert torch.equal(spk_indices, expected_spk_indices), f"Expected {expected_spk_indices} but got {spk_indices}"
+
+    @pytest.mark.unit
+    def test_unmatched_columns_zero_when_N_gt_S(self):
+        # B=1, T=2, S=2, N=3: one prediction stream remains unmatched -> zeros
+        labels = torch.tensor([[[1.0, 0.0],
+                                [0.0, 1.0]]])  # (1, 2, 2)
+        # Match speaker 0 -> col2 at t0, speaker 1 -> col0 at t1
+        logits = torch.tensor([[[-10.0, -10.0, 10.0],
+                                [10.0, -10.0, -10.0]]])  # (1, 2, 3)
+
+        out, spk_indices = get_pil_targets_hungarian(labels, logits)  # (1, 2, 3)
+        expected = torch.tensor([[[0.0, 0.0, 1.0],
+                                   [1.0, 0.0, 0.0]]])
+        # Expected: speaker 0 -> col2, speaker 1 -> col0, col1 unmatched
+        expected_spk_indices = torch.tensor([[1, -1, 0]])  # col0 -> speaker 1, col1 -> -1 (unmatched), col2 -> speaker 0
+
+        assert out.shape == (1, 2, 3)
+        assert torch.allclose(out, expected)
+        assert spk_indices.shape == (1, 3)
+        assert torch.equal(spk_indices, expected_spk_indices), f"Expected {expected_spk_indices} but got {spk_indices}"
+
+    @pytest.mark.unit
+    def test_inactive_speaker_returns_negative_one(self):
+        # B=1, T=3, S=3, N=2: speaker 1 has no activity (all zeros)
+        # Should return -1 for inactive speakers even if matched
+        labels = torch.tensor([[[1.0, 0.0, 0.0],
+                                [0.0, 0.0, 0.0],  # speaker 1 has no activity
+                                [0.0, 0.0, 1.0]]])  # (1, 3, 3)
+        # Design logits to match speaker 0 -> col0 and speaker 2 -> col1
+        # Speaker 1 should not be matched due to no activity, but if it were, should return -1
+        logits = torch.tensor([[[10.0, -10.0],
+                                [-10.0, -10.0],
+                                [-10.0, 10.0]]])  # (1, 3, 2)
+
+        out, spk_indices = get_pil_targets_hungarian(labels, logits)  # (1, 3, 2)
+        expected = torch.tensor([[[1.0, 0.0],
+                                   [0.0, 0.0],
+                                   [0.0, 1.0]]])
+        # Both speakers 0 and 2 are active, so they should get their indices
+        # Speaker 1 is inactive, so even if matched, should return -1 (but won't be matched here)
+        expected_spk_indices = torch.tensor([[0, 2]])  # col0 -> speaker 0, col1 -> speaker 2
+
+        assert out.shape == (1, 3, 2)
+        assert torch.allclose(out, expected)
+        assert spk_indices.shape == (1, 2)
+        assert torch.equal(spk_indices, expected_spk_indices), f"Expected {expected_spk_indices} but got {spk_indices}"
+
+    @pytest.mark.unit
+    def test_inactive_speaker_matched_returns_negative_one(self):
+        # B=1, T=3, S=3, N=3: speaker 1 has no activity
+        # When N=S and all speakers are matched, inactive speakers should return -1
+        labels = torch.tensor([[[1.0, 0.0, 0.0],
+                                [0.0, 0.0, 0.0],
+                                [0.0, 0.0, 1.0]]])  # (1, 3, 3), speaker 1 (middle) has no activity
+        # Design logits to match speaker 0 -> col1, speaker 1 (inactive) -> col0, speaker 2 -> col2
+        # Even though speaker 1 has no activity, Hungarian algorithm may still match it when N=S
+        logits = torch.tensor([[[-10.0, 10.0, -10.0],
+                                [9.0, -10.0, -10.0],
+                                [-10.0, -10.0, 10.0]]])  # (1, 3, 3)
+
+        out, spk_indices = get_pil_targets_hungarian(labels, logits)  # (1, 3, 3)
+        # Speaker 1 (index 1) has no activity, so should return -1 even if matched
+        # Speaker 0 and 2 have activity, so should return their indices
+        # Expected: speaker 0 -> col1, speaker 1 (inactive) -> col0 returns -1, speaker 2 -> col2
+        # spk_indices format: [col0_speaker_idx, col1_speaker_idx, col2_speaker_idx]
+        expected_spk_indices = torch.tensor([[-1, 0, 2]])  # col0 -> -1 (inactive speaker 1), col1 -> speaker 0, col2 -> speaker 2
+
+        assert out.shape == (1, 3, 3)
+        assert spk_indices.shape == (1, 3)
+        assert torch.equal(spk_indices, expected_spk_indices), f"Expected {expected_spk_indices} but got {spk_indices}"

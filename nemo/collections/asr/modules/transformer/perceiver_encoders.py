@@ -142,7 +142,7 @@ class SimplePerceiverBlock(torch.nn.Module):
         """
         # Add positional embedding to query for cross-attention
         cross_query = latent_states
-        logging.info(f"latent_states_before_ca: {latent_states[0, 0:20, 0:3]}")
+        #logging.info(f"latent_states_before_ca: {latent_states[0, 0:20, 0:3]}")
         if latent_pos_emb is not None:
             cross_query = latent_states + latent_pos_emb
 
@@ -154,10 +154,10 @@ class SimplePerceiverBlock(torch.nn.Module):
         cross_attn_output = self.first_sub_layer(
             query=cross_query, key=encoder_key, value=encoder_states, mask=encoder_mask
         )
-        logging.info(f"latent_states_ca: {cross_attn_output[0, 0:20, 0:3]}")
+        #logging.info(f"latent_states_ca: {cross_attn_output[0, 0:20, 0:3]}")
 
         cross_attn_output += latent_states
-        logging.info(f"latent_states_ca_residual: {cross_attn_output[0, 0:20, 0:3]}")
+        #logging.info(f"latent_states_ca_residual: {cross_attn_output[0, 0:20, 0:3]}")
         cross_attn_output = self.layer_norm_1(cross_attn_output)
 
         # Add positional embedding to query and key for self-attention
@@ -167,11 +167,11 @@ class SimplePerceiverBlock(torch.nn.Module):
             self_query = cross_attn_output + latent_pos_emb
             self_key = cross_attn_output + latent_pos_emb
             
-        logging.info(f"latent_states_before_sa: {cross_attn_output[0, 0:20, 0:3]}")
+        #logging.info(f"latent_states_before_sa: {cross_attn_output[0, 0:20, 0:3]}")
         self_attn_output = self.second_sub_layer(query=self_query, key=self_key, value=cross_attn_output, mask=latent_mask)
-        logging.info(f"latent_states_sa: {self_attn_output[0, 0:20, 0:3]}")
+        #logging.info(f"latent_states_sa: {self_attn_output[0, 0:20, 0:3]}")
         self_attn_output += cross_attn_output
-        logging.info(f"latent_states_sa_residual: {self_attn_output[0, 0:20, 0:3]}")
+        #logging.info(f"latent_states_sa_residual: {self_attn_output[0, 0:20, 0:3]}")
         self_attn_output = self.layer_norm_2(self_attn_output)
 
         output_states = self.third_sub_layer(self_attn_output)
@@ -291,7 +291,7 @@ class SimplePerceiverEncoder(torch.nn.Module):
                 # Expand (num_latents, hidden_size) to (batch_size, num_latents, hidden_size)
                 latent_states = self.init_latent_states.unsqueeze(0).expand(encoder_states.shape[0], -1, -1)
 
-        logging.info(f"encoder mask: {encoder_mask.to(int).sum(dim=2)}")
+        #logging.info(f"encoder mask: {encoder_mask.to(int).sum(dim=2)}")
         for layer in self.layers:
             latent_states = layer(
                 latent_states=latent_states,
