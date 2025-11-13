@@ -923,7 +923,7 @@ class SpeakerTaggedASR:
                     end_time=float(sentence_dict['end_time']),
                     text=sentence_dict["words"],
                     session_id=session_id,
-                ) 
+                )
                 if seglst_dict['words'].strip() != "":
                     self.instance_manager.seglst_dict_list.append(seglst_dict)
         return self.instance_manager.seglst_dict_list
@@ -1381,9 +1381,9 @@ class MultiTalkerInstanceManager:
         """
 
         def __init__(
-            self, 
-            max_num_of_spks: int = 4, 
-            frame_len_sec: float = 0.08, 
+            self,
+            max_num_of_spks: int = 4,
+            frame_len_sec: float = 0.08,
             sent_break_sec: float = 5.0,
             uppercase_first_letter: bool = True,
         ):
@@ -1607,10 +1607,7 @@ class MultiTalkerInstanceManager:
 
                         # Add the sentence to the speaker-wise sentences only if the text is not empty.
                         a_seg_dict = get_new_sentence_dict(
-                            speaker=f"speaker_{spk_idx}", 
-                            start_time=start_time, 
-                            end_time=end_time, 
-                            text=diff_text
+                            speaker=f"speaker_{spk_idx}", start_time=start_time, end_time=end_time, text=diff_text
                         )
                         if a_seg_dict['words'].strip() != "":
                             if self._uppercase_first_letter:
