@@ -26,8 +26,7 @@ from nemo.core.classes.exportable import Exportable
 from nemo.core.classes.module import NeuralModule
 from nemo.utils import logging
 from nemo.collections.asr.modules.transformer.transformer_modules import PositionWiseFF
-from nemo.collections.asr.modules.transformer.perceiver_encoders import SimplePerceiverBlock
-from nemo.collections.asr.parts.submodules.multi_head_attention import PositionalEncoding
+from nemo.collections.asr.parts.submodules.multi_head_attention import PositionalEncoding, MultiHeadAttention
 
 __all__ = ['NextformerModules', 'MaskedQueryDecoder']
 
@@ -49,6 +48,196 @@ class StreamingNextformerState:
     global_emb_set_lengths = None
     global_spk_centroids = None
 
+
+class MaskedQueryDecoderBlock(torch.nn.Module):
+    """
+    Building block of a Masked Query Decoder.
+    This block is similar to TransformerDecoderBlock but with a different order of operations.
+    It consists of one or two cross-attention layers, a self-attention layer, and a feed-forward network.
+    This is used to build a MaskedQueryDecoder.
+
+    Args:
+        hidden_size: size of the embeddings in the model, also known as d_model
+        inner_size: number of neurons in the intermediate part of feed-forward
+            net, usually is (4-8 x hidden_size) in the papers
+        extra_cross_attention: bool = False, whether to add an extra cross-attention layer after the first cross-attention layer
+        num_cross_attention_heads: number of heads in multi-head attention for cross-attention
+        num_self_attention_heads: number of heads in multi-head attention for self-attention
+        cross_attn_dropout: probability of dropout applied to attention scores for cross-attention
+        self_attn_dropout: probability of dropout applied to attention scores for self-attention
+        ffn_dropout: probability of dropout applied to FFN output
+        hidden_act: activation function used between two linear layers in FFN
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        inner_size: int,
+        extra_cross_attention: bool = False,
+        num_cross_attention_heads: int = 4,
+        num_self_attention_heads: int = 4,
+        cross_attn_dropout: float = 0.0,
+        self_attn_dropout: float = 0.0,
+        ffn_dropout: float = 0.0,
+        hidden_act: str = "relu",
+        pre_ln: bool = False,
+    ):
+        super().__init__()
+        self.pre_ln = pre_ln
+        self.extra_cross_attention = extra_cross_attention
+        # Cross-attention layer
+        self.layer_norm_1 = torch.nn.LayerNorm(hidden_size, eps=1e-5)
+        self.first_sub_layer = MultiHeadAttention(
+            n_head=num_cross_attention_heads,
+            n_feat=hidden_size,
+            dropout_rate=cross_attn_dropout,
+        )
+        if extra_cross_attention:
+            self.layer_norm_extra = torch.nn.LayerNorm(hidden_size, eps=1e-5)
+            self.extra_sub_layer = MultiHeadAttention(
+                n_head=num_cross_attention_heads,
+                n_feat=hidden_size,
+                dropout_rate=cross_attn_dropout,
+            )
+        # Self-attention layer
+        self.layer_norm_2 = torch.nn.LayerNorm(hidden_size, eps=1e-5)
+        self.second_sub_layer = MultiHeadAttention(
+            n_head=num_self_attention_heads,
+            n_feat=hidden_size,
+            dropout_rate=self_attn_dropout,
+        )
+        # Feed-forward layer
+        self.layer_norm_3 = torch.nn.LayerNorm(hidden_size, eps=1e-5)
+        self.third_sub_layer = PositionWiseFF(hidden_size, inner_size, ffn_dropout, hidden_act)
+
+
+    def forward_preln(
+        self, latent_states, latent_mask, encoder_states, encoder_mask, encoder_mask_extra=None, latent_pos_emb=None, encoder_pos_emb=None
+    ):
+        """
+        Pre-LayerNorm block
+        Order of operations: LN -> Cross-Attn -> Residual -> (LN -> Cross-Attn -> Residual) -> LN -> Self-Attn -> Residual -> LN -> FFN
+        """
+        residual = latent_states
+        latent_states = self.layer_norm_1(latent_states)
+        
+        # Add positional embedding to query for cross-attention
+        cross_query = latent_states
+        if latent_pos_emb is not None:
+            cross_query = latent_states + latent_pos_emb
+
+        if encoder_pos_emb is not None:
+            encoder_key = encoder_states + encoder_pos_emb
+        else:
+            encoder_key = encoder_states
+        cross_attn_output = self.first_sub_layer(
+            query=cross_query, key=encoder_key, value=encoder_states, mask=encoder_mask
+        )
+        cross_attn_output += residual
+
+        # Extra cross-attention layer (if enabled)
+        if self.extra_cross_attention:
+            residual = cross_attn_output
+            cross_attn_output = self.layer_norm_extra(cross_attn_output)
+            
+            # Add positional embedding to query for extra cross-attention
+            extra_cross_query = cross_attn_output
+            if latent_pos_emb is not None:
+                extra_cross_query = cross_attn_output + latent_pos_emb
+            
+            extra_cross_attn_output = self.extra_sub_layer(
+                query=extra_cross_query, key=encoder_key, value=encoder_states, mask=encoder_mask_extra
+            )
+            cross_attn_output = extra_cross_attn_output + residual
+
+        residual = cross_attn_output
+        cross_attn_output = self.layer_norm_2(cross_attn_output)
+        
+        # Add positional embedding to query and key for self-attention
+        self_query = cross_attn_output
+        self_key = cross_attn_output
+        if latent_pos_emb is not None:
+            self_query = cross_attn_output + latent_pos_emb
+            self_key = cross_attn_output + latent_pos_emb
+            
+        self_attn_output = self.second_sub_layer(query=self_query, key=self_key, value=cross_attn_output, mask=latent_mask)
+        self_attn_output += residual
+
+        residual = self_attn_output
+        self_attn_output = self.layer_norm_3(self_attn_output)
+        output_states = self.third_sub_layer(self_attn_output)
+        output_states += residual
+
+        return output_states
+
+    def forward_postln(
+        self, latent_states, latent_mask, encoder_states, encoder_mask, encoder_mask_extra=None, latent_pos_emb=None, encoder_pos_emb=None
+    ):
+        """
+        Post-LayerNorm block
+        Order of operations: Cross-Attn -> Residual -> LN -> (Cross-Attn -> Residual -> LN) -> Self-Attn -> Residual -> LN -> FFN -> Residual -> LN
+        """
+        # Add positional embedding to query for cross-attention
+        cross_query = latent_states
+        #logging.info(f"latent_states_before_ca: {latent_states[0, 0:20, 0:3]}")
+        if latent_pos_emb is not None:
+            cross_query = latent_states + latent_pos_emb
+
+        # Add positional embedding to key for cross-attention
+        encoder_key = encoder_states
+        if encoder_pos_emb is not None:
+            encoder_key = encoder_states + encoder_pos_emb
+            
+        cross_attn_output = self.first_sub_layer(
+            query=cross_query, key=encoder_key, value=encoder_states, mask=encoder_mask
+        )
+        #logging.info(f"latent_states_ca: {cross_attn_output[0, 0:20, 0:3]}")
+
+        cross_attn_output += latent_states
+        #logging.info(f"latent_states_ca_residual: {cross_attn_output[0, 0:20, 0:3]}")
+        cross_attn_output = self.layer_norm_1(cross_attn_output)
+
+        # Extra cross-attention layer (if enabled)
+        if self.extra_cross_attention:
+            # Add positional embedding to query for extra cross-attention
+            extra_cross_query = cross_attn_output
+            if latent_pos_emb is not None:
+                extra_cross_query = cross_attn_output + latent_pos_emb
+            
+            extra_cross_attn_output = self.extra_sub_layer(
+                query=extra_cross_query, key=encoder_key, value=encoder_states, mask=encoder_mask_extra
+            )
+            cross_attn_output = extra_cross_attn_output + cross_attn_output
+            cross_attn_output = self.layer_norm_extra(cross_attn_output)
+
+        # Add positional embedding to query and key for self-attention
+        self_query = cross_attn_output
+        self_key = cross_attn_output
+        if latent_pos_emb is not None:
+            self_query = cross_attn_output + latent_pos_emb
+            self_key = cross_attn_output + latent_pos_emb
+            
+        #logging.info(f"latent_states_before_sa: {cross_attn_output[0, 0:20, 0:3]}")
+        self_attn_output = self.second_sub_layer(query=self_query, key=self_key, value=cross_attn_output, mask=latent_mask)
+        #logging.info(f"latent_states_sa: {self_attn_output[0, 0:20, 0:3]}")
+        self_attn_output += cross_attn_output
+        #logging.info(f"latent_states_sa_residual: {self_attn_output[0, 0:20, 0:3]}")
+        self_attn_output = self.layer_norm_2(self_attn_output)
+
+        output_states = self.third_sub_layer(self_attn_output)
+        output_states += self_attn_output
+        return self.layer_norm_3(output_states)
+
+    def forward(self, latent_states, latent_mask, encoder_states, encoder_mask, encoder_mask_extra=None, latent_pos_emb=None, encoder_pos_emb=None):
+        if self.pre_ln:
+            return self.forward_preln(
+                latent_states, latent_mask, encoder_states, encoder_mask, encoder_mask_extra, latent_pos_emb, encoder_pos_emb
+            )
+        else:
+            return self.forward_postln(
+                latent_states, latent_mask, encoder_states, encoder_mask, encoder_mask_extra, latent_pos_emb, encoder_pos_emb
+            )
+
 class MaskedQueryDecoder(nn.Module):
     def __init__(
         self,
@@ -56,6 +245,7 @@ class MaskedQueryDecoder(nn.Module):
         num_layers: int,
         hidden_size: int,
         inner_size: int,
+        extra_cross_attention: bool = False,
         num_cross_attention_heads: int = 4,
         num_self_attention_heads: int = 4,
         cross_attn_dropout: float = 0.0,
@@ -77,6 +267,7 @@ class MaskedQueryDecoder(nn.Module):
 
         self.num_queries = num_queries
         self.num_layers = num_layers
+        self.extra_cross_attention = extra_cross_attention
         self.use_query_pos_emb = use_query_pos_emb
         self.use_encoder_pos_emb = use_encoder_pos_emb
 
@@ -98,10 +289,11 @@ class MaskedQueryDecoder(nn.Module):
         else:
             self.query_pos_emb = None
 
-        layer = SimplePerceiverBlock(
+        layer = MaskedQueryDecoderBlock(
             hidden_size=hidden_size,
             inner_size=inner_size,
             num_cross_attention_heads=num_cross_attention_heads,
+            extra_cross_attention=extra_cross_attention,
             num_self_attention_heads=num_self_attention_heads,
             cross_attn_dropout=cross_attn_dropout,
             self_attn_dropout=self_attn_dropout,
@@ -113,7 +305,7 @@ class MaskedQueryDecoder(nn.Module):
 
         self.mask_head = PositionWiseFF(hidden_size=hidden_size, inner_size=inner_size, ffn_dropout=ffn_dropout)
 
-    def forward(self, encoder_states, encoder_len_mask, encoder_mask=None, query_states=None, query_mask=None):
+    def forward(self, encoder_states, encoder_len_mask, encoder_mask=None, encoder_mask_extra=None, query_states=None, query_mask=None):
         """
         Args:
             encoder_states (torch.Tensor): outputs of the encoder
@@ -121,6 +313,8 @@ class MaskedQueryDecoder(nn.Module):
             encoder_len_mask (torch.Tensor): lengths-based mask of encoder states for cross-attention, True means masking out
                 Shape: (B, n_frames)
             encoder_mask (torch.Tensor): encoder inputs mask for cross-attention, True means masking out
+                Shape: (B, num_queries, n_frames)
+            encoder_mask_extra (torch.Tensor): encoder inputs mask for extra cross-attention, True means masking out
                 Shape: (B, num_queries, n_frames)
             query_states (torch.Tensor): optional initial query states
                 Shape: (B, num_queries, hidden_size)    
@@ -155,12 +349,16 @@ class MaskedQueryDecoder(nn.Module):
         if encoder_mask is None:
             encoder_mask = encoder_len_mask_expand.transpose(1, 2)
 
+        if encoder_mask_extra is None and self.extra_cross_attention:
+            encoder_mask_extra = encoder_len_mask_expand.transpose(1, 2)
+
         for i, layer in enumerate(self.layers):
             query_states = layer(
                 latent_states=query_states,
                 latent_mask=query_mask,
                 encoder_states=encoder_states,
                 encoder_mask=encoder_mask,
+                encoder_mask_extra=encoder_mask_extra,
                 latent_pos_emb=query_pos_emb,
                 encoder_pos_emb=encoder_pos_emb,
             )
@@ -188,7 +386,8 @@ class NextformerModules(NeuralModule, Exportable):
         self,
         ff_dropout_rate: float = 0.5,
         fc_d_model: int = 512,
-        tf_d_model: int = 192,
+        tf_d_model: int = 192,  
+        sq_d_model: int = 192,
         subsampling_factor: int = 8,
         local_num_spks: int = 4,
         max_num_spks: int = 4,
@@ -198,7 +397,7 @@ class NextformerModules(NeuralModule, Exportable):
         causal_attn_rate: float = 0,
         causal_attn_rc: int = 7,
         pred_score_threshold: float = 0.25,
-        global_emb_set_size: int = 100,
+        global_emb_set_size: int = 10,
         matching_threshold: float = 0.5,
     ):
         super().__init__()
@@ -206,12 +405,16 @@ class NextformerModules(NeuralModule, Exportable):
         self.subsampling_factor = subsampling_factor
         self.fc_d_model = fc_d_model
         self.tf_d_model = tf_d_model
+        self.sq_d_model = sq_d_model
         self.local_num_spks = local_num_spks
         self.max_num_spks = max_num_spks
         self.pred_score_threshold = pred_score_threshold
         self.matching_threshold = matching_threshold
 
         self.encoder_proj = nn.Linear(self.fc_d_model, self.tf_d_model)
+        self.query_proj = nn.Linear(self.fc_d_model, self.sq_d_model)
+        self.query_raw_proj = nn.Linear(self.fc_d_model, self.sq_d_model)
+        self.query_combiner = nn.Linear(2 * self.sq_d_model, self.sq_d_model)
         self.first_hidden_to_hidden = nn.Linear(self.tf_d_model, self.tf_d_model)
         self.single_hidden_to_spks = nn.Linear(self.tf_d_model, self.local_num_spks)
         self.dropout = nn.Dropout(ff_dropout_rate)
@@ -375,9 +578,9 @@ class NextformerModules(NeuralModule, Exportable):
             streaming_state (StreamingNextformerState): initialized streaming state
         """
         streaming_state = StreamingNextformerState()
-        streaming_state.global_emb_set = torch.zeros((batch_size, self.max_num_spks, self.global_emb_set_size, self.fc_d_model), device=device)
+        streaming_state.global_emb_set = torch.zeros((batch_size, self.max_num_spks, self.global_emb_set_size, self.sq_d_model), device=device)
         streaming_state.global_emb_set_lengths = torch.zeros((batch_size, self.max_num_spks), dtype=torch.long, device=device)
-        streaming_state.global_spk_centroids = torch.zeros((batch_size, self.max_num_spks, self.fc_d_model), device=device)
+        streaming_state.global_spk_centroids = torch.zeros((batch_size, self.max_num_spks, self.sq_d_model), device=device)
         return streaming_state
 
     def get_global_indices(self, spk_queries, global_spk_centroids):
@@ -401,30 +604,40 @@ class NextformerModules(NeuralModule, Exportable):
         global_spk_indices = torch.full((batch_size, local_num_spks), -1, dtype=torch.long, device=device)
 
         # Calculate norms for the entire batch to find zero-vectors
-        local_norms = spk_queries.norm(dim=2)
-        global_norms = global_spk_centroids.norm(dim=2)
+        local_norms = spk_queries.norm(dim=2)  # (B, local_num_spks)
+        global_norms = global_spk_centroids.norm(dim=2)  # (B, max_num_spks)
+
+        # OPTIMIZATION: Compute boolean masks for all batches at once
+        is_nonzero_local_all = local_norms > 1e-8  # (B, local_num_spks)
+        is_nonzero_global_all = global_norms > 1e-8  # (B, max_num_spks)
+
+        # OPTIMIZATION: Compute similarity matrix for entire batch at once
+        # Shape: (B, local_num_spks, max_num_spks)
+        sim_matrix_full = F.cosine_similarity(
+            spk_queries.unsqueeze(2),  # (B, local_num_spks, 1, emb_dim)
+            global_spk_centroids.unsqueeze(1),  # (B, 1, max_num_spks, emb_dim)
+            dim=3  # Compute similarity along embedding dimension
+        )  # Result: (B, local_num_spks, max_num_spks)
 
         for b in range(batch_size):
+            # Extract boolean masks for this batch item
+            is_nonzero_local = is_nonzero_local_all[b]
+            is_nonzero_global = is_nonzero_global_all[b]
+            
             # Filter out zero-norm queries (undetected speakers)
-            is_nonzero_local = local_norms[b] > 1e-8
             nonzero_local_indices = torch.where(is_nonzero_local)[0]
             if len(nonzero_local_indices) == 0:
                 continue
-            nonzero_local_queries = spk_queries[b][nonzero_local_indices]
 
             # Filter out zero-norm global centroids (inactive global speakers)
-            is_nonzero_global = global_norms[b] > 1e-8
             nonzero_global_indices = torch.where(is_nonzero_global)[0]
 
             logging.info(f"b={b}, nonzero_local_indices: {nonzero_local_indices}, nonzero_global_indices: {nonzero_global_indices}")
 
             if len(nonzero_global_indices) > 0:
-                nonzero_global_centroids = global_spk_centroids[b][nonzero_global_indices]
-
-                # Compute cosine similarity matrix
-                sim_matrix = F.cosine_similarity(
-                    nonzero_local_queries.unsqueeze(1), nonzero_global_centroids.unsqueeze(0), dim=2
-                )
+                # Extract relevant submatrix from precomputed full similarity matrix
+                # Shape: (len(nonzero_local_indices), len(nonzero_global_indices))
+                sim_matrix = sim_matrix_full[b][nonzero_local_indices][:, nonzero_global_indices]
 
                 logging.info(f"b={b}, sim_matrix: {sim_matrix}")
 
@@ -507,3 +720,116 @@ class NextformerModules(NeuralModule, Exportable):
         logging.info(f"updated streaming_state.global_emb_set_lengths: {streaming_state.global_emb_set_lengths}")
         return streaming_state
 
+    def update_streaming_state_last(self, streaming_state, spk_queries, global_spk_indices):
+        """
+        Update the streaming state with new speaker queries based on their global indices.
+        This function updates the global embedding set and recalculates speaker centroids.
+
+        Args:
+            streaming_state (StreamingNextformerState): The current streaming state.
+            spk_queries (torch.Tensor): Speaker queries from the current chunk.
+                Shape: (B, local_num_spks, emb_dim)
+            global_spk_indices (torch.Tensor): Global speaker indices for each local query.
+                Shape: (B, local_num_spks)
+
+        Returns:
+            streaming_state (StreamingNextformerState): The updated streaming state.
+        """
+        # Vectorized version: use advanced indexing to update all valid assignments at once
+        # Create mask for valid assignments (global_index != -1)
+        valid_mask = global_spk_indices != -1  # (B, local_num_spks)
+        
+        if valid_mask.any():
+            # Get indices of all valid (batch, local_speaker) pairs
+            batch_indices, local_indices = torch.where(valid_mask)  # 1D tensors of length num_valid
+            
+            # Get corresponding global indices for valid pairs
+            global_idx_flat = global_spk_indices[batch_indices, local_indices]  # (num_valid,)
+            
+            # Vectorized assignment: update all centroids at once
+            streaming_state.global_spk_centroids[batch_indices, global_idx_flat] = spk_queries[batch_indices, local_indices]
+        
+        return
+
+    def update_streaming_state_ma(self, streaming_state, spk_queries, global_spk_indices):
+        """
+        Update the streaming state with new speaker queries based on their global indices.
+        This function updates the global embedding set and recalculates speaker centroids.
+        This function uses similarity-guided fusion to update the speaker centroids.
+        
+        Note: streaming_state is modified in-place.
+
+        Args:
+            streaming_state (StreamingNextformerState): The current streaming state.
+            spk_queries (torch.Tensor): Speaker queries from the current chunk.
+                Shape: (B, local_num_spks, emb_dim)
+            global_spk_indices (torch.Tensor): Global speaker indices for each local query.
+                Shape: (B, local_num_spks)
+        """
+        # Create mask for valid assignments (global_index != -1)
+        valid_mask = global_spk_indices != -1  # (B, local_num_spks)
+        
+        if not valid_mask.any():
+            return
+        
+        # Get indices of all valid (batch, local_speaker) pairs
+        batch_indices, local_indices = torch.where(valid_mask)  # 1D tensors of length num_valid
+        
+        # Get corresponding global indices for valid pairs
+        global_idx_flat = global_spk_indices[batch_indices, local_indices]  # (num_valid,)
+        
+        # Get current counts for valid speakers
+        counts = streaming_state.global_emb_set_lengths[batch_indices, global_idx_flat]  # (num_valid,)
+        
+        # Get the valid embeddings from global_emb_set
+        # Shape: (num_valid, global_emb_set_size, emb_dim)
+        valid_emb_sets = streaming_state.global_emb_set[batch_indices, global_idx_flat]
+        
+        # Get current speaker queries for valid pairs
+        # Shape: (num_valid, emb_dim)
+        valid_spk_queries = spk_queries[batch_indices, local_indices]
+        
+        # Compute cosine similarity between each query and its history
+        # Shape: (num_valid, global_emb_set_size)
+        sim_to_history = F.cosine_similarity(
+            valid_spk_queries.unsqueeze(1),  # (num_valid, 1, emb_dim)
+            valid_emb_sets,  # (num_valid, global_emb_set_size, emb_dim)
+            dim=2
+        )
+        
+        # Mask out invalid entries (beyond count) in the embedding set
+        # Create a mask for valid positions in the embedding set
+        arange = torch.arange(self.global_emb_set_size, device=counts.device).unsqueeze(0)  # (1, global_emb_set_size)
+        valid_emb_mask = arange < counts.unsqueeze(1)  # (num_valid, global_emb_set_size)
+        
+        # Zero out similarities for invalid positions
+        sim_to_history_masked = torch.where(valid_emb_mask, sim_to_history, torch.tensor(0.0, device=sim_to_history.device))
+        
+        # Calculate coefficients: clamp to ensure non-negative
+        # Handle division by zero by setting coef=0 when count=0 (first embedding for this speaker)
+        coef = torch.where(
+            counts > 0,
+            torch.clamp(sim_to_history_masked.sum(dim=1) / counts, min=0),
+            torch.tensor(0.0, device=counts.device)
+        )  # (num_valid,)
+        
+        # Log the coefficients if needed (optional, for debugging)
+        if self.log:
+            for idx in range(len(batch_indices)):
+                b, i = batch_indices[idx].item(), local_indices[idx].item()
+                count = counts[idx].item()
+                logging.info(f"b={b}, i={i}, count={count}, coef={coef[idx].item()}, sim_matrix: {sim_to_history[idx]}")
+        
+        # Update global_spk_centroids using vectorized operations
+        old_centroids = streaming_state.global_spk_centroids[batch_indices, global_idx_flat]  # (num_valid, emb_dim)
+        new_centroids = (1 - coef.unsqueeze(1)) * old_centroids + coef.unsqueeze(1) * valid_spk_queries
+        streaming_state.global_spk_centroids[batch_indices, global_idx_flat] = new_centroids
+        
+        # Update global_emb_set (circular buffer)
+        insert_indices = counts % self.global_emb_set_size  # (num_valid,)
+        streaming_state.global_emb_set[batch_indices, global_idx_flat, insert_indices] = valid_spk_queries
+        
+        # Increment counts for all updated speakers
+        streaming_state.global_emb_set_lengths[batch_indices, global_idx_flat] += 1
+        
+        return

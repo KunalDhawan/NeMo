@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -37,7 +37,8 @@ from nemo.collections.asr.models.asr_model import ExportableEncDecModel
 from nemo.collections.asr.parts.mixins.diarization import DiarizeConfig, SpkDiarizationMixin
 from nemo.collections.asr.parts.preprocessing.features import FilterbankFeatures, WaveformFeaturizer
 from nemo.collections.asr.parts.preprocessing.perturb import process_augmentations
-from nemo.collections.asr.parts.utils.asr_multispeaker_utils import get_ats_targets, get_pil_targets, get_pil_targets_hungarian
+from nemo.collections.asr.parts.utils.asr_multispeaker_utils import get_ats_targets, get_pil_targets
+from nemo.collections.asr.parts.utils.asr_multispeaker_utils import get_pil_targets_hungarian
 from nemo.collections.asr.parts.utils.speaker_utils import generate_diarization_output_lines
 from nemo.collections.asr.parts.utils.vad_utils import ts_vad_post_processing
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
@@ -101,7 +102,24 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             self.spec_augmentation = None
 
         self.encoder = NextformerEncLabelModel.from_config_dict(self._cfg.encoder).to(self.device)
-        self.query_decoder = NextformerEncLabelModel.from_config_dict(self._cfg.query_decoder).to(self.device)
+        
+        # Get dual decoder mode before decoder initialization
+        self.dual_decoder_mode = self._cfg.get("dual_decoder_mode", "concat")  # "concat" or "init" or "init_concat"
+        
+        # Handle optional query_decoder
+        query_decoder_cfg = self._cfg.get('query_decoder', None)
+        if query_decoder_cfg is not None:
+            self.query_decoder = NextformerEncLabelModel.from_config_dict(query_decoder_cfg).to(self.device)
+        else:
+            self.query_decoder = None
+            
+        # Handle optional query_decoder_raw
+        query_decoder_raw_cfg = self._cfg.get('query_decoder_raw', None)
+        if query_decoder_raw_cfg is not None:
+            self.query_decoder_raw = NextformerEncLabelModel.from_config_dict(query_decoder_raw_cfg).to(self.device)
+        else:
+            self.query_decoder_raw = None
+            
         self.transformer_encoder = NextformerEncLabelModel.from_config_dict(self._cfg.transformer_encoder).to(
             self.device
         )
@@ -112,6 +130,28 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             self.nextformer_modules.encoder_proj = self.nextformer_modules.encoder_proj.to(self.device)
         else:
             self.nextformer_modules.encoder_proj = None
+        if self.query_decoder is not None:
+            self.nextformer_modules.query_proj = self.nextformer_modules.query_proj.to(self.device)
+        else:
+            self.nextformer_modules.query_proj = None
+        if self.query_decoder_raw is not None:
+            self.nextformer_modules.query_raw_proj = self.nextformer_modules.query_raw_proj.to(self.device)
+        else:
+            self.nextformer_modules.query_raw_proj = None
+        if self.query_decoder is not None and self.query_decoder_raw is not None and self.dual_decoder_mode != "init":
+            self.nextformer_modules.query_combiner = self.nextformer_modules.query_combiner.to(self.device)
+            logging.info(f"Both query_decoder and query_decoder_raw are enabled with mode '{self.dual_decoder_mode}'. Using query_combiner to merge outputs.")
+        else:
+            self.nextformer_modules.query_combiner = None
+            if self.query_decoder is None and self.query_decoder_raw is None:
+                raise ValueError("At least one of query_decoder or query_decoder_raw must be specified in the config.")
+            elif self.query_decoder is not None and self.query_decoder_raw is not None:
+                logging.info(f"Both query_decoder and query_decoder_raw are enabled with mode '{self.dual_decoder_mode}' (init mode - no combiner).")
+            elif self.query_decoder is not None:
+                logging.info("Using only query_decoder (query_decoder_raw not specified).")
+            else:
+                logging.info("Using only query_decoder_raw (query_decoder not specified).")
+        
         self._init_loss_weights()
 
         self.eps = 1e-3
@@ -124,6 +164,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.initialize_mask = self._cfg.get("initialize_mask", True)
         self.pil_metric = self._cfg.get("pil_metric", "bce")
         self.oracle_mode = self._cfg.get("oracle_mode", False)
+        self.q_contrastive_min_active_frames = self._cfg.get("q_contrastive_min_active_frames", 0)
 
         self.streaming_mode = self.cfg.get("streaming_mode", False)
         self.save_hyperparameters("cfg")
@@ -309,9 +350,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             bypass_pre_encode=bypass_pre_encode,
         )
         emb_seq = emb_seq.transpose(1, 2)
-        if self.nextformer_modules.encoder_proj is not None:
-            emb_seq_proj = self.nextformer_modules.encoder_proj(emb_seq)
-        return emb_seq_proj, emb_seq, emb_seq_length
+        return emb_seq, emb_seq_length
 
     def forward(
         self,
@@ -333,57 +372,140 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         Returns:
             logits (torch.Tensor): Sorted tensor containing predicted speaker labels
                 Shape: (batch_size, max. diar frame count, max_num_speakers)
-            local_logits_list (List[torch.Tensor]): List of tensors containing local speaker logits for each chunk.
-                Shape: (batch_size, local_chunk_len, local_num_speakers)
-            local_queries_list (List[torch.Tensor]): List of tensors containing local speaker queries for each chunk.
-                Shape: (batch_size, local_num_spks, emb_dim)
-            start_frame_list (List[int]): List of integers containing the start frame of each chunk.
-                Shape: (batch_size,)
+            local_logits (torch.Tensor): Tensor containing local speaker logits.
+                Shape: (num_chunks * batch_size, lc+chunk_len+rc, local_num_spks)
+            local_queries (torch.Tensor): Tensor containing local speaker queries.
+                Shape: (num_chunks * batch_size, local_num_spks, query_dim)
+            active_frames_per_query (torch.Tensor): Tensor containing the number of active frames per query
+                Shape: (num_chunks * batch_size, num_queries)
         """
         processed_signal, processed_signal_length = self.process_signal(
             audio_signal=audio_signal, audio_signal_length=audio_signal_length
         )
         processed_signal = processed_signal[:, :, : processed_signal_length.max()]
         if self.streaming_mode:
-            logits, emb_seq, local_logits_list, local_queries_list, start_frame_list = self.forward_streaming(
+            raise NotImplementedError("Streaming mode is not implemented for Nextformer model.")
+        else:
+            logits, emb_seq, local_logits, local_queries, active_frames_per_query = self.forward_offline(
                 processed_signal=processed_signal, processed_signal_length=processed_signal_length, targets=targets
             )
-            return logits, emb_seq, local_logits_list, local_queries_list, start_frame_list
-        else:
-            emb_seq, _, emb_seq_length = self.frontend_encoder(
-                processed_signal=processed_signal, processed_signal_length=processed_signal_length
-            )
-            logits = self.forward_infer(emb_seq, emb_seq_length)
-            return logits, emb_seq, None, None, None
+            return logits, emb_seq, local_logits, local_queries, active_frames_per_query
 
-    def forward_streaming(
+    def _create_batch_of_chunks(
+        self,
+        input_tensor: torch.Tensor,
+        input_lengths: Optional[torch.Tensor],
+        lc: int,
+        chunk_len: int,
+        rc: int,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], List[int], List[int], int, int]:
+        """
+        Create a batch of chunks from input tensor by slicing with left/right context.
+        
+        Args:
+            input_tensor: Input tensor to chunk
+                Shape: (batch_size, n_frames, feature_dim)
+            input_lengths: Optional tensor containing lengths of input sequences
+                Shape: (batch_size,)
+            lc: Left context size
+            chunk_len: Main chunk length
+            rc: Right context size
+            
+        Returns:
+            batch_chunks: Batched chunks tensor
+                Shape: (batch_size * num_chunks, chunk_total, feature_dim)
+            batch_chunk_lengths: Optional tensor containing lengths for each chunk
+                Shape: (batch_size * num_chunks,) or None if input_lengths is None
+            num_chunks: Number of chunks created
+        """
+        batch_size = input_tensor.shape[0]
+        chunk_total = lc + chunk_len + rc
+        total_n_frames = input_tensor.shape[1]
+        num_chunks = math.ceil(total_n_frames / chunk_len)
+        feature_dim = input_tensor.shape[-1]
+        
+        # Pre-allocate batch tensors
+        batch_chunks = torch.zeros(
+            (batch_size * num_chunks, chunk_total, feature_dim),
+            dtype=input_tensor.dtype,
+            device=input_tensor.device
+        )
+        
+        batch_chunk_lengths = None
+        if input_lengths is not None:
+            batch_chunk_lengths = torch.zeros(
+                (batch_size * num_chunks,),
+                dtype=input_lengths.dtype,
+                device=input_lengths.device
+            )
+        
+
+        # Fill pre-allocated tensors directly
+        for chunk_idx in range(num_chunks):
+            # Calculate start and end positions in pre_encode space
+            chunk_start = chunk_idx * chunk_len
+            chunk_end = min(chunk_start + chunk_len, total_n_frames)
+            
+            # Calculate left context (0 for first chunk, lc otherwise)
+            left_context_start = max(0, chunk_start - lc)
+            
+            # Calculate right context
+            right_context_end = min(chunk_end + rc, total_n_frames)
+            
+            # Calculate indices in the batch tensor
+            batch_start_idx = chunk_idx * batch_size
+            batch_end_idx = (chunk_idx + 1) * batch_size
+            
+            # Extract chunk with context from input_tensor
+            chunk_data = input_tensor[:, left_context_start:right_context_end, :]
+            chunk_data_size = chunk_data.shape[1]
+            
+            # Fill the batch_chunks tensor directly (no left padding, only right padding if needed)
+            # Copy data starting from the beginning of the chunk
+            batch_chunks[batch_start_idx:batch_end_idx, :chunk_data_size, :] = chunk_data
+            # Right padding is already zeros (from initialization), so no need to fill
+            
+            # Calculate chunk lengths if input_lengths provided
+            if batch_chunk_lengths is not None:
+                # The valid length is the number of valid frames in the chunk
+                # Valid data length: remaining_length_from_left_context_start, but not more than chunk_data_size
+                chunk_lengths = torch.clamp(input_lengths - left_context_start, min=0, max=chunk_data_size)
+                batch_chunk_lengths[batch_start_idx:batch_end_idx] = chunk_lengths
+        
+        return batch_chunks, batch_chunk_lengths, num_chunks
+
+    def forward_offline(
         self,
         processed_signal,
         processed_signal_length,
         targets: Optional[torch.Tensor] = None,
     ):
         """
-        The main forward pass for diarization inference in streaming mode.
+        The main forward pass for diarization in offline mode (for training/validation).
+        Processes the entire signal at once by creating a batch of chunks.
 
         Args:
-            processed_signal (torch.Tensor): Tensor containing audio waveform
-                Shape: (batch_size, num_samples)
-            processed_signal_length (torch.Tensor): Tensor containing lengths of audio waveforms
+            processed_signal (torch.Tensor): Tensor containing preprocessed audio features
+                Shape: (batch_size, channels, feature_length)
+            processed_signal_length (torch.Tensor): Tensor containing lengths of audio features
                 Shape: (batch_size,)
             targets (torch.Tensor, optional): Ground truth speaker labels.
                 Shape: (batch_size, diar_frame_count, num_speakers). Defaults to None.
+
         Returns:
-            total_preds (torch.Tensor): Tensor containing predicted speaker labels for the current chunk
-                and all previous chunks
-                Shape: (batch_size, pred_len, num_speakers)
+            logits (torch.Tensor): Tensor containing predicted speaker labels
+                Shape: (batch_size, total_n_frames, max_num_spks)
+            emb_seq (torch.Tensor): Encoder embeddings (placeholder for now)
+            local_logits (torch.Tensor): Tensor containing local speaker logits
+                Shape: (num_chunks * batch_size, lc+chunk_len+rc, local_num_spks)
+            local_queries (torch.Tensor): Tensor containing local speaker queries
+                Shape: (num_chunks * batch_size, local_num_spks, query_dim)
+            active_frames_per_query (torch.Tensor): Tensor containing the number of active frames per query
+                Shape: (num_chunks * batch_size, num_queries)
         """
-        streaming_state = self.nextformer_modules.init_streaming_state(
-            batch_size=processed_signal.shape[0], device=self.device
-        )
-
         batch_size, ch, sig_length = processed_signal.shape
-        processed_signal_offset = torch.zeros((batch_size,), dtype=torch.long, device=self.device)
 
+        # Step 1: Pad processed_signal similarly to forward_streaming
         if dist.is_available() and dist.is_initialized():
             local_tensor = torch.tensor([sig_length], device=processed_signal.device)
             dist.all_reduce(
@@ -412,186 +534,257 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 self.transformer_encoder.diag = self.nextformer_modules.causal_attn_rc
                 att_mod = True
 
-        total_logits = torch.zeros(
-            (batch_size, 0, self.nextformer_modules.max_num_spks), dtype=processed_signal.dtype, device=self.device
+        # Step 2: Get pre_encode_embs and pre_encode_lengths for the whole batch
+        # Transpose to (batch_size, feature_length, channels) for pre_encode
+        processed_signal_t = processed_signal.transpose(1, 2)
+        pre_encode_embs, pre_encode_lengths = self.encoder.pre_encode(
+            x=processed_signal_t, lengths=processed_signal_length
         )
-        total_emb_seq = torch.zeros(
-            (batch_size, 0, self.nextformer_modules.fc_d_model), dtype=processed_signal.dtype, device=self.device
-        )
-        local_logits_list = []
-        local_queries_list = []
-        start_frame_list = []
+        total_n_frames = pre_encode_embs.shape[1]  # Total number of frames after pre_encode
+        # pre_encode_embs shape: (batch_size, n_frames, fc_d_model)
+        # pre_encode_lengths shape: (batch_size,)
 
-        feat_len = processed_signal.shape[2]
-        num_chunks = math.ceil(
-            feat_len / (self.nextformer_modules.chunk_len * self.nextformer_modules.subsampling_factor)
+        # Step 3: Create a batch of chunks by slicing pre_encode_embs
+        lc = self.nextformer_modules.chunk_left_context
+        chunk_len = self.nextformer_modules.chunk_len
+        rc = self.nextformer_modules.chunk_right_context
+        batch_chunks, batch_chunk_lengths, num_chunks = self._create_batch_of_chunks(
+            input_tensor=pre_encode_embs,
+            input_lengths=pre_encode_lengths,
+            lc=lc,
+            chunk_len=chunk_len,
+            rc=rc,
         )
-        streaming_loader = self.nextformer_modules.streaming_feat_loader(
-            feat_seq=processed_signal,
-            feat_seq_length=processed_signal_length,
-            feat_seq_offset=processed_signal_offset,
+        if self.nextformer_modules.query_raw_proj is not None:
+            query_raw_proj = self.nextformer_modules.query_raw_proj(batch_chunks)
+        else:
+            query_raw_proj = batch_chunks
+
+        # Step 5: Run frontend_encoder, forward_infer, query_decoder in one pass
+        # Get encoder embeddings for all chunks
+        emb_seq, emb_seq_length = self.frontend_encoder(
+            processed_signal=batch_chunks, processed_signal_length=batch_chunk_lengths, bypass_pre_encode=True
         )
-        for chunk_idx, chunk_feat_seq_t, feat_lengths, left_offset, right_offset in tqdm(
-            streaming_loader,
-            total=num_chunks,
-            desc="Streaming Steps",
-            disable=self.training,
-        ):
-            lc = round(left_offset / self.encoder.subsampling_factor)
-            start_frame = chunk_idx * self.nextformer_modules.chunk_len - lc
-            start_frame_list.append(start_frame)
-            if targets is not None:
-                targets_chunk = targets[:,start_frame:start_frame + self.nextformer_modules.chunk_left_context + self.nextformer_modules.chunk_len + self.nextformer_modules.chunk_right_context, :]
-            else:
-                targets_chunk = None
-            streaming_state, total_logits, total_emb_seq, local_logits_list, local_queries_list = self.forward_streaming_step(
-                processed_signal=chunk_feat_seq_t,
-                processed_signal_length=feat_lengths,
-                targets=targets_chunk,
-                streaming_state=streaming_state,
-                total_logits=total_logits,
-                total_emb_seq=total_emb_seq,
-                local_logits_list=local_logits_list,
-                local_queries_list=local_queries_list,
-                left_offset=left_offset,
-                right_offset=right_offset,
+        if self.nextformer_modules.encoder_proj is not None:
+            emb_seq_enc_proj = self.nextformer_modules.encoder_proj(emb_seq)
+        else:
+            emb_seq_enc_proj = emb_seq
+
+        if self.nextformer_modules.query_proj is not None:
+            emb_seq_query_proj = self.nextformer_modules.query_proj(emb_seq)
+        else:
+            emb_seq_query_proj = emb_seq
+        
+        # Get local logits for all chunks
+        local_logits = self.forward_infer(emb_seq_enc_proj, emb_seq_length)
+        logging.info(f"local logits shape: {local_logits.shape}")
+        logging.info(f"emb_seq_length: {emb_seq_length}")
+        # logits shape: (batch_size * num_chunks, chunk_total, local_num_spks)
+
+        # Get speaker queries for all chunks
+        encoder_len_mask = self.nextformer_modules.length_to_mask(emb_seq_length, emb_seq.shape[1])
+        encoder_len_mask = ~encoder_len_mask
+        logging.info(f"encoder_len_mask: {encoder_len_mask.to(int).sum(dim=1)}")
+
+        # Handle oracle mode (targets) if provided
+        if targets is not None:
+            # Pad targets to match pre_encode_embs if necessary (when signal was padded for multi-GPU)
+            target_n_frames = targets.shape[1]
+            if target_n_frames < total_n_frames:
+                # Pad targets with zeros to match pre_encode_embs length
+                pad_size = total_n_frames - target_n_frames
+                targets = torch.nn.functional.pad(targets, (0, 0, 0, pad_size), mode='constant', value=0)
+                logging.info(f"Padded targets from {target_n_frames} to {total_n_frames} frames to match padded signal")
+            elif target_n_frames > total_n_frames:
+                logging.info(f"WARNING! targets has more frames than pre_encode_embs ({target_n_frames} > {total_n_frames}). Truncating targets.")
+                targets = targets[:, :total_n_frames, :]
+            
+            # Create batch of target chunks using the same chunking function
+            batch_targets, _, _ = self._create_batch_of_chunks(
+                input_tensor=targets,
+                input_lengths=None,  # Targets don't need length tracking for chunking
+                lc=lc,
+                chunk_len=chunk_len,
+                rc=rc,
             )
+            
+            # Get oracle predictions using Hungarian algorithm
+            logits_len = min(local_logits.shape[1], batch_targets.shape[1])
+            local_pil_targets, _ = get_pil_targets_hungarian(
+                labels=batch_targets[:, :logits_len, :],
+                logits=local_logits[:, :logits_len, :],
+                metric=self.pil_metric
+            )
+            preds = local_pil_targets
+        else:
+            preds = torch.sigmoid(local_logits)
+
+        # masks for the target speaker and non-target speakers in extra cross-attention
+        # encoder_mask_extra should have False (0) on frames where current speaker is inactive and any other speaker is active
+        if self.initialize_mask:
+            encoder_query_mask = ~(preds > self.local_mask_threshold).transpose(1, 2)  # (batch, num_queries, n_frames)
+            any_speaker_active = (preds.max(dim=2)[0] > self.local_mask_threshold).unsqueeze(1)  # (batch, 1, n_frames)
+            any_speaker_active = any_speaker_active.expand(-1, preds.shape[2], -1)  # (batch, num_queries, n_frames)
+            encoder_mask_extra = ~(encoder_query_mask & any_speaker_active)
+            logging.info(f"encoder_mask_extra: {encoder_mask_extra.to(int)[0, :, :20]}")
+            logging.info(f"encoder_query_mask: {encoder_query_mask.to(int)[0, :, :20]}")
+        else:
+            encoder_query_mask = None
+            encoder_mask_extra = None
+          
+        num_queries = preds.shape[-1]
+        active_frames_per_query = (preds > self.local_mask_threshold).to(int).sum(dim=1) # (num_chunks * batch_size, num_queries)
+        logging.info(f"active frames per query: {active_frames_per_query}")
+        spk_detected = active_frames_per_query > 0 # (num_chunks * batch_size, num_queries)
+        spk_not_detected = ~spk_detected # (num_chunks * batch_size, num_queries)
+        query_mask_from = spk_not_detected.unsqueeze(2).expand(-1, -1, num_queries)  # (num_chunks * batch_size, num_queries, num_queries)
+        query_mask_to = spk_not_detected.unsqueeze(1).expand(-1, num_queries, -1)  # (num_chunks * batch_size, num_queries, num_queries)
+        query_mask = query_mask_from | query_mask_to  # (num_chunks * batch_size, num_queries, num_queries)
+        logging.info(f"query_mask: {query_mask}")
+        logging.info(f"spk_not_detected: {spk_not_detected.to(int).sum(dim=1)}")
+
+        # Step 3: Run both query_decoder and query_decoder_raw with query_mask
+        if self.query_decoder_raw is not None:
+            if self.initialize_queries:
+                init_queries_raw = self.nextformer_modules.get_init_queries(preds, query_raw_proj)
+            else:
+                init_queries_raw = None
+            spk_queries_raw = self.query_decoder_raw(
+                encoder_states=query_raw_proj,
+                encoder_len_mask=encoder_len_mask,
+                encoder_mask=encoder_query_mask,
+                encoder_mask_extra=encoder_mask_extra,
+                query_states=init_queries_raw,
+                query_mask=query_mask
+            )
+            # spk_queries_raw shape: (num_chunks * batch_size, local_num_spks, emb_dim)
+            # Zero out queries for undetected speakers
+            spk_queries_raw = spk_queries_raw.masked_fill(spk_not_detected.unsqueeze(2), 0)
+        else:
+            spk_queries_raw = None
+
+        if self.query_decoder is not None:
+            if spk_queries_raw is not None and (self.dual_decoder_mode == "init" or self.dual_decoder_mode == "init_concat"):
+                init_queries = spk_queries_raw
+            elif self.initialize_queries:
+                init_queries = self.nextformer_modules.get_init_queries(preds, emb_seq_query_proj)                    
+            else:
+                init_queries = None
+
+            spk_queries = self.query_decoder(
+                encoder_states=emb_seq_query_proj,
+                encoder_len_mask=encoder_len_mask,
+                encoder_mask=encoder_query_mask,
+                encoder_mask_extra=encoder_mask_extra,
+                query_states=init_queries,
+                query_mask=query_mask
+            )
+            # spk_queries shape: (num_chunks * batch_size, local_num_spks, emb_dim)
+            # Zero out queries for undetected speakers
+            spk_queries = spk_queries.masked_fill(spk_not_detected.unsqueeze(2), 0)
+        else:
+            spk_queries = None
+
+
+        # Combine queries from both decoders if both are used
+        if spk_queries is not None and spk_queries_raw is not None:
+            if self.nextformer_modules.query_combiner is not None:
+                # Store original dtype to preserve it
+                original_dtype = spk_queries.dtype
+                # Concatenate along embedding dimension and project back
+                spk_queries_combined = torch.cat([spk_queries, spk_queries_raw], dim=-1)
+                spk_queries = self.nextformer_modules.query_combiner(spk_queries_combined)
+                # Ensure output has the same dtype as input
+                if spk_queries.dtype != original_dtype:
+                    spk_queries = spk_queries.to(original_dtype)
+            else:
+                # If no combiner is provided, just use the first decoder output
+                # (alternatively could raise an error or average the two)
+                logging.warning("Both query decoders are used but no query_combiner provided. Using only query_decoder output.")
+                spk_queries = spk_queries
+        elif spk_queries_raw is not None:
+            # Only raw decoder is used
+            spk_queries = spk_queries_raw
+        # else: only spk_queries is not None, use it as is
 
         if att_mod:
             self.encoder.att_context_size = [-1, -1]
             self.transformer_encoder.diag = None
 
-        del processed_signal, processed_signal_length
+        logits = torch.full(
+            (batch_size, total_n_frames, self.nextformer_modules.max_num_spks),
+            -1e9,
+            dtype=local_logits.dtype,
+            device=local_logits.device
+        )
 
+        if True:
+            # now fill logits using streaming logic
+            streaming_state = self.nextformer_modules.init_streaming_state(
+                batch_size=processed_signal.shape[0], device=self.device
+            )
+            for chunk_idx in range(num_chunks):
+                start = chunk_idx * chunk_len
+                end = min(start + chunk_len, total_n_frames)
+                dur = end - start
+                offset = min(lc, start)
+                spk_queries_chunk = spk_queries[chunk_idx * batch_size:(chunk_idx + 1) * batch_size, :, :] # (batch_size, local_num_spks, emb_dim)
+                local_logits_chunk = local_logits[chunk_idx * batch_size:(chunk_idx + 1) * batch_size, :, :] # (batch_size, lc+chunk_len+rc, local_num_spks)
+                global_spk_indices = self.nextformer_modules.get_global_indices(
+                    spk_queries_chunk, streaming_state.global_spk_centroids
+                )
+                self.nextformer_modules.update_streaming_state_ma(
+                    streaming_state=streaming_state,
+                    spk_queries=spk_queries_chunk,
+                    global_spk_indices=global_spk_indices,
+                )
+                
+                # Vectorized version: eliminate nested loops
+                valid_mask = global_spk_indices != -1  # (batch_size, local_num_spks)
+                
+                if valid_mask.any():
+                    # Get indices of valid (batch, local_speaker) pairs
+                    batch_indices, local_spk_indices = torch.where(valid_mask)  # 1D tensors of length num_valid
+                    global_spk_idx_flat = global_spk_indices[batch_indices, local_spk_indices]  # (num_valid,)
+                    num_valid = len(batch_indices)
+                    
+                    # Extract source slices: local_logits_chunk[b, offset:offset+dur, j] for each valid (b, j)
+                    # First, extract the time slices for all batches: (batch_size, dur, local_num_spks)
+                    time_slice = local_logits_chunk[:, offset:offset+dur, :]  # (batch_size, dur, local_num_spks)
+                    
+                    # Extract slices for valid batch indices: (num_valid, dur, local_num_spks)
+                    time_slice_valid = time_slice[batch_indices]  # (num_valid, dur, local_num_spks)
+                    
+                    # Extract the specific local speaker for each valid (batch, speaker) pair
+                    # Shape: (num_valid, dur)
+                    batch_idx_tensor = torch.arange(num_valid, device=local_logits_chunk.device)  # (num_valid,)
+                    source_slices = time_slice_valid[batch_idx_tensor, :, local_spk_indices]  # (num_valid, dur)
+                    
+                    # Create index arrays for assignment to logits[b, start:end, global_index]
+                    time_indices = torch.arange(start, end, device=local_logits_chunk.device)  # (dur,)
+                    
+                    # Expand indices: for each valid (batch, speaker) pair, assign to all time steps
+                    batch_indices_expanded = batch_indices.unsqueeze(0).expand(dur, -1)  # (dur, num_valid)
+                    time_indices_expanded = time_indices.unsqueeze(1).expand(-1, num_valid)  # (dur, num_valid)
+                    global_spk_idx_expanded = global_spk_idx_flat.unsqueeze(0).expand(dur, -1)  # (dur, num_valid)
+                    
+                    # Flatten all tensors for vectorized assignment
+                    batch_flat = batch_indices_expanded.flatten()  # (dur * num_valid,)
+                    time_flat = time_indices_expanded.flatten()  # (dur * num_valid,)
+                    global_spk_flat = global_spk_idx_expanded.flatten()  # (dur * num_valid,)
+                    source_flat = source_slices.transpose(0, 1).flatten()  # (dur * num_valid,) - transpose to match time-first order
+                    
+                    # Assign using advanced indexing for efficient vectorized assignment
+                    logits[batch_flat, time_flat, global_spk_flat] = source_flat
+
+        emb_seq = None  # Placeholder
+
+        # Remove padding from logits if necessary
         if sig_length < max_n_frames:  # Discard preds corresponding to padding
             n_frames = math.ceil(sig_length / self.encoder.subsampling_factor)
-            total_logits = total_logits[:, :n_frames, :]
-            total_emb_seq = total_emb_seq[:, :n_frames, :]
-        return total_logits, total_emb_seq, local_logits_list, local_queries_list, start_frame_list
+            logits = logits[:, :n_frames, :]
 
-    def forward_streaming_step(
-        self,
-        processed_signal,
-        processed_signal_length,
-        streaming_state,
-        total_logits,
-        total_emb_seq,
-        local_logits_list,
-        local_queries_list,
-        left_offset,
-        right_offset,
-        targets: Optional[torch.Tensor] = None,
-    ):
-        # get pre-encode embeddings for lc+chunk+rc
-        pre_encode_embs, pre_encode_lengths = self.encoder.pre_encode(
-            x=processed_signal, lengths=processed_signal_length
-        )
-        # get encoder embeddings for lc+chunk+rc
-        emb_seq_proj, emb_seq, emb_seq_length = self.frontend_encoder(
-            processed_signal=pre_encode_embs, processed_signal_length=pre_encode_lengths, bypass_pre_encode=True
-        )
-        #get local logits for lc+chunk+rc
-        logits = self.forward_infer(emb_seq_proj, emb_seq_length)
-        logging.info(f"local logits shape: {logits.shape}")
-
-        # get speaker queries for lc+chunk+rc
-        encoder_len_mask = self.nextformer_modules.length_to_mask(emb_seq_length, emb_seq.shape[1])
-        encoder_len_mask = ~encoder_len_mask
-        logging.info(f"encoder_len_mask: {encoder_len_mask.to(int).sum(dim=1)}")
-
-        if targets is not None:
-            logits_len = logits.shape[1]
-            local_pil_targets, local_target_indices = get_pil_targets_hungarian(labels=targets[:, :logits_len, :], logits=logits, metric=self.pil_metric)
-            preds = local_pil_targets
-            logging.info(f"oracle local preds: {preds.to(int).sum(dim=1)}")
-            logging.info(f"oracle local indices: {local_target_indices}")
-        else:
-            preds = torch.sigmoid(logits)
-            logging.info(f"real local preds: {preds.to(int).sum(dim=1)}")
-
-        if self.initialize_queries:
-            init_queries = self.nextformer_modules.get_init_queries(preds, emb_seq)
-            #init_queries = self.nextformer_modules.get_init_queries(preds, pre_encode_embs) # clown mode
-        else:
-            init_queries = None
-            
-        if self.initialize_mask:
-            encoder_query_mask = ~(preds > self.local_mask_threshold).transpose(1, 2)
-        else:
-            encoder_query_mask = None
-
-        lc = round(left_offset / self.encoder.subsampling_factor)
-        rc = math.ceil(right_offset / self.encoder.subsampling_factor)
-        chunk_len = logits.shape[1] - lc - rc
-        # Create query_mask for undetected speakers
-        # Check if each speaker is detected above threshold across all frames
-        # preds shape: (B, n_frames, num_queries)
-        # For each speaker, check if max value across frames is above threshold
-        spk_detected = preds[:, :lc+chunk_len].max(dim=1)[0] > 0.5  # (B, num_queries)
-        spk_not_detected = ~spk_detected  # (B, num_queries), True means speaker not detected
-        
-        # Create query_mask for self-attention: mask out attention to/from undetected speakers
-        # query_mask shape: (B, num_queries, num_queries)
-        num_queries = preds.shape[-1]
-        query_mask = None
-        if spk_not_detected.any():
-            # Expand spk_not_detected to create attention mask
-            # Mask attention FROM undetected speakers
-            query_mask_from = spk_not_detected.unsqueeze(2).expand(-1, -1, num_queries)  # (B, num_queries, num_queries)
-            # Mask attention TO undetected speakers
-            query_mask_to = spk_not_detected.unsqueeze(1).expand(-1, num_queries, -1)  # (B, num_queries, num_queries)
-            # Combine: mask if either FROM or TO an undetected speaker
-            query_mask = query_mask_from | query_mask_to
-
-        spk_queries = self.query_decoder(
-            encoder_states=emb_seq,
-            encoder_len_mask=encoder_len_mask,
-            encoder_mask=encoder_query_mask,
-            query_states=init_queries,
-            query_mask=query_mask
-        )
-        
-        # Zero out queries for undetected speakers
-        if spk_not_detected.any():
-            # Expand spk_not_detected to (B, num_queries, 1) for broadcasting
-            spk_not_detected_expanded = spk_not_detected.unsqueeze(2)  # (B, num_queries, 1)
-            spk_queries = spk_queries.masked_fill(spk_not_detected_expanded, 0)
-
-        #logging.info(f"query_mask: {query_mask}")
-        local_logits_list.append(logits)
-        local_queries_list.append(spk_queries)
-
-        # Step 1: get global indices for spk_queries.
-        global_spk_indices = self.nextformer_modules.get_global_indices(
-            spk_queries, streaming_state.global_spk_centroids
-        )
-
-        # Step 2: update the streaming state with the new spk_queries and global indices
-        streaming_state = self.nextformer_modules.update_streaming_state(
-            streaming_state=streaming_state,
-            spk_queries=spk_queries,
-            global_spk_indices=global_spk_indices,
-        )
-
-        # Step 3: Remap local logits to global speaker space
-        logits_chunk = logits[:, lc : lc + chunk_len, :]
-        batch_size, chunk_len_frames, _ = logits_chunk.shape
-        logits_ = torch.full(
-            (batch_size, chunk_len_frames, self.nextformer_modules.max_num_spks), -1e9, device=self.device
-        )
-        for b in range(batch_size):
-            for j in range(spk_queries.shape[1]):
-                global_index = global_spk_indices[b, j]
-                if global_index != -1:
-                    logits_[b, :, global_index] = logits_chunk[b, :, j]
-
-        emb_seq_ = emb_seq[:, lc:lc+chunk_len, :]
-        total_logits = torch.cat([total_logits, logits_], dim=1)
-        total_emb_seq = torch.cat([total_emb_seq, emb_seq_], dim=1)
-        logging.info(f"total_logits shape: {total_logits.shape}")
-        logging.info(f"total_emb_seq shape: {total_emb_seq.shape}")
-
-        return streaming_state, total_logits, total_emb_seq, local_logits_list, local_queries_list
+        return logits, emb_seq, local_logits, spk_queries, active_frames_per_query
 
     def forward_infer(self, emb_seq, emb_seq_length):
         """
@@ -793,8 +986,8 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 Shape: (batch_size,)
         """
         audio_signal, audio_signal_length = audio_signal.to(self.device), audio_signal_length.to(self.device)
-        if not self.streaming_mode:
-            audio_signal = (1 / (audio_signal.max() + self.eps)) * audio_signal
+        #if not self.streaming_mode:
+        #    audio_signal = (1 / (audio_signal.max() + self.eps)) * audio_signal
 
         batch_total_dur = audio_signal.shape[0] * audio_signal.shape[1] / self.preprocessor._cfg.sample_rate
         if self.max_batch_dur > 0 and self.max_batch_dur < batch_total_dur:
@@ -812,248 +1005,146 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             torch.cuda.empty_cache()
         return processed_signal, processed_signal_length
 
-    def _process_logits_and_targets_lists(self, local_logits_list, local_queries_list, start_frame_list, targets, target_lens) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _process_logits_and_targets(
+        self,
+        local_logits: torch.Tensor,
+        targets: torch.Tensor,
+        target_lens: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Process the logits and targets lists to get the batched tensors.
+        Process logits and targets tensors (not lists) to get batched tensors for offline mode.
+        
         Args:
-            local_logits_list (list): List of speaker logits for each chunk.
-                Shape: (batch_size, lc+chunk_len+rc, local_num_spks)
-            local_queries_list (list): List of local speaker queries.
-                Shape: (batch_size, local_num_spks, emb_dim)
-            start_frame_list (list): List of chunk start frames.
-                Shape: (batch_size,)
-            targets (torch.Tensor): Ground truth speaker labels.
+            local_logits (torch.Tensor): Speaker logits for all chunks
+                Shape: (batch_size * num_chunks, chunk_total, local_num_spks)
+            targets (torch.Tensor): Ground truth speaker labels
                 Shape: (batch_size, total_n_frames, max_num_spks)
-            target_lens (torch.Tensor): Lengths of target sequences.
+            target_lens (torch.Tensor): Lengths of target sequences
                 Shape: (batch_size,)
+        
         Returns:
-            local_logits (B*L, T_max, C)
-            local_pil_targets (B*L, T_max, C)
-            local_ats_targets (B*L, T_max, C)
-            local_target_lens (B*L,)
-            local_target_indices (B, local_num_spks*L)
-            local_queries (B, local_num_spks*L, emb_dim)
-            total_logits_op (B, T, C_max)
+            local_pil_targets (torch.Tensor): PIL targets for all chunks
+                Shape: (batch_size * num_chunks, chunk_total, max_num_spks)
+            local_ats_targets (torch.Tensor): ATS targets for all chunks
+                Shape: (batch_size * num_chunks, chunk_total, max_num_spks)
+            local_target_lens (torch.Tensor): Target lengths for all chunks
+                Shape: (batch_size * num_chunks,)
+            local_target_indices (torch.Tensor): Target indices mapping
+                Shape: (num_chunks, batch_size, local_num_spks)
+            total_logits_op (torch.Tensor): Oracle-permuted logits
+                Shape: (batch_size, total_n_frames, max_num_spks)
         """
-        # processing of lists to get tensors for local logits, local targets, and local target lengths
-        # Step 1: Ensure the three local lists have the same length and define L
-        L = len(local_logits_list)
-        if not (len(local_queries_list) == L and len(start_frame_list) == L and L > 0):
-            raise ValueError(
-                f"Inconsistent lengths: local_logits_list={L}, local_queries_list={len(local_queries_list)}, start_frame_list={len(start_frame_list)}"
-            )
-        total_logits_op = torch.full_like(targets, -1e9, dtype=local_logits_list[0].dtype, device=targets.device)
-
-        # Step 2: For each local logits, slice local targets and local target lengths
-        local_pil_targets_list: List[torch.Tensor] = []
-        local_ats_targets_list: List[torch.Tensor] = []
-        local_target_lens_list: List[torch.Tensor] = []
-        local_target_indices_list: List[torch.Tensor] = []
-        total_target_frames = targets.shape[1]
-        for idx in range(L):
-            local_logits = local_logits_list[idx]
-            local_preds = torch.sigmoid(local_logits)
-            start_frame = int(start_frame_list[idx])
-            local_T = local_logits.shape[1]
-
-            start = max(0, start_frame)
-            end = min(start_frame + local_T, total_target_frames)
-
-            local_targets = targets[:, start:end, :]
-            local_pil_targets, local_target_indices = get_pil_targets_hungarian(labels=local_targets.clone(), logits=local_logits, metric=self.pil_metric)
-            local_ats_targets = get_ats_targets(labels=local_pil_targets.clone(), preds=local_preds, speaker_permutations=self.speaker_permutations)
-            #logging.info(f"idx: {idx}, local_targets: {local_targets.to(int).sum(dim=1)}")
-            #logging.info(f"idx: {idx}, local_preds: {local_preds.sum(dim=1).to(int)}")
-            #logging.info(f"idx: {idx}, local_pil_targets: {local_pil_targets.to(int).sum(dim=1)}")
-            #logging.info(f"idx: {idx}, local_ats_targets: {local_ats_targets.to(int).sum(dim=1)}")
-            local_pil_targets_list.append(local_pil_targets)
-            local_ats_targets_list.append(local_ats_targets)
-            local_target_indices_list.append(local_target_indices)
-            local_target_lens = (target_lens - start_frame).clamp(min=0, max=local_targets.shape[1])
-            local_target_lens_list.append(local_target_lens)
-
-            # New: Create oracle-permuted streaming logits
-            chunk_len = self.nextformer_modules.chunk_len
-            lc = idx * chunk_len - start_frame
-            if lc >= 0 and lc < local_logits.shape[1]:
-                local_logits_content = local_logits[:, lc : lc + chunk_len, :]
-                batch_size, content_len_frames, n_local_spks = local_logits_content.shape
-                permuted_chunk_content = torch.full(
-                    (batch_size, content_len_frames, targets.shape[-1]),
-                    -1e9,
-                    device=local_logits.device,
-                    dtype=local_logits.dtype,
-                )
-                for b in range(batch_size):
-                    for j in range(n_local_spks):
-                        target_idx = local_target_indices[b, j]
-                        if target_idx != -1:
-                            permuted_chunk_content[b, :, target_idx] = local_logits_content[b, :, j]
-                dest_start_frame = idx * chunk_len
-                if dest_start_frame < targets.shape[1]:
-                    dest_end_frame = min(dest_start_frame + content_len_frames, targets.shape[1])
-                    len_to_copy = dest_end_frame - dest_start_frame
-                    total_logits_op[:, dest_start_frame:dest_end_frame, :] = permuted_chunk_content[
-                        :, :len_to_copy, :
-                    ]
-
-        # Step 3: Combine local logits and targets into (B*L, T_max, C)
-        batch_size = local_logits_list[0].shape[0]
-        t_max = max(t.shape[1] for t in local_logits_list)
-        c_logits = local_logits_list[0].shape[-1]
-        c_targets = local_pil_targets_list[0].shape[-1]
-
-        # Preallocate buffers
-        logits_buf = torch.full(
-            (batch_size, L, t_max, c_logits), -1e9, dtype=local_logits_list[0].dtype, device=local_logits_list[0].device
+        # Extract dimensions
+        batch_size = targets.shape[0]
+        targets_num_spks = targets.shape[-1]
+        total_n_frames = targets.shape[1]
+        
+        # Create batch of target chunks using the same chunking function
+        local_targets, local_target_lens, _ = self._create_batch_of_chunks(
+            input_tensor=targets,
+            input_lengths=target_lens,
+            lc=self.nextformer_modules.chunk_left_context,
+            chunk_len=self.nextformer_modules.chunk_len,
+            rc=self.nextformer_modules.chunk_right_context,
         )
-        pil_targets_buf = torch.zeros(
-            (batch_size, L, t_max, c_targets), dtype=local_pil_targets_list[0].dtype, device=local_pil_targets_list[0].device
-        )
-        ats_targets_buf = torch.zeros(
-            (batch_size, L, t_max, c_targets), dtype=local_ats_targets_list[0].dtype, device=local_ats_targets_list[0].device
-        )
+        # local_targets shape: (batch_size * num_chunks, chunk_total, max_num_spks)
+        # local_target_lens shape: (batch_size * num_chunks,)
 
-        for idx in range(L):
-            cur_logits = local_logits_list[idx]
-            cur_pil_targets = local_pil_targets_list[idx]
-            cur_ats_targets = local_ats_targets_list[idx]
-            t_i = cur_logits.shape[1]
-            logits_buf[:, idx, :t_i, :] = cur_logits
-            pil_targets_buf[:, idx, :t_i, :] = cur_pil_targets
-            ats_targets_buf[:, idx, :t_i, :] = cur_ats_targets
+        logging.info(f"local logits shape: {local_logits.shape}")
+        logging.info(f"local targets shape: {local_targets.shape}")
 
-        local_logits = logits_buf.reshape(batch_size * L, t_max, c_logits)
-        local_pil_targets = pil_targets_buf.reshape(batch_size * L, t_max, c_targets)
-        local_ats_targets = ats_targets_buf.reshape(batch_size * L, t_max, c_targets)
-        local_target_lens = torch.stack(local_target_lens_list, dim=1).reshape(batch_size * L)
-        #logging.info(f"local_logits shape: {local_logits.shape}, local_pil_targets shape: {local_pil_targets.shape}, local_ats_targets shape: {local_ats_targets.shape}, local_target_lens: {local_target_lens}")
+        local_preds = torch.sigmoid(local_logits)
+        if local_targets.shape[0] < local_logits.shape[0]:
+            pad_size = local_logits.shape[0] - local_targets.shape[0]
+            logging.info(f"Padding local targets from {local_targets.shape[0]} to {local_logits.shape[0]}")
+            # For 3D tensor: pad dimension 0 (first dim) on the right
+            # Padding tuple format: (pad_dim2_left, pad_dim2_right, pad_dim1_left, pad_dim1_right, pad_dim0_left, pad_dim0_right)
+            local_targets = torch.nn.functional.pad(local_targets, (0, 0, 0, 0, 0, pad_size), mode='constant', value=0)
+            # For 1D tensor: pad dimension 0 on the right
+            # Padding tuple format: (pad_dim0_left, pad_dim0_right)
+            local_target_lens = torch.nn.functional.pad(local_target_lens, (0, pad_size), mode='constant', value=0)
+        elif local_targets.shape[0] > local_logits.shape[0]:
+            logging.info(f"Truncating local targets from {local_targets.shape[0]} to {local_logits.shape[0]}")
+            local_targets = local_targets[:local_logits.shape[0], :, :]
+            local_target_lens = local_target_lens[:local_logits.shape[0]]
 
-        # Concatenate local queries along speaker dimension -> (B, local_num_spks*L, emb_dim)
-        local_queries = torch.cat(local_queries_list, dim=1)
-        # Concatenate local target indices along speaker dimension -> (B, local_num_spks*L)
-        local_target_indices = torch.cat(local_target_indices_list, dim=1)
-        #logging.info(f"local_queries shape: {local_queries.shape}")
-        logging.info(f"local_target_indices shape: {local_target_indices.shape}")
+        local_pil_targets, local_target_indices = get_pil_targets_hungarian(labels=local_targets.clone(), logits=local_logits, metric=self.pil_metric)
+        local_ats_targets = get_ats_targets(labels=local_pil_targets.clone(), preds=local_preds, speaker_permutations=self.speaker_permutations)
+
+        #logging.info(f"local_targets: {local_targets.to(int).sum(dim=1)}")
+        #logging.info(f"local_preds: {(local_preds > 0.5).to(int).sum(dim=1)}")
+        #logging.info(f"local_pil_targets: {local_pil_targets.to(int).sum(dim=1)}")
+        #logging.info(f"local_ats_targets: {local_ats_targets.to(int).sum(dim=1)}")
         logging.info(f"local_target_indices: {local_target_indices}")
-        return local_logits, local_pil_targets, local_ats_targets, local_target_lens, local_target_indices, local_queries, total_logits_op
+        logging.info(f"local_target_lens: {local_target_lens}")
 
-    def _extract_query_pairs_for_batch(self, local_queries_b: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Extract all non-zero query pairs for a single batch.
-        
-        Args:
-            local_queries_b (torch.Tensor): Query tensor for a single batch
-                Shape: (N, emb_dim) where N = local_num_spks * L (number of chunks)
-        
-        Returns:
-            query_pairs_1 (torch.Tensor): First query in each pair
-                Shape: (num_pairs, emb_dim)
-            query_pairs_2 (torch.Tensor): Second query in each pair
-                Shape: (num_pairs, emb_dim)
-            pair_indices (torch.Tensor): Indices of queries in each pair
-                Shape: (num_pairs, 2)
-        """
-        # Check which queries are non-zero (not all zeros)
-        # Sum along embedding dimension to check if query is non-zero
-        query_norms = local_queries_b.norm(dim=1)  # (N,)
-        non_zero_mask = query_norms > 1e-8  # (N,)
-        non_zero_indices = torch.nonzero(non_zero_mask, as_tuple=False).squeeze(-1)  # (num_non_zero,)
-        
-        # Handle scalar case (when only one non-zero query)
-        if non_zero_indices.dim() == 0:
-            non_zero_indices = non_zero_indices.unsqueeze(0)
-        
-        # If less than 2 non-zero queries, return empty tensors
-        if len(non_zero_indices) < 2:
-            device = local_queries_b.device
-            dtype = local_queries_b.dtype
-            emb_dim = local_queries_b.shape[-1]
-            return torch.empty((0, emb_dim), device=device, dtype=dtype), torch.empty((0, emb_dim), device=device, dtype=dtype), torch.empty((0, 2), device=device, dtype=torch.long)
-        
-        # Generate all pairs (i, j) where i >= 0, j > i and both are non-zero
-        num_non_zero = len(non_zero_indices)
-        pairs_list = []
-        for i in range(num_non_zero):
-            for j in range(i + 1, num_non_zero):
-                pairs_list.append((non_zero_indices[i].item(), non_zero_indices[j].item()))
-        
-        if len(pairs_list) == 0:
-            device = local_queries_b.device
-            dtype = local_queries_b.dtype
-            emb_dim = local_queries_b.shape[-1]
-            return torch.empty((0, emb_dim), device=device, dtype=dtype), torch.empty((0, emb_dim), device=device, dtype=dtype), torch.empty((0, 2), device=device, dtype=torch.long)
-        
-        # Extract query pairs
-        indices_1 = torch.tensor([p[0] for p in pairs_list], device=local_queries_b.device)
-        indices_2 = torch.tensor([p[1] for p in pairs_list], device=local_queries_b.device)
-        query_pairs_1 = local_queries_b[indices_1]  # (num_pairs, emb_dim)
-        query_pairs_2 = local_queries_b[indices_2]  # (num_pairs, emb_dim)
-        pair_indices = torch.stack([indices_1, indices_2], dim=1)  # (num_pairs, 2)
-        
-        return query_pairs_1, query_pairs_2, pair_indices
+        total_logits_op = torch.full(
+            (batch_size, total_n_frames, targets_num_spks),
+            -1e9,
+            dtype=local_logits.dtype,
+            device=local_logits.device
+        )
 
-    def _compute_q_sim_loss(self, local_queries: torch.Tensor, local_target_indices: torch.Tensor) -> torch.Tensor:
-        """
-        Compute query similarity loss using CosineEmbeddingLoss.
-        
-        Args:
-            local_queries (torch.Tensor): Local speaker queries
-                Shape: (B, N, emb_dim) where N = local_num_spks * L
-            local_target_indices (torch.Tensor): Speaker indices mapping
-                Shape: (B, N) where local_target_indices[b, n] is the original speaker index
-                that query n corresponds to, or -1 if unmatched
-        
-        Returns:
-            q_sim_loss (torch.Tensor): Query similarity loss scalar
-        """
-        batch_size = local_queries.shape[0]
-        device = local_queries.device
-        dtype = local_queries.dtype
-        
-        # Build megabatch: collect all pairs from all batches
-        all_pairs_1 = []
-        all_pairs_2 = []
-        all_targets = []
-        
-        for b in range(batch_size):
-            pairs_1, pairs_2, pair_indices = self._extract_query_pairs_for_batch(local_queries[b])
-            logging.info(f"batch index: {b}, pairs_1 shape: {pairs_1.shape}, pairs_2 shape: {pairs_2.shape}, pair_indices shape: {pair_indices.shape}")
-            if pairs_1.shape[0] > 0:  # Only add if there are pairs
-                # Get speaker indices for each query in the pair
-                spk_idx_1 = local_target_indices[b, pair_indices[:, 0]]  # (num_pairs,)
-                spk_idx_2 = local_target_indices[b, pair_indices[:, 1]]  # (num_pairs,)
+        lc=self.nextformer_modules.chunk_left_context
+        chunk_len=self.nextformer_modules.chunk_len
+        num_chunks = local_targets.shape[0] // batch_size
+        local_num_spks = local_logits.shape[2]
+
+        for chunk_idx in range(num_chunks):
+            start = chunk_idx * chunk_len
+            end = min(start + chunk_len, total_n_frames)
+            dur = end - start
+            logging.info(f"chunk_idx: {chunk_idx}, start: {start}, end: {end}, dur: {dur}, lc: {lc}, chunk_len: {chunk_len}")
+            offset = min(lc, start)
+            local_logits_chunk = local_logits[chunk_idx * batch_size:(chunk_idx + 1) * batch_size, :, :] # (batch_size, lc+chunk_len+rc, local_num_spks)
+            global_spk_indices = local_target_indices[chunk_idx * batch_size:(chunk_idx + 1) * batch_size, :]  # (batch_size, local_num_spks)
+            
+            # Vectorized version: create mask for valid mappings
+            valid_mask = global_spk_indices != -1  # (batch_size, local_num_spks)
+            
+            if valid_mask.any():
+                # Get indices of valid (batch, local_speaker) pairs
+                batch_indices, local_spk_indices = torch.where(valid_mask)  # 1D tensors of length num_valid
+                global_spk_idx_flat = global_spk_indices[batch_indices, local_spk_indices]  # (num_valid,)
+                num_valid = len(batch_indices)
                 
-                # Compute targets: 1 if same speaker, -1 if different speaker
-                # Only consider pairs where both queries are matched (spk_idx != -1)
-                valid_mask = (spk_idx_1 >= 0) & (spk_idx_2 >= 0)
-                if valid_mask.any():
-                    pair_targets = torch.where(
-                        spk_idx_1 == spk_idx_2,
-                        torch.tensor(1.0, device=device, dtype=dtype),
-                        torch.tensor(-1.0, device=device, dtype=dtype)
-                    )
-                    # Only include valid pairs
-                    all_pairs_1.append(pairs_1[valid_mask])
-                    all_pairs_2.append(pairs_2[valid_mask])
-                    all_targets.append(pair_targets[valid_mask])
+                # Extract source slices: local_logits_chunk[b, offset:offset+dur, j] for each valid (b, j)
+                # First, extract the time slices for all batches: (batch_size, dur, local_num_spks)
+                time_slice = local_logits_chunk[:, offset:offset+dur, :]  # (batch_size, dur, local_num_spks)
+                
+                # Extract slices for valid batch indices: (num_valid, dur, local_num_spks)
+                time_slice_valid = time_slice[batch_indices]  # (num_valid, dur, local_num_spks)
+                
+                # Extract the specific local speaker for each valid (batch, speaker) pair
+                # Use advanced indexing: for each batch i, select speaker local_spk_indices[i] across all time steps
+                # Shape: (num_valid, dur)
+                batch_idx_tensor = torch.arange(num_valid, device=local_logits.device)  # (num_valid,)
+                source_slices = time_slice_valid[batch_idx_tensor, :, local_spk_indices]  # (num_valid, dur)
+                
+                # Create index arrays for assignment to total_logits_op[b, start:end, global_index]
+                # We need to assign for each (batch, time, global_speaker) combination
+                time_indices = torch.arange(start, end, device=local_logits.device)  # (dur,)
+                
+                # Expand indices: for each valid (batch, speaker) pair, assign to all time steps
+                # batch_indices_expanded: (dur, num_valid) - repeat batch indices for each time step
+                # time_indices_expanded: (dur, num_valid) - repeat time indices for each valid pair
+                # global_spk_idx_expanded: (dur, num_valid) - repeat global speaker indices for each time step
+                batch_indices_expanded = batch_indices.unsqueeze(0).expand(dur, -1)  # (dur, num_valid)
+                time_indices_expanded = time_indices.unsqueeze(1).expand(-1, num_valid)  # (dur, num_valid)
+                global_spk_idx_expanded = global_spk_idx_flat.unsqueeze(0).expand(dur, -1)  # (dur, num_valid)
+                
+                # Flatten all tensors for vectorized assignment
+                batch_flat = batch_indices_expanded.flatten()  # (dur * num_valid,)
+                time_flat = time_indices_expanded.flatten()  # (dur * num_valid,)
+                global_spk_flat = global_spk_idx_expanded.flatten()  # (dur * num_valid,)
+                source_flat = source_slices.transpose(0, 1).flatten()  # (dur * num_valid,) - transpose to match time-first order
+                
+                # Assign using advanced indexing for efficient vectorized assignment
+                total_logits_op[batch_flat, time_flat, global_spk_flat] = source_flat
         
-        # If no pairs found across all batches, return zero loss
-        if len(all_pairs_1) == 0:
-            return torch.tensor(0.0, device=device, dtype=dtype)
-        
-        # Concatenate all pairs into megabatch
-        query_pairs_1 = torch.cat(all_pairs_1, dim=0)  # (total_pairs, emb_dim)
-        query_pairs_2 = torch.cat(all_pairs_2, dim=0)  # (total_pairs, emb_dim)
-        targets = torch.cat(all_targets, dim=0)  # (total_pairs,)
-        logging.info(f"query_pairs_1 shape: {query_pairs_1.shape}, query_pairs_2 shape: {query_pairs_2.shape}, targets shape: {targets.shape}")
-        
-        # Compute cosine embedding loss
-        q_sim_loss = self.q_sim_loss(query_pairs_1, query_pairs_2, targets)
-        
-        return q_sim_loss
+        return local_pil_targets, local_ats_targets, local_target_lens, local_target_indices, total_logits_op
 
-    def _compute_q_contrastive_loss(self, local_queries: torch.Tensor, local_target_indices: torch.Tensor) -> torch.Tensor:
+    def _compute_q_contrastive_loss(self, local_queries: torch.Tensor, local_target_indices: torch.Tensor, active_frames_per_query: torch.Tensor) -> torch.Tensor:
         """
         Compute query similarity loss using InfoNCE.
         
@@ -1063,7 +1154,8 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             local_target_indices (torch.Tensor): Speaker indices mapping
                 Shape: (B, N) where local_target_indices[b, n] is the original speaker index
                 that query n corresponds to, or -1 if unmatched
-        
+            active_frames_per_query (torch.Tensor): Tensor containing the number of active frames per query
+                Shape: (B, N)
         Returns:
             infonce_loss (torch.Tensor): InfoNCE loss scalar
         """
@@ -1081,7 +1173,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         is_same_speaker = targets.unsqueeze(2) == targets.unsqueeze(1)
         identity_mask = torch.eye(N, device=device, dtype=torch.bool).unsqueeze(0)
         
-        valid_mask = (queries_norm.squeeze(2) > 1e-8) & (targets != -1)
+        valid_mask = (queries_norm.squeeze(2) > 1e-8) & (targets != -1) & (active_frames_per_query > self.q_contrastive_min_active_frames)
         valid_rows = valid_mask.unsqueeze(2)
         valid_cols = valid_mask.unsqueeze(1)
         
@@ -1158,7 +1250,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         return total_loss
 
     def _get_aux_train_evaluations(
-        self, logits, emb_seq, local_logits_list, local_queries_list, start_frame_list, targets, target_lens
+        self, logits, emb_seq, local_logits, local_queries, active_frames_per_query, targets, target_lens
     ) -> dict:
         """
         Compute auxiliary training evaluations including losses and metrics.
@@ -1172,12 +1264,12 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 Shape: (batch_size, total_n_frames, local_num_spks)
             emb_seq (torch.Tensor): Encoder embeddings for the entire audio.
                 Shape: (batch_size, total_n_frames, emb_dim)
-            local_logits_list (list): List of speaker logits for each chunk.
-                Shape: (batch_size, lc+chunk_len+rc, local_num_spks)
-            local_queries_list (list): List of local speaker queries.
-                Shape: (batch_size, local_num_spks, emb_dim)
-            start_frame_list (list): List of chunk start frames.
-                Shape: (batch_size,)
+            local_logits (torch.Tensor): Speaker logits for the entire audio.
+                Shape: (batch_size * num_chunks, lc+chunk_len+rc, local_num_spks)
+            local_queries (torch.Tensor): Local speaker queries.
+                Shape: (batch_size * num_chunks, local_num_spks, emb_dim)
+            active_frames_per_query (torch.Tensor): Tensor containing the number of active frames per query
+                Shape: (num_chunks * batch_size, num_queries)
             targets (torch.Tensor): Ground truth speaker labels.
                 Shape: (batch_size, total_n_frames, max_num_spks)
             target_lens (torch.Tensor): Lengths of target sequences.
@@ -1198,32 +1290,37 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         # get global PIL targets using Hungarian algorithm
         targets_pil, _ = get_pil_targets_hungarian(labels=targets.clone(), logits=logits, metric=self.pil_metric)
-        #loss_scale_factor = logits.shape[2] / 4.0
-        #global_pil_loss = loss_scale_factor * self.loss(logits=logits, labels=targets_pil, target_lens=target_lens)
         self._accuracy_train_global(preds, targets_pil, target_lens)
         train_f1_acc_global, _, _ = self._accuracy_train_global.compute()
 
-        local_logits, local_pil_targets, local_ats_targets, local_target_lens, local_target_indices, local_queries, total_logits_op = self._process_logits_and_targets_lists(
-            local_logits_list, local_queries_list, start_frame_list, targets, target_lens
+        local_pil_targets, local_ats_targets, local_target_lens, local_target_indices, total_logits_op = self._process_logits_and_targets(
+            local_logits, targets, target_lens
         )
+        
         preds_op = torch.sigmoid(total_logits_op)
         self._accuracy_train_global_op(preds_op, targets, target_lens)
         train_f1_acc_global_op, _, _ = self._accuracy_train_global_op.compute()
         
-        #loss_scale_factor = logits.shape[2] / 4.0
-        loss_scale_factor = 1.0
-        pil_loss = loss_scale_factor * self.loss(logits=local_logits, labels=local_pil_targets, target_lens=local_target_lens)
-        ats_loss = loss_scale_factor * self.loss(logits=local_logits, labels=local_ats_targets, target_lens=local_target_lens)
+        pil_loss = self.loss(logits=local_logits, labels=local_pil_targets, target_lens=local_target_lens)
+        ats_loss = self.loss(logits=local_logits, labels=local_ats_targets, target_lens=local_target_lens)
 
-        emb_seq_norm = F.normalize(emb_seq, p=2, dim=2)
-        emb_similarity = torch.matmul(emb_seq_norm, emb_seq_norm.transpose(1, 2))
-        targets_pil_norm = F.normalize(targets_pil.float(), p=2, dim=2)
-        target_similarity = torch.matmul(targets_pil_norm, targets_pil_norm.transpose(1, 2))
-        emb_sim_loss = self.emb_sim_loss(emb_similarity, target_similarity)
+        emb_sim_loss = torch.tensor(0.0, device=pil_loss.device, dtype=pil_loss.dtype)
         #q_sim_loss = self.q_sim_loss(q_similarity, target_similarity)
         #q_sim_loss = self._compute_q_sim_loss(local_queries, local_target_indices)
         q_sim_loss = torch.tensor(0.0, device=pil_loss.device, dtype=pil_loss.dtype)
-        q_contrastive_loss = self._compute_q_contrastive_loss(local_queries, local_target_indices)
+        if self.q_contrastive_weight > 0:
+            _, local_num_spks, emb_dim = local_queries.shape
+            batch_size = targets.shape[0]
+            num_chunks = local_queries.shape[0] // batch_size
+            local_queries = local_queries.view(num_chunks, batch_size, local_num_spks, emb_dim).transpose(0, 1).reshape(batch_size, num_chunks * local_num_spks, emb_dim)
+            local_target_indices = local_target_indices.view(num_chunks, batch_size, local_num_spks).transpose(0, 1).reshape(batch_size, num_chunks * local_num_spks)
+            logging.info(f"local_target_indices: {local_target_indices}")
+            logging.info(f"local_queries: {local_queries.shape}")
+            active_frames_per_query = active_frames_per_query.view(num_chunks, batch_size, local_num_spks).transpose(0, 1).reshape(batch_size, num_chunks * local_num_spks)
+            logging.info(f"active_frames_per_query: {active_frames_per_query}")
+            q_contrastive_loss = self._compute_q_contrastive_loss(local_queries, local_target_indices, active_frames_per_query)
+        else:
+            q_contrastive_loss = torch.tensor(0.0, device=pil_loss.device, dtype=pil_loss.dtype)
 
         loss = (
             self.ats_weight * ats_loss
@@ -1274,22 +1371,22 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         """
         audio_signal, audio_signal_length, targets, target_lens = batch
         if self.oracle_mode:
-            logits, emb_seq, local_logits_list, local_queries_list, start_frame_list = self.forward(
+            logits, emb_seq, local_logits, local_queries, active_frames_per_query = self.forward(
                 audio_signal=audio_signal, audio_signal_length=audio_signal_length, targets=targets
             )
         else:
-            logits, emb_seq, local_logits_list, local_queries_list, start_frame_list = self.forward(
+            logits, emb_seq, local_logits, local_queries, active_frames_per_query = self.forward(
                 audio_signal=audio_signal, audio_signal_length=audio_signal_length
             )
         train_metrics = self._get_aux_train_evaluations(
-            logits, emb_seq, local_logits_list, local_queries_list, start_frame_list, targets, target_lens
+            logits, emb_seq, local_logits, local_queries, active_frames_per_query, targets, target_lens
         )
         self._reset_train_metrics()
         self.log_dict(train_metrics, sync_dist=True, on_step=True, on_epoch=False, logger=True)
         return {'loss': train_metrics['loss']}
 
     def _get_aux_validation_evaluations(
-        self, logits, emb_seq, local_logits_list, local_queries_list, start_frame_list, targets, target_lens
+        self, logits, emb_seq, local_logits, local_queries, active_frames_per_query, targets, target_lens
     ) -> dict:
         """
         Compute auxiliary validation evaluations including losses and metrics.
@@ -1303,12 +1400,12 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 Shape: (batch_size, total_n_frames, local_num_spks)
             emb_seq (torch.Tensor): Encoder embeddings for the entire audio.
                 Shape: (batch_size, total_n_frames, emb_dim)
-            local_logits_list (list): List of speaker logits for each chunk.
-                Shape: (batch_size, lc+chunk_len+rc, local_num_spks)
-            local_queries_list (list): List of local speaker queries.
-                Shape: (batch_size, local_num_spks, emb_dim)
-            start_frame_list (list): List of chunk start frames.
-                Shape: (batch_size,)
+            local_logits (torch.Tensor): Speaker logits for the entire audio.
+                Shape: (batch_size * num_chunks, lc+chunk_len+rc, local_num_spks)
+            local_queries (torch.Tensor): Local speaker queries.
+                Shape: (batch_size * num_chunks, local_num_spks, emb_dim)
+            active_frames_per_query (torch.Tensor): Tensor containing the number of active frames per query
+                Shape: (num_chunks * batch_size, num_queries)
             targets (torch.Tensor): Ground truth speaker labels.
                 Shape: (batch_size, total_n_frames, max_num_spks)
             target_lens (torch.Tensor): Lengths of target sequences.
@@ -1332,32 +1429,33 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self._accuracy_valid_global(preds, targets_pil, target_lens)
         val_f1_acc_global, _, _ = self._accuracy_valid_global.compute()
 
-        # Local tensors from streaming chunks
-        local_logits, local_pil_targets, local_ats_targets, local_target_lens, local_target_indices, local_queries, total_logits_op = self._process_logits_and_targets_lists(
-            local_logits_list, local_queries_list, start_frame_list, targets, target_lens
+        local_pil_targets, local_ats_targets, local_target_lens, local_target_indices, total_logits_op = self._process_logits_and_targets(
+            local_logits, targets, target_lens
         )
 
         preds_op = torch.sigmoid(total_logits_op)
         self._accuracy_valid_global_op(preds_op, targets, target_lens)
         val_f1_acc_global_op, _, _ = self._accuracy_valid_global_op.compute()
 
-        #loss_scale_factor = logits.shape[2] / 4.0
-        loss_scale_factor = 1.0
-        val_pil_loss = loss_scale_factor * self.loss(
-            logits=local_logits, labels=local_pil_targets, target_lens=local_target_lens
-        )
-        val_ats_loss = loss_scale_factor * self.loss(
-            logits=local_logits, labels=local_ats_targets, target_lens=local_target_lens
-        )
+        val_pil_loss = self.loss(logits=local_logits, labels=local_pil_targets, target_lens=local_target_lens)
+        val_ats_loss = self.loss(logits=local_logits, labels=local_ats_targets, target_lens=local_target_lens)
 
-        emb_seq_norm = F.normalize(emb_seq, p=2, dim=2)
-        emb_similarity = torch.matmul(emb_seq_norm, emb_seq_norm.transpose(1, 2))
-        targets_pil_norm = F.normalize(targets_pil.float(), p=2, dim=2)
-        target_similarity = torch.matmul(targets_pil_norm, targets_pil_norm.transpose(1, 2))
-        val_emb_sim_loss = self.emb_sim_loss(emb_similarity, target_similarity)
+        val_emb_sim_loss = torch.tensor(0.0, device=val_pil_loss.device, dtype=val_pil_loss.dtype)
         #val_q_sim_loss = self._compute_q_sim_loss(local_queries, local_target_indices)
         val_q_sim_loss = torch.tensor(0.0, device=val_pil_loss.device, dtype=val_pil_loss.dtype)
-        val_q_contrastive_loss = self._compute_q_contrastive_loss(local_queries, local_target_indices)
+        if self.q_contrastive_weight > 0:
+            _, local_num_spks, emb_dim = local_queries.shape
+            batch_size = targets.shape[0]
+            num_chunks = local_queries.shape[0] // batch_size
+            local_queries = local_queries.view(num_chunks, batch_size, local_num_spks, emb_dim).transpose(0, 1).reshape(batch_size, num_chunks * local_num_spks, emb_dim)
+            local_target_indices = local_target_indices.view(num_chunks, batch_size, local_num_spks).transpose(0, 1).reshape(batch_size, num_chunks * local_num_spks)
+            logging.info(f"local_target_indices: {local_target_indices}")
+            logging.info(f"local_queries: {local_queries.shape}")
+            active_frames_per_query = active_frames_per_query.view(num_chunks, batch_size, local_num_spks).transpose(0, 1).reshape(batch_size, num_chunks * local_num_spks)
+            logging.info(f"active_frames_per_query: {active_frames_per_query}")
+            val_q_contrastive_loss = self._compute_q_contrastive_loss(local_queries, local_target_indices, active_frames_per_query)
+        else:
+            val_q_contrastive_loss = torch.tensor(0.0, device=val_pil_loss.device, dtype=val_pil_loss.dtype)
 
         val_loss = (
             self.ats_weight * val_ats_loss
@@ -1418,15 +1516,15 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         """
         audio_signal, audio_signal_length, targets, target_lens = batch
         if self.oracle_mode:
-            logits, emb_seq, local_logits_list, local_queries_list, start_frame_list = self.forward(
+            logits, emb_seq, local_logits, local_queries, active_frames_per_query = self.forward(
                 audio_signal=audio_signal, audio_signal_length=audio_signal_length, targets=targets
             )
         else:
-            logits, emb_seq, local_logits_list, local_queries_list, start_frame_list = self.forward(
+            logits, emb_seq, local_logits, local_queries, active_frames_per_query = self.forward(
                 audio_signal=audio_signal, audio_signal_length=audio_signal_length
             )
         val_metrics = self._get_aux_validation_evaluations(
-            logits, emb_seq, local_logits_list, local_queries_list, start_frame_list, targets, target_lens
+            logits, emb_seq, local_logits, local_queries, active_frames_per_query, targets, target_lens
         )
         if isinstance(self.trainer.val_dataloaders, list) and len(self.trainer.val_dataloaders) > 1:
             self.validation_step_outputs[dataloader_idx].append(val_metrics)
@@ -1646,3 +1744,558 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             verbose=verbose,
             override_config=override_config,
         )
+
+###############################################
+    def forward_streaming(
+        self,
+        processed_signal,
+        processed_signal_length,
+        targets: Optional[torch.Tensor] = None,
+    ):
+        """
+        The main forward pass for diarization inference in streaming mode.
+
+        Args:
+            processed_signal (torch.Tensor): Tensor containing audio waveform
+                Shape: (batch_size, num_samples)
+            processed_signal_length (torch.Tensor): Tensor containing lengths of audio waveforms
+                Shape: (batch_size,)
+            targets (torch.Tensor, optional): Ground truth speaker labels.
+                Shape: (batch_size, diar_frame_count, num_speakers). Defaults to None.
+        Returns:
+            total_preds (torch.Tensor): Tensor containing predicted speaker labels for the current chunk
+                and all previous chunks
+                Shape: (batch_size, pred_len, num_speakers)
+        """
+        streaming_state = self.nextformer_modules.init_streaming_state(
+            batch_size=processed_signal.shape[0], device=self.device
+        )
+
+        batch_size, ch, sig_length = processed_signal.shape
+        processed_signal_offset = torch.zeros((batch_size,), dtype=torch.long, device=self.device)
+
+        if dist.is_available() and dist.is_initialized():
+            local_tensor = torch.tensor([sig_length], device=processed_signal.device)
+            dist.all_reduce(
+                local_tensor, op=dist.ReduceOp.MAX, async_op=False
+            )  # get max feature length across all GPUs
+            max_n_frames = local_tensor.item()
+            if dist.get_rank() == 0:
+                logging.info(f"Maximum feature length across all GPUs: {max_n_frames}")
+        else:
+            max_n_frames = sig_length
+
+        if sig_length < max_n_frames:  # need padding to have the same feature length for all GPUs
+            pad_tensor = torch.full(
+                (batch_size, ch, max_n_frames - sig_length),
+                self.negative_init_val,
+                dtype=processed_signal.dtype,
+                device=processed_signal.device,
+            )
+            processed_signal = torch.cat([processed_signal, pad_tensor], dim=2)
+
+        att_mod = False
+        if self.training:
+            rand_num = random.random()
+            if rand_num < self.nextformer_modules.causal_attn_rate:
+                self.encoder.att_context_size = [-1, self.nextformer_modules.causal_attn_rc]
+                self.transformer_encoder.diag = self.nextformer_modules.causal_attn_rc
+                att_mod = True
+
+        total_logits = torch.zeros(
+            (batch_size, 0, self.nextformer_modules.max_num_spks), dtype=processed_signal.dtype, device=self.device
+        )
+        total_emb_seq = torch.zeros(
+            (batch_size, 0, self.nextformer_modules.fc_d_model), dtype=processed_signal.dtype, device=self.device
+        )
+        local_logits_list = []
+        local_queries_list = []
+        start_frame_list = []
+        end_frame_list = []
+
+        feat_len = processed_signal.shape[2]
+        num_chunks = math.ceil(
+            feat_len / (self.nextformer_modules.chunk_len * self.nextformer_modules.subsampling_factor)
+        )
+        streaming_loader = self.nextformer_modules.streaming_feat_loader(
+            feat_seq=processed_signal,
+            feat_seq_length=processed_signal_length,
+            feat_seq_offset=processed_signal_offset,
+        )
+        for chunk_idx, chunk_feat_seq_t, feat_lengths, left_offset, right_offset in tqdm(
+            streaming_loader,
+            total=num_chunks,
+            desc="Streaming Steps",
+            disable=self.training,
+        ):
+            lc = round(left_offset / self.encoder.subsampling_factor)
+            start_frame = chunk_idx * self.nextformer_modules.chunk_len - lc
+            start_frame_list.append(start_frame)
+            end_frame = start_frame + math.ceil(chunk_feat_seq_t.shape[1] / self.encoder.subsampling_factor)
+            end_frame_list.append(end_frame)
+            if targets is not None:
+                targets_chunk = targets[:,start_frame:start_frame + self.nextformer_modules.chunk_left_context + self.nextformer_modules.chunk_len + self.nextformer_modules.chunk_right_context, :]
+            else:
+                targets_chunk = None
+            streaming_state, total_logits, total_emb_seq, local_logits_list, local_queries_list = self.forward_streaming_step(
+                processed_signal=chunk_feat_seq_t,
+                processed_signal_length=feat_lengths,
+                targets=targets_chunk,
+                streaming_state=streaming_state,
+                total_logits=total_logits,
+                total_emb_seq=total_emb_seq,
+                local_logits_list=local_logits_list,
+                local_queries_list=local_queries_list,
+                left_offset=left_offset,
+                right_offset=right_offset,
+            )
+
+        if att_mod:
+            self.encoder.att_context_size = [-1, -1]
+            self.transformer_encoder.diag = None
+
+        del processed_signal, processed_signal_length
+
+        if sig_length < max_n_frames:  # Discard preds corresponding to padding
+            n_frames = math.ceil(sig_length / self.encoder.subsampling_factor)
+            total_logits = total_logits[:, :n_frames, :]
+            #total_emb_seq = total_emb_seq[:, :n_frames, :]
+        return total_logits, total_emb_seq, local_logits_list, local_queries_list, start_frame_list, end_frame_list
+
+
+    def forward_streaming_step(
+        self,
+        processed_signal,
+        processed_signal_length,
+        streaming_state,
+        total_logits,
+        total_emb_seq,
+        local_logits_list,
+        local_queries_list,
+        left_offset,
+        right_offset,
+        targets: Optional[torch.Tensor] = None,
+    ):
+        # get pre-encode embeddings for lc+chunk+rc
+        pre_encode_embs, pre_encode_lengths = self.encoder.pre_encode(
+            x=processed_signal, lengths=processed_signal_length
+        )
+        
+        # Apply raw projection if needed
+        if self.nextformer_modules.query_raw_proj is not None:
+            query_raw_proj = self.nextformer_modules.query_raw_proj(pre_encode_embs)
+        else:
+            query_raw_proj = pre_encode_embs
+        
+        # get encoder embeddings for lc+chunk+rc
+        emb_seq_enc_proj, emb_seq, emb_seq_length = self.frontend_encoder(
+            processed_signal=pre_encode_embs, processed_signal_length=pre_encode_lengths, bypass_pre_encode=True
+        )
+        
+        # Apply query projection if needed
+        if self.nextformer_modules.query_proj is not None:
+            emb_seq_query_proj = self.nextformer_modules.query_proj(emb_seq)
+        else:
+            emb_seq_query_proj = emb_seq
+        
+        #get local logits for lc+chunk+rc
+        logits = self.forward_infer(emb_seq_enc_proj, emb_seq_length)
+        logging.info(f"local logits shape: {logits.shape}")
+
+        # get speaker queries for lc+chunk+rc
+        encoder_len_mask = self.nextformer_modules.length_to_mask(emb_seq_length, emb_seq.shape[1])
+        encoder_len_mask = ~encoder_len_mask
+        logging.info(f"encoder_len_mask: {encoder_len_mask.to(int).sum(dim=1)}")
+
+        if targets is not None:
+            logits_len = min(logits.shape[1], targets.shape[1])
+            local_pil_targets, local_target_indices = get_pil_targets_hungarian(labels=targets[:, :logits_len, :], logits=logits[:,:logits_len, :], metric=self.pil_metric)
+            preds = local_pil_targets
+            logging.info(f"oracle local preds: {(preds > 0.5).to(int).sum(dim=1)}")
+            logging.info(f"oracle local indices: {local_target_indices}")
+        else:
+            preds = torch.sigmoid(logits)
+            logging.info(f"real local preds: {(preds > 0.5).to(int).sum(dim=1)}")
+
+        if self.initialize_queries:
+            init_queries = self.nextformer_modules.get_init_queries(preds, emb_seq_query_proj)
+            init_queries_raw = self.nextformer_modules.get_init_queries(preds, query_raw_proj)
+        else:
+            init_queries = None
+            init_queries_raw = None
+            
+        if self.initialize_mask:
+            encoder_query_mask = ~(preds > self.local_mask_threshold).transpose(1, 2)
+        else:
+            encoder_query_mask = None
+
+        # masks for the non-target speakers in extra cross-attention
+        # encoder_mask_extra should have False (0) on frames where current speaker is inactive and any other speaker is active
+        if (self.query_decoder_raw is not None and self.query_decoder_raw.extra_cross_attention) or (self.query_decoder is not None and self.query_decoder.extra_cross_attention):
+            any_speaker_active = (preds.max(dim=2)[0] > self.local_mask_threshold).unsqueeze(1)  # (batch, 1, n_frames)
+            any_speaker_active = any_speaker_active.expand(-1, preds.shape[2], -1)  # (batch, num_queries, n_frames)
+            encoder_mask_extra = ~(encoder_query_mask & any_speaker_active)
+        else:
+            encoder_mask_extra = None
+
+        lc = round(left_offset / self.encoder.subsampling_factor)
+        rc = math.ceil(right_offset / self.encoder.subsampling_factor)
+        chunk_len = logits.shape[1] - lc - rc
+        # Create query_mask for undetected speakers
+        # Check if each speaker is detected above threshold across all frames
+        # preds shape: (B, n_frames, num_queries)
+        # For each speaker, check if max value across frames is above threshold
+        spk_detected = preds[:, :lc+chunk_len].max(dim=1)[0] > 0.5  # (B, num_queries)
+        spk_not_detected = ~spk_detected  # (B, num_queries), True means speaker not detected
+        
+        # Create query_mask for self-attention: mask out attention to/from undetected speakers
+        # query_mask shape: (B, num_queries, num_queries)
+        num_queries = preds.shape[-1]
+        query_mask = None
+        if spk_not_detected.any():
+            # Expand spk_not_detected to create attention mask
+            # Mask attention FROM undetected speakers
+            query_mask_from = spk_not_detected.unsqueeze(2).expand(-1, -1, num_queries)  # (B, num_queries, num_queries)
+            # Mask attention TO undetected speakers
+            query_mask_to = spk_not_detected.unsqueeze(1).expand(-1, num_queries, -1)  # (B, num_queries, num_queries)
+            # Combine: mask if either FROM or TO an undetected speaker
+            query_mask = query_mask_from | query_mask_to
+
+        # Run both query decoders if they exist
+        if self.query_decoder is not None:
+            spk_queries = self.query_decoder(
+                encoder_states=emb_seq_query_proj,
+                encoder_len_mask=encoder_len_mask,
+                encoder_mask=encoder_query_mask,
+                encoder_mask_extra=encoder_mask_extra,
+                query_states=init_queries,
+                query_mask=query_mask
+            )
+            # Zero out queries for undetected speakers
+            spk_queries = spk_queries.masked_fill(spk_not_detected.unsqueeze(2), 0)
+        else:
+            spk_queries = None
+        
+        if self.query_decoder_raw is not None:
+            spk_queries_raw = self.query_decoder_raw(
+                encoder_states=query_raw_proj,
+                encoder_len_mask=encoder_len_mask,
+                encoder_mask=encoder_query_mask,
+                encoder_mask_extra=encoder_mask_extra,
+                query_states=init_queries_raw,
+                query_mask=query_mask
+            )
+            # Zero out queries for undetected speakers
+            spk_queries_raw = spk_queries_raw.masked_fill(spk_not_detected.unsqueeze(2), 0)
+        else:
+            spk_queries_raw = None
+        
+        # Combine queries from both decoders if both are used
+        if spk_queries is not None and spk_queries_raw is not None:
+            if self.nextformer_modules.query_combiner is not None:
+                # Store original dtype to preserve it
+                original_dtype = spk_queries.dtype
+                # Concatenate along embedding dimension and project back
+                spk_queries_combined = torch.cat([spk_queries, spk_queries_raw], dim=-1)
+                spk_queries = self.nextformer_modules.query_combiner(spk_queries_combined)
+                # Ensure output has the same dtype as input
+                if spk_queries.dtype != original_dtype:
+                    spk_queries = spk_queries.to(original_dtype)
+            else:
+                # If no combiner is provided, just use the first decoder output
+                logging.warning("Both query decoders are used but no query_combiner provided. Using only query_decoder output.")
+                spk_queries = spk_queries
+        elif spk_queries_raw is not None:
+            # Only raw decoder is used
+            spk_queries = spk_queries_raw
+        # else: only spk_queries is not None, use it as is
+
+        #logging.info(f"query_mask: {query_mask}")
+        local_logits_list.append(logits)
+        local_queries_list.append(spk_queries)
+
+        if not self.training:
+            # Step 1: get global indices for spk_queries.
+            global_spk_indices = self.nextformer_modules.get_global_indices(
+                spk_queries, streaming_state.global_spk_centroids
+            )
+
+            # Step 2: update the streaming state with the new spk_queries and global indices
+            streaming_state = self.nextformer_modules.update_streaming_state(
+                streaming_state=streaming_state,
+                spk_queries=spk_queries,
+                global_spk_indices=global_spk_indices,
+            )
+
+            # Step 3: Remap local logits to global speaker space
+            logits_chunk = logits[:, lc : lc + chunk_len, :]
+            batch_size, chunk_len_frames, _ = logits_chunk.shape
+            logits_ = torch.full(
+                (batch_size, chunk_len_frames, self.nextformer_modules.max_num_spks), -1e9, device=self.device
+            )
+            for b in range(batch_size):
+                for j in range(spk_queries.shape[1]):
+                    global_index = global_spk_indices[b, j]
+                    if global_index != -1:
+                        logits_[b, :, global_index] = logits_chunk[b, :, j]
+        else:
+            logits_ = torch.full((logits.shape[0], chunk_len, self.nextformer_modules.max_num_spks), -1e9, device=self.device)
+        
+        total_logits = torch.cat([total_logits, logits_], dim=1)
+        #emb_seq_ = emb_seq[:, lc:lc+chunk_len, :]
+        #total_emb_seq = torch.cat([total_emb_seq, emb_seq_], dim=1)
+        total_emb_seq = None
+        logging.info(f"total_logits shape: {total_logits.shape}")
+        #logging.info(f"total_emb_seq shape: {total_emb_seq.shape}")
+        return streaming_state, total_logits, total_emb_seq, local_logits_list, local_queries_list
+
+    def _process_logits_and_targets_lists(self, local_logits_list, local_queries_list, start_frame_list, end_frame_list, targets, target_lens) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Process the logits and targets lists to get the batched tensors.
+        Args:
+            local_logits_list (list): List of speaker logits for each chunk.
+                Shape: (batch_size, lc+chunk_len+rc, local_num_spks)
+            local_queries_list (list): List of local speaker queries.
+                Shape: (batch_size, local_num_spks, emb_dim)
+            start_frame_list (list): List of chunk start frames.
+                Shape: (batch_size,)
+            end_frame_list (list): List of chunk end frames.
+                Shape: (batch_size,)
+            targets (torch.Tensor): Ground truth speaker labels.
+                Shape: (batch_size, total_n_frames, max_num_spks)
+            target_lens (torch.Tensor): Lengths of target sequences.
+                Shape: (batch_size,)
+        Returns:
+            local_logits (B*L, T_max, C)
+            local_pil_targets (B*L, T_max, C)
+            local_ats_targets (B*L, T_max, C)
+            local_target_lens (B*L,)
+            local_target_indices (B, local_num_spks*L)
+            local_queries (B, local_num_spks*L, emb_dim)
+            total_logits_op (B, T, C_max)
+        """
+        # processing of lists to get tensors for local logits, local targets, and local target lengths
+        # Step 1: Ensure the three local lists have the same length and define L
+        L = len(local_logits_list)
+        if not (len(local_queries_list) == L and len(start_frame_list) == L and L > 0):
+            raise ValueError(
+                f"Inconsistent lengths: local_logits_list={L}, local_queries_list={len(local_queries_list)}, start_frame_list={len(start_frame_list)}"
+            )
+        total_logits_op = torch.full_like(targets, -1e9, dtype=local_logits_list[0].dtype, device=targets.device)
+
+        # Step 2: For each local logits, slice local targets and local target lengths
+        local_pil_targets_list: List[torch.Tensor] = []
+        local_ats_targets_list: List[torch.Tensor] = []
+        local_target_lens_list: List[torch.Tensor] = []
+        local_target_indices_list: List[torch.Tensor] = []
+        total_target_frames = targets.shape[1]
+        for idx in range(L):
+            local_logits = local_logits_list[idx]
+            logging.info(f"local logits shape: {local_logits.shape}")
+            start_frame = int(start_frame_list[idx])
+            end_frame = int(end_frame_list[idx])
+            logging.info(f"start_frame: {start_frame}, end_frame: {end_frame}")
+            local_T = local_logits.shape[1]
+            start = max(0, start_frame)
+            end = min(end_frame, total_target_frames)
+
+            local_targets = targets[:, start:end, :]
+            logging.info(f"local targets shape: {local_targets.shape}")
+            if end-start < local_logits.shape[1]:
+                local_logits = local_logits[:, :end-start, :]
+                local_logits_list[idx] = local_logits
+            local_preds = torch.sigmoid(local_logits)
+            logging.info(f"local preds shape: {local_preds.shape}")
+            local_pil_targets, local_target_indices = get_pil_targets_hungarian(labels=local_targets.clone(), logits=local_logits, metric=self.pil_metric)
+            local_ats_targets = get_ats_targets(labels=local_pil_targets.clone(), preds=local_preds, speaker_permutations=self.speaker_permutations)
+            logging.info(f"idx: {idx}, local_targets: {local_targets.to(int).sum(dim=1)}")
+            logging.info(f"idx: {idx}, local_preds: {(local_preds > 0.5).to(int).sum(dim=1)}")
+            logging.info(f"idx: {idx}, local_pil_targets: {local_pil_targets.to(int).sum(dim=1)}")
+            logging.info(f"idx: {idx}, local_ats_targets: {local_ats_targets.to(int).sum(dim=1)}")
+            local_pil_targets_list.append(local_pil_targets)
+            local_ats_targets_list.append(local_ats_targets)
+            local_target_indices_list.append(local_target_indices)
+            local_target_lens = (target_lens - start_frame).clamp(min=0, max=local_targets.shape[1])
+            logging.info(f"idx: {idx}, local_target_lens: {local_target_lens}")
+            local_target_lens_list.append(local_target_lens)
+
+            # New: Create oracle-permuted streaming logits
+            chunk_len = self.nextformer_modules.chunk_len
+            lc = idx * chunk_len - start_frame
+            if lc >= 0 and lc < local_logits.shape[1]:
+                local_logits_content = local_logits[:, lc : lc + chunk_len, :]
+                batch_size, content_len_frames, n_local_spks = local_logits_content.shape
+                permuted_chunk_content = torch.full(
+                    (batch_size, content_len_frames, targets.shape[-1]),
+                    -1e9,
+                    device=local_logits.device,
+                    dtype=local_logits.dtype,
+                )
+                for b in range(batch_size):
+                    for j in range(n_local_spks):
+                        target_idx = local_target_indices[b, j]
+                        if target_idx != -1:
+                            permuted_chunk_content[b, :, target_idx] = local_logits_content[b, :, j]
+                dest_start_frame = idx * chunk_len
+                if dest_start_frame < targets.shape[1]:
+                    dest_end_frame = min(dest_start_frame + content_len_frames, targets.shape[1])
+                    len_to_copy = dest_end_frame - dest_start_frame
+                    total_logits_op[:, dest_start_frame:dest_end_frame, :] = permuted_chunk_content[
+                        :, :len_to_copy, :
+                    ]
+
+        # Step 3: Combine local logits and targets into (B*L, T_max, C)
+        batch_size = local_logits_list[0].shape[0]
+        t_max = max(t.shape[1] for t in local_logits_list)
+        c_logits = local_logits_list[0].shape[-1]
+        c_targets = local_pil_targets_list[0].shape[-1]
+
+        # Preallocate buffers
+        logits_buf = torch.full(
+            (batch_size, L, t_max, c_logits), -1e9, dtype=local_logits_list[0].dtype, device=local_logits_list[0].device
+        )
+        pil_targets_buf = torch.zeros(
+            (batch_size, L, t_max, c_targets), dtype=local_pil_targets_list[0].dtype, device=local_pil_targets_list[0].device
+        )
+        ats_targets_buf = torch.zeros(
+            (batch_size, L, t_max, c_targets), dtype=local_ats_targets_list[0].dtype, device=local_ats_targets_list[0].device
+        )
+
+        for idx in range(L):
+            cur_logits = local_logits_list[idx]
+            cur_pil_targets = local_pil_targets_list[idx]
+            cur_ats_targets = local_ats_targets_list[idx]
+            t_i = cur_logits.shape[1]
+            logits_buf[:, idx, :t_i, :] = cur_logits
+            pil_targets_buf[:, idx, :t_i, :] = cur_pil_targets
+            ats_targets_buf[:, idx, :t_i, :] = cur_ats_targets
+
+        local_logits = logits_buf.reshape(batch_size * L, t_max, c_logits)
+        local_pil_targets = pil_targets_buf.reshape(batch_size * L, t_max, c_targets)
+        local_ats_targets = ats_targets_buf.reshape(batch_size * L, t_max, c_targets)
+        local_target_lens = torch.stack(local_target_lens_list, dim=1).reshape(batch_size * L)
+        #logging.info(f"local_logits shape: {local_logits.shape}, local_pil_targets shape: {local_pil_targets.shape}, local_ats_targets shape: {local_ats_targets.shape}, local_target_lens: {local_target_lens}")
+
+        # Concatenate local queries along speaker dimension -> (B, local_num_spks*L, emb_dim)
+        local_queries = torch.cat(local_queries_list, dim=1)
+        # Concatenate local target indices along speaker dimension -> (B, local_num_spks*L)
+        local_target_indices = torch.cat(local_target_indices_list, dim=1)
+        #logging.info(f"local_queries shape: {local_queries.shape}")
+        logging.info(f"local_target_indices shape: {local_target_indices.shape}")
+        logging.info(f"local_target_indices: {local_target_indices}")
+        return local_logits, local_pil_targets, local_ats_targets, local_target_lens, local_target_indices, local_queries, total_logits_op
+
+    def _extract_query_pairs_for_batch(self, local_queries_b: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Extract all non-zero query pairs for a single batch.
+        
+        Args:
+            local_queries_b (torch.Tensor): Query tensor for a single batch
+                Shape: (N, emb_dim) where N = local_num_spks * L (number of chunks)
+        
+        Returns:
+            query_pairs_1 (torch.Tensor): First query in each pair
+                Shape: (num_pairs, emb_dim)
+            query_pairs_2 (torch.Tensor): Second query in each pair
+                Shape: (num_pairs, emb_dim)
+            pair_indices (torch.Tensor): Indices of queries in each pair
+                Shape: (num_pairs, 2)
+        """
+        # Check which queries are non-zero (not all zeros)
+        # Sum along embedding dimension to check if query is non-zero
+        query_norms = local_queries_b.norm(dim=1)  # (N,)
+        non_zero_mask = query_norms > 1e-8  # (N,)
+        non_zero_indices = torch.nonzero(non_zero_mask, as_tuple=False).squeeze(-1)  # (num_non_zero,)
+        
+        # Handle scalar case (when only one non-zero query)
+        if non_zero_indices.dim() == 0:
+            non_zero_indices = non_zero_indices.unsqueeze(0)
+        
+        # If less than 2 non-zero queries, return empty tensors
+        if len(non_zero_indices) < 2:
+            device = local_queries_b.device
+            dtype = local_queries_b.dtype
+            emb_dim = local_queries_b.shape[-1]
+            return torch.empty((0, emb_dim), device=device, dtype=dtype), torch.empty((0, emb_dim), device=device, dtype=dtype), torch.empty((0, 2), device=device, dtype=torch.long)
+        
+        # Generate all pairs (i, j) where i >= 0, j > i and both are non-zero
+        num_non_zero = len(non_zero_indices)
+        pairs_list = []
+        for i in range(num_non_zero):
+            for j in range(i + 1, num_non_zero):
+                pairs_list.append((non_zero_indices[i].item(), non_zero_indices[j].item()))
+        
+        if len(pairs_list) == 0:
+            device = local_queries_b.device
+            dtype = local_queries_b.dtype
+            emb_dim = local_queries_b.shape[-1]
+            return torch.empty((0, emb_dim), device=device, dtype=dtype), torch.empty((0, emb_dim), device=device, dtype=dtype), torch.empty((0, 2), device=device, dtype=torch.long)
+        
+        # Extract query pairs
+        indices_1 = torch.tensor([p[0] for p in pairs_list], device=local_queries_b.device)
+        indices_2 = torch.tensor([p[1] for p in pairs_list], device=local_queries_b.device)
+        query_pairs_1 = local_queries_b[indices_1]  # (num_pairs, emb_dim)
+        query_pairs_2 = local_queries_b[indices_2]  # (num_pairs, emb_dim)
+        pair_indices = torch.stack([indices_1, indices_2], dim=1)  # (num_pairs, 2)
+        
+        return query_pairs_1, query_pairs_2, pair_indices
+
+    def _compute_q_sim_loss(self, local_queries: torch.Tensor, local_target_indices: torch.Tensor) -> torch.Tensor:
+        """
+        Compute query similarity loss using CosineEmbeddingLoss.
+        
+        Args:
+            local_queries (torch.Tensor): Local speaker queries
+                Shape: (B, N, emb_dim) where N = local_num_spks * L
+            local_target_indices (torch.Tensor): Speaker indices mapping
+                Shape: (B, N) where local_target_indices[b, n] is the original speaker index
+                that query n corresponds to, or -1 if unmatched
+        
+        Returns:
+            q_sim_loss (torch.Tensor): Query similarity loss scalar
+        """
+        batch_size = local_queries.shape[0]
+        device = local_queries.device
+        dtype = local_queries.dtype
+        
+        # Build megabatch: collect all pairs from all batches
+        all_pairs_1 = []
+        all_pairs_2 = []
+        all_targets = []
+        
+        for b in range(batch_size):
+            pairs_1, pairs_2, pair_indices = self._extract_query_pairs_for_batch(local_queries[b])
+            logging.info(f"batch index: {b}, pairs_1 shape: {pairs_1.shape}, pairs_2 shape: {pairs_2.shape}, pair_indices shape: {pair_indices.shape}")
+            if pairs_1.shape[0] > 0:  # Only add if there are pairs
+                # Get speaker indices for each query in the pair
+                spk_idx_1 = local_target_indices[b, pair_indices[:, 0]]  # (num_pairs,)
+                spk_idx_2 = local_target_indices[b, pair_indices[:, 1]]  # (num_pairs,)
+                
+                # Compute targets: 1 if same speaker, -1 if different speaker
+                # Only consider pairs where both queries are matched (spk_idx != -1)
+                valid_mask = (spk_idx_1 >= 0) & (spk_idx_2 >= 0)
+                if valid_mask.any():
+                    pair_targets = torch.where(
+                        spk_idx_1 == spk_idx_2,
+                        torch.tensor(1.0, device=device, dtype=dtype),
+                        torch.tensor(-1.0, device=device, dtype=dtype)
+                    )
+                    # Only include valid pairs
+                    all_pairs_1.append(pairs_1[valid_mask])
+                    all_pairs_2.append(pairs_2[valid_mask])
+                    all_targets.append(pair_targets[valid_mask])
+        
+        # If no pairs found across all batches, return zero loss
+        if len(all_pairs_1) == 0:
+            return torch.tensor(0.0, device=device, dtype=dtype)
+        
+        # Concatenate all pairs into megabatch
+        query_pairs_1 = torch.cat(all_pairs_1, dim=0)  # (total_pairs, emb_dim)
+        query_pairs_2 = torch.cat(all_pairs_2, dim=0)  # (total_pairs, emb_dim)
+        targets = torch.cat(all_targets, dim=0)  # (total_pairs,)
+        logging.info(f"query_pairs_1 shape: {query_pairs_1.shape}, query_pairs_2 shape: {query_pairs_2.shape}, targets shape: {targets.shape}")
+        
+        # Compute cosine embedding loss
+        q_sim_loss = self.q_sim_loss(query_pairs_1, query_pairs_2, targets)
+        
+        return q_sim_loss

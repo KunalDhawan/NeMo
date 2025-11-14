@@ -12,17 +12,20 @@ model:
   q_contrastive_weight: 0.0 # Weight for Contrastive Query Similarity loss
   q_contrastive_temperature: 0.1 # Temperature for Contrastive Query Similarity loss
   q_contrastive_extra_positive: false # Use an explicit 0.5 margin in contrastive loss
+  q_contrastive_min_active_frames: 10 # Minimum number of active frames per query for contrastive loss
 
   local_num_spks: 4 # Number of speakers for local queries
   max_num_spks: 8 # Maximum number of speakers per model; currently set to 8
   initialize_queries: true # If True, use mean of encoder embeddings over local predictions as initial queries, otherwise use zeros.
   initialize_mask: true # If True, use local predictions as initial encoder mask, otherwise use. (not recommended setting to False!)
+  dual_decoder_mode: "concat" # "concat" or "init" or "init_concat"
   streaming_mode: False
   pil_metric: "dot_product"
 
   model_defaults:
     fc_d_model: 512 # Hidden dimension size of the Fast-conformer Encoder
-    tf_d_model: 192 # Hidden dimension size of the Query Encoder
+    tf_d_model: 192 # Hidden dimension size of the Transformer Encoder
+    sq_d_model: 192 # Hidden dimension size of the Spk Query Decoder
 
   train_ds:
     manifest_filepath: ???
@@ -115,7 +118,8 @@ model:
     _target_: nemo.collections.asr.modules.nextformer_modules.NextformerModules
     ff_dropout_rate: 0.5 # Dropout rate
     fc_d_model: ${model.model_defaults.fc_d_model} # Hidden dimension size for Fast Conformer encoder
-    tf_d_model: ${model.model_defaults.tf_d_model} # Hidden dimension size for Query encoder
+    tf_d_model: ${model.model_defaults.tf_d_model} # Hidden dimension size for Transformer encoder
+    sq_d_model: ${model.model_defaults.sq_d_model} # Hidden dimension size for Spk Query decoder
     local_num_spks: ${model.local_num_spks} # Number of speakers for local queries
     max_num_spks: ${model.max_num_spks} # Maximum number of speakers per model
     pred_score_threshold: 0.25 # Threshold for speaker predictions to be used in scoring
@@ -178,9 +182,29 @@ model:
   query_decoder:
     _target_: nemo.collections.asr.modules.nextformer_modules.MaskedQueryDecoder
     num_layers: 4
-    hidden_size: ${model.model_defaults.fc_d_model} # Needs to be multiple of num_attention_heads
-    inner_size: 2048
+    hidden_size: ${model.model_defaults.sq_d_model} # Needs to be multiple of num_attention_heads
+    inner_size: 768
     num_queries: ${model.local_num_spks}
+    extra_cross_attention: False
+    num_cross_attention_heads: 4
+    num_self_attention_heads: 4
+    cross_attn_dropout: 0.0
+    self_attn_dropout: 0.0
+    ffn_dropout: 0.0
+    hidden_act: relu
+    pre_ln: False
+    pre_ln_final_layer_norm: True
+    use_query_pos_emb: False
+    use_encoder_pos_emb: False
+    encoder_pos_emb_max_len: 5000
+
+  query_decoder_raw:
+    _target_: nemo.collections.asr.modules.nextformer_modules.MaskedQueryDecoder
+    num_layers: 4
+    hidden_size: ${model.model_defaults.sq_d_model} # Needs to be multiple of num_attention_heads
+    inner_size: 768
+    num_queries: ${model.local_num_spks}
+    extra_cross_attention: False
     num_cross_attention_heads: 4
     num_self_attention_heads: 4
     cross_attn_dropout: 0.0
