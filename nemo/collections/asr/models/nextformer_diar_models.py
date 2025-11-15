@@ -164,7 +164,9 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.initialize_mask = self._cfg.get("initialize_mask", True)
         self.pil_metric = self._cfg.get("pil_metric", "bce")
         self.oracle_mode = self._cfg.get("oracle_mode", False)
-        self.q_contrastive_min_active_frames = self._cfg.get("q_contrastive_min_active_frames", 0)
+        self.q_contrastive_min_frames_positive = self._cfg.get("q_contrastive_min_frames_positive", 10)
+        self.q_contrastive_min_frames_anchor = self._cfg.get("q_contrastive_min_frames_anchor", 5)
+        self.q_contrastive_max_frames = self._cfg.get("q_contrastive_max_frames", 32)
 
         self.streaming_mode = self.cfg.get("streaming_mode", False)
         self.save_hyperparameters("cfg")
@@ -182,6 +184,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.q_contrastive_weight = self._cfg.get("q_contrastive_weight", 0.0)
         self.q_contrastive_temperature = self._cfg.get("q_contrastive_temperature", 0.1)
         self.q_contrastive_extra_positive = self._cfg.get("q_contrastive_extra_positive", False)
+        self.q_contrastive_duration_averaged = self._cfg.get("q_contrastive_duration_averaged", False)
         total_weight = pil_weight + ats_weight
         if total_weight == 0:
             raise ValueError(
@@ -577,14 +580,14 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         
         # Get local logits for all chunks
         local_logits = self.forward_infer(emb_seq_enc_proj, emb_seq_length)
-        logging.info(f"local logits shape: {local_logits.shape}")
-        logging.info(f"emb_seq_length: {emb_seq_length}")
+        #logging.info(f"local logits shape: {local_logits.shape}")
+        #logging.info(f"emb_seq_length: {emb_seq_length}")
         # logits shape: (batch_size * num_chunks, chunk_total, local_num_spks)
 
         # Get speaker queries for all chunks
         encoder_len_mask = self.nextformer_modules.length_to_mask(emb_seq_length, emb_seq.shape[1])
         encoder_len_mask = ~encoder_len_mask
-        logging.info(f"encoder_len_mask: {encoder_len_mask.to(int).sum(dim=1)}")
+        #logging.info(f"encoder_len_mask: {encoder_len_mask.to(int).sum(dim=1)}")
 
         # Handle oracle mode (targets) if provided
         if targets is not None:
@@ -626,22 +629,22 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             any_speaker_active = (preds.max(dim=2)[0] > self.local_mask_threshold).unsqueeze(1)  # (batch, 1, n_frames)
             any_speaker_active = any_speaker_active.expand(-1, preds.shape[2], -1)  # (batch, num_queries, n_frames)
             encoder_mask_extra = ~(encoder_query_mask & any_speaker_active)
-            logging.info(f"encoder_mask_extra: {encoder_mask_extra.to(int)[0, :, :20]}")
-            logging.info(f"encoder_query_mask: {encoder_query_mask.to(int)[0, :, :20]}")
+            #logging.info(f"encoder_mask_extra: {encoder_mask_extra.to(int)[0, :, :20]}")
+            #logging.info(f"encoder_query_mask: {encoder_query_mask.to(int)[0, :, :20]}")
         else:
             encoder_query_mask = None
             encoder_mask_extra = None
           
         num_queries = preds.shape[-1]
         active_frames_per_query = (preds > self.local_mask_threshold).to(int).sum(dim=1) # (num_chunks * batch_size, num_queries)
-        logging.info(f"active frames per query: {active_frames_per_query}")
+        #logging.info(f"active frames per query: {active_frames_per_query}")
         spk_detected = active_frames_per_query > 0 # (num_chunks * batch_size, num_queries)
         spk_not_detected = ~spk_detected # (num_chunks * batch_size, num_queries)
         query_mask_from = spk_not_detected.unsqueeze(2).expand(-1, -1, num_queries)  # (num_chunks * batch_size, num_queries, num_queries)
         query_mask_to = spk_not_detected.unsqueeze(1).expand(-1, num_queries, -1)  # (num_chunks * batch_size, num_queries, num_queries)
         query_mask = query_mask_from | query_mask_to  # (num_chunks * batch_size, num_queries, num_queries)
-        logging.info(f"query_mask: {query_mask}")
-        logging.info(f"spk_not_detected: {spk_not_detected.to(int).sum(dim=1)}")
+        #logging.info(f"query_mask: {query_mask}")
+        #logging.info(f"spk_not_detected: {spk_not_detected.to(int).sum(dim=1)}")
 
         # Step 3: Run both query_decoder and query_decoder_raw with query_mask
         if self.query_decoder_raw is not None:
@@ -733,10 +736,17 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 global_spk_indices = self.nextformer_modules.get_global_indices(
                     spk_queries_chunk, streaming_state.global_spk_centroids
                 )
-                self.nextformer_modules.update_streaming_state_ma(
+                active_frames_per_query_chunk = active_frames_per_query[chunk_idx * batch_size:(chunk_idx + 1) * batch_size] # (batch_size, num_queries)
+                #self.nextformer_modules.update_streaming_state_ma(
+                #    streaming_state=streaming_state,
+                #    spk_queries=spk_queries_chunk,
+                #    global_spk_indices=global_spk_indices,
+                #)
+                self.nextformer_modules.update_streaming_state_duration_averaged(
                     streaming_state=streaming_state,
                     spk_queries=spk_queries_chunk,
                     global_spk_indices=global_spk_indices,
+                    active_frames_per_query=active_frames_per_query_chunk,
                 )
                 
                 # Vectorized version: eliminate nested loops
@@ -1050,8 +1060,8 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         # local_targets shape: (batch_size * num_chunks, chunk_total, max_num_spks)
         # local_target_lens shape: (batch_size * num_chunks,)
 
-        logging.info(f"local logits shape: {local_logits.shape}")
-        logging.info(f"local targets shape: {local_targets.shape}")
+        #logging.info(f"local logits shape: {local_logits.shape}")
+        #logging.info(f"local targets shape: {local_targets.shape}")
 
         local_preds = torch.sigmoid(local_logits)
         if local_targets.shape[0] < local_logits.shape[0]:
@@ -1075,8 +1085,8 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         #logging.info(f"local_preds: {(local_preds > 0.5).to(int).sum(dim=1)}")
         #logging.info(f"local_pil_targets: {local_pil_targets.to(int).sum(dim=1)}")
         #logging.info(f"local_ats_targets: {local_ats_targets.to(int).sum(dim=1)}")
-        logging.info(f"local_target_indices: {local_target_indices}")
-        logging.info(f"local_target_lens: {local_target_lens}")
+        #logging.info(f"local_target_indices: {local_target_indices}")
+        #logging.info(f"local_target_lens: {local_target_lens}")
 
         total_logits_op = torch.full(
             (batch_size, total_n_frames, targets_num_spks),
@@ -1094,7 +1104,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             start = chunk_idx * chunk_len
             end = min(start + chunk_len, total_n_frames)
             dur = end - start
-            logging.info(f"chunk_idx: {chunk_idx}, start: {start}, end: {end}, dur: {dur}, lc: {lc}, chunk_len: {chunk_len}")
+            #logging.info(f"chunk_idx: {chunk_idx}, start: {start}, end: {end}, dur: {dur}, lc: {lc}, chunk_len: {chunk_len}")
             offset = min(lc, start)
             local_logits_chunk = local_logits[chunk_idx * batch_size:(chunk_idx + 1) * batch_size, :, :] # (batch_size, lc+chunk_len+rc, local_num_spks)
             global_spk_indices = local_target_indices[chunk_idx * batch_size:(chunk_idx + 1) * batch_size, :]  # (batch_size, local_num_spks)
@@ -1146,7 +1156,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
     def _compute_q_contrastive_loss(self, local_queries: torch.Tensor, local_target_indices: torch.Tensor, active_frames_per_query: torch.Tensor) -> torch.Tensor:
         """
-        Compute query similarity loss using InfoNCE.
+        Compute query similarity loss using InfoNCE based on duration-averaged method.
         
         Args:
             local_queries (torch.Tensor): Local speaker queries
@@ -1169,20 +1179,20 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         sim_matrix = torch.bmm(normalized_queries, normalized_queries.transpose(1, 2))
 
         # 2. Create masks
-        targets = local_target_indices
-        is_same_speaker = targets.unsqueeze(2) == targets.unsqueeze(1)
+        is_same_speaker = local_target_indices.unsqueeze(2) == local_target_indices.unsqueeze(1)
         identity_mask = torch.eye(N, device=device, dtype=torch.bool).unsqueeze(0)
         
-        valid_mask = (queries_norm.squeeze(2) > 1e-8) & (targets != -1) & (active_frames_per_query > self.q_contrastive_min_active_frames)
-        valid_rows = valid_mask.unsqueeze(2)
-        valid_cols = valid_mask.unsqueeze(1)
+        valid_rows_mask = (queries_norm.squeeze(2) > 1e-8) & (local_target_indices != -1) & (active_frames_per_query > self.q_contrastive_min_frames_anchor)
+        valid_cols_mask = (queries_norm.squeeze(2) > 1e-8) & (local_target_indices != -1) & (active_frames_per_query > self.q_contrastive_min_frames_positive)
+        valid_rows = valid_rows_mask.unsqueeze(2)
+        valid_cols = valid_cols_mask.unsqueeze(1)
         
         # positive mask contains candidates for positive samples
         positive_mask = is_same_speaker & ~identity_mask & valid_rows & valid_cols
-        logging.info(f"positive_mask: {positive_mask.sum(dim=2)}")
+        #logging.info(f"positive_mask: {positive_mask.sum(dim=2)}")
         # negative mask contains all negative samples
         negative_mask = ~is_same_speaker & valid_rows & valid_cols
-        logging.info(f"negative_mask: {negative_mask.sum(dim=2)}")
+        #logging.info(f"negative_mask: {negative_mask.sum(dim=2)}")
 
         if self.q_contrastive_extra_positive:
             # Augment similarities with an extra column representing a new class
@@ -1204,7 +1214,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             logits[~keep_logits_mask]=-99
 
             # Set the final mask and number of classes for loss calculation
-            final_anchor_mask = valid_mask            
+            final_anchor_mask = valid_rows_mask            
         else:
             # Original logic without the extra class
             sim_matrix_flat = sim_matrix.view(B * N, N)
@@ -1227,25 +1237,38 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             logits = torch.cat([positive_sims.unsqueeze(2), negative_sims], dim=2)
 
             # Set the final mask and number of classes
-            final_anchor_mask = valid_mask & has_positives_mask
-            logging.info(f"positive_sims: {positive_sims * final_anchor_mask.float()}")
-            logging.info(f"negative_sims: {negative_sims}")
+            final_anchor_mask = valid_rows_mask & has_positives_mask
+            #logging.info(f"positive_sims: {positive_sims * final_anchor_mask.float()}")
+            #logging.info(f"negative_sims: {negative_sims}")
             
             labels = torch.zeros(B * N, dtype=torch.long, device=device)
 
         # 6. Compute loss
         loss = F.cross_entropy(logits.reshape(-1, N + 1), labels, reduction='none').view(B, N)
 
-        # 7. Mask out invalid anchors and average the loss
-        loss = loss * final_anchor_mask.float()
-        
         num_valid_anchors = final_anchor_mask.sum()
         logging.info(f"num_valid_anchors: {num_valid_anchors}")
-        
-        if num_valid_anchors == 0:
-            return torch.tensor(0.0, device=device, dtype=local_queries.dtype)
+        # 7. Average the loss (weighted or simple average based on config)
+        if self.q_contrastive_duration_averaged:
+            # Weighted average using active_frames_per_query as weights
+            weights = active_frames_per_query.clamp(max=self.q_contrastive_max_frames) * final_anchor_mask.float()
+            weighted_loss = loss * weights
             
-        total_loss = loss.sum() / num_valid_anchors
+            total_weight = weights.sum()
+            logging.info(f"total_weight (sum of active frames): {total_weight}")
+            
+            if total_weight == 0:
+                return torch.tensor(0.0, device=device, dtype=local_queries.dtype)
+                
+            total_loss = weighted_loss.sum() / total_weight
+        else:
+            # Simple average over valid anchors
+            loss = loss * final_anchor_mask.float()
+                      
+            if num_valid_anchors == 0:
+                return torch.tensor(0.0, device=device, dtype=local_queries.dtype)
+                
+            total_loss = loss.sum() / num_valid_anchors
         
         return total_loss
 
@@ -1449,10 +1472,10 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             num_chunks = local_queries.shape[0] // batch_size
             local_queries = local_queries.view(num_chunks, batch_size, local_num_spks, emb_dim).transpose(0, 1).reshape(batch_size, num_chunks * local_num_spks, emb_dim)
             local_target_indices = local_target_indices.view(num_chunks, batch_size, local_num_spks).transpose(0, 1).reshape(batch_size, num_chunks * local_num_spks)
-            logging.info(f"local_target_indices: {local_target_indices}")
-            logging.info(f"local_queries: {local_queries.shape}")
+            #logging.info(f"local_target_indices: {local_target_indices}")
+            #logging.info(f"local_queries: {local_queries.shape}")
             active_frames_per_query = active_frames_per_query.view(num_chunks, batch_size, local_num_spks).transpose(0, 1).reshape(batch_size, num_chunks * local_num_spks)
-            logging.info(f"active_frames_per_query: {active_frames_per_query}")
+            #logging.info(f"active_frames_per_query: {active_frames_per_query}")
             val_q_contrastive_loss = self._compute_q_contrastive_loss(local_queries, local_target_indices, active_frames_per_query)
         else:
             val_q_contrastive_loss = torch.tensor(0.0, device=val_pil_loss.device, dtype=val_pil_loss.dtype)
@@ -2299,3 +2322,108 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         q_sim_loss = self.q_sim_loss(query_pairs_1, query_pairs_2, targets)
         
         return q_sim_loss
+
+    def _compute_q_contrastive_loss_legacy(self, local_queries: torch.Tensor, local_target_indices: torch.Tensor, active_frames_per_query: torch.Tensor) -> torch.Tensor:
+        """
+        Compute query similarity loss using InfoNCE.
+        
+        Args:
+            local_queries (torch.Tensor): Local speaker queries
+                Shape: (B, N, emb_dim) where N = local_num_spks * L
+            local_target_indices (torch.Tensor): Speaker indices mapping
+                Shape: (B, N) where local_target_indices[b, n] is the original speaker index
+                that query n corresponds to, or -1 if unmatched
+            active_frames_per_query (torch.Tensor): Tensor containing the number of active frames per query
+                Shape: (B, N)
+        Returns:
+            infonce_loss (torch.Tensor): InfoNCE loss scalar
+        """
+        B, N, D = local_queries.shape
+        device = local_queries.device
+
+        # 1. Normalize queries and compute pairwise similarity
+        # Use a small epsilon to prevent division by zero for zero-norm queries
+        queries_norm = torch.norm(local_queries, p=2, dim=2, keepdim=True)
+        normalized_queries = local_queries / (queries_norm + 1e-8)
+        sim_matrix = torch.bmm(normalized_queries, normalized_queries.transpose(1, 2))
+
+        # 2. Create masks
+        targets = local_target_indices
+        is_same_speaker = targets.unsqueeze(2) == targets.unsqueeze(1)
+        identity_mask = torch.eye(N, device=device, dtype=torch.bool).unsqueeze(0)
+        
+        valid_mask = (queries_norm.squeeze(2) > 1e-8) & (targets != -1) & (active_frames_per_query > self.q_contrastive_min_frames_anchor)
+        valid_rows = valid_mask.unsqueeze(2)
+        valid_cols = valid_mask.unsqueeze(1)
+        
+        # positive mask contains candidates for positive samples
+        positive_mask = is_same_speaker & ~identity_mask & valid_rows & valid_cols
+        logging.info(f"positive_mask: {positive_mask.sum(dim=2)}")
+        # negative mask contains all negative samples
+        negative_mask = ~is_same_speaker & valid_rows & valid_cols
+        logging.info(f"negative_mask: {negative_mask.sum(dim=2)}")
+
+        if self.q_contrastive_extra_positive:
+            # Augment similarities with an extra column representing a new class
+            margin_col = torch.full((B, N, 1), 0.5, device=device, dtype=sim_matrix.dtype)
+            logits = torch.cat([sim_matrix, margin_col], dim=2)
+            logits /= self.q_contrastive_temperature
+
+            # Augment positive and negative masks: the extra column is always a valid positive candidate
+            extra_col_mask = torch.ones(B, N, 1, device=device, dtype=torch.bool)
+            pos_candidate_mask = torch.cat([positive_mask, extra_col_mask], dim=2)
+            extended_neg_mask = torch.cat([negative_mask, extra_col_mask], dim=2)
+
+            # Sample a ground truth label from the valid positive candidates for each anchor
+            labels = torch.multinomial(pos_candidate_mask.float().view(-1, N + 1), 1).squeeze(1) # (B*N,)
+            labels_mask = torch.nn.functional.one_hot(labels, num_classes=N + 1).bool().view(B, N, N + 1) # (B, N, N+1)
+
+            # Keep only the logits that are either negative or the chosen positive
+            keep_logits_mask = extended_neg_mask | labels_mask
+            logits[~keep_logits_mask]=-99
+
+            # Set the final mask and number of classes for loss calculation
+            final_anchor_mask = valid_mask            
+        else:
+            # Original logic without the extra class
+            sim_matrix_flat = sim_matrix.view(B * N, N)
+
+            # Sample one positive for each potential anchor
+            pos_probs = positive_mask.float()
+            has_positives_mask = pos_probs.sum(dim=2) > 0
+            pos_probs[~has_positives_mask] = 1.0 # Avoid error
+            
+            sampled_pos_indices = torch.multinomial(pos_probs.view(-1, N), 1).squeeze(1)
+            
+            positive_sims = sim_matrix_flat[torch.arange(B * N, device=device), sampled_pos_indices].view(B, N)
+
+            # Scale similarities and prepare negatives
+            positive_sims /= self.q_contrastive_temperature
+            negative_sims = sim_matrix / self.q_contrastive_temperature
+            negative_sims[~negative_mask] = -99
+
+            # Combine to form logits
+            logits = torch.cat([positive_sims.unsqueeze(2), negative_sims], dim=2)
+
+            # Set the final mask and number of classes
+            final_anchor_mask = valid_mask & has_positives_mask
+            logging.info(f"positive_sims: {positive_sims * final_anchor_mask.float()}")
+            logging.info(f"negative_sims: {negative_sims}")
+            
+            labels = torch.zeros(B * N, dtype=torch.long, device=device)
+
+        # 6. Compute loss
+        loss = F.cross_entropy(logits.reshape(-1, N + 1), labels, reduction='none').view(B, N)
+
+        # 7. Mask out invalid anchors and average the loss
+        loss = loss * final_anchor_mask.float()
+        
+        num_valid_anchors = final_anchor_mask.sum()
+        logging.info(f"num_valid_anchors: {num_valid_anchors}")
+        
+        if num_valid_anchors == 0:
+            return torch.tensor(0.0, device=device, dtype=local_queries.dtype)
+            
+        total_loss = loss.sum() / num_valid_anchors
+        
+        return total_loss
