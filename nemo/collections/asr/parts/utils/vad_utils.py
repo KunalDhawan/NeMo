@@ -1893,3 +1893,133 @@ def predlist_to_timestamps(
             speaker_timestamps[spk_id].extend(ts_seg_list)
         total_speaker_timestamps.append(speaker_timestamps)
     return total_speaker_timestamps
+
+
+def binarize_vector_fast(sequence: torch.Tensor, threshold: float = 0.5, 
+                         frame_length_in_sec: float = 0.01) -> torch.Tensor:
+    """
+    Fast vectorized binarization for a single sequence using a single threshold.
+    
+    This is a simple run-length encoding of regions above threshold.
+    Fully vectorized with no Python loops - much faster than the original binarization function.
+    
+    Args:
+        sequence: Frame-level predictions (num_frames,)
+        threshold: Threshold for speech detection
+        frame_length_in_sec: Duration of each frame in seconds
+        
+    Returns:
+        speech_segments: Tensor of shape (num_segments, 2) with [start, end] times
+    """
+    if len(sequence) == 0:
+        return torch.empty((0, 2), dtype=torch.float32, device=sequence.device)
+    
+    # Create binary mask
+    above_threshold = sequence > threshold
+    
+    # Pad with False at boundaries
+    padded = torch.nn.functional.pad(above_threshold.unsqueeze(0), (1, 1), value=False).squeeze(0)
+    
+    # Find transitions: 0->1 (starts) and 1->0 (ends)
+    diff = padded[1:].long() - padded[:-1].long()
+    starts = torch.where(diff == 1)[0]
+    ends = torch.where(diff == -1)[0]
+    
+    # Validate we have matching starts and ends
+    if len(starts) == 0 or len(ends) == 0:
+        return torch.empty((0, 2), dtype=torch.float32, device=sequence.device)
+    
+    # For sequences ending with speech, the end should be last frame index
+    if len(starts) > len(ends):
+        ends = torch.cat([ends, torch.tensor([len(sequence) - 1], device=ends.device, dtype=ends.dtype)])
+    
+    # Ensure we have equal numbers
+    min_len = min(len(starts), len(ends))
+    starts = starts[:min_len]
+    ends = ends[:min_len]
+    
+    # Convert frame indices to timestamps
+    speech_segments = torch.stack([starts.float(), ends.float()], dim=1) * frame_length_in_sec
+    
+    return speech_segments
+
+
+def predlist_to_timestamps_fast(
+    batch_preds_list: List[torch.Tensor],
+    audio_rttm_map_dict: Dict[str, Dict[str, Union[float, int]]],
+    unit_10ms_frame_count: int,
+    precision: int = 2,
+    threshold: float = 0.5,
+) -> List[List[List[float]]]:
+    """
+    Optimized version of predlist_to_timestamps for bypass_postprocessing=True mode.
+    
+    This version is significantly faster due to:
+    - Fully vectorized operations (no Python loops in binarization)
+    - Working directly on original tensor (no repeat_interleave needed)
+    - Efficient integer-based rounding
+    
+    Note: This function only supports single threshold mode (onset == offset).
+    For general post-processing, use the original predlist_to_timestamps function.
+    
+    Args:
+        batch_preds_list (List[Tensor]):
+            Tensor diarization results for each sample.
+            Dimension: [(num_frames, num_speakers), ...]
+        audio_rttm_map_dict (Dict[str, Dict[str, Union[float, int]]]):
+            Dictionary mapping unique audio file names to their rttm file entries.
+        unit_10ms_frame_count (int):
+            Number of 10ms frames in a unit (e.g., 8 for 80ms frames).
+        precision (int, optional):
+            Number of decimal places for timestamps. Defaults to 2.
+        threshold (float, optional):
+            Threshold for speech detection. Defaults to 0.5.
+    
+    Returns:
+        total_speaker_timestamps (List[List[List[float]]]):
+            A list of lists of timestamp lists for each session
+            Levels:
+                - Session-level (uniq_id) [session1_list, session2_list,...]
+                    - Speaker-level: [speaker1_segments, speaker2_segments,...]
+                        - Segment-level: [[start1, end1], [start2, end2],...]
+    """
+    total_speaker_timestamps = []
+    
+    # Pre-compute rounding multiplier and frame length for efficiency
+    round_mult = 10 ** precision
+    # Work directly on original frames (e.g., 80ms frames instead of expanding to 10ms)
+    actual_frame_length = 0.01 * unit_10ms_frame_count
+    
+    for sample_idx, (uniq_id, audio_rttm_values) in tqdm(
+        enumerate(audio_rttm_map_dict.items()), 
+        total=len(audio_rttm_map_dict), 
+        desc="Fast Binarization"
+    ):
+        offset_time = audio_rttm_values['offset']
+        speaker_assign_mat = batch_preds_list[sample_idx].squeeze(dim=0)  # (num_frames, num_speakers)
+        num_speakers = speaker_assign_mat.shape[-1]
+        
+        speaker_timestamps = []
+        for spk_id in range(num_speakers):
+            # Binarize using fast vectorized function on original tensor (no repeat_interleave!)
+            ts_mat = binarize_vector_fast(
+                speaker_assign_mat[:, spk_id], 
+                threshold=threshold, 
+                frame_length_in_sec=actual_frame_length
+            )
+            
+            # Add offset and round
+            if len(ts_mat) > 0:
+                ts_mat = ts_mat + offset_time
+                # Efficient rounding: scale to int, then divide back for clean decimal representation
+                # Must convert to int64 to avoid float32 precision issues
+                ts_seg_scaled = torch.round(ts_mat * round_mult).long().cpu().numpy()
+                ts_seg_list = (ts_seg_scaled / round_mult).tolist()
+            else:
+                ts_seg_list = []
+            
+            speaker_timestamps.append(ts_seg_list)
+        
+        total_speaker_timestamps.append(speaker_timestamps)
+    
+    return total_speaker_timestamps

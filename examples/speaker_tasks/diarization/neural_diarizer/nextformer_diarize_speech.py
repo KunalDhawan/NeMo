@@ -62,6 +62,7 @@ from nemo.collections.asr.parts.utils.vad_utils import (
     PostProcessingParams,
     load_postprocessing_from_yaml,
     predlist_to_timestamps,
+    predlist_to_timestamps_fast,
 )
 from nemo.collections.common.parts.preprocessing.manifest import get_full_path
 from nemo.core.config import hydra_runner
@@ -276,13 +277,21 @@ def convert_pred_mat_to_segments(
     """
     all_hypothesis, all_reference, all_uems = [], [], []
     cfg_vad_params = OmegaConf.structured(postprocessing_cfg)
-    total_speaker_timestamps = predlist_to_timestamps(
-        batch_preds_list=batch_preds_list,
-        audio_rttm_map_dict=audio_rttm_map_dict,
-        cfg_vad_params=cfg_vad_params,
-        unit_10ms_frame_count=unit_10ms_frame_count,
-        bypass_postprocessing=bypass_postprocessing,
-    )
+    if bypass_postprocessing:
+        total_speaker_timestamps = predlist_to_timestamps_fast(
+            batch_preds_list=batch_preds_list,
+            audio_rttm_map_dict=audio_rttm_map_dict,
+            unit_10ms_frame_count=unit_10ms_frame_count,
+            threshold=0.5,
+        )
+    else:
+        total_speaker_timestamps = predlist_to_timestamps(
+            batch_preds_list=batch_preds_list,
+            audio_rttm_map_dict=audio_rttm_map_dict,
+            cfg_vad_params=cfg_vad_params,
+            unit_10ms_frame_count=unit_10ms_frame_count,
+            bypass_postprocessing=bypass_postprocessing,
+        )
     for sample_idx, (uniq_id, audio_rttm_values) in enumerate(audio_rttm_map_dict.items()):
         speaker_timestamps = total_speaker_timestamps[sample_idx]
         if uniq_id is None:
@@ -374,6 +383,8 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     diar_model._cfg.test_ds.use_bucketing = False
     diar_model._cfg.test_ds.drop_last = False
     diar_model._cfg.test_ds.batch_duration = cfg.batch_duration
+    diar_model._cfg.test_ds.num_speakers = cfg.max_num_spks
+    diar_model._cfg.test_ds.num_spks = cfg.max_num_spks
     OmegaConf.set_struct(diar_model._cfg, True)
 
     # Model setup for inference
