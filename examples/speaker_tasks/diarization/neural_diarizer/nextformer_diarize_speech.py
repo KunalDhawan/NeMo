@@ -99,6 +99,11 @@ class DiarizationConfig:
     collar: float = 0.25  # Collar in seconds for DER calculation
     ignore_overlap: bool = False  # If True, DER will be calculated only for non-overlapping segments
 
+    chunk_len: int = 125
+    chunk_left_context: int = 62
+    chunk_right_context: int = 10
+    max_num_spks: int = 8
+
     # If `cuda` is a negative number, inference will be on CPU only.
     cuda: Optional[int] = None
     matmul_precision: str = "highest"  # Literal["highest", "high", "medium"]
@@ -374,6 +379,13 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     # Model setup for inference
     diar_model._cfg.test_ds.num_workers = cfg.num_workers
     diar_model.setup_test_data(test_data_config=diar_model._cfg.test_ds)
+
+    # Chunks setup
+    diar_model.nextformer_modules.max_num_spks = cfg.max_num_spks
+    diar_model.nextformer_modules.chunk_len = cfg.chunk_len
+    diar_model.nextformer_modules.chunk_left_context = cfg.chunk_left_context
+    diar_model.nextformer_modules.chunk_right_context = cfg.chunk_right_context
+    diar_model.nextformer_modules.log = cfg.log
 
     postprocessing_cfg = load_postprocessing_from_yaml(cfg.postprocessing_yaml)
     tensor_path, model_id, tensor_filename = get_tensor_path(cfg)

@@ -198,7 +198,9 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         If there is no label, then the evaluation metrics will be based on Permutation Invariant Loss (PIL).
         """
         self._accuracy_test = MultiBinaryAccuracy()
-        self._accuracy_test_global = MultiBinaryAccuracy()
+        self._accuracy_test_op = MultiBinaryAccuracy()
+        self._accuracy_test_local = MultiBinaryAccuracy()
+        self._accuracy_test_local_ats = MultiBinaryAccuracy()
         self._accuracy_train = MultiBinaryAccuracy()
         self._accuracy_train_global = MultiBinaryAccuracy()
         self._accuracy_valid = MultiBinaryAccuracy()
@@ -206,7 +208,6 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self._accuracy_train_global_op = MultiBinaryAccuracy()
         self._accuracy_valid_global_op = MultiBinaryAccuracy()
 
-        self._accuracy_test_ats = MultiBinaryAccuracy()
         self._accuracy_train_ats = MultiBinaryAccuracy()
         self._accuracy_valid_ats = MultiBinaryAccuracy()
 
@@ -1614,33 +1615,9 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         return {'log': multi_val_metrics}
 
     def _get_aux_test_batch_evaluations(
-        self, batch_idx: int, logits_local, logits, targets, target_lens, query_logits, emb_seq
+        self, batch_idx: int, logits, emb_seq, local_logits, local_queries, active_frames_per_query, targets, target_lens
     ):
-        """
-        Compute auxiliary validation evaluations including losses and metrics.
-
-        This function calculates various losses and metrics for the training process,
-        including Arrival Time Sort (ATS) Loss and Permutation Invariant Loss (PIL)
-        based evaluations.
-
-        Args:
-            batch_idx (int): The index of the current batch.
-            logits_local (torch.Tensor): Predicted local speaker labels.
-                Shape: (batch_size, diar_frame_count, num_speakers_in_preds)
-            logits (torch.Tensor): Predicted speaker labels.
-                Shape: (batch_size, diar_frame_count, num_speakers_in_preds)
-            targets (torch.Tensor): Ground truth speaker labels.
-                Shape: (batch_size, diar_frame_count, num_speakers_in_targets)
-            target_lens (torch.Tensor): Lengths of target sequences.
-                Shape: (batch_size,)
-            query_logits (torch.Tensor): Predicted query existence probabilities.
-                Shape: (batch_size, num_speakers_in_preds)
-            emb_seq (torch.Tensor): Encoder embeddings.
-                Shape: (batch_size, diar_frame_count, emb_dim)
-        """
-        preds_local = torch.sigmoid(logits_local)
         preds = torch.sigmoid(logits)
-        query_probs = torch.sigmoid(query_logits)
         targets = targets.to(preds.dtype)
         if preds.shape[1] < targets.shape[1]:
             logging.info(
@@ -1650,35 +1627,40 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             targets = targets[:, : preds.shape[1], :]
             target_lens = target_lens.clamp(max=preds.shape[1])
 
-        targets_ats = get_ats_targets(targets.clone(), preds_local, speaker_permutations=self.speaker_permutations)
-        targets_pil = get_pil_targets(targets.clone(), preds_local, speaker_permutations=self.speaker_permutations)
-
-        # Zero out predictions based on query_probs threshold during testing
-        cls_mask = (query_probs > self.cls_threshold).to(preds.dtype)
-        preds = preds * cls_mask.unsqueeze(1)
-
-        self._accuracy_test_local(preds_local, targets_pil, target_lens)
-        f1_acc_local, _, _ = self._accuracy_test_local.compute()
-        self.batch_f1_accs_local_list.append(f1_acc_local)
-        logging.info(f"batch {batch_idx}: f1_acc_local={f1_acc_local}")
-
+        # get global f1 accuracy
+        targets_pil, _ = get_pil_targets_hungarian(labels=targets.clone(), logits=logits, metric=self.pil_metric)
         self._accuracy_test(preds, targets_pil, target_lens)
         f1_acc, precision, recall = self._accuracy_test.compute()
         self.batch_f1_accs_list.append(f1_acc)
-        self.batch_precision_list.append(precision)
-        self.batch_recall_list.append(recall)
         logging.info(f"batch {batch_idx}: f1_acc={f1_acc}, precision={precision}, recall={recall}")
 
-        self._accuracy_test_ats(preds, targets_ats, target_lens)
-        f1_acc_ats, precision_ats, recall_ats = self._accuracy_test_ats.compute()
-        self.batch_f1_accs_ats_list.append(f1_acc_ats)
-        logging.info(
-            f"batch {batch_idx}: f1_acc_ats={f1_acc_ats}, precision_ats={precision_ats}, recall_ats={recall_ats}"
+        local_pil_targets, local_ats_targets, local_target_lens, local_target_indices, total_logits_op = self._process_logits_and_targets(
+            local_logits, targets, target_lens
         )
 
+        # get global optimally-permuted f1 accuracy (upper bound)
+        preds_op = torch.sigmoid(total_logits_op)
+        self._accuracy_test_op(preds_op, targets, target_lens)
+        f1_acc_op, precision_op, recall_op = self._accuracy_test_op.compute()
+        self.batch_f1_accs_op_list.append(f1_acc_op)
+        logging.info(f"batch {batch_idx}: f1_acc_op={f1_acc_op}, precision_op={precision_op}, recall_op={recall_op}")
+
+        # get local f1 accuracy
+        local_preds = torch.sigmoid(local_logits)
+        self._accuracy_test_local(local_preds, local_pil_targets, local_target_lens)
+        f1_acc_local, precision_local, recall_local = self._accuracy_test_local.compute()
+        self.batch_f1_accs_local_list.append(f1_acc_local)
+        logging.info(f"batch {batch_idx}: f1_acc_local={f1_acc_local}, precision_local={precision_local}, recall_local={recall_local}")
+
+        self._accuracy_test_local_ats(local_preds, local_ats_targets, local_target_lens)
+        f1_acc_local_ats, precision_local_ats, recall_local_ats = self._accuracy_test_local_ats.compute()
+        self.batch_f1_accs_local_ats_list.append(f1_acc_local_ats)
+        logging.info(f"batch {batch_idx}: f1_acc_local_ats={f1_acc_local_ats}, precision_local_ats={precision_local_ats}, recall_local_ats={recall_local_ats}")
+
         self._accuracy_test.reset()
-        self._accuracy_test_ats.reset()
+        self._accuracy_test_op.reset()
         self._accuracy_test_local.reset()
+        self._accuracy_test_local_ats.reset()
 
     def test_batch(
         self,
@@ -1692,11 +1674,10 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         (
             self.preds_total_list,
             self.batch_f1_accs_list,
-            self.batch_precision_list,
-            self.batch_recall_list,
-            self.batch_f1_accs_ats_list,
+            self.batch_f1_accs_op_list,
             self.batch_f1_accs_local_list,
-        ) = ([], [], [], [], [], [])
+            self.batch_f1_accs_local_ats_list,
+        ) = ([], [], [], [], [])
 
         with torch.no_grad():
             for batch_idx, batch in enumerate(tqdm(self._test_dl)):
@@ -1704,12 +1685,11 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 audio_signal = audio_signal.to(self.device)
                 audio_signal_length = audio_signal_length.to(self.device)
                 targets = targets.to(self.device)
-                logits_local, logits, query_logits, emb_seq = self.forward(
-                    audio_signal=audio_signal,
-                    audio_signal_length=audio_signal_length,
+                logits, emb_seq, local_logits, local_queries, active_frames_per_query = self.forward(
+                    audio_signal=audio_signal, audio_signal_length=audio_signal_length
                 )
                 self._get_aux_test_batch_evaluations(
-                    batch_idx, logits_local, logits, targets, target_lens, query_logits, emb_seq
+                    batch_idx, logits, emb_seq, local_logits, local_queries, active_frames_per_query, targets, target_lens
                 )
                 preds = torch.sigmoid(logits).detach().to('cpu')
                 if preds.shape[0] == 1:  # batch size = 1
@@ -1719,10 +1699,9 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 torch.cuda.empty_cache()
 
         logging.info(f"Batch F1Acc. MEAN: {torch.mean(torch.tensor(self.batch_f1_accs_list))}")
-        logging.info(f"Batch Precision MEAN: {torch.mean(torch.tensor(self.batch_precision_list))}")
-        logging.info(f"Batch Recall MEAN: {torch.mean(torch.tensor(self.batch_recall_list))}")
-        logging.info(f"Batch ATS F1Acc. MEAN: {torch.mean(torch.tensor(self.batch_f1_accs_ats_list))}")
+        logging.info(f"Batch OP-F1Acc. MEAN: {torch.mean(torch.tensor(self.batch_f1_accs_op_list))}")
         logging.info(f"Batch Local F1Acc. MEAN: {torch.mean(torch.tensor(self.batch_f1_accs_local_list))}")
+        logging.info(f"Batch Local F1Acc. ATS MEAN: {torch.mean(torch.tensor(self.batch_f1_accs_local_ats_list))}")
 
     def on_validation_epoch_end(self) -> Optional[dict[str, dict[str, torch.Tensor]]]:
         """Run validation with sync_dist=True."""
