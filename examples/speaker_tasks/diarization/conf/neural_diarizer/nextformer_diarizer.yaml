@@ -12,6 +12,7 @@ model:
   q_contrastive_weight: 0.0 # Weight for Contrastive Query Similarity loss
   q_contrastive_temperature: 0.1 # Temperature for Contrastive Query Similarity loss
   q_contrastive_extra_positive: false # Use an explicit 0.5 margin in contrastive loss
+  q_contrastive_extra_positive_rate: 0.1 # Rate for extra positive class in contrastive loss
   q_contrastive_min_frames_anchor: 5 # Minimum number of active frames per query for contrastive loss to be a valid anchor
   q_contrastive_min_frames_positive: 10 # Minimum number of active frames per query for contrastive loss to be a candidate for a positive sample
   q_contrastive_duration_averaged: true # Use duration-averaging for contrastive loss
