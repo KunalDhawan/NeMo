@@ -1288,7 +1288,7 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
             spks_tokeep = all_spks
 
         spks_todrop = [spk for spk in all_spks if spk not in spks_tokeep]
-        logging.info(f"uniq_id: {sample.uniq_id}, num_speakers: {num_speakers}, spks_tokeep: {spks_tokeep}, spks_todrop: {spks_todrop}")
+        #logging.info(f"uniq_id: {sample.uniq_id}, num_speakers: {num_speakers}, spks_tokeep: {spks_tokeep}, spks_todrop: {spks_todrop}")
 
         frame_level_target = get_frame_targets_from_rttm(
             rttm_timestamps=rttm_timestamps,
@@ -1338,9 +1338,9 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
 
             two_chunks_sampled = False
             if use_two_chunks and current_duration_frames > 2 * max_len_frames:
-                logging.info(
-                    f"uniq_id: {sample.uniq_id}, trying two chunks: max_len_frames: {max_len_frames}, current_duration_frames: {current_duration_frames}"
-                )
+                #logging.info(
+                #    f"uniq_id: {sample.uniq_id}, trying two chunks: max_len_frames: {max_len_frames}, current_duration_frames: {current_duration_frames}"
+                #)
 
                 silence_frames_mask = frame_level_target.sum(dim=1) == 0
                 silence_frame_indices = torch.where(silence_frames_mask)[0]
@@ -1357,7 +1357,7 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
                     start1 = potential_start1_indices[
                         random.randint(0, len(potential_start1_indices) - 1)
                     ].item()
-                    logging.info(f"uniq_id: {sample.uniq_id}, successfully sampled start1: {start1}, len1: {len1}")
+                    #logging.info(f"uniq_id: {sample.uniq_id}, successfully sampled start1: {start1}, len1: {len1}")
                     s2_min = start1 + len1
                     s2_max = current_duration_frames - len2
                     valid_start2_indices = silence_frame_indices[
@@ -1373,7 +1373,7 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
                                 (silence_frame_indices >= s2_min_fallback) & (silence_frame_indices <= s2_max_fallback)
                             ]
                             len2_is_fixed = False
-                            logging.info(f"uniq_id: {sample.uniq_id}, can't sample start2 of len2: {len2}, trying to reduce len2")
+                            #logging.info(f"uniq_id: {sample.uniq_id}, can't sample start2 of len2: {len2}, trying to reduce len2")
 
                     if len(valid_start2_indices) > 0:
                         start2 = valid_start2_indices[random.randint(0, len(valid_start2_indices) - 1)].item()
@@ -1382,15 +1382,15 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
                             len2 = min(max_len_frames - len1, current_duration_frames - start2)
 
                         end1, end2 = start1 + len1, start2 + len2
-                        logging.info(f"uniq_id: {sample.uniq_id}, successfully sampled start2: {start2}, len2: {len2}, total len: {len1 + len2}")
-                        logging.info(f"uniq_id: {sample.uniq_id}, sanity check: start1 targets: {frame_level_target[start1]}, start2 targets: {frame_level_target[start2]}")
+                        #logging.info(f"uniq_id: {sample.uniq_id}, successfully sampled start2: {start2}, len2: {len2}, total len: {len1 + len2}")
+                        #logging.info(f"uniq_id: {sample.uniq_id}, sanity check: start1 targets: {frame_level_target[start1]}, start2 targets: {frame_level_target[start2]}")
 
                         if random.random() < 0.5:
                             starts, ends = [start1, start2], [end1, end2]
                         else:
                             starts, ends = [start2, start1], [end2, end1]
 
-                        logging.info(f"uniq_id: {sample.uniq_id}, starts: {starts}, ends: {ends}")
+                        #logging.info(f"uniq_id: {sample.uniq_id}, starts: {starts}, ends: {ends}")
 
                         frame_level_target = torch.cat(
                             [frame_level_target[starts[0] : ends[0]], frame_level_target[starts[1] : ends[1]]]
@@ -1403,17 +1403,17 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
                                 audio_signal[int(starts[1] * samples_per_frame) : int(ends[1] * samples_per_frame)],
                             ]
                         )
-                        logging.info(
-                            f"uniq_id: {sample.uniq_id}, audio_signal after two-chunk trimming: {audio_signal.shape}"
-                        )
-                        logging.info(
-                            f"uniq_id: {sample.uniq_id}, frame_level_target after two-chunk trimming: {frame_level_target.shape}"
-                        )
+                        #logging.info(
+                        #    f"uniq_id: {sample.uniq_id}, audio_signal after two-chunk trimming: {audio_signal.shape}"
+                        #)
+                        #logging.info(
+                        #    f"uniq_id: {sample.uniq_id}, frame_level_target after two-chunk trimming: {frame_level_target.shape}"
+                        #)
                         two_chunks_sampled = True
-                    else:
-                        logging.info(f"uniq_id: {sample.uniq_id}, can't sample start2, falling back to single chunk")
-                else:
-                    logging.info(f"uniq_id: {sample.uniq_id}, can't sample start1, falling back to single chunk")
+                    #else:
+                        #logging.info(f"uniq_id: {sample.uniq_id}, can't sample start2, falling back to single chunk")
+                #else:
+                    #logging.info(f"uniq_id: {sample.uniq_id}, can't sample start1, falling back to single chunk")
 
             if not two_chunks_sampled:
                 # Get a single chunk
@@ -1451,9 +1451,9 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         targets = self.get_soft_targets_seg(feat_level_target=frame_level_target, target_len=target_len)
         targets = targets[:target_len, :]
         actual_n_spk = (targets >= self.soft_label_thres).any(dim=0).sum().item()
-        logging.info(
-            f"uniq_id: {sample.uniq_id}, targets: {targets.shape}, target_len: {target_len}, actual n_spk: {actual_n_spk}"
-        )
+        #logging.info(
+        #    f"uniq_id: {sample.uniq_id}, targets: {targets.shape}, target_len: {target_len}, actual n_spk: {actual_n_spk}"
+        #)
         return audio_signal, audio_signal_length, targets, target_len
 
     def __getitem__(self, index):

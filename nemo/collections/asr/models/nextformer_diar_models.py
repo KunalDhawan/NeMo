@@ -517,8 +517,8 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 local_tensor, op=dist.ReduceOp.MAX, async_op=False
             )  # get max feature length across all GPUs
             max_n_frames = local_tensor.item()
-            if dist.get_rank() == 0:
-                logging.info(f"Maximum feature length across all GPUs: {max_n_frames}")
+            #if dist.get_rank() == 0:
+            #    logging.info(f"Maximum feature length across all GPUs: {max_n_frames}")
         else:
             max_n_frames = sig_length
 
@@ -1561,7 +1561,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         
         # Count valid anchors for logging
         num_valid = final_anchor_mask.sum()
-        logging.info(f"Computing loss for {num_valid.item()} valid anchors")
+        #logging.info(f"Computing loss for {num_valid.item()} valid anchors")
         
         # Check for early return if no valid anchors
         if num_valid == 0:
@@ -1578,7 +1578,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             weighted_loss = loss * weights
             
             total_weight = weights.sum()
-            logging.info(f"Duration-averaged mode: total_weight (sum of active frames): {total_weight.item():.1f}")
+            #logging.info(f"Duration-averaged mode: total_weight (sum of active frames): {total_weight.item():.1f}")
             
             if total_weight == 0:
                 logging.info("Total weight is zero, returning zero loss")
@@ -1594,7 +1594,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 return torch.tensor(0.0, device=device, dtype=local_queries.dtype)
             
             total_loss = loss.sum() / num_valid
-            logging.info(f"Simple average mode: averaged over {num_valid.item()} anchors")
+            #logging.info(f"Simple average mode: averaged over {num_valid.item()} anchors")
         
         #logging.info(f"Final centroid contrastive loss: {total_loss.item():.6f}")
         
