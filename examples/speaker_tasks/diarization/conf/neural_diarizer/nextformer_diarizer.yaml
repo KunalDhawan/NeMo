@@ -275,7 +275,7 @@ exp_manager:
   create_checkpoint_callback: True
   create_wandb_logger: False
   checkpoint_callback_params:
-    monitor: "val_f1_acc"
+    monitor: "val_f1_acc_global"
     mode: "max"
     save_top_k: 9
     every_n_epochs: 1

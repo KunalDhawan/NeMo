@@ -589,7 +589,7 @@ class NextformerModules(NeuralModule, Exportable):
         streaming_state.global_spk_centroids_duration = torch.zeros((batch_size, self.max_num_spks), dtype=torch.float, device=device)
         return streaming_state
 
-    def get_global_indices(self, spk_queries, global_spk_centroids):
+    def get_global_indices_v1(self, spk_queries, global_spk_centroids):
         """
         Get global indices for speaker queries. This function performs speaker matching between
         local speaker queries from the current chunk and global speaker centroids maintained
@@ -689,6 +689,144 @@ class NextformerModules(NeuralModule, Exportable):
                     global_spk_indices[b, nonzero_local_indices[i]] = i
 
             logging.info(f"b={b}, global_spk_indices: {global_spk_indices[b]}")
+
+        return global_spk_indices
+
+    def get_global_indices(self, spk_queries, global_spk_centroids):
+        """
+        Get global indices for speaker queries (Version 2 with extended similarity matrix).
+        
+        This function performs speaker matching between local speaker queries from the current chunk 
+        and global speaker centroids maintained throughout the stream. It uses cosine similarity and 
+        the Hungarian algorithm for matching, with an extended similarity matrix that includes potential 
+        new speaker slots for optimal assignment.
+
+        Key improvements over v1:
+        - Extended similarity matrix includes "new speaker slots" as explicit options
+        - Hungarian algorithm makes globally optimal assignments in a single pass
+        - No post-hoc threshold filtering needed
+        - New speaker assignments preserve local speaker ordering
+
+        Args:
+            spk_queries (torch.Tensor): Speaker queries for the current chunk.
+                Shape: (B, local_num_spks, emb_dim)
+            global_spk_centroids (torch.Tensor): Global speaker centroids.
+                Shape: (B, max_num_spks, emb_dim)
+
+        Returns:
+            global_spk_indices (torch.Tensor): Tensor with global speaker indices for each local query.
+                Shape: (B, local_num_spks)
+        """
+        batch_size, local_num_spks, _ = spk_queries.shape
+        device = spk_queries.device
+        global_spk_indices = torch.full((batch_size, local_num_spks), -1, dtype=torch.long, device=device)
+
+        # Calculate norms for the entire batch to find zero-vectors
+        local_norms = spk_queries.norm(dim=2)  # (B, local_num_spks)
+        global_norms = global_spk_centroids.norm(dim=2)  # (B, max_num_spks)
+
+        # OPTIMIZATION: Compute boolean masks for all batches at once
+        is_nonzero_local_all = local_norms > 1e-8  # (B, local_num_spks)
+        is_nonzero_global_all = global_norms > 1e-8  # (B, max_num_spks)
+
+        # OPTIMIZATION: Compute similarity matrix for entire batch at once
+        # Shape: (B, local_num_spks, max_num_spks)
+        sim_matrix_full = F.cosine_similarity(
+            spk_queries.unsqueeze(2),  # (B, local_num_spks, 1, emb_dim)
+            global_spk_centroids.unsqueeze(1),  # (B, 1, max_num_spks, emb_dim)
+            dim=3  # Compute similarity along embedding dimension
+        )  # Result: (B, local_num_spks, max_num_spks)
+
+        for b in range(batch_size):
+            # Extract boolean masks for this batch item
+            is_nonzero_local = is_nonzero_local_all[b]
+            is_nonzero_global = is_nonzero_global_all[b]
+            
+            # Filter out zero-norm queries (undetected speakers)
+            nonzero_local_indices = torch.where(is_nonzero_local)[0]
+            if len(nonzero_local_indices) == 0:
+                continue
+
+            # Filter out zero-norm global centroids (inactive global speakers)
+            nonzero_global_indices = torch.where(is_nonzero_global)[0]
+
+            if not self.training:
+                logging.info(f"b={b}, nonzero_local_indices: {nonzero_local_indices}, nonzero_global_indices: {nonzero_global_indices}")
+
+            # Calculate available slots for potential new speakers
+            all_global_indices = torch.arange(self.max_num_spks, device=device)
+            currently_used_mask = torch.zeros(self.max_num_spks, dtype=torch.bool, device=device)
+            currently_used_mask[nonzero_global_indices] = True
+            available_global_indices = all_global_indices[~currently_used_mask]
+            num_available_slots = len(available_global_indices)
+
+            if len(nonzero_global_indices) == 0:
+                # First chunk with speakers, assign sequentially to slots 0, 1, 2, ...
+                num_to_assign = min(len(nonzero_local_indices), self.max_num_spks)
+                for i in range(num_to_assign):
+                    global_spk_indices[b, nonzero_local_indices[i]] = i
+                if not self.training:
+                    logging.info(f"b={b}, first chunk assignment, global_spk_indices: {global_spk_indices[b]}")
+                continue
+
+            # Extract similarity matrix for existing global speakers
+            # Shape: (len(nonzero_local_indices), len(nonzero_global_indices))
+            sim_matrix_existing = sim_matrix_full[b][nonzero_local_indices][:, nonzero_global_indices]
+
+            # Extend similarity matrix with new speaker slots
+            # Each new slot has similarity = matching_threshold (indifference point)
+            num_new_slots = min(len(nonzero_local_indices), num_available_slots)
+            if num_new_slots > 0:
+                new_slots_sim = torch.full(
+                    (len(nonzero_local_indices), num_new_slots),
+                    self.matching_threshold,
+                    device=device
+                )
+                extended_sim_matrix = torch.cat([sim_matrix_existing, new_slots_sim], dim=1)
+            else:
+                # No available slots, only match to existing speakers
+                extended_sim_matrix = sim_matrix_existing
+
+            if not self.training:
+                logging.info(f"b={b}, extended_sim_matrix shape: {extended_sim_matrix.shape}, "
+                        f"existing: {len(nonzero_global_indices)}, new_slots: {num_new_slots}")
+                logging.info(f"b={b}, extended_sim_matrix: {extended_sim_matrix}")
+
+            # Run Hungarian algorithm on extended cost matrix
+            cost_matrix = 1 - extended_sim_matrix
+            row_ind, col_ind = linear_sum_assignment(cost_matrix.detach().cpu().numpy())
+
+            hungarian_map = {r: (c, extended_sim_matrix[r, c].item()) for r, c in zip(row_ind, col_ind)}
+            if not self.training:
+                logging.info(f"b={b}, hungarian_map: {hungarian_map}")
+
+            # Parse Hungarian results and separate existing vs new assignments
+            assignments_to_existing = []  # (local_idx, global_idx, similarity)
+            assignments_to_new = []  # (local_idx, col_in_extended_matrix)
+            
+            for r, c in zip(row_ind, col_ind):
+                local_idx = nonzero_local_indices[r]
+                if c < len(nonzero_global_indices):
+                    # Assigned to existing global speaker
+                    global_idx = nonzero_global_indices[c]
+                    sim = extended_sim_matrix[r, c].item()
+                    assignments_to_existing.append((local_idx.item(), global_idx.item(), sim))
+                    global_spk_indices[b, local_idx] = global_idx
+                else:
+                    # Assigned to new speaker slot
+                    assignments_to_new.append((local_idx.item(), c))
+
+            # Post-process: Assign new speakers to sequential available slots
+            # Sort by local index to preserve order
+            assignments_to_new.sort(key=lambda x: x[0])
+            for i, (local_idx, _) in enumerate(assignments_to_new):
+                if i < len(available_global_indices):
+                    global_spk_indices[b, local_idx] = available_global_indices[i]
+
+            if not self.training:
+                logging.info(f"b={b}, assignments_to_existing: {assignments_to_existing}")
+                logging.info(f"b={b}, assignments_to_new (local_idx): {[x[0] for x in assignments_to_new]}")
+                logging.info(f"b={b}, global_spk_indices: {global_spk_indices[b]}")
 
         return global_spk_indices
 
