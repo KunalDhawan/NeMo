@@ -186,6 +186,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.q_contrastive_extra_positive = self._cfg.get("q_contrastive_extra_positive", False)
         self.q_contrastive_extra_positive_rate = self._cfg.get("q_contrastive_extra_positive_rate", 0.1)
         self.q_contrastive_duration_averaged = self._cfg.get("q_contrastive_duration_averaged", False)
+        self.q_contrastive_aam = self._cfg.get("q_contrastive_aam", 0.0)
         total_weight = pil_weight + ats_weight
         if total_weight == 0:
             raise ValueError(
@@ -1446,6 +1447,49 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         # normalized_centroids: (B, N, S, D)
         # Result: (B, N, S)
         sim_matrix = torch.einsum('bnd,bnsd->bns', normalized_queries, normalized_centroids)
+        
+        # Apply additive angular margin (ArcFace-style) to positive samples
+        if self.q_contrastive_aam > 0:
+            # Identify positive samples: same speaker as anchor AND valid centroid
+            anchor_speaker = local_target_indices.unsqueeze(2)  # (B, N, 1)
+            speaker_indices_for_aam = torch.arange(max_num_spks, device=device).view(1, 1, max_num_spks)  # (1, 1, S)
+            is_same_speaker = (anchor_speaker == speaker_indices_for_aam)  # (B, N, S)
+            
+            # Only apply margin to valid positive centroids
+            is_positive_for_aam = is_same_speaker & valid_centroids  # (B, N, S)
+            
+            # Pre-compute trigonometric constants as Python scalars (no gradients)
+            m_scalar = float(self.q_contrastive_aam)
+            cos_m = math.cos(m_scalar)
+            sin_m = math.sin(m_scalar)
+            
+            # Compute threshold: if theta > pi - m, then theta + m > pi
+            # Since cos is decreasing on [0, pi], this means cos(theta) < cos(pi - m) = -cos(m)
+            threshold = -cos_m
+            
+            # For positive samples, compute cos(theta + m) = cos(theta)cos(m) - sin(theta)sin(m)
+            # cos(theta) is already in sim_matrix
+            # Clamp cos_theta to valid range [-1, 1] for numerical stability
+            cos_theta = torch.clamp(sim_matrix, -1.0, 1.0)
+            
+            # Compute sin(theta) = sqrt(1 - cos^2(theta))
+            # Clamp cos^2(theta) to [0, 1] for numerical stability
+            # Add epsilon to prevent gradient explosion near 0
+            cos_theta_squared = torch.clamp(cos_theta ** 2, 0.0, 1.0)
+            sin_theta = torch.sqrt(torch.clamp(1.0 - cos_theta_squared, min=1e-8))
+            
+            # Apply the angular margin formula
+            cos_theta_plus_m = cos_theta * cos_m - sin_theta * sin_m
+            
+            # If theta + m > pi, set cos(theta + m) = -1 (maximum penalty)
+            exceeds_pi = cos_theta < threshold
+            cos_theta_plus_m = torch.where(exceeds_pi, -1.0, cos_theta_plus_m)
+            
+            # Clamp result to valid cosine range [-1, 1] for any remaining numerical issues
+            cos_theta_plus_m = torch.clamp(cos_theta_plus_m, -1.0, 1.0)
+            
+            # Replace positive sample similarities with margin-adjusted values (only for valid centroids)
+            sim_matrix = torch.where(is_positive_for_aam, cos_theta_plus_m, sim_matrix)
         
         # Apply temperature scaling
         sim_matrix = sim_matrix / self.q_contrastive_temperature
