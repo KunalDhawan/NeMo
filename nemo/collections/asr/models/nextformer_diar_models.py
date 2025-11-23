@@ -204,8 +204,10 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self._accuracy_test_local = MultiBinaryAccuracy()
         self._accuracy_test_local_ats = MultiBinaryAccuracy()
         self._accuracy_train = MultiBinaryAccuracy()
+        self._accuracy_train_0 = MultiBinaryAccuracy()
         self._accuracy_train_global = MultiBinaryAccuracy()
         self._accuracy_valid = MultiBinaryAccuracy()
+        self._accuracy_valid_0 = MultiBinaryAccuracy()
         self._accuracy_valid_global = MultiBinaryAccuracy()
         self._accuracy_train_global_op = MultiBinaryAccuracy()
         self._accuracy_valid_global_op = MultiBinaryAccuracy()
@@ -215,12 +217,14 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
     def _reset_train_metrics(self):
         self._accuracy_train.reset()
+        self._accuracy_train_0.reset()
         self._accuracy_train_ats.reset()
         self._accuracy_train_global.reset()
         self._accuracy_train_global_op.reset()
 
     def _reset_valid_metrics(self):
         self._accuracy_valid.reset()
+        self._accuracy_valid_0.reset()
         self._accuracy_valid_ats.reset()
         self._accuracy_valid_global.reset()
         self._accuracy_valid_global_op.reset()
@@ -378,7 +382,10 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         Returns:
             logits (torch.Tensor): Sorted tensor containing predicted speaker labels
                 Shape: (batch_size, max. diar frame count, max_num_speakers)
-            local_logits (torch.Tensor): Tensor containing local speaker logits.
+            emb_seq (torch.Tensor): Encoder embeddings (placeholder for now)
+            local_logits (torch.Tensor): Tensor containing local speaker logits with historical context
+                Shape: (num_chunks * batch_size, lc+chunk_len+rc, local_num_spks)
+            local_logits_init (torch.Tensor): Tensor containing local speaker logits without historical context
                 Shape: (num_chunks * batch_size, lc+chunk_len+rc, local_num_spks)
             local_queries (torch.Tensor): Tensor containing local speaker queries.
                 Shape: (num_chunks * batch_size, local_num_spks, query_dim)
@@ -392,10 +399,10 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         if self.streaming_mode:
             raise NotImplementedError("Streaming mode is not implemented for Nextformer model.")
         else:
-            logits, emb_seq, local_logits, local_queries, active_frames_per_query = self.forward_offline(
+            logits, emb_seq, local_logits, local_logits_init, local_queries, active_frames_per_query = self.forward_offline(
                 processed_signal=processed_signal, processed_signal_length=processed_signal_length, targets=targets
             )
-            return logits, emb_seq, local_logits, local_queries, active_frames_per_query
+            return logits, emb_seq, local_logits, local_logits_init, local_queries, active_frames_per_query
 
     def _create_batch_of_chunks(
         self,
@@ -502,7 +509,9 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             logits (torch.Tensor): Tensor containing predicted speaker labels
                 Shape: (batch_size, total_n_frames, max_num_spks)
             emb_seq (torch.Tensor): Encoder embeddings (placeholder for now)
-            local_logits (torch.Tensor): Tensor containing local speaker logits
+            local_logits (torch.Tensor): Tensor containing local speaker logits with historical context
+                Shape: (num_chunks * batch_size, lc+chunk_len+rc, local_num_spks)
+            local_logits_init (torch.Tensor): Tensor containing local speaker logits without historical context
                 Shape: (num_chunks * batch_size, lc+chunk_len+rc, local_num_spks)
             local_queries (torch.Tensor): Tensor containing local speaker queries
                 Shape: (num_chunks * batch_size, local_num_spks, query_dim)
@@ -566,7 +575,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         else:
             query_raw_proj = batch_chunks
 
-        # Step 5: Run frontend_encoder, forward_infer, query_decoder in one pass
+        # Step 5: Run frontend_encoder and projections in parallel for all chunks
         # Get encoder embeddings for all chunks
         emb_seq, emb_seq_length = self.frontend_encoder(
             processed_signal=batch_chunks, processed_signal_length=batch_chunk_lengths, bypass_pre_encode=True
@@ -580,19 +589,9 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             emb_seq_query_proj = self.nextformer_modules.query_proj(emb_seq)
         else:
             emb_seq_query_proj = emb_seq
-        
-        # Get local logits for all chunks
-        local_logits = self.forward_infer(emb_seq_enc_proj, emb_seq_length)
-        #logging.info(f"local logits shape: {local_logits.shape}")
-        #logging.info(f"emb_seq_length: {emb_seq_length}")
-        # logits shape: (batch_size * num_chunks, chunk_total, local_num_spks)
 
-        # Get speaker queries for all chunks
-        encoder_len_mask = self.nextformer_modules.length_to_mask(emb_seq_length, emb_seq.shape[1])
-        encoder_len_mask = ~encoder_len_mask
-        #logging.info(f"encoder_len_mask: {encoder_len_mask.to(int).sum(dim=1)}")
-
-        # Handle oracle mode (targets) if provided
+        # Handle oracle mode (targets) if provided - prepare batch_targets for all chunks
+        batch_targets = None
         if targets is not None:
             # Pad targets to match pre_encode_embs if necessary (when signal was padded for multi-GPU)
             target_n_frames = targets.shape[1]
@@ -613,46 +612,66 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 chunk_len=chunk_len,
                 rc=rc,
             )
-            
-            # Get oracle predictions using Hungarian algorithm
-            logits_len = min(local_logits.shape[1], batch_targets.shape[1])
-            local_pil_targets, _ = get_pil_targets_hungarian(
+
+        # Initialize global logits and streaming state
+        # Use emb_seq_enc_proj.dtype as it determines the dtype of forward_infer output
+        logits = torch.full(
+            (batch_size, total_n_frames, self.nextformer_modules.max_num_spks),
+            -1e9,
+            dtype=emb_seq_enc_proj.dtype,
+            device=emb_seq_enc_proj.device
+        )
+        streaming_state = self.nextformer_modules.init_streaming_state(
+            batch_size=batch_size, device=self.device
+        )
+
+        # Initialize list to accumulate final logits (with historical context)
+        local_logits_list = []
+
+        # Step 6: Get predictions for all chunks in parallel (for query initialization and masking)
+        # Run forward_infer on all chunks without historical context (parallel for all chunks)
+        local_logits_init = self.forward_infer(emb_seq_enc_proj, emb_seq_length)
+        
+        if batch_targets is not None:
+            # Oracle mode: apply Hungarian matching in parallel to all chunks at once
+            logits_len = min(local_logits_init.shape[1], batch_targets.shape[1])
+            preds_all, _ = get_pil_targets_hungarian(
                 labels=batch_targets[:, :logits_len, :],
-                logits=local_logits[:, :logits_len, :],
+                logits=local_logits_init[:, :logits_len, :],
                 metric=self.pil_metric
             )
-            preds = local_pil_targets
         else:
-            preds = torch.sigmoid(local_logits)
-
-        # masks for the target speaker and non-target speakers in extra cross-attention
-        # encoder_mask_extra should have False (0) on frames where current speaker is inactive and any other speaker is active
+            # Non-oracle mode: use sigmoid of logits
+            preds_all = torch.sigmoid(local_logits_init)  # (batch_size * num_chunks, chunk_total, local_num_spks)
+        
+        # Step 7: Compute masks and run query decoders in parallel for all chunks
+        # Get encoder masks for all chunks
+        encoder_len_mask = self.nextformer_modules.length_to_mask(emb_seq_length, emb_seq.shape[1])
+        encoder_len_mask = ~encoder_len_mask
+        
+        # Create masks for all chunks
+        encoder_query_mask = None
+        encoder_mask_extra = None
         if self.initialize_mask:
-            encoder_query_mask = ~(preds > self.local_mask_threshold).transpose(1, 2)  # (batch, num_queries, n_frames)
-            any_speaker_active = (preds.max(dim=2)[0] > self.local_mask_threshold).unsqueeze(1)  # (batch, 1, n_frames)
-            any_speaker_active = any_speaker_active.expand(-1, preds.shape[2], -1)  # (batch, num_queries, n_frames)
+            encoder_query_mask = ~(preds_all > self.local_mask_threshold).transpose(1, 2)
+            any_speaker_active = (preds_all.max(dim=2)[0] > self.local_mask_threshold).unsqueeze(1)
+            any_speaker_active = any_speaker_active.expand(-1, preds_all.shape[2], -1)
             encoder_mask_extra = ~(encoder_query_mask & any_speaker_active)
-            #logging.info(f"encoder_mask_extra: {encoder_mask_extra.to(int)[0, :, :20]}")
-            #logging.info(f"encoder_query_mask: {encoder_query_mask.to(int)[0, :, :20]}")
-        else:
-            encoder_query_mask = None
-            encoder_mask_extra = None
-          
-        num_queries = preds.shape[-1]
-        active_frames_per_query = (preds > self.local_mask_threshold).to(int).sum(dim=1) # (num_chunks * batch_size, num_queries)
-        #logging.info(f"active frames per query: {active_frames_per_query}")
-        spk_detected = active_frames_per_query > 0 # (num_chunks * batch_size, num_queries)
-        spk_not_detected = ~spk_detected # (num_chunks * batch_size, num_queries)
-        query_mask_from = spk_not_detected.unsqueeze(2).expand(-1, -1, num_queries)  # (num_chunks * batch_size, num_queries, num_queries)
-        query_mask_to = spk_not_detected.unsqueeze(1).expand(-1, num_queries, -1)  # (num_chunks * batch_size, num_queries, num_queries)
-        query_mask = query_mask_from | query_mask_to  # (num_chunks * batch_size, num_queries, num_queries)
-        #logging.info(f"query_mask: {query_mask}")
-        #logging.info(f"spk_not_detected: {spk_not_detected.to(int).sum(dim=1)}")
-
-        # Step 3: Run both query_decoder and query_decoder_raw with query_mask
+        
+        # Calculate active frames and query mask for all chunks
+        num_queries = preds_all.shape[-1]
+        active_frames_per_query = (preds_all > self.local_mask_threshold).to(int).sum(dim=1)
+        spk_detected = active_frames_per_query > 0
+        spk_not_detected = ~spk_detected
+        query_mask_from = spk_not_detected.unsqueeze(2).expand(-1, -1, num_queries)
+        query_mask_to = spk_not_detected.unsqueeze(1).expand(-1, num_queries, -1)
+        query_mask = query_mask_from | query_mask_to
+        
+        # Run query decoders in parallel for all chunks
+        spk_queries_raw = None
         if self.query_decoder_raw is not None:
             if self.initialize_queries:
-                init_queries_raw = self.nextformer_modules.get_init_queries(preds, query_raw_proj)
+                init_queries_raw = self.nextformer_modules.get_init_queries(preds_all, query_raw_proj)
             else:
                 init_queries_raw = None
             spk_queries_raw = self.query_decoder_raw(
@@ -663,20 +682,17 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 query_states=init_queries_raw,
                 query_mask=query_mask
             )
-            # spk_queries_raw shape: (num_chunks * batch_size, local_num_spks, emb_dim)
-            # Zero out queries for undetected speakers
             spk_queries_raw = spk_queries_raw.masked_fill(spk_not_detected.unsqueeze(2), 0)
-        else:
-            spk_queries_raw = None
-
+        
+        spk_queries = None
         if self.query_decoder is not None:
             if spk_queries_raw is not None and (self.dual_decoder_mode == "init" or self.dual_decoder_mode == "init_concat"):
                 init_queries = spk_queries_raw
             elif self.initialize_queries:
-                init_queries = self.nextformer_modules.get_init_queries(preds, emb_seq_query_proj)                    
+                init_queries = self.nextformer_modules.get_init_queries(preds_all, emb_seq_query_proj)
             else:
                 init_queries = None
-
+            
             spk_queries = self.query_decoder(
                 encoder_states=emb_seq_query_proj,
                 encoder_len_mask=encoder_len_mask,
@@ -685,110 +701,117 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 query_states=init_queries,
                 query_mask=query_mask
             )
-            # spk_queries shape: (num_chunks * batch_size, local_num_spks, emb_dim)
-            # Zero out queries for undetected speakers
             spk_queries = spk_queries.masked_fill(spk_not_detected.unsqueeze(2), 0)
-        else:
-            spk_queries = None
-
-
+        
         # Combine queries from both decoders if both are used
         if spk_queries is not None and spk_queries_raw is not None:
             if self.nextformer_modules.query_combiner is not None:
-                # Store original dtype to preserve it
                 original_dtype = spk_queries.dtype
-                # Concatenate along embedding dimension and project back
                 spk_queries_combined = torch.cat([spk_queries, spk_queries_raw], dim=-1)
                 spk_queries = self.nextformer_modules.query_combiner(spk_queries_combined)
-                # Ensure output has the same dtype as input
                 if spk_queries.dtype != original_dtype:
                     spk_queries = spk_queries.to(original_dtype)
             else:
-                # If no combiner is provided, just use the first decoder output
-                # (alternatively could raise an error or average the two)
                 logging.warning("Both query decoders are used but no query_combiner provided. Using only query_decoder output.")
-                spk_queries = spk_queries
         elif spk_queries_raw is not None:
-            # Only raw decoder is used
             spk_queries = spk_queries_raw
-        # else: only spk_queries is not None, use it as is
-
-        if att_mod:
-            self.encoder.att_context_size = [-1, -1]
-            self.transformer_encoder.diag = None
-
-        logits = torch.full(
-            (batch_size, total_n_frames, self.nextformer_modules.max_num_spks),
-            -1e9,
-            dtype=local_logits.dtype,
-            device=local_logits.device
+        
+        # Step 8: Parallel processing with prepended queries for final logits
+        # Prepare all prepended queries at once for all chunks
+        local_num_spks = self._cfg.local_num_spks
+        emb_dim = spk_queries.shape[-1]
+        max_historical_queries = num_chunks * local_num_spks
+        
+        # Reshape spk_queries from (batch_size * num_chunks, local_num_spks, emb_dim)
+        # to (num_chunks, batch_size, local_num_spks, emb_dim)
+        spk_queries_reshaped = spk_queries.view(num_chunks, batch_size, local_num_spks, emb_dim)
+        
+        # Pre-allocate prepended_queries tensor (initialized to zeros)
+        # Shape: (num_chunks, batch_size, max_historical_queries, emb_dim)
+        prepended_queries = torch.zeros(
+            (num_chunks, batch_size, max_historical_queries, emb_dim),
+            device=emb_seq_enc_proj.device, 
+            dtype=emb_seq_enc_proj.dtype
         )
-
-        if True:
-            # now fill logits using streaming logic
-            streaming_state = self.nextformer_modules.init_streaming_state(
-                batch_size=processed_signal.shape[0], device=self.device
+        
+        # Fill in historical queries for each chunk (chunk 0 already has all zeros)
+        for chunk_idx in range(1, num_chunks):
+            num_historical = chunk_idx * local_num_spks
+            # Take queries from chunks 0..chunk_idx-1
+            historical_real = spk_queries_reshaped[:chunk_idx]  # (chunk_idx, batch_size, local_num_spks, emb_dim)
+            historical_real = historical_real.transpose(0, 1)  # (batch_size, chunk_idx, local_num_spks, emb_dim)
+            historical_real = historical_real.reshape(batch_size, num_historical, emb_dim)
+            # Fill in-place (rest remains zeros)
+            prepended_queries[chunk_idx, :, :num_historical, :] = historical_real
+        
+        # Reshape to (batch_size * num_chunks, max_historical_queries, emb_dim)
+        prepended_queries = prepended_queries.reshape(batch_size * num_chunks, max_historical_queries, emb_dim)
+        
+        # Prepend to all chunks at once
+        emb_seq_enc_proj_with_queries = torch.cat([prepended_queries, emb_seq_enc_proj], dim=1)
+        emb_seq_length_with_queries = emb_seq_length + max_historical_queries
+        
+        # Call forward_infer_masking in parallel for all chunks
+        local_logits_full = self.forward_infer_masking(
+            emb_seq_enc_proj_with_queries, 
+            emb_seq_length_with_queries,
+            max_historical_queries
+        )
+        
+        # Extract only audio frame logits (discard query position logits)
+        local_logits = local_logits_full[:, max_historical_queries:, :]
+        
+        # Step 9: Sequential processing for global speaker tracking and logits assignment
+        # (This part still needs to be sequential for proper global speaker state updates)
+        for chunk_idx in range(num_chunks):
+            # Extract chunk-specific tensors
+            chunk_start_idx = chunk_idx * batch_size
+            chunk_end_idx = (chunk_idx + 1) * batch_size
+            
+            local_logits_chunk = local_logits[chunk_start_idx:chunk_end_idx]
+            spk_queries_chunk = spk_queries[chunk_start_idx:chunk_end_idx]
+            active_frames_per_query_chunk = active_frames_per_query[chunk_start_idx:chunk_end_idx]
+            
+            # Update streaming state and fill global logits
+            start = chunk_idx * chunk_len
+            end = min(start + chunk_len, total_n_frames)
+            dur = end - start
+            offset = min(lc, start)
+            
+            global_spk_indices = self.nextformer_modules.get_global_indices(
+                spk_queries_chunk, streaming_state.global_spk_centroids
             )
-            for chunk_idx in range(num_chunks):
-                start = chunk_idx * chunk_len
-                end = min(start + chunk_len, total_n_frames)
-                dur = end - start
-                offset = min(lc, start)
-                spk_queries_chunk = spk_queries[chunk_idx * batch_size:(chunk_idx + 1) * batch_size, :, :] # (batch_size, local_num_spks, emb_dim)
-                local_logits_chunk = local_logits[chunk_idx * batch_size:(chunk_idx + 1) * batch_size, :, :] # (batch_size, lc+chunk_len+rc, local_num_spks)
-                global_spk_indices = self.nextformer_modules.get_global_indices(
-                    spk_queries_chunk, streaming_state.global_spk_centroids
-                )
-                active_frames_per_query_chunk = active_frames_per_query[chunk_idx * batch_size:(chunk_idx + 1) * batch_size] # (batch_size, num_queries)
-                #self.nextformer_modules.update_streaming_state_ma(
-                #    streaming_state=streaming_state,
-                #    spk_queries=spk_queries_chunk,
-                #    global_spk_indices=global_spk_indices,
-                #)
-                self.nextformer_modules.update_streaming_state_duration_averaged(
-                    streaming_state=streaming_state,
-                    spk_queries=spk_queries_chunk,
-                    global_spk_indices=global_spk_indices,
-                    active_frames_per_query=active_frames_per_query_chunk,
-                )
+            self.nextformer_modules.update_streaming_state_duration_averaged(
+                streaming_state=streaming_state,
+                spk_queries=spk_queries_chunk,
+                global_spk_indices=global_spk_indices,
+                active_frames_per_query=active_frames_per_query_chunk,
+            )
+            
+            # Vectorized assignment to global logits
+            valid_mask = global_spk_indices != -1
+            if valid_mask.any():
+                batch_indices, local_spk_indices = torch.where(valid_mask)
+                global_spk_idx_flat = global_spk_indices[batch_indices, local_spk_indices]
+                num_valid = len(batch_indices)
                 
-                # Vectorized version: eliminate nested loops
-                valid_mask = global_spk_indices != -1  # (batch_size, local_num_spks)
+                time_slice = local_logits_chunk[:, offset:offset+dur, :]
+                time_slice_valid = time_slice[batch_indices]
                 
-                if valid_mask.any():
-                    # Get indices of valid (batch, local_speaker) pairs
-                    batch_indices, local_spk_indices = torch.where(valid_mask)  # 1D tensors of length num_valid
-                    global_spk_idx_flat = global_spk_indices[batch_indices, local_spk_indices]  # (num_valid,)
-                    num_valid = len(batch_indices)
-                    
-                    # Extract source slices: local_logits_chunk[b, offset:offset+dur, j] for each valid (b, j)
-                    # First, extract the time slices for all batches: (batch_size, dur, local_num_spks)
-                    time_slice = local_logits_chunk[:, offset:offset+dur, :]  # (batch_size, dur, local_num_spks)
-                    
-                    # Extract slices for valid batch indices: (num_valid, dur, local_num_spks)
-                    time_slice_valid = time_slice[batch_indices]  # (num_valid, dur, local_num_spks)
-                    
-                    # Extract the specific local speaker for each valid (batch, speaker) pair
-                    # Shape: (num_valid, dur)
-                    batch_idx_tensor = torch.arange(num_valid, device=local_logits_chunk.device)  # (num_valid,)
-                    source_slices = time_slice_valid[batch_idx_tensor, :, local_spk_indices]  # (num_valid, dur)
-                    
-                    # Create index arrays for assignment to logits[b, start:end, global_index]
-                    time_indices = torch.arange(start, end, device=local_logits_chunk.device)  # (dur,)
-                    
-                    # Expand indices: for each valid (batch, speaker) pair, assign to all time steps
-                    batch_indices_expanded = batch_indices.unsqueeze(0).expand(dur, -1)  # (dur, num_valid)
-                    time_indices_expanded = time_indices.unsqueeze(1).expand(-1, num_valid)  # (dur, num_valid)
-                    global_spk_idx_expanded = global_spk_idx_flat.unsqueeze(0).expand(dur, -1)  # (dur, num_valid)
-                    
-                    # Flatten all tensors for vectorized assignment
-                    batch_flat = batch_indices_expanded.flatten()  # (dur * num_valid,)
-                    time_flat = time_indices_expanded.flatten()  # (dur * num_valid,)
-                    global_spk_flat = global_spk_idx_expanded.flatten()  # (dur * num_valid,)
-                    source_flat = source_slices.transpose(0, 1).flatten()  # (dur * num_valid,) - transpose to match time-first order
-                    
-                    # Assign using advanced indexing for efficient vectorized assignment
-                    logits[batch_flat, time_flat, global_spk_flat] = source_flat
+                batch_idx_tensor = torch.arange(num_valid, device=local_logits_chunk.device)
+                source_slices = time_slice_valid[batch_idx_tensor, :, local_spk_indices]
+                
+                time_indices = torch.arange(start, end, device=local_logits_chunk.device)
+                batch_indices_expanded = batch_indices.unsqueeze(0).expand(dur, -1)
+                time_indices_expanded = time_indices.unsqueeze(1).expand(-1, num_valid)
+                global_spk_idx_expanded = global_spk_idx_flat.unsqueeze(0).expand(dur, -1)
+                
+                batch_flat = batch_indices_expanded.flatten()
+                time_flat = time_indices_expanded.flatten()
+                global_spk_flat = global_spk_idx_expanded.flatten()
+                source_flat = source_slices.transpose(0, 1).flatten()
+                
+                logits[batch_flat, time_flat, global_spk_flat] = source_flat
 
         emb_seq = None  # Placeholder
 
@@ -797,7 +820,11 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             n_frames = math.ceil(sig_length / self.encoder.subsampling_factor)
             logits = logits[:, :n_frames, :]
 
-        return logits, emb_seq, local_logits, spk_queries, active_frames_per_query
+        if att_mod:
+            self.encoder.att_context_size = [-1, -1]
+            self.transformer_encoder.diag = None
+
+        return logits, emb_seq, local_logits, local_logits_init, spk_queries, active_frames_per_query
 
     def forward_infer(self, emb_seq, emb_seq_length):
         """
@@ -820,6 +847,53 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         logits = logits.masked_fill(~mask, -1e9)
         return logits
 
+    def forward_infer_masking(self, emb_seq, emb_seq_length, num_prepended_queries):
+        """
+        Forward inference with masking for prepended query positions.
+        
+        This version supports masking of zero-valued prepended queries, which is useful
+        when processing multiple chunks in parallel with varying amounts of historical context.
+        
+        Args:
+            emb_seq (torch.Tensor): Tensor containing encoder states with prepended queries.
+                Shape: (batch_size, total_seq_len, emb_dim)
+                where total_seq_len = num_prepended_queries + audio_frames
+            emb_seq_length (torch.Tensor): Tensor containing lengths including prepended queries.
+                Shape: (batch_size,)
+            num_prepended_queries (int): Number of prepended query positions at the start of emb_seq.
+        
+        Returns:
+            logits (torch.Tensor): Tensor containing local speaker logits.
+                Shape: (batch_size, total_seq_len, num_speakers)
+        """
+        # Create length-based mask (True = valid, False = padded)
+        length_mask = self.nextformer_modules.length_to_mask(emb_seq_length, emb_seq.shape[1])
+        
+        # Create invalid mask for zero queries in prepended positions
+        # Compute norms for entire sequence
+        seq_norms = torch.norm(emb_seq, p=2, dim=-1)  # (batch_size, total_seq_len)
+        
+        # Create position index mask (True for positions < num_prepended_queries)
+        position_indices = torch.arange(emb_seq.shape[1], device=emb_seq.device)  # (total_seq_len,)
+        is_prepended_position = position_indices < num_prepended_queries  # (total_seq_len,)
+        
+        # Invalid mask: zero norm AND in prepended region (True = invalid)
+        invalid_mask = (seq_norms < 1e-8) & is_prepended_position.unsqueeze(0)  # (batch_size, total_seq_len)
+        
+        # Final valid mask: length-valid AND not invalid (True = valid)
+        encoder_mask = length_mask & ~invalid_mask
+        
+        # Run transformer encoder
+        trans_emb_seq = self.transformer_encoder(encoder_states=emb_seq, encoder_mask=encoder_mask)
+        
+        # Get logits
+        logits = self.nextformer_modules.forward_spk_logits(trans_emb_seq)
+        
+        # Apply mask to logits (use valid mask directly)
+        logits = logits.masked_fill(~encoder_mask.unsqueeze(-1), -1e9)
+        
+        return logits
+
     def _diarize_forward(self, batch: Any):
         """
         A counterpart of `_transcribe_forward` function in ASR.
@@ -834,7 +908,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 Shape: (batch_size, diar_frame_count, num_speakers)
         """
         with torch.no_grad():
-            _, logits, _, _ = self.forward(audio_signal=batch[0], audio_signal_length=batch[1])
+            _, logits, _, _, _, _ = self.forward(audio_signal=batch[0], audio_signal_length=batch[1])
             preds = torch.sigmoid(logits)
             preds = preds.to('cpu')
             torch.cuda.empty_cache()
@@ -1645,7 +1719,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         return total_loss
 
     def _get_aux_train_evaluations(
-        self, logits, emb_seq, local_logits, local_queries, active_frames_per_query, targets, target_lens
+        self, logits, emb_seq, local_logits, local_logits_init, local_queries, active_frames_per_query, targets, target_lens
     ) -> dict:
         """
         Compute auxiliary training evaluations including losses and metrics.
@@ -1659,7 +1733,9 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 Shape: (batch_size, total_n_frames, local_num_spks)
             emb_seq (torch.Tensor): Encoder embeddings for the entire audio.
                 Shape: (batch_size, total_n_frames, emb_dim)
-            local_logits (torch.Tensor): Speaker logits for the entire audio.
+            local_logits (torch.Tensor): Speaker logits with historical context.
+                Shape: (batch_size * num_chunks, lc+chunk_len+rc, local_num_spks)
+            local_logits_init (torch.Tensor): Speaker logits without historical context.
                 Shape: (batch_size * num_chunks, lc+chunk_len+rc, local_num_spks)
             local_queries (torch.Tensor): Local speaker queries.
                 Shape: (batch_size * num_chunks, local_num_spks, emb_dim)
@@ -1732,6 +1808,11 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self._accuracy_train_ats(local_preds, local_ats_targets, local_target_lens)
         train_f1_acc_ats, _, _ = self._accuracy_train_ats.compute()
 
+        # Compute accuracy for local_logits_init (without historical context)
+        local_preds_0 = torch.sigmoid(local_logits_init)
+        self._accuracy_train_0(local_preds_0, local_pil_targets, local_target_lens)
+        train_f1_acc_0, _, _ = self._accuracy_train_0.compute()
+
         train_metrics = {
             'loss': loss,
             'ats_loss': ats_loss,
@@ -1741,6 +1822,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'q_contrastive_loss': q_contrastive_loss,
             'learning_rate': self._optimizer.param_groups[0]['lr'],
             'train_f1_acc': train_f1_acc,
+            'train_f1_acc_0': train_f1_acc_0,
             'train_f1_acc_global': train_f1_acc_global,
             'train_f1_acc_global_op': train_f1_acc_global_op,
             'train_precision': train_precision,
@@ -1766,22 +1848,22 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         """
         audio_signal, audio_signal_length, targets, target_lens = batch
         if self.oracle_mode:
-            logits, emb_seq, local_logits, local_queries, active_frames_per_query = self.forward(
+            logits, emb_seq, local_logits, local_logits_init, local_queries, active_frames_per_query = self.forward(
                 audio_signal=audio_signal, audio_signal_length=audio_signal_length, targets=targets
             )
         else:
-            logits, emb_seq, local_logits, local_queries, active_frames_per_query = self.forward(
+            logits, emb_seq, local_logits, local_logits_init, local_queries, active_frames_per_query = self.forward(
                 audio_signal=audio_signal, audio_signal_length=audio_signal_length
             )
         train_metrics = self._get_aux_train_evaluations(
-            logits, emb_seq, local_logits, local_queries, active_frames_per_query, targets, target_lens
+            logits, emb_seq, local_logits, local_logits_init, local_queries, active_frames_per_query, targets, target_lens
         )
         self._reset_train_metrics()
         self.log_dict(train_metrics, sync_dist=True, on_step=True, on_epoch=False, logger=True)
         return {'loss': train_metrics['loss']}
 
     def _get_aux_validation_evaluations(
-        self, logits, emb_seq, local_logits, local_queries, active_frames_per_query, targets, target_lens
+        self, logits, emb_seq, local_logits, local_logits_init, local_queries, active_frames_per_query, targets, target_lens
     ) -> dict:
         """
         Compute auxiliary validation evaluations including losses and metrics.
@@ -1795,7 +1877,9 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 Shape: (batch_size, total_n_frames, local_num_spks)
             emb_seq (torch.Tensor): Encoder embeddings for the entire audio.
                 Shape: (batch_size, total_n_frames, emb_dim)
-            local_logits (torch.Tensor): Speaker logits for the entire audio.
+            local_logits (torch.Tensor): Speaker logits with historical context.
+                Shape: (batch_size * num_chunks, lc+chunk_len+rc, local_num_spks)
+            local_logits_init (torch.Tensor): Speaker logits without historical context.
                 Shape: (batch_size * num_chunks, lc+chunk_len+rc, local_num_spks)
             local_queries (torch.Tensor): Local speaker queries.
                 Shape: (batch_size * num_chunks, local_num_spks, emb_dim)
@@ -1867,7 +1951,13 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self._accuracy_valid_ats(local_preds, local_ats_targets, local_target_lens)
         val_f1_acc_ats, _, _ = self._accuracy_valid_ats.compute()
 
+        # Compute accuracy for local_logits_init (without historical context)
+        local_preds_0 = torch.sigmoid(local_logits_init)
+        self._accuracy_valid_0(local_preds_0, local_pil_targets, local_target_lens)
+        val_f1_acc_0, _, _ = self._accuracy_valid_0.compute()
+
         self._accuracy_valid.reset()
+        self._accuracy_valid_0.reset()
         self._accuracy_valid_ats.reset()
         self._accuracy_valid_global.reset()
         self._accuracy_valid_global_op.reset()
@@ -1880,6 +1970,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'val_emb_sim_loss': val_emb_sim_loss,
             'val_q_contrastive_loss': val_q_contrastive_loss,
             'val_f1_acc': val_f1_acc,
+            'val_f1_acc_0': val_f1_acc_0,
             'val_f1_acc_global': val_f1_acc_global,
             'val_f1_acc_global_op': val_f1_acc_global_op,
             'val_precision': val_precision,
@@ -1911,15 +2002,15 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         """
         audio_signal, audio_signal_length, targets, target_lens = batch
         if self.oracle_mode:
-            logits, emb_seq, local_logits, local_queries, active_frames_per_query = self.forward(
+            logits, emb_seq, local_logits, local_logits_init, local_queries, active_frames_per_query = self.forward(
                 audio_signal=audio_signal, audio_signal_length=audio_signal_length, targets=targets
             )
         else:
-            logits, emb_seq, local_logits, local_queries, active_frames_per_query = self.forward(
+            logits, emb_seq, local_logits, local_logits_init, local_queries, active_frames_per_query = self.forward(
                 audio_signal=audio_signal, audio_signal_length=audio_signal_length
             )
         val_metrics = self._get_aux_validation_evaluations(
-            logits, emb_seq, local_logits, local_queries, active_frames_per_query, targets, target_lens
+            logits, emb_seq, local_logits, local_logits_init, local_queries, active_frames_per_query, targets, target_lens
         )
         if isinstance(self.trainer.val_dataloaders, list) and len(self.trainer.val_dataloaders) > 1:
             self.validation_step_outputs[dataloader_idx].append(val_metrics)
@@ -1961,6 +2052,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         val_emb_sim_loss_mean = torch.stack([x['val_emb_sim_loss'] for x in outputs]).mean()
         val_q_contrastive_loss_mean = torch.stack([x['val_q_contrastive_loss'] for x in outputs]).mean()
         val_f1_acc_mean = torch.stack([x['val_f1_acc'] for x in outputs]).mean()
+        val_f1_acc_0_mean = torch.stack([x['val_f1_acc_0'] for x in outputs]).mean()
         val_f1_acc_global_mean = torch.stack([x['val_f1_acc_global'] for x in outputs]).mean()
         val_f1_acc_global_op_mean = torch.stack([x['val_f1_acc_global_op'] for x in outputs]).mean()
         val_precision_mean = torch.stack([x['val_precision'] for x in outputs]).mean()
@@ -1977,6 +2069,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'val_emb_sim_loss': val_emb_sim_loss_mean,
             'val_q_contrastive_loss': val_q_contrastive_loss_mean,
             'val_f1_acc': val_f1_acc_mean,
+            'val_f1_acc_0': val_f1_acc_0_mean,
             'val_f1_acc_global': val_f1_acc_global_mean,
             'val_f1_acc_global_op': val_f1_acc_global_op_mean,
             'val_precision': val_precision_mean,
@@ -2056,7 +2149,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 audio_signal = audio_signal.to(self.device)
                 audio_signal_length = audio_signal_length.to(self.device)
                 targets = targets.to(self.device)
-                logits, emb_seq, local_logits, local_queries, active_frames_per_query = self.forward(
+                logits, emb_seq, local_logits, local_logits_init, local_queries, active_frames_per_query = self.forward(
                     audio_signal=audio_signal, audio_signal_length=audio_signal_length
                 )
                 self._get_aux_test_batch_evaluations(

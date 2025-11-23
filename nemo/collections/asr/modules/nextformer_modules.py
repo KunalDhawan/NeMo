@@ -47,11 +47,14 @@ class StreamingNextformerState:
             Shape: (B, max_num_spks, emb_dim)
         global_spk_centroids_duration (torch.Tensor): duration of each global speaker centroid
             Shape: (B, max_num_spks)
+        historical_queries (torch.Tensor): accumulated speaker queries from previous chunks for context
+            Shape: (B, num_accumulated_queries, emb_dim)
     """
     global_emb_set = None
     global_emb_set_lengths = None
     global_spk_centroids = None
     global_spk_centroids_duration = None
+    historical_queries = None
 
 
 class MaskedQueryDecoderBlock(torch.nn.Module):
@@ -587,6 +590,7 @@ class NextformerModules(NeuralModule, Exportable):
         streaming_state.global_emb_set_lengths = torch.zeros((batch_size, self.max_num_spks), dtype=torch.long, device=device)
         streaming_state.global_spk_centroids = torch.zeros((batch_size, self.max_num_spks, self.sq_d_model), device=device)
         streaming_state.global_spk_centroids_duration = torch.zeros((batch_size, self.max_num_spks), dtype=torch.float, device=device)
+        streaming_state.historical_queries = torch.zeros((batch_size, 0, self.sq_d_model), device=device)  # Empty tensor that will grow
         return streaming_state
 
     def get_global_indices_v1(self, spk_queries, global_spk_centroids):
