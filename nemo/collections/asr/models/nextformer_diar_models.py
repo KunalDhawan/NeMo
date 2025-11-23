@@ -630,7 +630,8 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         # Step 6: Get predictions for all chunks in parallel (for query initialization and masking)
         # Run forward_infer on all chunks without historical context (parallel for all chunks)
-        local_logits_init = self.forward_infer(emb_seq_enc_proj, emb_seq_length)
+        # Detach since this is only used for initialization, not for loss computation
+        local_logits_init = self.forward_infer(emb_seq_enc_proj, emb_seq_length).detach()
         
         if batch_targets is not None:
             # Oracle mode: apply Hungarian matching in parallel to all chunks at once
