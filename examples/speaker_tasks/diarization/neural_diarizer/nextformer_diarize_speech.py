@@ -104,6 +104,7 @@ class DiarizationConfig:
     chunk_left_context: int = 62
     chunk_right_context: int = 10
     max_num_spks: int = 8
+    spk_centroid_update_min_frames: int = 0
 
     # If `cuda` is a negative number, inference will be on CPU only.
     cuda: Optional[int] = None
@@ -396,6 +397,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     diar_model.nextformer_modules.chunk_len = cfg.chunk_len
     diar_model.nextformer_modules.chunk_left_context = cfg.chunk_left_context
     diar_model.nextformer_modules.chunk_right_context = cfg.chunk_right_context
+    diar_model.nextformer_modules.spk_centroid_update_min_frames = cfg.spk_centroid_update_min_frames
     diar_model.nextformer_modules.log = cfg.log
 
     postprocessing_cfg = load_postprocessing_from_yaml(cfg.postprocessing_yaml)

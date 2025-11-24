@@ -134,6 +134,7 @@ model:
     chunk_right_context: 1 # Right context for each chunk
     causal_attn_rate: 0 # Causal attention rate
     causal_attn_rc: 7 # Causal attention radius
+    spk_centroid_update_min_frames: 0 # Minimum number of active frames for each query to be considered valid for updating speaker centroids
 
   encoder:
     _target_: nemo.collections.asr.modules.ConformerEncoder

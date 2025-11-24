@@ -404,6 +404,7 @@ class NextformerModules(NeuralModule, Exportable):
         pred_score_threshold: float = 0.25,
         global_emb_set_size: int = 10,
         matching_threshold: float = 0.5,
+        spk_centroid_update_min_frames: int = 0,
     ):
         super().__init__()
         # General params
@@ -433,6 +434,7 @@ class NextformerModules(NeuralModule, Exportable):
         self.causal_attn_rc = causal_attn_rc
 
         self.global_emb_set_size = global_emb_set_size
+        self.spk_centroid_update_min_frames = spk_centroid_update_min_frames
 
     @staticmethod
     def length_to_mask(lengths, max_length: int):
@@ -979,7 +981,7 @@ class NextformerModules(NeuralModule, Exportable):
         return
 
 
-    def update_streaming_state_duration_averaged(self, streaming_state, spk_queries, global_spk_indices, active_frames_per_query):
+    def update_streaming_state_duration_averaged_v0(self, streaming_state, spk_queries, global_spk_indices, active_frames_per_query):
         """
         Update the streaming state with new speaker queries based on their global indices.
         This function updates the global embedding set and recalculates speaker centroids based on duration-averaged method.
@@ -999,6 +1001,54 @@ class NextformerModules(NeuralModule, Exportable):
         # Vectorized version: use advanced indexing to update all valid assignments at once
         # Create mask for valid assignments (global_index != -1)
         valid_mask = global_spk_indices != -1  # (B, local_num_spks)
+        
+        if valid_mask.any():
+            # Get indices of all valid (batch, local_speaker) pairs
+            batch_indices, local_indices = torch.where(valid_mask)  # 1D tensors of length num_valid
+            
+            # Get corresponding global indices for valid pairs
+            global_idx_flat = global_spk_indices[batch_indices, local_indices]  # (num_valid,)
+
+            # Get corresponding active frames for valid pairs
+            active_frames_flat = active_frames_per_query[batch_indices, local_indices]  # (num_valid,)
+            
+            # Get old centroids and durations
+            old_centroids = streaming_state.global_spk_centroids[batch_indices, global_idx_flat]  # (num_valid, emb_dim)
+            old_durations = streaming_state.global_spk_centroids_duration[batch_indices, global_idx_flat]  # (num_valid,)
+            
+            # Compute new centroids using proper weighted average formula
+            # C_new = (C_old * D_old + Q_new * d_new) / (D_old + d_new)
+            new_durations = old_durations + active_frames_flat
+            new_centroids = (old_centroids * old_durations.unsqueeze(-1) + 
+                            spk_queries[batch_indices, local_indices] * active_frames_flat.unsqueeze(-1)) / new_durations.unsqueeze(-1)
+            #logging.info(f"new centroids durations: {new_durations}")
+            # Update streaming state
+            streaming_state.global_spk_centroids[batch_indices, global_idx_flat] = new_centroids
+            streaming_state.global_spk_centroids_duration[batch_indices, global_idx_flat] = new_durations
+        
+        return
+
+    def update_streaming_state_duration_averaged(self, streaming_state, spk_queries, global_spk_indices, active_frames_per_query):
+        """
+        Update the streaming state with new speaker queries based on their global indices.
+        This function updates the global embedding set and recalculates speaker centroids based on duration-averaged method.
+        To mitigate noisy queries, this function only updates the speaker centroids for queries with at least spk_centroid_update_min_frames active frames.
+
+        Args:
+            streaming_state (StreamingNextformerState): The current streaming state.
+            spk_queries (torch.Tensor): Speaker queries from the current chunk.
+                Shape: (B, local_num_spks, emb_dim)
+            global_spk_indices (torch.Tensor): Global speaker indices for each local query.
+                Shape: (B, local_num_spks)
+            active_frames_per_query (torch.Tensor): Number of active frames for each query.
+                Shape: (B, local_num_spks)
+
+        Returns:
+            streaming_state (StreamingNextformerState): The updated streaming state.
+        """
+        # Vectorized version: use advanced indexing to update all valid assignments at once
+        # Create mask for valid assignments (global_index != -1)
+        valid_mask = (global_spk_indices != -1) & (active_frames_per_query >= self.spk_centroid_update_min_frames)  # (B, local_num_spks)
         
         if valid_mask.any():
             # Get indices of all valid (batch, local_speaker) pairs
