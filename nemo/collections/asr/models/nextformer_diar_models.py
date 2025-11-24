@@ -187,6 +187,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.q_contrastive_extra_positive_rate = self._cfg.get("q_contrastive_extra_positive_rate", 0.1)
         self.q_contrastive_duration_averaged = self._cfg.get("q_contrastive_duration_averaged", False)
         self.q_contrastive_aam = self._cfg.get("q_contrastive_aam", 0.0)
+        self.q_contrastive_cross_batch = self._cfg.get("q_contrastive_cross_batch", False)
         total_weight = pil_weight + ats_weight
         if total_weight == 0:
             raise ValueError(
@@ -1644,6 +1645,418 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         
         return total_loss
 
+    def _compute_q_contrastive_loss_centroid_cross_batch(self, local_queries: torch.Tensor, local_target_indices: torch.Tensor, active_frames_per_query: torch.Tensor) -> torch.Tensor:
+        """
+        Compute query similarity loss using InfoNCE with speaker centroids.
+        
+        This version creates speaker centroids by averaging random subsets of queries
+        for each speaker, then computes similarities between anchors and these centroids.
+        
+        Unlike the original version that samples individual queries as positives/negatives,
+        this approach:
+        - Creates a centroid (weighted average) for each speaker from a random subset of queries
+        - Computes similarity between each anchor and all speaker centroids
+        - Positive: centroid of anchor's speaker, Negatives: centroids of other speakers AND all centroids from the other batch elements
+        
+        Args:
+            local_queries (torch.Tensor): Local speaker queries
+                Shape: (B, N, emb_dim) where N = local_num_spks * L
+            local_target_indices (torch.Tensor): Speaker indices mapping
+                Shape: (B, N) where local_target_indices[b, n] is the original speaker index
+                that query n corresponds to, or -1 if unmatched
+            active_frames_per_query (torch.Tensor): Tensor containing the number of active frames per query
+                Shape: (B, N)
+        
+        Returns:
+            torch.Tensor: InfoNCE loss scalar
+        """
+        # Step 1: Extract dimensions and determine max_num_spks
+        B, N, D = local_queries.shape
+        device = local_queries.device
+        max_num_spks = self.nextformer_modules.max_num_spks
+
+        # Step 2: Create speaker membership masks
+        # Compute query norms to identify valid (non-zero) queries
+        queries_norm = torch.norm(local_queries, p=2, dim=2, keepdim=False)  # (B, N)
+        
+        # Create validity mask for queries that can contribute to centroids
+        # A query is valid if:
+        # - It has non-zero norm (query is not degenerate)
+        # - It's matched to a speaker (local_target_indices != -1)
+        # - It has sufficient active frames (meets min_frames_positive threshold)
+        valid_query_mask = (
+            (queries_norm > 1e-8) & 
+            (local_target_indices != -1) & 
+            (active_frames_per_query > self.q_contrastive_min_frames_positive)
+        )  # (B, N)
+        
+        # Create speaker membership masks: speaker_masks[b, n, s] = True if query n belongs to speaker s
+        # Shape: (B, N, max_num_spks)
+        speaker_indices = torch.arange(max_num_spks, device=device).view(1, 1, max_num_spks)  # (1, 1, S)
+        target_indices_expanded = local_target_indices.unsqueeze(2)  # (B, N, 1)
+        speaker_membership = (target_indices_expanded == speaker_indices)  # (B, N, S)
+        
+        # Combine speaker membership with validity: only valid queries can contribute to centroids
+        valid_speaker_masks = speaker_membership & valid_query_mask.unsqueeze(2)  # (B, N, S)
+        
+        # Count how many valid queries exist for each speaker in each batch element
+        queries_per_speaker = valid_speaker_masks.sum(dim=1)  # (B, S)
+        
+        #logging.info(f"queries_per_speaker: {queries_per_speaker}")
+        #logging.info(f"Total valid queries: {valid_query_mask.sum().item()} / {B * N}")
+        
+        # Step 3: Sample random subsets for each speaker
+        # For each anchor n and speaker s, we want to sample a random subset of queries belonging to speaker s
+        # If anchor n belongs to speaker s, we must exclude it from the sampling pool (avoid self-comparison)
+        
+        # Create identity mask to handle self-exclusion: identity[b, n, m] = (n == m)
+        identity_mask = torch.eye(N, device=device, dtype=torch.bool).unsqueeze(0).expand(B, -1, -1)  # (B, N, N)
+        
+        # Expand valid_speaker_masks from (B, N, S) to (B, N, S, N) for sampling
+        # valid_speaker_masks[b, m, s] tells us if query m belongs to speaker s
+        # We need to reshape to: eligible[b, n, s, m] = whether query m is eligible for speaker s centroid at anchor n
+        valid_speaker_expanded = valid_speaker_masks.unsqueeze(1).expand(-1, N, -1, -1)  # (B, 1, N, S) -> (B, N, N, S)
+        valid_speaker_expanded = valid_speaker_expanded.transpose(2, 3)  # (B, N, S, N)
+        
+        # For self-exclusion: if anchor n belongs to speaker s, exclude n from the pool
+        # speaker_membership is (B, N, S): speaker_membership[b, n, s] = (anchor n belongs to speaker s)
+        anchor_is_same_speaker = speaker_membership.unsqueeze(3)  # (B, N, S, 1)
+        identity_expanded = identity_mask.unsqueeze(2)  # (B, N, 1, N)
+        should_exclude = anchor_is_same_speaker & identity_expanded  # (B, N, S, N)
+        
+        # Eligible queries for sampling: valid member of speaker AND not self (if same speaker)
+        eligible_for_sampling = valid_speaker_expanded & ~should_exclude  # (B, N, S, N)
+        
+        # Sample random subsets using Bernoulli distribution with probability 0.5
+        sampling_prob = 0.5
+        random_sample = torch.rand(B, N, max_num_spks, N, device=device) < sampling_prob  # (B, N, S, N)
+        
+        # Apply sampling to eligible queries
+        sampled_queries_mask = eligible_for_sampling & random_sample  # (B, N, S, N)
+        
+        # Fallback: if no queries sampled for a speaker, use all eligible queries
+        num_sampled = sampled_queries_mask.sum(dim=3)  # (B, N, S)
+        has_samples = num_sampled > 0
+        # Where no samples, use all eligible queries instead
+        sampled_queries_mask = torch.where(
+            has_samples.unsqueeze(3),
+            sampled_queries_mask,
+            eligible_for_sampling
+        )  # (B, N, S, N)
+        
+        # Count final number of queries contributing to each centroid
+        num_queries_for_centroid = sampled_queries_mask.sum(dim=3)  # (B, N, S)
+
+        # Step 4: Compute weighted centroids
+        # For each (b, n, s), compute centroid as weighted average of sampled queries
+        # Weights are from active_frames_per_query
+        
+        # Expand active_frames_per_query to match sampling mask dimensions
+        # active_frames_per_query: (B, N) -> (B, 1, 1, N) for broadcasting
+        weights = active_frames_per_query.unsqueeze(1).unsqueeze(1)  # (B, 1, 1, N)
+        
+        # Apply sampling mask to weights: only sampled queries contribute
+        masked_weights = sampled_queries_mask.float() * weights  # (B, N, S, N)
+        
+        # Normalize weights so they sum to 1 for each centroid
+        # Sum over the query dimension (dim=3)
+        total_weight = masked_weights.sum(dim=3, keepdim=True)  # (B, N, S, 1)
+        
+        # Avoid division by zero: where total_weight is 0, use 1 (won't matter as weights are all 0)
+        total_weight = torch.where(total_weight > 0, total_weight, torch.ones_like(total_weight))
+        normalized_weights = masked_weights / total_weight  # (B, N, S, N)
+        
+        # Compute weighted average of queries
+        # local_queries: (B, N, D)
+        # normalized_weights: (B, N, S, N)
+        # We want: contrastive_samples[b, n, s, :] = sum_m(normalized_weights[b, n, s, m] * local_queries[b, m, :])
+        
+        # Reshape for batch matrix multiplication
+        # normalized_weights: (B, N, S, N) -> (B*N*S, 1, N)
+        # local_queries: (B, N, D) -> expand to (B, 1, N, D) -> (B*N*S, N, D)
+        
+        weights_reshaped = normalized_weights.reshape(B * N * max_num_spks, 1, N)  # (B*N*S, 1, N)
+        queries_expanded = local_queries.unsqueeze(1).expand(-1, N * max_num_spks, -1, -1)  # (B, N*S, N, D)
+        queries_reshaped = queries_expanded.reshape(B * N * max_num_spks, N, D)  # (B*N*S, N, D)
+        
+        # Batch matrix multiply: (B*N*S, 1, N) @ (B*N*S, N, D) -> (B*N*S, 1, D)
+        centroids_flat = torch.bmm(weights_reshaped, queries_reshaped)  # (B*N*S, 1, D)
+        
+        # Reshape back to (B, N, S, D)
+        contrastive_samples = centroids_flat.reshape(B, N, max_num_spks, D)  # (B, N, S, D)
+        
+        # Mark which centroids are valid (have at least one contributing query)
+        valid_centroids = num_queries_for_centroid > 0  # (B, N, S)
+        
+        # Step 4.5: Cross-batch expansion (if enabled)
+        # Expand centroids from (B, N, S, D) to (B, N, B*S, D) by gathering centroids from
+        # the same anchor position n across all batch elements
+        if self.q_contrastive_cross_batch:
+            # For each anchor at (b, n), gather centroids from position n across all batches
+            # contrastive_samples[:, n, :, :] has shape (B, S, D) - centroids at position n from all batches
+            # We want to reshape this to (B, B*S, D) and replicate for all N positions
+            
+            # Transpose to get (N, B, S, D) so we can easily gather position n across batches
+            centroids_by_position = contrastive_samples.transpose(0, 1)  # (N, B, S, D)
+            valid_by_position = valid_centroids.transpose(0, 1)  # (N, B, S)
+            
+            # Reshape to (N, B*S, D) - concatenate all batch centroids for each position
+            centroids_cross_batch = centroids_by_position.reshape(N, B * max_num_spks, D)  # (N, B*S, D)
+            valid_cross_batch = valid_by_position.reshape(N, B * max_num_spks)  # (N, B*S)
+            
+            # Expand to (B, N, B*S, D) - replicate for all batch elements
+            contrastive_samples = centroids_cross_batch.unsqueeze(0).expand(B, -1, -1, -1)  # (B, N, B*S, D)
+            valid_centroids = valid_cross_batch.unsqueeze(0).expand(B, -1, -1)  # (B, N, B*S)
+            
+            # Update max_num_spks to reflect the new number of classes (B*S instead of S)
+            num_cross_batch_classes = B * max_num_spks
+        else:
+            num_cross_batch_classes = max_num_spks
+              
+        # Step 5: Compute similarity matrix
+        # Compute cosine similarity between each anchor and all speaker centroids
+        # sim_matrix[b, n, s] = cosine_similarity(local_queries[b, n], contrastive_samples[b, n, s])
+        
+        # Normalize local_queries (anchors)
+        queries_norm_for_sim = torch.norm(local_queries, p=2, dim=2, keepdim=True)  # (B, N, 1)
+        normalized_queries = local_queries / (queries_norm_for_sim + 1e-8)  # (B, N, D)
+        
+        # Normalize contrastive_samples (centroids)
+        # Note: in cross-batch mode, the last dimension is B*S instead of S
+        centroids_norm_for_sim = torch.norm(contrastive_samples, p=2, dim=3, keepdim=True)  # (B, N, S or B*S, 1)
+        normalized_centroids = contrastive_samples / (centroids_norm_for_sim + 1e-8)  # (B, N, S or B*S, D)
+        
+        # Compute cosine similarity using einsum for efficiency
+        # normalized_queries: (B, N, D)
+        # normalized_centroids: (B, N, S or B*S, D)
+        # Result: (B, N, S or B*S)
+        sim_matrix = torch.einsum('bnd,bnsd->bns', normalized_queries, normalized_centroids)
+        
+        # Apply additive angular margin (ArcFace-style) to positive samples
+        if self.q_contrastive_aam > 0:
+            # Identify positive samples for AAM application
+            if self.q_contrastive_cross_batch:
+                # Cross-batch mode: positive is only at index b*S + s
+                batch_indices = torch.arange(B, device=device).view(B, 1)  # (B, 1)
+                positive_indices = batch_indices * max_num_spks + local_target_indices  # (B, N)
+                centroid_indices = torch.arange(num_cross_batch_classes, device=device).view(1, 1, num_cross_batch_classes)  # (1, 1, B*S)
+                positive_indices_expanded = positive_indices.unsqueeze(2)  # (B, N, 1)
+                is_same_speaker = (centroid_indices == positive_indices_expanded)  # (B, N, B*S)
+                # Only apply to valid speakers (not -1)
+                has_valid_speaker = (local_target_indices != -1).unsqueeze(2)  # (B, N, 1)
+                is_same_speaker = is_same_speaker & has_valid_speaker  # (B, N, B*S)
+            else:
+                # Standard mode: same speaker within batch
+                anchor_speaker = local_target_indices.unsqueeze(2)  # (B, N, 1)
+                speaker_indices_for_aam = torch.arange(max_num_spks, device=device).view(1, 1, max_num_spks)  # (1, 1, S)
+                is_same_speaker = (anchor_speaker == speaker_indices_for_aam)  # (B, N, S)
+            
+            # Only apply margin to valid positive centroids
+            # Note: shape is (B, N, S) in standard mode or (B, N, B*S) in cross-batch mode
+            is_positive_for_aam = is_same_speaker & valid_centroids
+            
+            # Pre-compute trigonometric constants as Python scalars (no gradients)
+            m_scalar = float(self.q_contrastive_aam)
+            cos_m = math.cos(m_scalar)
+            sin_m = math.sin(m_scalar)
+            
+            # Compute threshold: if theta > pi - m, then theta + m > pi
+            # Since cos is decreasing on [0, pi], this means cos(theta) < cos(pi - m) = -cos(m)
+            threshold = -cos_m
+            
+            # For positive samples, compute cos(theta + m) = cos(theta)cos(m) - sin(theta)sin(m)
+            # cos(theta) is already in sim_matrix
+            # Clamp cos_theta to valid range [-1, 1] for numerical stability
+            cos_theta = torch.clamp(sim_matrix, -1.0, 1.0)
+            
+            # Compute sin(theta) = sqrt(1 - cos^2(theta))
+            # Clamp cos^2(theta) to [0, 1] for numerical stability
+            # Add epsilon to prevent gradient explosion near 0
+            cos_theta_squared = torch.clamp(cos_theta ** 2, 0.0, 1.0)
+            sin_theta = torch.sqrt(torch.clamp(1.0 - cos_theta_squared, min=1e-8))
+            
+            # Apply the angular margin formula
+            cos_theta_plus_m = cos_theta * cos_m - sin_theta * sin_m
+            
+            # If theta + m > pi, set cos(theta + m) = -1 (maximum penalty)
+            exceeds_pi = cos_theta < threshold
+            cos_theta_plus_m = torch.where(exceeds_pi, -1.0, cos_theta_plus_m)
+            
+            # Clamp result to valid cosine range [-1, 1] for any remaining numerical issues
+            cos_theta_plus_m = torch.clamp(cos_theta_plus_m, -1.0, 1.0)
+            
+            # Replace positive sample similarities with margin-adjusted values (only for valid centroids)
+            sim_matrix = torch.where(is_positive_for_aam, cos_theta_plus_m, sim_matrix)
+        
+        # Apply temperature scaling
+        sim_matrix = sim_matrix / self.q_contrastive_temperature
+        
+        # Log similarity statistics
+        #logging.info(f"Similarity matrix (min/mean/max): {sim_matrix.min().item():.4f} / "
+        #             f"{sim_matrix.mean().item():.4f} / "
+        #             f"{sim_matrix.max().item():.4f}")
+        
+        # Step 6: Create positive/negative masks
+        # Identify which centroids are positive (same speaker) vs negative (different speaker) for each anchor
+        
+        # Valid anchor mask: anchors that can participate in the loss
+        # Same criteria as in original function but for anchors (min_frames_anchor threshold)
+        valid_anchor_mask = (
+            (queries_norm_for_sim.squeeze(2) > 1e-8) & 
+            (local_target_indices != -1) & 
+            (active_frames_per_query > self.q_contrastive_min_frames_anchor)
+        )  # (B, N)
+        
+        # For each anchor, identify its positive centroid (same speaker)
+        if self.q_contrastive_cross_batch:
+            # Cross-batch mode: positive is only at index b*S + s for anchor at (b, n) with speaker s
+            # Reuse the same logic as in AAM section
+            batch_indices = torch.arange(B, device=device).view(B, 1)  # (B, 1)
+            positive_indices = batch_indices * max_num_spks + local_target_indices  # (B, N)
+            centroid_indices = torch.arange(num_cross_batch_classes, device=device).view(1, 1, num_cross_batch_classes)  # (1, 1, B*S)
+            positive_indices_expanded = positive_indices.unsqueeze(2)  # (B, N, 1)
+            is_positive_index = (centroid_indices == positive_indices_expanded)  # (B, N, B*S)
+            
+            # Only valid if centroid is valid AND anchor has a valid speaker (not -1)
+            has_valid_speaker = (local_target_indices != -1).unsqueeze(2)  # (B, N, 1)
+            positive_mask = is_positive_index & valid_centroids & has_valid_speaker  # (B, N, B*S)
+            
+            # Negative mask: all valid centroids except the positive one
+            negative_mask = (~is_positive_index) & valid_centroids  # (B, N, B*S)
+        else:
+            # Standard mode: positive is same speaker within the same batch element
+            # positive_mask[b, n, s] = True if s == local_target_indices[b, n] AND centroid is valid
+            anchor_speaker = local_target_indices.unsqueeze(2)  # (B, N, 1)
+            speaker_indices_expanded = torch.arange(max_num_spks, device=device).view(1, 1, max_num_spks)  # (1, 1, S)
+            is_positive_speaker = (anchor_speaker == speaker_indices_expanded)  # (B, N, S)
+            
+            # Positive mask: same speaker AND valid centroid
+            positive_mask = is_positive_speaker & valid_centroids  # (B, N, S)
+            
+            # Negative mask: different speaker AND valid centroid
+            negative_mask = (~is_positive_speaker) & valid_centroids  # (B, N, S)
+        
+        # Check if each anchor has a valid positive centroid
+        has_positive = positive_mask.sum(dim=2) > 0  # (B, N)
+        
+        # Final valid anchor mask: must have valid positive AND be a valid anchor
+        final_valid_anchor_mask = valid_anchor_mask & has_positive  # (B, N)
+        
+        num_valid_anchors = final_valid_anchor_mask.sum()
+        num_positives = positive_mask.sum()
+        num_negatives = negative_mask.sum()
+        
+        #logging.info(f"Valid anchors: {num_valid_anchors.item()}")
+        #logging.info(f"Positive pairs: {num_positives.item()}, Negative pairs: {num_negatives.item()}")
+        
+        # Step 7: Handle margin mode (q_contrastive_extra_positive)
+        # This adds an extra "class" representing a margin/boundary for more flexible contrastive learning
+        
+        if self.q_contrastive_extra_positive:
+            # Add an extra column to similarity matrix representing a margin class
+            # Note: sim_matrix is already temperature-scaled, so we scale the margin value too
+            margin_value = 0.5 / self.q_contrastive_temperature
+            margin_col = torch.full((B, N, 1), margin_value, device=device, dtype=sim_matrix.dtype)
+            logits = torch.cat([sim_matrix, margin_col], dim=2)  # (B, N, S+1) or (B, N, B*S+1) in cross-batch mode
+            
+            # Extend positive and negative masks with weighted margin class
+            # Weight the margin class so it's sampled at the desired rate
+            # If we want P(margin) = rate, then margin_weight = rate / (1 - rate)
+            margin_weight = self.q_contrastive_extra_positive_rate / (1.0 - self.q_contrastive_extra_positive_rate)
+            extra_col_mask = torch.full((B, N, 1), margin_weight, device=device, dtype=torch.float32)
+            pos_candidate_mask = torch.cat([positive_mask.float(), extra_col_mask], dim=2)  # (B, N, S+1) or (B, N, B*S+1)
+            extended_neg_mask = torch.cat([negative_mask, torch.ones(B, N, 1, device=device, dtype=torch.bool)], dim=2)  # (B, N, S+1) or (B, N, B*S+1)
+            
+            # Sample a ground truth label from the valid positive candidates for each anchor
+            # This randomly chooses between the actual positive speaker or the margin class
+            # with probability controlled by q_contrastive_extra_positive_rate
+            labels = torch.multinomial(pos_candidate_mask.view(-1, num_cross_batch_classes + 1), 1).squeeze(1)  # (B*N,)
+            labels_mask = torch.nn.functional.one_hot(labels, num_classes=num_cross_batch_classes + 1).bool().view(B, N, num_cross_batch_classes + 1)  # (B, N, S+1) or (B, N, B*S+1)
+            
+            # Keep only the logits that are either negative or the chosen positive
+            # This implements a more efficient form of contrastive learning
+            keep_logits_mask = extended_neg_mask | labels_mask
+            logits = logits.clone()  # Avoid in-place modification issues
+            logits[~keep_logits_mask] = -99
+            
+            # Use the original valid anchor mask (before checking for positives)
+            # because the margin class can serve as a positive
+            final_anchor_mask = valid_anchor_mask
+            num_classes = num_cross_batch_classes + 1
+            
+            #logging.info(f"Margin mode: extra class added, total classes: {num_classes}")
+        else:
+            # Standard mode without margin
+            logits = sim_matrix  # (B, N, S) or (B, N, B*S) in cross-batch mode
+            
+            if self.q_contrastive_cross_batch:
+                # In cross-batch mode, labels are b*S + speaker_id
+                batch_indices = torch.arange(B, device=device).view(B, 1)  # (B, 1)
+                labels = batch_indices * max_num_spks + local_target_indices  # (B, N)
+                
+                # Replace invalid labels (where local_target_indices == -1) with 0
+                # These will be masked out later using final_anchor_mask
+                labels = torch.where(local_target_indices >= 0, labels, torch.zeros_like(labels))
+            else:
+                # Standard mode: labels are the speaker indices for each anchor
+                labels = local_target_indices.clone()  # (B, N)
+                
+                # Replace invalid labels (-1) with 0 to avoid CUDA errors in cross_entropy
+                # These will be masked out later using final_anchor_mask
+                labels = torch.where(labels >= 0, labels, torch.zeros_like(labels))
+            
+            # Convert to flat indices for cross-entropy
+            labels = labels.view(-1)  # (B*N,)
+            
+            final_anchor_mask = final_valid_anchor_mask
+            num_classes = num_cross_batch_classes
+            
+            #logging.info(f"Standard mode: {num_classes} speaker classes")
+        
+        # Step 8: Compute InfoNCE loss
+        # Use cross-entropy loss between predicted logits and ground truth labels
+        
+        # Reshape logits from (B, N, num_classes) to (B*N, num_classes)
+        logits_flat = logits.reshape(-1, num_classes)  # (B*N, num_classes)
+        
+        # Labels are already flattened: (B*N,)
+        # Compute per-sample cross-entropy loss
+        loss_per_sample = F.cross_entropy(logits_flat, labels, reduction='none')  # (B*N,)
+        
+        # Reshape back to (B, N)
+        loss = loss_per_sample.view(B, N)  # (B, N)
+        
+        # Count valid anchors for logging
+        num_valid = final_anchor_mask.sum()
+        #logging.info(f"Computing loss for {num_valid.item()} valid anchors")
+        
+        # Check for early return if no valid anchors
+        if num_valid == 0:
+            logging.info("No valid anchors, returning zero loss")
+            return torch.tensor(0.0, device=device, dtype=local_queries.dtype)
+        
+        # Step 9: Apply duration averaging
+        # Aggregate per-anchor losses into a single scalar
+        if self.q_contrastive_duration_averaged:
+            # Weighted average using active_frames_per_query as weights
+            # Clamp weights to max_frames to prevent overly long segments from dominating
+            weights = active_frames_per_query.clamp(max=self.q_contrastive_max_frames) * final_anchor_mask.float()
+            weighted_loss = loss * weights
+            total_weight = weights.sum()
+            if total_weight == 0:
+                logging.info("Total weight is zero, returning zero loss")
+                return torch.tensor(0.0, device=device, dtype=local_queries.dtype)
+            total_loss = weighted_loss.sum() / total_weight
+        else:
+            # Simple average over valid anchors
+            loss = loss * final_anchor_mask.float()
+            if num_valid == 0:
+                logging.info("No valid anchors for simple average, returning zero loss")
+                return torch.tensor(0.0, device=device, dtype=local_queries.dtype)
+            total_loss = loss.sum() / num_valid
+        
+        return total_loss
+
     def _get_aux_train_evaluations(
         self, logits, emb_seq, local_logits, local_queries, active_frames_per_query, targets, target_lens
     ) -> dict:
@@ -1713,7 +2126,10 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             #logging.info(f"local_queries: {local_queries.shape}")
             active_frames_per_query = active_frames_per_query.view(num_chunks, batch_size, local_num_spks).transpose(0, 1).reshape(batch_size, num_chunks * local_num_spks)
             #logging.info(f"active_frames_per_query: {active_frames_per_query}")
-            q_contrastive_loss = self._compute_q_contrastive_loss_centroid(local_queries, local_target_indices, active_frames_per_query)
+            if self.q_contrastive_cross_batch:
+                q_contrastive_loss = self._compute_q_contrastive_loss_centroid_cross_batch(local_queries, local_target_indices, active_frames_per_query)
+            else:
+                q_contrastive_loss = self._compute_q_contrastive_loss_centroid(local_queries, local_target_indices, active_frames_per_query)
         else:
             q_contrastive_loss = torch.tensor(0.0, device=pil_loss.device, dtype=pil_loss.dtype)
 
