@@ -1075,3 +1075,276 @@ class NextformerModules(NeuralModule, Exportable):
             streaming_state.global_spk_centroids_duration[batch_indices, global_idx_flat] = new_durations
         
         return
+
+    def _prefill_new_speakers(
+        self,
+        centroids: torch.Tensor,  # (B, max_num_spks, emb_dim)
+        queries: torch.Tensor,     # (B, local_num_spks, emb_dim)
+        global_spk_indices: torch.Tensor  # (B, local_num_spks)
+    ) -> torch.Tensor:
+        """
+        Pre-fill empty centroid slots with their assigned queries.
+        This handles new speaker initialization before transformer processing.
+        
+        When a new speaker appears (empty centroid slot gets assigned a query),
+        this function initializes that slot with the query embedding so the 
+        transformer sees meaningful input instead of zeros.
+        
+        Args:
+            centroids: Current centroid embeddings
+                Shape: (B, max_num_spks, emb_dim)
+            queries: New query embeddings from current chunk
+                Shape: (B, local_num_spks, emb_dim)
+            global_spk_indices: Assignment of local queries to global centroid slots
+                Shape: (B, local_num_spks)
+                Values: global slot index or -1 if unassigned
+        
+        Returns:
+            centroids_prefilled: Centroids with new speakers initialized
+                Shape: (B, max_num_spks, emb_dim)
+        """
+        B, max_num_spks, emb_dim = centroids.shape
+        local_num_spks = queries.shape[1]
+        centroids_prefilled = centroids.clone()
+        
+        # Compute norms to identify empty slots (zero vectors)
+        centroid_norms = torch.norm(centroids, p=2, dim=2)  # (B, max_num_spks)
+        is_empty = centroid_norms < 1e-8  # (B, max_num_spks)
+        
+        # VECTORIZED: Find all queries assigned to empty slots
+        # Condition: global_spk_indices != -1 AND assigned slot is empty
+        valid_assignment = global_spk_indices != -1  # (B, local_num_spks)
+        
+        if valid_assignment.any():
+            # Get batch and local indices where there's a valid assignment
+            batch_indices, local_indices = torch.where(valid_assignment)  # 1D tensors
+            
+            # Get corresponding global indices
+            global_indices = global_spk_indices[batch_indices, local_indices]  # 1D tensor
+            
+            # Check which of these assigned slots are empty
+            assigned_slot_is_empty = is_empty[batch_indices, global_indices]  # 1D tensor
+            
+            # Filter to only new speaker assignments (assigned to empty slots)
+            batch_indices_new = batch_indices[assigned_slot_is_empty]
+            local_indices_new = local_indices[assigned_slot_is_empty]
+            global_indices_new = global_indices[assigned_slot_is_empty]
+            
+            # Initialize all empty slots with their assigned queries (vectorized)
+            if len(batch_indices_new) > 0:
+                centroids_prefilled[batch_indices_new, global_indices_new] = queries[batch_indices_new, local_indices_new]
+        
+        return centroids_prefilled
+
+    def _create_centroid_update_mask(
+        self,
+        centroids: torch.Tensor,  # (B, max_num_spks, emb_dim)
+        queries: torch.Tensor,     # (B, local_num_spks, emb_dim)
+        global_spk_indices: torch.Tensor  # (B, local_num_spks)
+    ) -> torch.Tensor:
+        """
+        Create attention mask for transformer-based centroid update.
+        
+        The mask implements the following rules:
+        1. Zero centroids and zero queries don't participate in attention
+        2. Each centroid can attend to: itself + its assigned query (if any)
+        3. Each query can attend to: itself + its assigned centroid (if any)
+        4. Centroids cannot attend to other centroids
+        5. Queries cannot attend to other queries
+        
+        This prevents:
+        - Unassigned centroids from getting corrupted by irrelevant queries
+        - Information leakage between different speakers
+        
+        Args:
+            centroids: Current centroid embeddings (after prefilling)
+                Shape: (B, max_num_spks, emb_dim)
+            queries: New query embeddings from current chunk
+                Shape: (B, local_num_spks, emb_dim)
+            global_spk_indices: Assignment of local queries to global centroid slots
+                Shape: (B, local_num_spks)
+                Values: global slot index or -1 if unassigned
+        
+        Returns:
+            mask: Attention mask for transformer
+                Shape: (B, total_len, total_len) where total_len = max_num_spks + local_num_spks
+                Values: True = masked out (not allowed), False = allowed
+        """
+        B, max_num_spks, emb_dim = centroids.shape
+        local_num_spks = queries.shape[1]
+        total_len = max_num_spks + local_num_spks
+        device = centroids.device
+        
+        # Initialize: mask everything (True = masked out)
+        mask = torch.ones(B, total_len, total_len, dtype=torch.bool, device=device)
+        
+        # Compute norms to identify non-zero centroids and queries
+        centroid_norms = torch.norm(centroids, p=2, dim=2)  # (B, max_num_spks)
+        query_norms = torch.norm(queries, p=2, dim=2)  # (B, local_num_spks)
+        
+        is_nonzero_centroid = centroid_norms > 1e-8  # (B, max_num_spks)
+        is_nonzero_query = query_norms > 1e-8  # (B, local_num_spks)
+        
+        # Rule 1: Self-attention for non-zero centroids
+        # Set mask[b, i, i] = False where is_nonzero_centroid[b, i] = True
+        batch_idx_cent = torch.arange(B, device=device).unsqueeze(1).expand(-1, max_num_spks)  # (B, max_num_spks)
+        centroid_idx = torch.arange(max_num_spks, device=device).unsqueeze(0).expand(B, -1)  # (B, max_num_spks)
+        mask[batch_idx_cent[is_nonzero_centroid], centroid_idx[is_nonzero_centroid], centroid_idx[is_nonzero_centroid]] = False
+        
+        # Rule 2: Self-attention for non-zero queries
+        # Set mask[b, max_num_spks+j, max_num_spks+j] = False where is_nonzero_query[b, j] = True
+        batch_idx_query = torch.arange(B, device=device).unsqueeze(1).expand(-1, local_num_spks)  # (B, local_num_spks)
+        query_local_idx = torch.arange(local_num_spks, device=device).unsqueeze(0).expand(B, -1)  # (B, local_num_spks)
+        query_pos = max_num_spks + query_local_idx  # (B, local_num_spks)
+        mask[batch_idx_query[is_nonzero_query], query_pos[is_nonzero_query], query_pos[is_nonzero_query]] = False
+        
+        # Rule 3: Cross-connections based on assignment (vectorized)
+        # For each valid assignment, create bidirectional connection between centroid and query
+        
+        # Identify valid assignments: assigned AND query is non-zero
+        valid_assignment = (global_spk_indices != -1) & is_nonzero_query  # (B, local_num_spks)
+        
+        if valid_assignment.any():
+            # Get batch and local indices where assignment is valid
+            batch_indices, local_indices = torch.where(valid_assignment)  # 1D tensors
+            
+            # Get corresponding global centroid indices
+            global_indices = global_spk_indices[batch_indices, local_indices]  # 1D tensor
+            
+            # Check if assigned centroids are non-zero
+            centroid_is_nonzero = is_nonzero_centroid[batch_indices, global_indices]  # 1D tensor
+            
+            # Filter to only keep assignments where centroid is also non-zero
+            batch_indices = batch_indices[centroid_is_nonzero]
+            local_indices = local_indices[centroid_is_nonzero]
+            global_indices = global_indices[centroid_is_nonzero]
+            
+            # Compute query positions
+            query_positions = max_num_spks + local_indices
+            
+            # Set bidirectional connections (vectorized)
+            mask[batch_indices, global_indices, query_positions] = False  # Centroid -> Query
+            mask[batch_indices, query_positions, global_indices] = False  # Query -> Centroid
+        
+        return mask
+
+    def update_streaming_state_with_transformer(
+        self, 
+        streaming_state: StreamingNextformerState,
+        spk_queries: torch.Tensor,
+        global_spk_indices: torch.Tensor,
+        active_frames_per_query: torch.Tensor,
+        centroid_encoder: torch.nn.Module
+    ) -> None:
+        """
+        Update streaming state using transformer-based centroid fusion.
+        
+        This function fuses current centroids with new queries using a transformer
+        encoder with controlled attention patterns. The transformer learns how to
+        update centroids based on new observations while preventing corruption
+        from unrelated speakers.
+        
+        Args:
+            streaming_state: Current streaming state containing global centroids
+            spk_queries: New query embeddings from current chunk
+                Shape: (B, local_num_spks, emb_dim)
+            global_spk_indices: Assignment of local queries to global centroid slots
+                Shape: (B, local_num_spks)
+                Values: global slot index or -1 if unassigned
+            active_frames_per_query: Number of active frames for each query
+                Shape: (B, local_num_spks)
+            centroid_encoder: Transformer encoder module for centroid update
+        """
+        B, local_num_spks, emb_dim = spk_queries.shape
+        device = spk_queries.device
+        
+        # Step 1: Get current centroids
+        current_centroids = streaming_state.global_spk_centroids  # (B, max_num_spks, emb_dim)
+        
+        # Step 2: Pre-fill empty slots with assigned queries (solves Issue 2)
+        centroids_prefilled = self._prefill_new_speakers(
+            current_centroids, spk_queries, global_spk_indices
+        )
+        
+        # Step 3: Create input sequence [centroids, queries]
+        input_seq = torch.cat([centroids_prefilled, spk_queries], dim=1)
+        # Shape: (B, max_num_spks + local_num_spks, emb_dim)
+        
+        # Step 4: Create attention mask (solves Issue 1)
+        attn_mask_full = self._create_centroid_update_mask(
+            centroids_prefilled, spk_queries, global_spk_indices
+        )
+        # Shape: (B, total_len, total_len)
+        # True = masked out, False = allowed
+        
+        # Step 5: Run transformer encoder with custom 2D attention masks
+        # We need full control over the attention pattern to prevent:
+        # - Centroids from attending to other centroids
+        # - Queries from attending to other queries
+        # - Unassigned centroids from getting corrupted by irrelevant queries
+        
+        # Convert our boolean mask to attention scores format
+        # Our mask: True = masked out, False = allowed
+        # Transformer expects: 0 = attend, -10000 = masked out
+        NEG_INF = -10000.0
+        attn_scores_mask = torch.where(attn_mask_full, NEG_INF, 0.0)  # (B, total_len, total_len)
+        attn_scores_mask = attn_scores_mask.unsqueeze(1)  # (B, 1, total_len, total_len) for multi-head
+        
+        # Run through transformer layers manually to apply custom mask
+        encoder_states = input_seq  # (B, total_len, emb_dim)
+        
+        for layer in centroid_encoder.layers:
+            # Each layer expects (encoder_states, encoder_attn_mask, memory_states)
+            # where encoder_attn_mask has shape (B, 1, L, L)
+            encoder_states = layer(encoder_states, attn_scores_mask, encoder_states)
+        
+        # Apply final layer norm if present
+        if centroid_encoder.final_layer_norm is not None:
+            encoder_states = centroid_encoder.final_layer_norm(encoder_states)
+        
+        output_seq = encoder_states  # (B, total_len, emb_dim)
+        
+        # Step 6: Extract updated centroids (first max_num_spks positions)
+        updated_centroids = output_seq[:, :self.max_num_spks, :]  # (B, max_num_spks, emb_dim)
+        
+        # Step 7: Selective update - only update centroids that have assigned queries
+        # This prevents drift for unassigned centroids
+        # Create mask indicating which centroids have assigned queries (VECTORIZED)
+        has_assigned_query = torch.zeros(B, self.max_num_spks, dtype=torch.bool, device=device)
+        
+        # Find all valid assignments (where global_spk_indices != -1)
+        valid_assignment_mask = global_spk_indices != -1  # (B, local_num_spks)
+        
+        if valid_assignment_mask.any():
+            # Get batch and local indices of all valid assignments
+            batch_indices, local_indices = torch.where(valid_assignment_mask)  # 1D tensors
+            
+            # Get corresponding global indices
+            global_indices = global_spk_indices[batch_indices, local_indices]  # 1D tensor
+            
+            # Set has_assigned_query[b, global_idx] = True for all valid assignments
+            has_assigned_query[batch_indices, global_indices] = True
+        
+        # Apply selective update: keep old centroids if no assignment, use updated if assigned
+        final_centroids = torch.where(
+            has_assigned_query.unsqueeze(-1),  # (B, max_num_spks, 1)
+            updated_centroids,                  # Use updated version
+            current_centroids                   # Keep original version
+        )
+        
+        # Step 8: Write back to streaming state
+        streaming_state.global_spk_centroids = final_centroids
+        
+        # Step 9: Update durations (for tracking/logging)
+        # Create mask for valid assignments
+        valid_mask = (global_spk_indices != -1) & (active_frames_per_query >= self.spk_centroid_update_min_frames)
+        
+        if valid_mask.any():
+            batch_indices, local_indices = torch.where(valid_mask)
+            global_idx_flat = global_spk_indices[batch_indices, local_indices]
+            active_frames_flat = active_frames_per_query[batch_indices, local_indices]
+            
+            # Update durations
+            streaming_state.global_spk_centroids_duration[batch_indices, global_idx_flat] += active_frames_flat
+        
+        return

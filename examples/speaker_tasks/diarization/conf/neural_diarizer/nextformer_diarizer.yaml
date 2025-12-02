@@ -4,7 +4,14 @@ batch_size: 4
 
 model: 
   sample_rate: 16000
-  oracle_mode: False
+  
+  # Oracle parameters for debugging/ablation studies - use ground truth information instead of predictions
+  oracle_queries_train: false # If true, use ground truth speaker activity (instead of predicted) during training for mask initialization and query generation
+  oracle_queries_test: false # If true, use ground truth speaker activity (instead of predicted) during testing for mask initialization and query generation
+  oracle_centroids_train: true # If true, use ground truth speaker indices (instead of predicted) during training for updating speaker centroids
+  oracle_centroids_test: false # If true, use ground truth speaker indices (instead of predicted) during testing for updating speaker centroids
+  centroid_update_period: 1 # number of frames between centroid updates
+
   pil_weight: 0.5 # Weight for Permutation Invariant Loss (PIL) used in training the Nextformer diarizer model
   ats_weight: 0.5 # Weight for Arrival Time Sort (ATS) loss in training the Nextformer diarizer model
   q_sim_weight: 0.0 # Weight for Query Similarity loss
@@ -182,6 +189,19 @@ model:
     attn_score_dropout: 0.5
     attn_layer_dropout: 0.5
     ffn_dropout: 0.5
+    hidden_act: relu
+    pre_ln: False
+    pre_ln_final_layer_norm: True
+
+  centroid_encoder:
+    _target_: nemo.collections.asr.modules.transformer.transformer_encoders.TransformerEncoder
+    num_layers: 1
+    hidden_size: ${model.model_defaults.sq_d_model} # Needs to be multiple of num_attention_heads
+    inner_size: 768
+    num_attention_heads: 8
+    attn_score_dropout: 0.0
+    attn_layer_dropout: 0.0
+    ffn_dropout: 0.0
     hidden_act: relu
     pre_ln: False
     pre_ln_final_layer_norm: True
