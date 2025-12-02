@@ -15,6 +15,7 @@
 import math
 from typing import Optional, Union, Tuple
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from lhotse import SupervisionSet
@@ -210,6 +211,18 @@ def get_pil_targets_hungarian(
     batch_size, _num_frames, num_speakers_labels = labels.shape
     _batch_size, _num_frames, num_speakers_preds = logits.shape
 
+    # Check for NaN/Inf in input logits (can happen early in training)
+    # Clip logits to [-20, 20] to prevent numerical overflow in sigmoid/BCE computation
+    # sigmoid(20) ≈ 1.0 and sigmoid(-20) ≈ 0.0 within floating point precision
+    if torch.isnan(logits).any() or torch.isinf(logits).any():
+        nan_count = torch.isnan(logits).sum().item()
+        inf_count = torch.isinf(logits).sum().item()
+        logging.warning(f"Invalid values detected in logits: {nan_count} NaNs, {inf_count} Infs. Clipping to [-20, 20].")
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0)
+    else:
+        # Even if no NaN/Inf, clamp extreme values for numerical stability
+        logits = torch.clamp(logits, min=-20.0, max=20.0)
+
     # Allow rectangular assignment when num_speakers_labels > num_speakers_preds (N < S)
 
     # Expand dimensions to calculate the pair-wise match score
@@ -259,6 +272,17 @@ def get_pil_targets_hungarian(
     # linear_sum_assignment minimizes the cost, so we use the negative of the score for maximization.
     # We also convert to float32, as numpy doesn't support bfloat16.
     cost_matrix_np = -match_score_matrix.detach().cpu().to(torch.float32).numpy()
+
+    # Additional safety check: ensure cost matrix has no NaN/Inf values
+    if not np.isfinite(cost_matrix_np).all():
+        nan_count = np.isnan(cost_matrix_np).sum()
+        inf_count = np.isinf(cost_matrix_np).sum()
+        logging.warning(
+            f"Invalid values in cost matrix for Hungarian algorithm: {nan_count} NaNs, {inf_count} Infs. "
+            f"Replacing with large finite values. This may indicate numerical instability in the model."
+        )
+        # Replace NaN with 0 and Inf with large finite values
+        cost_matrix_np = np.nan_to_num(cost_matrix_np, nan=0.0, posinf=1e6, neginf=-1e6)
 
     # Find the best permutation using the Hungarian algorithm for each item in the batch
     batch_row_ind = []
