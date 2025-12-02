@@ -105,6 +105,8 @@ class DiarizationConfig:
     chunk_right_context: int = 10
     max_num_spks: int = 8
     spk_centroid_update_min_frames: int = 0
+    oracle_queries: bool = False
+    oracle_centroids: bool = False
 
     # If `cuda` is a negative number, inference will be on CPU only.
     cuda: Optional[int] = None
@@ -399,6 +401,8 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     diar_model.nextformer_modules.chunk_right_context = cfg.chunk_right_context
     diar_model.nextformer_modules.spk_centroid_update_min_frames = cfg.spk_centroid_update_min_frames
     diar_model.nextformer_modules.log = cfg.log
+    diar_model.oracle_queries_test = cfg.oracle_queries
+    diar_model.oracle_centroids_test = cfg.oracle_centroids
 
     postprocessing_cfg = load_postprocessing_from_yaml(cfg.postprocessing_yaml)
     tensor_path, model_id, tensor_filename = get_tensor_path(cfg)
@@ -406,6 +410,8 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     cfg.optuna_storage: str = f"sqlite:///{cfg.optuna_temp_dir}/{cfg.optuna_study_name}.db"
     cfg.optuna_log_file: str = f"{cfg.optuna_temp_dir}/{cfg.optuna_study_name}.log"
 
+    logging.info(f"Oracle queries: {diar_model.oracle_queries_test}")
+    logging.info(f"Oracle centroids: {diar_model.oracle_centroids_test}")
     if os.path.exists(tensor_path) and cfg.save_preds_tensors:
         logging.info(
             f"A saved prediction tensor has been found. Loading the saved prediction tensors from {tensor_path}..."

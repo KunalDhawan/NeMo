@@ -769,9 +769,14 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 local_logits_chunk = local_logits[chunk_idx * batch_size:(chunk_idx + 1) * batch_size, :, :] # (batch_size, lc+chunk_len+rc, local_num_spks)
                 
                 # get global indices using real centroids
-                global_spk_indices = self.nextformer_modules.get_global_indices(
-                    spk_queries_chunk, streaming_state.global_spk_centroids
-                )
+                if self.oracle_centroids_test and not self.training:
+                    global_spk_indices = self.nextformer_modules.get_global_indices(
+                        spk_queries_chunk, streaming_state_oracle.global_spk_centroids
+                    )
+                else:
+                    global_spk_indices = self.nextformer_modules.get_global_indices(
+                        spk_queries_chunk, streaming_state.global_spk_centroids
+                    )
 
                 # get global indices using oracle information if available
                 global_spk_indices_oracle = None

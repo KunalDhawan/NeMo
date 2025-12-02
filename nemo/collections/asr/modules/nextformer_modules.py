@@ -1308,12 +1308,13 @@ class NextformerModules(NeuralModule, Exportable):
         updated_centroids = output_seq[:, :self.max_num_spks, :]  # (B, max_num_spks, emb_dim)
         
         # Step 7: Selective update - only update centroids that have assigned queries
-        # This prevents drift for unassigned centroids
-        # Create mask indicating which centroids have assigned queries (VECTORIZED)
-        has_assigned_query = torch.zeros(B, self.max_num_spks, dtype=torch.bool, device=device)
+        # with sufficient active frames. This prevents drift for unassigned centroids
+        # and avoids updating based on unreliable short-duration queries.
+        # Create mask indicating which centroids should be updated (VECTORIZED)
+        should_update_centroid = torch.zeros(B, self.max_num_spks, dtype=torch.bool, device=device)
         
-        # Find all valid assignments (where global_spk_indices != -1)
-        valid_assignment_mask = global_spk_indices != -1  # (B, local_num_spks)
+        # Find all valid assignments (where global_spk_indices != -1 AND active_frames >= threshold)
+        valid_assignment_mask = (global_spk_indices != -1) & (active_frames_per_query >= self.spk_centroid_update_min_frames)  # (B, local_num_spks)
         
         if valid_assignment_mask.any():
             # Get batch and local indices of all valid assignments
@@ -1322,25 +1323,23 @@ class NextformerModules(NeuralModule, Exportable):
             # Get corresponding global indices
             global_indices = global_spk_indices[batch_indices, local_indices]  # 1D tensor
             
-            # Set has_assigned_query[b, global_idx] = True for all valid assignments
-            has_assigned_query[batch_indices, global_indices] = True
+            # Set should_update_centroid[b, global_idx] = True for all valid assignments
+            should_update_centroid[batch_indices, global_indices] = True
         
-        # Apply selective update: keep old centroids if no assignment, use updated if assigned
+        # Apply selective update: keep old centroids if no assignment or insufficient frames, use updated if assigned with sufficient frames
         final_centroids = torch.where(
-            has_assigned_query.unsqueeze(-1),  # (B, max_num_spks, 1)
-            updated_centroids,                  # Use updated version
-            current_centroids                   # Keep original version
+            should_update_centroid.unsqueeze(-1),  # (B, max_num_spks, 1)
+            updated_centroids,                      # Use updated version
+            current_centroids                       # Keep original version
         )
         
         # Step 8: Write back to streaming state
         streaming_state.global_spk_centroids = final_centroids
         
         # Step 9: Update durations (for tracking/logging)
-        # Create mask for valid assignments
-        valid_mask = (global_spk_indices != -1) & (active_frames_per_query >= self.spk_centroid_update_min_frames)
-        
-        if valid_mask.any():
-            batch_indices, local_indices = torch.where(valid_mask)
+        # Reuse valid_assignment_mask from Step 7 (same condition)
+        if valid_assignment_mask.any():
+            batch_indices, local_indices = torch.where(valid_assignment_mask)
             global_idx_flat = global_spk_indices[batch_indices, local_indices]
             active_frames_flat = active_frames_per_query[batch_indices, local_indices]
             
