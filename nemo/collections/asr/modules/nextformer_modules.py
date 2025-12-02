@@ -1020,7 +1020,7 @@ class NextformerModules(NeuralModule, Exportable):
             # C_new = (C_old * D_old + Q_new * d_new) / (D_old + d_new)
             new_durations = old_durations + active_frames_flat
             new_centroids = (old_centroids * old_durations.unsqueeze(-1) + 
-                            spk_queries[batch_indices, local_indices] * active_frames_flat.unsqueeze(-1)) / new_durations.unsqueeze(-1)
+                            spk_queries[batch_indices, local_indices] * active_frames_flat.unsqueeze(-1)) / (new_durations.unsqueeze(-1) + 1e-8)
             #logging.info(f"new centroids durations: {new_durations}")
             # Update streaming state
             streaming_state.global_spk_centroids[batch_indices, global_idx_flat] = new_centroids
@@ -1068,7 +1068,7 @@ class NextformerModules(NeuralModule, Exportable):
             # C_new = (C_old * D_old + Q_new * d_new) / (D_old + d_new)
             new_durations = old_durations + active_frames_flat
             new_centroids = (old_centroids * old_durations.unsqueeze(-1) + 
-                            spk_queries[batch_indices, local_indices] * active_frames_flat.unsqueeze(-1)) / new_durations.unsqueeze(-1)
+                            spk_queries[batch_indices, local_indices] * active_frames_flat.unsqueeze(-1)) / (new_durations.unsqueeze(-1) + 1e-8)
             #logging.info(f"new centroids durations: {new_durations}")
             # Update streaming state
             streaming_state.global_spk_centroids[batch_indices, global_idx_flat] = new_centroids
