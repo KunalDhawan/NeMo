@@ -119,6 +119,12 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             self.query_decoder_raw = NextformerEncLabelModel.from_config_dict(query_decoder_raw_cfg).to(self.device)
         else:
             self.query_decoder_raw = None
+
+        query_enhancer_cfg = self._cfg.get('query_enhancer', None)
+        if query_enhancer_cfg is not None:
+            self.query_enhancer = NextformerEncLabelModel.from_config_dict(query_enhancer_cfg).to(self.device)
+        else:
+            self.query_enhancer = None
             
         self.transformer_encoder = NextformerEncLabelModel.from_config_dict(self._cfg.transformer_encoder).to(
             self.device
@@ -395,7 +401,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             local_queries (torch.Tensor): Tensor containing local speaker queries.
                 Shape: (num_chunks * batch_size, local_num_spks, query_dim)
             active_frames_per_query (torch.Tensor): Tensor containing the number of active frames per query
-                Shape: (num_chunks * batch_size, num_queries)
+                Shape: (num_chunks * batch_size, local_num_spks)
             current_spk_centroids (torch.Tensor): Tensor containing global speaker centroids before each chunk update
                 Shape: (num_chunks * batch_size, max_num_spks, query_dim)
         """
@@ -521,7 +527,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             local_queries (torch.Tensor): Tensor containing local speaker queries
                 Shape: (num_chunks * batch_size, local_num_spks, query_dim)
             active_frames_per_query (torch.Tensor): Tensor containing the number of active frames per query
-                Shape: (num_chunks * batch_size, num_queries)
+                Shape: (num_chunks * batch_size, local_num_spks)
             current_spk_centroids (torch.Tensor): Tensor containing global speaker centroids before each chunk update
                 Shape: (num_chunks * batch_size, max_num_spks, query_dim)
         """
@@ -648,9 +654,9 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         # masks for the target speaker and non-target speakers in extra cross-attention
         # encoder_mask_extra should have False (0) on frames where current speaker is inactive and any other speaker is active
         if self.initialize_mask:
-            encoder_query_mask = ~(preds > self.local_mask_threshold).transpose(1, 2)  # (batch, num_queries, n_frames)
+            encoder_query_mask = ~(preds > self.local_mask_threshold).transpose(1, 2)  # (batch, local_num_spks, n_frames)
             any_speaker_active = (preds.max(dim=2)[0] > self.local_mask_threshold).unsqueeze(1)  # (batch, 1, n_frames)
-            any_speaker_active = any_speaker_active.expand(-1, preds.shape[2], -1)  # (batch, num_queries, n_frames)
+            any_speaker_active = any_speaker_active.expand(-1, preds.shape[2], -1)  # (batch, local_num_spks, n_frames)
             encoder_mask_extra = ~(encoder_query_mask & any_speaker_active)
             #logging.info(f"encoder_mask_extra: {encoder_mask_extra.to(int)[0, :, :20]}")
             #logging.info(f"encoder_query_mask: {encoder_query_mask.to(int)[0, :, :20]}")
@@ -658,14 +664,14 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             encoder_query_mask = None
             encoder_mask_extra = None
           
-        num_queries = preds.shape[-1]
-        active_frames_per_query = (preds > self.local_mask_threshold).to(int).sum(dim=1) # (num_chunks * batch_size, num_queries)
+        local_num_spks = preds.shape[-1]
+        active_frames_per_query = (preds > self.local_mask_threshold).to(int).sum(dim=1) # (num_chunks * batch_size, local_num_spks)
         #logging.info(f"active frames per query: {active_frames_per_query}")
-        spk_detected = active_frames_per_query > 0 # (num_chunks * batch_size, num_queries)
-        spk_not_detected = ~spk_detected # (num_chunks * batch_size, num_queries)
-        query_mask_from = spk_not_detected.unsqueeze(2).expand(-1, -1, num_queries)  # (num_chunks * batch_size, num_queries, num_queries)
-        query_mask_to = spk_not_detected.unsqueeze(1).expand(-1, num_queries, -1)  # (num_chunks * batch_size, num_queries, num_queries)
-        query_mask = query_mask_from | query_mask_to  # (num_chunks * batch_size, num_queries, num_queries)
+        spk_detected = active_frames_per_query > 0 # (num_chunks * batch_size, local_num_spks)
+        spk_not_detected = ~spk_detected # (num_chunks * batch_size, local_num_spks)
+        query_mask_from = spk_not_detected.unsqueeze(2).expand(-1, -1, local_num_spks)  # (num_chunks * batch_size, local_num_spks, local_num_spks)
+        query_mask_to = spk_not_detected.unsqueeze(1).expand(-1, local_num_spks, -1)  # (num_chunks * batch_size, local_num_spks, local_num_spks)
+        query_mask = query_mask_from | query_mask_to  # (num_chunks * batch_size, local_num_spks, local_num_spks)
         #logging.info(f"query_mask: {query_mask}")
         #logging.info(f"spk_not_detected: {spk_not_detected.to(int).sum(dim=1)}")
 
@@ -736,6 +742,16 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             self.encoder.att_context_size = [-1, -1]
             self.transformer_encoder.diag = None
 
+        if self.query_enhancer is not None:
+            emb_dim = spk_queries.shape[-1]
+            spk_queries_reshaped = spk_queries.view(num_chunks, batch_size, local_num_spks, emb_dim).transpose(0, 1)
+            spk_queries_reshaped = spk_queries_reshaped.reshape(batch_size, num_chunks * local_num_spks, emb_dim)
+            valid_query_mask = spk_detected.view(num_chunks, batch_size, local_num_spks).transpose(0, 1).reshape(batch_size, num_chunks * local_num_spks)
+            spk_queries_enhanced = self.query_enhancer(encoder_states=spk_queries_reshaped, encoder_mask=valid_query_mask)
+            spk_queries_enhanced = spk_queries_enhanced.masked_fill(~valid_query_mask.unsqueeze(-1), 0)
+            spk_queries = spk_queries_enhanced.view(batch_size, num_chunks, local_num_spks, emb_dim).transpose(0, 1)
+            spk_queries = spk_queries.reshape(num_chunks * batch_size, local_num_spks, emb_dim)
+
         logits = torch.full(
             (batch_size, total_n_frames, self.nextformer_modules.max_num_spks),
             -1e9,
@@ -783,7 +799,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 if local_target_indices is not None:
                     global_spk_indices_oracle = local_target_indices[chunk_idx * batch_size:(chunk_idx + 1) * batch_size, :]  # (batch_size, local_num_spks)
 
-                active_frames_per_query_chunk = active_frames_per_query[chunk_idx * batch_size:(chunk_idx + 1) * batch_size] # (batch_size, num_queries)
+                active_frames_per_query_chunk = active_frames_per_query[chunk_idx * batch_size:(chunk_idx + 1) * batch_size] # (batch_size, local_num_spks)
                 
                 if streaming_state_oracle is not None:
                     # store oracle centroids
@@ -1618,7 +1634,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             local_queries (torch.Tensor): Local speaker queries.
                 Shape: (batch_size * num_chunks, local_num_spks, emb_dim)
             active_frames_per_query (torch.Tensor): Tensor containing the number of active frames per query
-                Shape: (num_chunks * batch_size, num_queries)
+                Shape: (num_chunks * batch_size, local_num_spks)
             current_spk_centroids (torch.Tensor): Tensor containing global speaker centroids before each chunk update
                 Shape: (num_chunks * batch_size, max_num_spks, query_dim)
             targets (torch.Tensor): Ground truth speaker labels.
@@ -1754,7 +1770,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             local_queries (torch.Tensor): Local speaker queries.
                 Shape: (batch_size * num_chunks, local_num_spks, emb_dim)
             active_frames_per_query (torch.Tensor): Tensor containing the number of active frames per query
-                Shape: (num_chunks * batch_size, num_queries)
+                Shape: (num_chunks * batch_size, local_num_spks)
             current_spk_centroids (torch.Tensor): Tensor containing global speaker centroids before each chunk update
                 Shape: (num_chunks * batch_size, max_num_spks, query_dim)
             targets (torch.Tensor): Ground truth speaker labels.
@@ -2259,7 +2275,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         # encoder_mask_extra should have False (0) on frames where current speaker is inactive and any other speaker is active
         if (self.query_decoder_raw is not None and self.query_decoder_raw.extra_cross_attention) or (self.query_decoder is not None and self.query_decoder.extra_cross_attention):
             any_speaker_active = (preds.max(dim=2)[0] > self.local_mask_threshold).unsqueeze(1)  # (batch, 1, n_frames)
-            any_speaker_active = any_speaker_active.expand(-1, preds.shape[2], -1)  # (batch, num_queries, n_frames)
+            any_speaker_active = any_speaker_active.expand(-1, preds.shape[2], -1)  # (batch, local_num_spks, n_frames)
             encoder_mask_extra = ~(encoder_query_mask & any_speaker_active)
         else:
             encoder_mask_extra = None
@@ -2269,21 +2285,21 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         chunk_len = logits.shape[1] - lc - rc
         # Create query_mask for undetected speakers
         # Check if each speaker is detected above threshold across all frames
-        # preds shape: (B, n_frames, num_queries)
+        # preds shape: (B, n_frames, local_num_spks)
         # For each speaker, check if max value across frames is above threshold
-        spk_detected = preds[:, :lc+chunk_len].max(dim=1)[0] > 0.5  # (B, num_queries)
-        spk_not_detected = ~spk_detected  # (B, num_queries), True means speaker not detected
+        spk_detected = preds[:, :lc+chunk_len].max(dim=1)[0] > 0.5  # (B, local_num_spks)
+        spk_not_detected = ~spk_detected  # (B, local_num_spks), True means speaker not detected
         
         # Create query_mask for self-attention: mask out attention to/from undetected speakers
-        # query_mask shape: (B, num_queries, num_queries)
-        num_queries = preds.shape[-1]
+        # query_mask shape: (B, local_num_spks, local_num_spks)
+        local_num_spks = preds.shape[-1]
         query_mask = None
         if spk_not_detected.any():
             # Expand spk_not_detected to create attention mask
             # Mask attention FROM undetected speakers
-            query_mask_from = spk_not_detected.unsqueeze(2).expand(-1, -1, num_queries)  # (B, num_queries, num_queries)
+            query_mask_from = spk_not_detected.unsqueeze(2).expand(-1, -1, local_num_spks)  # (B, local_num_spks, local_num_spks)
             # Mask attention TO undetected speakers
-            query_mask_to = spk_not_detected.unsqueeze(1).expand(-1, num_queries, -1)  # (B, num_queries, num_queries)
+            query_mask_to = spk_not_detected.unsqueeze(1).expand(-1, local_num_spks, -1)  # (B, local_num_spks, local_num_spks)
             # Combine: mask if either FROM or TO an undetected speaker
             query_mask = query_mask_from | query_mask_to
 

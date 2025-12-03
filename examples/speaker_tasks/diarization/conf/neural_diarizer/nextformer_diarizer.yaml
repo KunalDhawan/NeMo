@@ -244,6 +244,20 @@ model:
     use_encoder_pos_emb: False
     encoder_pos_emb_max_len: 5000
 
+  query_enhancer:
+    _target_: nemo.collections.asr.modules.transformer.transformer_encoders.TransformerEncoder
+    num_layers: 1
+    hidden_size: ${model.model_defaults.sq_d_model} # Needs to be multiple of num_attention_heads
+    inner_size: 768
+    num_attention_heads: 8
+    attn_score_dropout: 0.1
+    attn_layer_dropout: 0.1
+    ffn_dropout: 0.1
+    hidden_act: relu
+    pre_ln: False
+    pre_ln_final_layer_norm: True
+    mask_future: True
+
   loss: 
     _target_: nemo.collections.asr.losses.bce_loss.BCEWithLogitsLoss
     reduction: mean
