@@ -405,6 +405,9 @@ class NextformerModules(NeuralModule, Exportable):
         global_emb_set_size: int = 10,
         matching_threshold: float = 0.5,
         spk_centroid_update_min_frames: int = 0,
+        extra_left_context: int = 0,
+        extra_right_context: int = 0,
+        extra_silence_frames: int = 3,
     ):
         super().__init__()
         # General params
@@ -432,6 +435,11 @@ class NextformerModules(NeuralModule, Exportable):
         self.chunk_right_context = chunk_right_context
         self.causal_attn_rate = causal_attn_rate
         self.causal_attn_rc = causal_attn_rc
+
+        # Extra encoder context params (for handling high speaker density)
+        self.extra_left_context = extra_left_context
+        self.extra_right_context = extra_right_context
+        self.extra_silence_frames = extra_silence_frames
 
         self.global_emb_set_size = global_emb_set_size
         self.spk_centroid_update_min_frames = spk_centroid_update_min_frames

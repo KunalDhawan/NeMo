@@ -147,6 +147,9 @@ model:
     chunk_len: 125 # Length of each chunk
     chunk_left_context: 62 # Left context for each chunk
     chunk_right_context: 1 # Right context for each chunk
+    extra_left_context: 0 # Extra left context for encoder (provides additional acoustic context without requiring predictions)
+    extra_right_context: 0 # Extra right context for encoder (provides additional acoustic context without requiring predictions)
+    extra_silence_frames: 3 # Number of silence frames to separate extra_right from extra_left in reordered sequence
     causal_attn_rate: 0 # Causal attention rate
     causal_attn_rc: 7 # Causal attention radius
     spk_centroid_update_min_frames: 0 # Minimum number of active frames for each query to be considered valid for updating speaker centroids

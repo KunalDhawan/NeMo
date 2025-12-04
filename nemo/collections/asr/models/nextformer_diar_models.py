@@ -180,6 +180,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.oracle_queries_test = self._cfg.get("oracle_queries_test", False)
         self.oracle_centroids_train = self._cfg.get("oracle_centroids_train", False)
         self.oracle_centroids_test = self._cfg.get("oracle_centroids_test", False)
+        self.oracle_assignment = self._cfg.get("oracle_assignment", False)
         
         # Oracle centroid scheduling parameters
         self.oracle_centroid_rate_init = self._cfg.get("oracle_centroid_rate_init", 1.0)
@@ -427,6 +428,154 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             )
             return logits, emb_seq, local_logits, local_queries, active_frames_per_query, current_spk_centroids
 
+    def _create_batch_of_chunks_extra(
+        self,
+        input_tensor: torch.Tensor,
+        input_lengths: Optional[torch.Tensor],
+        lc: int,
+        chunk_len: int,
+        rc: int,
+        extra_lc: int = 0,
+        extra_rc: int = 0,
+        silence_frames: int = 3,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], int]:
+        """
+        Create a batch of chunks with extra context, reordered to exploit ATS ordering.
+        
+        Reordering: [lc+chunk+rc | extra_rc | silence | extra_lc]
+        This ensures speakers in the prediction window appear first in ATS order.
+        
+        Args:
+            input_tensor: Input tensor to chunk
+                Shape: (batch_size, n_frames, feature_dim)
+            input_lengths: Optional tensor containing lengths of input sequences
+                Shape: (batch_size,)
+            lc: Left context size for prediction window
+            chunk_len: Main chunk length for prediction window
+            rc: Right context size for prediction window
+            extra_lc: Extra left context (for encoder acoustic context only)
+            extra_rc: Extra right context (for encoder acoustic context only)
+            silence_frames: Number of silence frames to insert between sections
+            
+        Returns:
+            batch_chunks: Batched chunks tensor with reordered frames
+                Shape: (batch_size * num_chunks, chunk_total, feature_dim)
+                where chunk_total = lc + chunk_len + rc + extra_rc + silence_frames + extra_lc
+            batch_chunk_lengths: Full lengths including extra context (for encoder)
+                Shape: (batch_size * num_chunks,) or None
+            batch_chunk_prediction_lengths: Prediction window lengths only (lc+chunk+rc)
+                Shape: (batch_size * num_chunks,) or None
+            num_chunks: Number of chunks created
+        """
+        batch_size = input_tensor.shape[0]
+        total_n_frames = input_tensor.shape[1]
+        feature_dim = input_tensor.shape[-1]
+        num_chunks = math.ceil(total_n_frames / chunk_len)
+        
+        # Calculate total chunk size after reordering
+        prediction_window_size = lc + chunk_len + rc
+        # Only include silence if we have extra_lc (silence separates extra_right from extra_left)
+        actual_silence_frames = silence_frames if extra_lc > 0 else 0
+        chunk_total = prediction_window_size + extra_rc + actual_silence_frames + extra_lc
+        
+        # Pre-allocate batch tensors
+        batch_chunks = torch.zeros(
+            (batch_size * num_chunks, chunk_total, feature_dim),
+            dtype=input_tensor.dtype,
+            device=input_tensor.device
+        )
+        
+        batch_chunk_lengths = None
+        batch_chunk_prediction_lengths = None
+        if input_lengths is not None:
+            batch_chunk_lengths = torch.zeros(
+                (batch_size * num_chunks,),
+                dtype=input_lengths.dtype,
+                device=input_lengths.device
+            )
+            batch_chunk_prediction_lengths = torch.zeros(
+                (batch_size * num_chunks,),
+                dtype=input_lengths.dtype,
+                device=input_lengths.device
+            )
+        
+        # Fill pre-allocated tensors directly
+        for chunk_idx in range(num_chunks):
+            # Calculate positions in original sequence
+            chunk_start = chunk_idx * chunk_len
+            chunk_end = min(chunk_start + chunk_len, total_n_frames)
+            
+            # Main prediction window: [lc + chunk + rc]
+            main_left = max(0, chunk_start - lc)
+            main_right = min(chunk_end + rc, total_n_frames)
+            
+            # Extra context regions (in original sequence)
+            extra_left_start = max(0, chunk_start - lc - extra_lc)
+            extra_left_end = max(0, chunk_start - lc)
+            extra_right_start = min(chunk_end + rc, total_n_frames)
+            extra_right_end = min(chunk_end + rc + extra_rc, total_n_frames)
+
+            logging.info(f"chunk {chunk_idx} start: {chunk_start}, end: {chunk_end}, main_left: {main_left}, main_right: {main_right}, extra_left_start: {extra_left_start}, extra_left_end: {extra_left_end}, extra_right_start: {extra_right_start}, extra_right_end: {extra_right_end}")
+
+            # Calculate actual sizes
+            main_size = main_right - main_left
+            extra_left_size = extra_left_end - extra_left_start
+            extra_right_size = extra_right_end - extra_right_start
+
+            logging.info(f"chunk {chunk_idx} main_size: {main_size}, extra_left_size: {extra_left_size}, extra_right_size: {extra_right_size}")
+            
+            # Extract data from input_tensor
+            main_window = input_tensor[:, main_left:main_right, :]  # (batch_size, main_size, feature_dim)
+            extra_left_data = input_tensor[:, extra_left_start:extra_left_end, :] if extra_lc > 0 else None
+            extra_right_data = input_tensor[:, extra_right_start:extra_right_end, :] if extra_rc > 0 else None
+            
+            # Calculate indices in the batch tensor
+            batch_start_idx = chunk_idx * batch_size
+            batch_end_idx = (chunk_idx + 1) * batch_size
+            
+            # Reorder: [main_window | extra_right | silence | extra_left]
+            pos = 0
+            
+            # 1. Main window (lc + chunk + rc)
+            batch_chunks[batch_start_idx:batch_end_idx, pos:pos+main_size, :] = main_window
+            pos += main_size
+            
+            # 2. Extra right context (immediately after main data)
+            if extra_right_data is not None and extra_right_size > 0:
+                batch_chunks[batch_start_idx:batch_end_idx, pos:pos+extra_right_size, :] = extra_right_data
+            pos += extra_right_size
+            
+            # 3. Silence frames (only if we have extra_lc)
+            pos += actual_silence_frames
+            
+            # 4. Extra left context
+            if extra_left_data is not None and extra_left_size > 0:
+                batch_chunks[batch_start_idx:batch_end_idx, pos:pos+extra_left_size, :] = extra_left_data
+            
+            # Calculate chunk lengths if input_lengths provided
+            if batch_chunk_lengths is not None:
+                # Prediction window length: valid frames in main window
+                pred_window_len = torch.clamp(input_lengths - main_left, min=0, max=main_size)
+                batch_chunk_prediction_lengths[batch_start_idx:batch_end_idx] = pred_window_len
+                
+                # Full chunk length: sum of valid frames across all sections
+                # Section 1: main window
+                valid_main = pred_window_len
+                
+                # Section 2: extra right (frames from extra_right_start to min(input_lengths, extra_right_end))
+                valid_extra_right = torch.clamp(input_lengths - extra_right_start, min=0, max=extra_right_size)
+                
+                # Section 4: extra left (frames from extra_left_start to min(input_lengths, extra_left_end))
+                valid_extra_left = torch.clamp(input_lengths - extra_left_start, min=0, max=extra_left_size)
+                
+                # Section 3: silence (only if we have extra_lc and valid extra_left data)
+                valid_silence = torch.where(valid_extra_left > 0, actual_silence_frames, 0)
+                
+                total_valid = valid_main + valid_extra_right + valid_silence + valid_extra_left
+                batch_chunk_lengths[batch_start_idx:batch_end_idx] = total_valid
+        
+        return batch_chunks, batch_chunk_lengths, batch_chunk_prediction_lengths, num_chunks
+
     def _create_batch_of_chunks(
         self,
         input_tensor: torch.Tensor,
@@ -586,23 +735,63 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         lc = self.nextformer_modules.chunk_left_context
         chunk_len = self.nextformer_modules.chunk_len
         rc = self.nextformer_modules.chunk_right_context
-        batch_chunks, batch_chunk_lengths, num_chunks = self._create_batch_of_chunks(
-            input_tensor=pre_encode_embs,
-            input_lengths=pre_encode_lengths,
-            lc=lc,
-            chunk_len=chunk_len,
-            rc=rc,
-        )
-        if self.nextformer_modules.query_raw_proj is not None:
-            query_raw_proj = self.nextformer_modules.query_raw_proj(batch_chunks)
+        extra_lc = self.nextformer_modules.extra_left_context
+        extra_rc = self.nextformer_modules.extra_right_context
+        
+        # Use extra context chunking if either extra context is enabled
+        if extra_lc > 0 or extra_rc > 0:
+            batch_chunks, batch_chunk_lengths, batch_chunk_prediction_lengths, num_chunks = self._create_batch_of_chunks_extra(
+                input_tensor=pre_encode_embs,
+                input_lengths=pre_encode_lengths,
+                lc=lc,
+                chunk_len=chunk_len,
+                rc=rc,
+                extra_lc=extra_lc,
+                extra_rc=extra_rc,
+                silence_frames=self.nextformer_modules.extra_silence_frames,
+            )
+            logging.info(f"batch_chunks shape: {batch_chunks.shape}")
+            logging.info(f"batch_chunk_lengths: {batch_chunk_lengths}")
+            logging.info(f"batch_chunk_prediction_lengths: {batch_chunk_prediction_lengths}")
+            logging.info(f"num_chunks: {num_chunks}")
         else:
-            query_raw_proj = batch_chunks
+            batch_chunks, batch_chunk_lengths, num_chunks = self._create_batch_of_chunks(
+                input_tensor=pre_encode_embs,
+                input_lengths=pre_encode_lengths,
+                lc=lc,
+                chunk_len=chunk_len,
+                rc=rc,
+            )
+            batch_chunk_prediction_lengths = batch_chunk_lengths  # Same as full length when no extra context
+        
+        # Extract prediction window from reordered chunks (if using extra contexts)
+        if extra_lc > 0 or extra_rc > 0:
+            prediction_window_size = lc + chunk_len + rc
+            batch_chunks_prediction_window = batch_chunks[:, :prediction_window_size, :]
+        else:
+            batch_chunks_prediction_window = batch_chunks
+        
+        # Apply query_raw_proj if available
+        if self.nextformer_modules.query_raw_proj is not None:
+            query_raw_proj = self.nextformer_modules.query_raw_proj(batch_chunks_prediction_window)
+        else:
+            query_raw_proj = batch_chunks_prediction_window
 
         # Step 5: Run frontend_encoder, forward_infer, query_decoder in one pass
         # Get encoder embeddings for all chunks
         emb_seq, emb_seq_length = self.frontend_encoder(
             processed_signal=batch_chunks, processed_signal_length=batch_chunk_lengths, bypass_pre_encode=True
         )
+        
+        # Step 6: Extract only prediction window from encoder output (if using extra contexts)
+        # The encoder has processed the full reordered sequence, but we only need predictions for the main window
+        if extra_lc > 0 or extra_rc > 0:
+            prediction_window_size = lc + chunk_len + rc
+            emb_seq = emb_seq[:, :prediction_window_size, :]  # Extract only prediction window
+            emb_seq_length = batch_chunk_prediction_lengths  # Use prediction window lengths
+            logging.info(f"emb_seq shape: {emb_seq.shape}")
+            logging.info(f"emb_seq_length: {emb_seq_length}")
+        
         if self.nextformer_modules.encoder_proj is not None:
             emb_seq_enc_proj = self.nextformer_modules.encoder_proj(emb_seq)
         else:
@@ -876,9 +1065,12 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                             )
                     accumulated_frames = 0
                 
+                # hacky mode to use oracle assignment for all chunks
+                if self.oracle_assignment and not self.training:
+                    global_spk_indices = global_spk_indices_oracle
+
                 # fill logits using real global_spk_indices
                 valid_mask = global_spk_indices != -1  # (batch_size, local_num_spks)
-                
                 if valid_mask.any():
                     # Get indices of valid (batch, local_speaker) pairs
                     batch_indices, local_spk_indices = torch.where(valid_mask)  # 1D tensors of length num_valid
