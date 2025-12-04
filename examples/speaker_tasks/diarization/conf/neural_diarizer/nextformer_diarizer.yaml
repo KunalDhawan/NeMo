@@ -232,7 +232,8 @@ model:
     hidden_act: relu
     pre_ln: False
     pre_ln_final_layer_norm: True
-    use_query_pos_emb: False
+    use_learned_init: False # If True, use learned embeddings for query content initialization
+    use_query_pos_emb: False # If True, use learned positional embeddings in self-attention
     use_encoder_pos_emb: False
     encoder_pos_emb_max_len: 5000
 
@@ -251,7 +252,8 @@ model:
     hidden_act: relu
     pre_ln: False
     pre_ln_final_layer_norm: True
-    use_query_pos_emb: False
+    use_learned_init: False # If True, use learned embeddings for query content initialization
+    use_query_pos_emb: False # If True, use learned positional embeddings in self-attention
     use_encoder_pos_emb: False
     encoder_pos_emb_max_len: 5000
 

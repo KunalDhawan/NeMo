@@ -244,6 +244,13 @@ class MaskedQueryDecoderBlock(torch.nn.Module):
             )
 
 class MaskedQueryDecoder(nn.Module):
+    """
+    Masked query decoder for speaker diarization.
+    
+    This decoder uses learnable query embeddings that attend to encoder features
+    to extract speaker-specific representations.
+    """
+    
     def __init__(
         self,
         num_queries: int,
@@ -259,6 +266,7 @@ class MaskedQueryDecoder(nn.Module):
         hidden_act: str = "relu",
         pre_ln: bool = True,
         pre_ln_final_layer_norm: bool = True,
+        use_learned_init: bool = False,
         use_query_pos_emb: bool = False,
         use_encoder_pos_emb: bool = False,
         encoder_pos_emb_max_len: int = 5000,
@@ -273,6 +281,7 @@ class MaskedQueryDecoder(nn.Module):
         self.num_queries = num_queries
         self.num_layers = num_layers
         self.extra_cross_attention = extra_cross_attention
+        self.use_learned_init = use_learned_init
         self.use_query_pos_emb = use_query_pos_emb
         self.use_encoder_pos_emb = use_encoder_pos_emb
 
@@ -286,7 +295,15 @@ class MaskedQueryDecoder(nn.Module):
         else:
             self.pos_enc_encoder = None
 
-        # learnable positional embeddings for queries
+        # Learnable initialization for query content (separate from positional embeddings)
+        if self.use_learned_init:
+            self.learned_init = torch.nn.Parameter(
+                torch.nn.init.xavier_normal_(torch.empty(num_queries, hidden_size))
+            )
+        else:
+            self.learned_init = None
+
+        # Learnable positional embeddings for queries (used in attention, not initialization)
         if self.use_query_pos_emb:
             self.query_pos_emb = torch.nn.Parameter(
                 torch.nn.init.xavier_normal_(torch.empty(num_queries, hidden_size))
@@ -336,16 +353,18 @@ class MaskedQueryDecoder(nn.Module):
             self.pos_enc_encoder.extend_pe(encoder_states.size(1), encoder_states.device, encoder_states.dtype)
             encoder_pos_emb = self.pos_enc_encoder.pe[:, : encoder_states.size(1)]
 
-        # Get positional embedding for queries if enabled
+        # Get positional embedding for queries if enabled (used in attention layers)
         query_pos_emb = None
         if self.use_query_pos_emb:
             query_pos_emb = self.query_pos_emb.unsqueeze(0).expand(encoder_states.shape[0], -1, -1)
         
-        # initialize query states
+        # Initialize query states (separate from positional embeddings)
         if query_states is None:
-            if self.use_query_pos_emb:
-                query_states = query_pos_emb
+            if self.use_learned_init:
+                # Use learned initialization (speaker-discriminative content)
+                query_states = self.learned_init.unsqueeze(0).expand(encoder_states.shape[0], -1, -1)
             else:
+                # Zero initialization (will be populated by cross-attention)
                 query_states = torch.zeros((encoder_states.shape[0], self.num_queries, encoder_states.shape[2]), device=encoder_states.device, dtype=encoder_states.dtype)
         
         encoder_len_mask_expand = encoder_len_mask.unsqueeze(-1).expand(-1, -1, self.num_queries)

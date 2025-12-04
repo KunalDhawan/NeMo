@@ -515,14 +515,14 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             extra_right_start = min(chunk_end + rc, total_n_frames)
             extra_right_end = min(chunk_end + rc + extra_rc, total_n_frames)
 
-            logging.info(f"chunk {chunk_idx} start: {chunk_start}, end: {chunk_end}, main_left: {main_left}, main_right: {main_right}, extra_left_start: {extra_left_start}, extra_left_end: {extra_left_end}, extra_right_start: {extra_right_start}, extra_right_end: {extra_right_end}")
+            #logging.info(f"chunk {chunk_idx} start: {chunk_start}, end: {chunk_end}, main_left: {main_left}, main_right: {main_right}, extra_left_start: {extra_left_start}, extra_left_end: {extra_left_end}, extra_right_start: {extra_right_start}, extra_right_end: {extra_right_end}")
 
             # Calculate actual sizes
             main_size = main_right - main_left
             extra_left_size = extra_left_end - extra_left_start
             extra_right_size = extra_right_end - extra_right_start
 
-            logging.info(f"chunk {chunk_idx} main_size: {main_size}, extra_left_size: {extra_left_size}, extra_right_size: {extra_right_size}")
+            #logging.info(f"chunk {chunk_idx} main_size: {main_size}, extra_left_size: {extra_left_size}, extra_right_size: {extra_right_size}")
             
             # Extract data from input_tensor
             main_window = input_tensor[:, main_left:main_right, :]  # (batch_size, main_size, feature_dim)
@@ -750,10 +750,10 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 extra_rc=extra_rc,
                 silence_frames=self.nextformer_modules.extra_silence_frames,
             )
-            logging.info(f"batch_chunks shape: {batch_chunks.shape}")
-            logging.info(f"batch_chunk_lengths: {batch_chunk_lengths}")
-            logging.info(f"batch_chunk_prediction_lengths: {batch_chunk_prediction_lengths}")
-            logging.info(f"num_chunks: {num_chunks}")
+            #logging.info(f"batch_chunks shape: {batch_chunks.shape}")
+            #logging.info(f"batch_chunk_lengths: {batch_chunk_lengths}")
+            #logging.info(f"batch_chunk_prediction_lengths: {batch_chunk_prediction_lengths}")
+            #logging.info(f"num_chunks: {num_chunks}")
         else:
             batch_chunks, batch_chunk_lengths, num_chunks = self._create_batch_of_chunks(
                 input_tensor=pre_encode_embs,
@@ -789,8 +789,8 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             prediction_window_size = lc + chunk_len + rc
             emb_seq = emb_seq[:, :prediction_window_size, :]  # Extract only prediction window
             emb_seq_length = batch_chunk_prediction_lengths  # Use prediction window lengths
-            logging.info(f"emb_seq shape: {emb_seq.shape}")
-            logging.info(f"emb_seq_length: {emb_seq_length}")
+            #logging.info(f"emb_seq shape: {emb_seq.shape}")
+            #logging.info(f"emb_seq_length: {emb_seq_length}")
         
         if self.nextformer_modules.encoder_proj is not None:
             emb_seq_enc_proj = self.nextformer_modules.encoder_proj(emb_seq)
@@ -966,7 +966,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             )
             # this is a streaming state with oracle centroids
             streaming_state_oracle = None
-            if (self.oracle_centroids_train and self.training) or (self.oracle_centroids_test and not self.training):
+            if (self.oracle_centroids_train and self.training) or (not self.training):
                 streaming_state_oracle = self.nextformer_modules.init_streaming_state(
                     batch_size=processed_signal.shape[0], device=self.device
                 )
