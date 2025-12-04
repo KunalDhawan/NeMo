@@ -180,6 +180,16 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.oracle_queries_test = self._cfg.get("oracle_queries_test", False)
         self.oracle_centroids_train = self._cfg.get("oracle_centroids_train", False)
         self.oracle_centroids_test = self._cfg.get("oracle_centroids_test", False)
+        
+        # Oracle centroid scheduling parameters
+        self.oracle_centroid_rate_init = self._cfg.get("oracle_centroid_rate_init", 1.0)
+        self.oracle_centroid_rate_min = self._cfg.get("oracle_centroid_rate_min", 1.0)
+        self.oracle_centroid_rate_decay = self._cfg.get("oracle_centroid_rate_decay", 0.1)
+        self.oracle_centroid_rate_decay_type = self._cfg.get("oracle_centroid_rate_decay_type", "linear")
+        self.oracle_centroid_rate_warmup_epochs = self._cfg.get("oracle_centroid_rate_warmup_epochs", 0)
+        # Initialize current oracle centroid rate (will be decayed during training)
+        self.oracle_centroid_rate = self.oracle_centroid_rate_init
+        
         self.q_contrastive_min_frames_positive = self._cfg.get("q_contrastive_min_frames_positive", 10)
         self.q_contrastive_min_frames_anchor = self._cfg.get("q_contrastive_min_frames_anchor", 5)
         self.q_contrastive_max_frames = self._cfg.get("q_contrastive_max_frames", 32)
@@ -798,6 +808,24 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 global_spk_indices_oracle = None
                 if local_target_indices is not None:
                     global_spk_indices_oracle = local_target_indices[chunk_idx * batch_size:(chunk_idx + 1) * batch_size, :]  # (batch_size, local_num_spks)
+                
+                # Create sampled indices for curriculum learning: mix oracle and real indices per sample
+                global_spk_indices_sampled = None
+                if streaming_state_oracle is not None and global_spk_indices_oracle is not None:
+                    if self.training:
+                        # Per-sample decision: use oracle indices with probability oracle_centroid_rate
+                        use_oracle_mask = torch.rand(batch_size, device=self.device) < self.oracle_centroid_rate
+                        use_oracle_mask = use_oracle_mask.unsqueeze(1)  # (batch_size, 1) for broadcasting over local_num_spks
+                        
+                        # Mix oracle and real indices per sample
+                        global_spk_indices_sampled = torch.where(
+                            use_oracle_mask,
+                            global_spk_indices_oracle,
+                            global_spk_indices
+                        )
+                    else:
+                        # During validation/test, use pure oracle indices if oracle_centroids_test is True
+                        global_spk_indices_sampled = global_spk_indices_oracle
 
                 active_frames_per_query_chunk = active_frames_per_query[chunk_idx * batch_size:(chunk_idx + 1) * batch_size] # (batch_size, local_num_spks)
                 
@@ -822,11 +850,11 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                             centroid_encoder=self.centroid_encoder,
                         )
                         if streaming_state_oracle is not None:
-                            # update streaming state with oracle centroids
+                            # update streaming state with sampled centroids (curriculum learning)
                             self.nextformer_modules.update_streaming_state_with_transformer(
                                 streaming_state=streaming_state_oracle,
                                 spk_queries=spk_queries_chunk,
-                                global_spk_indices=global_spk_indices_oracle,
+                                global_spk_indices=global_spk_indices_sampled,
                                 active_frames_per_query=active_frames_per_query_chunk,
                                 centroid_encoder=self.centroid_encoder,
                             )
@@ -839,11 +867,11 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                             active_frames_per_query=active_frames_per_query_chunk,
                         )
                         if streaming_state_oracle is not None:
-                            # update streaming state with oracle centroids
+                            # update streaming state with sampled centroids (curriculum learning)
                             self.nextformer_modules.update_streaming_state_duration_averaged(
                                 streaming_state=streaming_state_oracle,
                                 spk_queries=spk_queries_chunk,
-                                global_spk_indices=global_spk_indices_oracle,
+                                global_spk_indices=global_spk_indices_sampled,
                                 active_frames_per_query=active_frames_per_query_chunk,
                             )
                     accumulated_frames = 0
@@ -2042,6 +2070,30 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         logging.info(f"Batch OP-F1Acc. MEAN: {torch.mean(torch.tensor(self.batch_f1_accs_op_list))}")
         logging.info(f"Batch Local F1Acc. MEAN: {torch.mean(torch.tensor(self.batch_f1_accs_local_list))}")
         logging.info(f"Batch Local F1Acc. ATS MEAN: {torch.mean(torch.tensor(self.batch_f1_accs_local_ats_list))}")
+
+    def on_train_epoch_end(self):
+        """
+        Callback executed at the end of each training epoch.
+        Decays the oracle_centroid_rate to gradually transition from oracle to predicted centroids.
+        Respects warmup period where rate remains at initial value.
+        """
+        if self.oracle_centroids_train and self.oracle_centroid_rate_min < 1.0:
+            old_rate = self.oracle_centroid_rate
+            # Check if we're still in warmup period
+            if self.current_epoch < self.oracle_centroid_rate_warmup_epochs:
+                # During warmup, keep the rate at initial value
+                logging.info(f"Oracle centroid warmup: epoch {self.current_epoch + 1}/{self.oracle_centroid_rate_warmup_epochs}, rate={self.oracle_centroid_rate:.4f}")
+            else:
+                # After warmup, apply decay
+                if self.oracle_centroid_rate_decay_type == "exponential":
+                    # Exponential decay: multiply by (1 - decay)
+                    self.oracle_centroid_rate = self.oracle_centroid_rate * (1 - self.oracle_centroid_rate_decay)
+                else:
+                    # Linear decay: subtract decay amount
+                    self.oracle_centroid_rate = self.oracle_centroid_rate - self.oracle_centroid_rate_decay
+                # Apply minimum bound
+                self.oracle_centroid_rate = max(self.oracle_centroid_rate_min, self.oracle_centroid_rate)
+                logging.info(f"Oracle centroid rate updated: {old_rate:.4f} -> {self.oracle_centroid_rate:.4f}")
 
     def on_validation_epoch_end(self) -> Optional[dict[str, dict[str, torch.Tensor]]]:
         """Run validation with sync_dist=True."""

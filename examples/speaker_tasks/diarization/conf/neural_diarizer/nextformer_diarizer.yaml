@@ -10,6 +10,14 @@ model:
   oracle_queries_test: false # If true, use ground truth speaker activity (instead of predicted) during testing for mask initialization and query generation
   oracle_centroids_train: true # If true, use ground truth speaker indices (instead of predicted) during training for updating speaker centroids
   oracle_centroids_test: false # If true, use ground truth speaker indices (instead of predicted) during testing for updating speaker centroids
+  
+  # Oracle centroid scheduling - curriculum learning to reduce train/test mismatch
+  oracle_centroid_rate_init: 1.0 # Initial probability of using oracle indices for centroid updates (1.0 = always use oracle)
+  oracle_centroid_rate_min: 1.0 # Minimum probability floor (0.0 = eventually use only real predictions)
+  oracle_centroid_rate_decay: 0.1 # Amount to decay oracle_centroid_rate per epoch
+  oracle_centroid_rate_decay_type: "linear" # Decay type: "linear" or "exponential"
+  oracle_centroid_rate_warmup_epochs: 10 # Number of epochs to keep rate at initial value before starting decay (warmup period)
+  
   centroid_update_period: 1 # number of frames between centroid updates
 
   pil_weight: 0.5 # Weight for Permutation Invariant Loss (PIL) used in training the Nextformer diarizer model
