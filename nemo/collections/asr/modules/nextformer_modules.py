@@ -424,6 +424,7 @@ class NextformerModules(NeuralModule, Exportable):
         global_emb_set_size: int = 10,
         matching_threshold: float = 0.5,
         spk_centroid_update_min_frames: int = 0,
+        assignment_swap_prob: float = 0.0,
         extra_left_context: int = 0,
         extra_right_context: int = 0,
         extra_silence_frames: int = 3,
@@ -462,6 +463,7 @@ class NextformerModules(NeuralModule, Exportable):
 
         self.global_emb_set_size = global_emb_set_size
         self.spk_centroid_update_min_frames = spk_centroid_update_min_frames
+        self.assignment_swap_prob = assignment_swap_prob
 
     @staticmethod
     def length_to_mask(lengths, max_length: int):
@@ -1163,6 +1165,53 @@ class NextformerModules(NeuralModule, Exportable):
         
         return centroids_prefilled
 
+    def _augment_assignments_for_mask(
+        self,
+        global_spk_indices: torch.Tensor  # (B, local_num_spks)
+    ) -> torch.Tensor:
+        """
+        Apply assignment swap augmentation during training to create train-test robustness.
+        
+        This augmentation randomly swaps speaker assignments, which creates incorrect
+        attention patterns in the mask. This forces the transformer to learn to ignore
+        or downweight irrelevant query-centroid pairs, mimicking test-time assignment errors.
+        
+        The key insight: By training with intentionally wrong attention masks, the model
+        learns robust attention weights that can reject mismatched information at test time.
+        
+        Args:
+            global_spk_indices: Assignment of local queries to global centroid slots
+                Shape: (B, local_num_spks)
+                Values: global slot index or -1 if unassigned
+        
+        Returns:
+            augmented_indices: Possibly corrupted assignments for attention mask creation
+                Shape: (B, local_num_spks)
+        """
+        if not self.training or self.assignment_swap_prob == 0.0:
+            return global_spk_indices
+        
+        B, local_num_spks = global_spk_indices.shape
+        device = global_spk_indices.device
+        
+        # Clone to avoid modifying the original
+        augmented_indices = global_spk_indices.clone()
+        
+        # Only swap valid assignments (not -1)
+        valid_mask = global_spk_indices != -1  # (B, local_num_spks)
+        
+        # Create swap mask: which assignments should be swapped
+        swap_mask = torch.rand(B, local_num_spks, device=device) < self.assignment_swap_prob
+        apply_swap = swap_mask & valid_mask  # (B, local_num_spks)
+        
+        if apply_swap.any():
+            # Strategy: Randomly reassign to a different speaker slot
+            # This simulates the model assigning a query to the wrong speaker
+            random_slots = torch.randint(0, self.max_num_spks, (B, local_num_spks), device=device)
+            augmented_indices[apply_swap] = random_slots[apply_swap]
+        
+        return augmented_indices
+
     def _create_centroid_update_mask(
         self,
         centroids: torch.Tensor,  # (B, max_num_spks, emb_dim)
@@ -1297,9 +1346,15 @@ class NextformerModules(NeuralModule, Exportable):
         input_seq = torch.cat([centroids_prefilled, spk_queries], dim=1)
         # Shape: (B, max_num_spks + local_num_spks, emb_dim)
         
+        # Step 3.5: Apply assignment augmentation for attention mask (train-test robustness)
+        # During training, randomly swap some assignments to create incorrect attention patterns.
+        # This forces the transformer to learn to ignore/downweight mismatched query-centroid pairs.
+        global_spk_indices_for_mask = self._augment_assignments_for_mask(global_spk_indices)
+        
         # Step 4: Create attention mask (solves Issue 1)
+        # Note: We use augmented assignments for mask but keep original for final updates
         attn_mask_full = self._create_centroid_update_mask(
-            centroids_prefilled, spk_queries, global_spk_indices
+            centroids_prefilled, spk_queries, global_spk_indices_for_mask
         )
         # Shape: (B, total_len, total_len)
         # True = masked out, False = allowed

@@ -153,6 +153,7 @@ model:
     causal_attn_rate: 0 # Causal attention rate
     causal_attn_rc: 7 # Causal attention radius
     spk_centroid_update_min_frames: 0 # Minimum number of active frames for each query to be considered valid for updating speaker centroids
+    assignment_swap_prob: 0.0 # Probability of swapping speaker assignments during training to create train-test robustness (0.0 = no augmentation, 0.1-0.3 = recommended range)
 
   encoder:
     _target_: nemo.collections.asr.modules.ConformerEncoder
