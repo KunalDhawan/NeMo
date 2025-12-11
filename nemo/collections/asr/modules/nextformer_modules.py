@@ -360,12 +360,16 @@ class MaskedQueryDecoder(nn.Module):
         
         # Initialize query states (separate from positional embeddings)
         if query_states is None:
-            if self.use_learned_init:
-                # Use learned initialization (speaker-discriminative content)
-                query_states = self.learned_init.unsqueeze(0).expand(encoder_states.shape[0], -1, -1)
-            else:
-                # Zero initialization (will be populated by cross-attention)
-                query_states = torch.zeros((encoder_states.shape[0], self.num_queries, encoder_states.shape[2]), device=encoder_states.device, dtype=encoder_states.dtype)
+            # Zero initialization (will be populated by cross-attention)
+            query_states = torch.zeros(
+                (encoder_states.shape[0], self.num_queries, encoder_states.shape[2]), 
+                device=encoder_states.device, 
+                dtype=encoder_states.dtype
+            )
+        
+        # Add learned initialization/bias if enabled
+        if self.use_learned_init:
+            query_states = query_states + self.learned_init.unsqueeze(0)
         
         encoder_len_mask_expand = encoder_len_mask.unsqueeze(-1).expand(-1, -1, self.num_queries)
         #logging.info(f"encoder_len_mask: {encoder_len_mask.to(int).sum(dim=1)}")
