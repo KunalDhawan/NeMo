@@ -216,6 +216,8 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.q_contrastive_duration_averaged = self._cfg.get("q_contrastive_duration_averaged", False)
         self.q_contrastive_aam = self._cfg.get("q_contrastive_aam", 0.0)
         self.q_contrastive_cross_batch = self._cfg.get("q_contrastive_cross_batch", False)
+        # Centroid-anchored contrastive loss (symmetric to query-anchored)
+        self.c_contrastive_weight = self._cfg.get("c_contrastive_weight", 0.0)
         total_weight = pil_weight + ats_weight
         if total_weight == 0:
             raise ValueError(
@@ -1834,6 +1836,149 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         return total_loss
         
 
+    def _compute_c_contrastive_loss(
+        self,
+        local_queries: torch.Tensor,
+        local_target_indices: torch.Tensor,
+        current_spk_centroids: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute centroid-anchored contrastive loss using InfoNCE with margin class.
+        
+        This is the symmetric counterpart to _compute_q_contrastive_loss. Here:
+        - **Anchors**: Global speaker centroids (representing historical speaker identity)
+        - **Positive**: Local query from the same speaker, or margin class (0.5) if no match
+        - **Negatives**: All other queries (implicitly handled by cross-entropy)
+        
+        Args:
+            local_queries (torch.Tensor): Local speaker queries
+                Shape: (B, N, emb_dim) where N = local_num_spks * L (L = num_chunks)
+            local_target_indices (torch.Tensor): Speaker indices mapping
+                Shape: (B, N) where local_target_indices[b, n] is the original speaker index
+                that query n corresponds to, or -1 if unmatched
+            current_spk_centroids (torch.Tensor): Global speaker centroids before each chunk update
+                Shape: (B, L, max_num_spks, emb_dim) where L = num_chunks
+        
+        Returns:
+            torch.Tensor: InfoNCE loss scalar
+        """
+        # Step 1: Extract dimensions and setup
+        B, N, D = local_queries.shape
+        device = local_queries.device
+        local_num_spks = self.nextformer_modules.local_num_spks
+        max_num_spks = self.nextformer_modules.max_num_spks
+        num_chunks = N // local_num_spks
+        
+        # Reshape inputs to (B, L, local_num_spks, D) for easier indexing
+        local_queries_reshaped = local_queries.view(B, num_chunks, local_num_spks, D)
+        local_target_indices_reshaped = local_target_indices.view(B, num_chunks, local_num_spks)
+        
+        # Step 2: Identify valid centroids
+        centroid_norms = torch.norm(current_spk_centroids, p=2, dim=3)  # (B, L, max_num_spks)
+        valid_centroids = centroid_norms > 1e-8  # (B, L, max_num_spks)
+        
+        # Step 3: For each centroid, find its corresponding positive query
+        # Create a mapping from (batch, chunk, global_speaker) -> local_speaker_index
+        # Initialize with -1 (no match)
+        global_to_local_map = torch.full(
+            (B, num_chunks, max_num_spks), -1, dtype=torch.long, device=device
+        )  # (B, L, max_num_spks)
+        
+        # Populate the mapping: for each valid local query, map its global speaker to local position
+        valid_queries = local_target_indices_reshaped != -1  # (B, L, local_num_spks)
+        batch_idx, chunk_idx, local_idx = torch.where(valid_queries)
+        global_speaker_ids = local_target_indices_reshaped[batch_idx, chunk_idx, local_idx]
+        global_to_local_map[batch_idx, chunk_idx, global_speaker_ids] = local_idx
+        
+        # Step 4: Gather all queries for each centroid and identify positives
+        # Expand queries: (B, L, max_num_spks, local_num_spks, D)
+        queries_by_chunk = local_queries_reshaped.unsqueeze(2).expand(-1, -1, max_num_spks, -1, -1)
+        
+        # Create positive mask for AAM: positive_mask[b, l, s, j] = True if query j is positive for centroid s
+        local_spk_range = torch.arange(local_num_spks, device=device).view(1, 1, 1, local_num_spks)
+        positive_local_idx = global_to_local_map.unsqueeze(3)  # (B, L, max_num_spks, 1)
+        is_positive = (local_spk_range == positive_local_idx)  # (B, L, max_num_spks, local_num_spks)
+        valid_queries_expanded = valid_queries.unsqueeze(2).expand(-1, -1, max_num_spks, -1)
+        positive_mask = is_positive & valid_queries_expanded  # (B, L, max_num_spks, local_num_spks)
+        
+        # Step 5: Compute similarity matrix
+        # Normalize centroids (anchors)
+        centroid_norms_keepdim = torch.norm(current_spk_centroids, p=2, dim=3, keepdim=True)  # (B, L, S, 1)
+        normalized_centroids = current_spk_centroids / (centroid_norms_keepdim + 1e-8)  # (B, L, S, D)
+        
+        # Normalize queries
+        query_norms = torch.norm(queries_by_chunk, p=2, dim=4, keepdim=True)  # (B, L, S, local_num_spks, 1)
+        normalized_queries = queries_by_chunk / (query_norms + 1e-8)  # (B, L, S, local_num_spks, D)
+        
+        # Compute cosine similarity
+        # sim_matrix[b, l, s, j] = cosine_similarity(centroid[b, l, s], query[b, l, j])
+        sim_matrix = torch.einsum('blsd,blsjd->blsj', normalized_centroids, normalized_queries)
+        
+        # Step 6: Apply additive angular margin (ArcFace) to positive samples
+        if self.q_contrastive_aam > 0:
+            is_positive_for_aam = positive_mask & valid_centroids.unsqueeze(3)
+            
+            # Pre-compute trigonometric constants
+            m_scalar = float(self.q_contrastive_aam)
+            cos_m = math.cos(m_scalar)
+            sin_m = math.sin(m_scalar)
+            threshold = -cos_m
+            
+            # Apply angular margin
+            cos_theta = torch.clamp(sim_matrix, -1.0, 1.0)
+            cos_theta_squared = torch.clamp(cos_theta ** 2, 0.0, 1.0)
+            sin_theta = torch.sqrt(torch.clamp(1.0 - cos_theta_squared, min=1e-8))
+            cos_theta_plus_m = cos_theta * cos_m - sin_theta * sin_m
+            
+            # If theta + m > pi, set cos(theta + m) = -1
+            exceeds_pi = cos_theta < threshold
+            cos_theta_plus_m = torch.where(exceeds_pi, -1.0, cos_theta_plus_m)
+            cos_theta_plus_m = torch.clamp(cos_theta_plus_m, -1.0, 1.0)
+            
+            # Replace positive sample similarities with margin-adjusted values
+            sim_matrix = torch.where(is_positive_for_aam, cos_theta_plus_m, sim_matrix)
+        
+        # Apply temperature scaling
+        sim_matrix = sim_matrix / self.q_contrastive_temperature
+        
+        # Step 7: Add margin class (extra query with similarity 0.5)
+        # Centroids WITH positive query learn to exceed this margin
+        # Centroids WITHOUT positive query learn to stay below this margin
+        margin_value = 0.5 / self.q_contrastive_temperature
+        margin_col = torch.full((B, num_chunks, max_num_spks, 1), margin_value, device=device, dtype=sim_matrix.dtype)
+        logits = torch.cat([sim_matrix, margin_col], dim=3)  # (B, L, S, local_num_spks+1)
+        
+        # Step 8: Create labels
+        # For centroids WITH positive query: use the actual positive query index
+        # For centroids WITHOUT positive query: use margin class (index = local_num_spks)
+        labels = global_to_local_map.clone()  # (B, L, S) - contains -1 for no match
+        # Replace -1 (no positive) with local_num_spks (margin class index)
+        labels = torch.where(labels >= 0, labels, torch.full_like(labels, local_num_spks))
+        
+        # Step 9: Create valid anchor mask
+        # A centroid is valid if it's non-zero (regardless of whether it has a positive query)
+        valid_anchor_mask = valid_centroids  # (B, L, S)
+        
+        num_valid_anchors = valid_anchor_mask.sum()
+        if num_valid_anchors == 0:
+            logging.info("No valid centroid anchors, returning zero loss")
+            return torch.tensor(0.0, device=device, dtype=local_queries.dtype)
+        
+        # Step 10: Reshape for loss computation
+        logits_flat = logits.reshape(B * num_chunks * max_num_spks, local_num_spks + 1)
+        labels_flat = labels.reshape(B * num_chunks * max_num_spks)
+        
+        # Step 11: Compute cross-entropy loss
+        loss_per_sample = F.cross_entropy(logits_flat, labels_flat, reduction='none')
+        loss = loss_per_sample.view(B, num_chunks, max_num_spks)
+        
+        # Step 12: Average over valid anchors (no duration weighting)
+        loss = loss * valid_anchor_mask.float()
+        total_loss = loss.sum() / num_valid_anchors
+        
+        return total_loss
+
+
     def _get_aux_train_evaluations(
         self, logits, emb_seq, local_logits, local_queries, active_frames_per_query, current_spk_centroids, targets, target_lens
     ) -> dict:
@@ -1912,12 +2057,19 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         else:
             q_contrastive_loss = torch.tensor(0.0, device=pil_loss.device, dtype=pil_loss.dtype)
 
+        # Compute centroid-anchored contrastive loss (symmetric to query-anchored)
+        if self.c_contrastive_weight >= 0:
+            c_contrastive_loss = self._compute_c_contrastive_loss(local_queries, local_target_indices, current_spk_centroids)
+        else:
+            c_contrastive_loss = torch.tensor(0.0, device=pil_loss.device, dtype=pil_loss.dtype)
+
         loss = (
             self.ats_weight * ats_loss
             + self.pil_weight * pil_loss
             + self.emb_sim_weight * emb_sim_loss
             + self.q_sim_weight * q_sim_loss
             + self.q_contrastive_weight * q_contrastive_loss
+            + self.c_contrastive_weight * c_contrastive_loss
         )
 
         local_preds = torch.sigmoid(local_logits)
@@ -1934,6 +2086,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'q_sim_loss': q_sim_loss,
             'emb_sim_loss': emb_sim_loss,
             'q_contrastive_loss': q_contrastive_loss,
+            'c_contrastive_loss': c_contrastive_loss,
             'learning_rate': self._optimizer.param_groups[0]['lr'],
             'train_f1_acc': train_f1_acc,
             'train_f1_acc_global': train_f1_acc_global,
@@ -2046,12 +2199,19 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         else:
             val_q_contrastive_loss = torch.tensor(0.0, device=val_pil_loss.device, dtype=val_pil_loss.dtype)
 
+        # Compute centroid-anchored contrastive loss (symmetric to query-anchored)
+        if self.c_contrastive_weight >= 0:
+            val_c_contrastive_loss = self._compute_c_contrastive_loss(local_queries, local_target_indices, current_spk_centroids)
+        else:
+            val_c_contrastive_loss = torch.tensor(0.0, device=val_pil_loss.device, dtype=val_pil_loss.dtype)
+
         val_loss = (
             self.ats_weight * val_ats_loss
             + self.pil_weight * val_pil_loss
             + self.emb_sim_weight * val_emb_sim_loss
             + self.q_sim_weight * val_q_sim_loss
             + self.q_contrastive_weight * val_q_contrastive_loss
+            + self.c_contrastive_weight * val_c_contrastive_loss
         )
 
         local_preds = torch.sigmoid(local_logits)
@@ -2073,6 +2233,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'val_q_sim_loss': val_q_sim_loss,
             'val_emb_sim_loss': val_emb_sim_loss,
             'val_q_contrastive_loss': val_q_contrastive_loss,
+            'val_c_contrastive_loss': val_c_contrastive_loss,
             'val_f1_acc': val_f1_acc,
             'val_f1_acc_global': val_f1_acc_global,
             'val_f1_acc_global_op': val_f1_acc_global_op,
@@ -2149,6 +2310,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         val_q_sim_loss_mean = torch.stack([x['val_q_sim_loss'] for x in outputs]).mean()
         val_emb_sim_loss_mean = torch.stack([x['val_emb_sim_loss'] for x in outputs]).mean()
         val_q_contrastive_loss_mean = torch.stack([x['val_q_contrastive_loss'] for x in outputs]).mean()
+        val_c_contrastive_loss_mean = torch.stack([x['val_c_contrastive_loss'] for x in outputs]).mean()
         val_f1_acc_mean = torch.stack([x['val_f1_acc'] for x in outputs]).mean()
         val_f1_acc_global_mean = torch.stack([x['val_f1_acc_global'] for x in outputs]).mean()
         val_f1_acc_global_op_mean = torch.stack([x['val_f1_acc_global_op'] for x in outputs]).mean()
@@ -2165,6 +2327,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'val_q_sim_loss': val_q_sim_loss_mean,
             'val_emb_sim_loss': val_emb_sim_loss_mean,
             'val_q_contrastive_loss': val_q_contrastive_loss_mean,
+            'val_c_contrastive_loss': val_c_contrastive_loss_mean,
             'val_f1_acc': val_f1_acc_mean,
             'val_f1_acc_global': val_f1_acc_global_mean,
             'val_f1_acc_global_op': val_f1_acc_global_op_mean,
