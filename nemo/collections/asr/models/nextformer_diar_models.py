@@ -47,6 +47,7 @@ from nemo.core.classes.common import PretrainedModelInfo
 from nemo.core.neural_types import AudioSignal, LengthsType, NeuralType, LogitsType
 from nemo.core.neural_types.elements import ProbsType
 from nemo.utils import logging
+from nemo.collections.asr.parts.utils.offline_clustering import SpeakerClustering
 
 __all__ = ['NextformerEncLabelModel']
 
@@ -181,7 +182,11 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.oracle_centroids_train = self._cfg.get("oracle_centroids_train", False)
         self.oracle_centroids_test = self._cfg.get("oracle_centroids_test", False)
         self.oracle_assignment = self._cfg.get("oracle_assignment", False)
-        
+        self.clustering_assignment = self._cfg.get("clustering_assignment", False)
+        if self.clustering_assignment:
+            self.speaker_clustering = SpeakerClustering(cuda=self.cuda, device=self.device)
+        else:
+            self.speaker_clustering = None
         # Oracle centroid scheduling parameters
         self.oracle_centroid_rate_init = self._cfg.get("oracle_centroid_rate_init", 1.0)
         self.oracle_centroid_rate_min = self._cfg.get("oracle_centroid_rate_min", 1.0)
@@ -960,6 +965,73 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             device=local_logits.device
         )
 
+        spk_clustering_indices_list = []
+        spk_clustering_indices = None
+        if self.clustering_assignment and not self.training:
+            emb_dim = spk_queries.shape[-1]
+            spk_queries_reshaped = spk_queries.view(num_chunks, batch_size, local_num_spks, emb_dim).transpose(0, 1)
+            spk_queries_reshaped = spk_queries_reshaped.reshape(batch_size, num_chunks * local_num_spks, emb_dim)
+            spk_queries_norm = torch.norm(spk_queries_reshaped, p=2, dim=2, keepdim=True)  # (B, N, 1)
+            spk_queries_normalized = spk_queries_reshaped / (spk_queries_norm + 1e-8)  # (B, N, D)
+            
+            # Identify valid (non-zero) queries - threshold for detecting zero queries
+            valid_queries_mask = (spk_queries_norm.squeeze(2) > 1e-6)  # (B, N)
+            
+            for b in range(batch_size):
+                valid_mask_b = valid_queries_mask[b]  # (N,)
+                num_valid = valid_mask_b.sum().item()
+                logging.info(f"b={b}, num_valid: {num_valid}")
+                
+                # Initialize all indices as -1 (unmatched)
+                clustered_indices = torch.full((valid_mask_b.shape[0],), -1, dtype=torch.long, device=self.device)
+                
+                if num_valid > 0:
+                    # Extract only valid queries (already normalized)
+                    valid_indices = torch.where(valid_mask_b)[0]  # Indices of valid queries
+                    valid_queries_normalized = spk_queries_normalized[b, valid_mask_b, :]  # (num_valid, D)
+                    
+                    # Compute cosine similarity only among valid queries
+                    cos_sim_valid = torch.matmul(valid_queries_normalized, valid_queries_normalized.T)  # (num_valid, num_valid)
+                    
+                    # Run clustering on valid queries only
+                    clustered_indices_valid = self.speaker_clustering.forward_unit_infer(
+                        cos_sim_valid, max_num_speakers=self.nextformer_modules.max_num_spks
+                    )  # (num_valid,)
+                    
+                    # Ensure clustering results are on the same device as the model
+                    clustered_indices_valid = clustered_indices_valid.to(self.device)
+                    
+                    # Validate clustering results
+                    if clustered_indices_valid.min() < 0:
+                        logging.warning(f"Clustering returned negative indices (min={clustered_indices_valid.min().item()}). Clamping to 0.")
+                        clustered_indices_valid = clustered_indices_valid.clamp(min=0)
+                    
+                    if clustered_indices_valid.max() >= self.nextformer_modules.max_num_spks:
+                        logging.warning(
+                            f"Clustering returned indices >= max_num_spks "
+                            f"(max={clustered_indices_valid.max().item()}, max_num_spks={self.nextformer_modules.max_num_spks}). "
+                            f"Clamping to max_num_spks-1."
+                        )
+                        clustered_indices_valid = clustered_indices_valid.clamp(max=self.nextformer_modules.max_num_spks - 1)
+                    
+                    # Check number of unique clusters
+                    num_clusters = len(torch.unique(clustered_indices_valid))
+                    if num_clusters > self.nextformer_modules.max_num_spks:
+                        logging.warning(
+                            f"Clustering produced {num_clusters} clusters, exceeding max_num_spks={self.nextformer_modules.max_num_spks}. "
+                            f"This may indicate a clustering algorithm issue."
+                        )
+                    
+                    # Map clustering results back to original indices
+                    clustered_indices[valid_indices] = clustered_indices_valid
+                
+                logging.info(f"b={b}, clustered_indices: {clustered_indices}")
+                spk_clustering_indices_list.append(clustered_indices)
+            
+            spk_clustering_indices = torch.stack(spk_clustering_indices_list, dim=0) # (B, N)
+            spk_clustering_indices = spk_clustering_indices.view(batch_size, num_chunks, local_num_spks).transpose(0, 1)
+            spk_clustering_indices = spk_clustering_indices.reshape(num_chunks * batch_size, local_num_spks)
+
         if True:
             # now fill logits using streaming logic
             # this is a streaming state with real centroids
@@ -1067,8 +1139,12 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                             )
                     accumulated_frames = 0
                 
+                if spk_clustering_indices is not None:
+                    # Use clustering-based assignment instead of centroid matching
+                    global_spk_indices = spk_clustering_indices[chunk_idx * batch_size:(chunk_idx + 1) * batch_size, :]
+                    logging.info(f"using clustering-based assignment, global_spk_indices: {global_spk_indices}")
                 # hacky mode to use oracle assignment for all chunks
-                if self.oracle_assignment and not self.training:
+                elif self.oracle_assignment and not self.training:
                     global_spk_indices = global_spk_indices_oracle
 
                 # fill logits using real global_spk_indices

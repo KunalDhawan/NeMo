@@ -111,6 +111,7 @@ class DiarizationConfig:
     oracle_queries: bool = False
     oracle_centroids: bool = False
     oracle_assignment: bool = False
+    clustering_assignment: bool = False
 
     # If `cuda` is a negative number, inference will be on CPU only.
     cuda: Optional[int] = None
@@ -411,6 +412,15 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     diar_model.oracle_queries_test = cfg.oracle_queries
     diar_model.oracle_centroids_test = cfg.oracle_centroids
     diar_model.oracle_assignment = cfg.oracle_assignment
+    diar_model.clustering_assignment = cfg.clustering_assignment
+    
+    # Initialize clustering if enabled but not already initialized (e.g., model trained without it)
+    if cfg.clustering_assignment and (not hasattr(diar_model, 'speaker_clustering') or diar_model.speaker_clustering is None):
+        from nemo.collections.asr.parts.utils.offline_clustering import SpeakerClustering
+        use_cuda = torch.cuda.is_available() and diar_model.device.type == 'cuda'
+        diar_model.speaker_clustering = SpeakerClustering(cuda=use_cuda)
+        logging.info(f"Initialized SpeakerClustering for inference (cuda={use_cuda})")
+    
     postprocessing_cfg = load_postprocessing_from_yaml(cfg.postprocessing_yaml)
     tensor_path, model_id, tensor_filename = get_tensor_path(cfg)
     cfg.optuna_study_name = f"__{model_id}_{tensor_filename}"
@@ -419,6 +429,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
 
     logging.info(f"Oracle queries: {diar_model.oracle_queries_test}")
     logging.info(f"Oracle centroids: {diar_model.oracle_centroids_test}")
+    logging.info(f"Clustering assignment: {diar_model.clustering_assignment}")
     if os.path.exists(tensor_path) and cfg.save_preds_tensors:
         logging.info(
             f"A saved prediction tensor has been found. Loading the saved prediction tensors from {tensor_path}..."
