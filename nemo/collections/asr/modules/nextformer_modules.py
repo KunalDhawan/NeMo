@@ -43,6 +43,8 @@ class StreamingNextformerState:
             Shape: (B, max_num_spks, global_emb_set_size, emb_dim)
         global_emb_set_lengths (torch.Tensor): number of embeddings stored in the global speaker embeddings set for each speaker
             Shape: (B, max_num_spks)
+        global_emb_set_durations (torch.Tensor): duration (in frames) for each embedding stored in global_emb_set
+            Shape: (B, max_num_spks, global_emb_set_size)
         global_spk_centroids (torch.Tensor): global speaker centroid embeddings for each speaker
             Shape: (B, max_num_spks, emb_dim)
         global_spk_centroids_duration (torch.Tensor): duration of each global speaker centroid
@@ -50,6 +52,7 @@ class StreamingNextformerState:
     """
     global_emb_set = None
     global_emb_set_lengths = None
+    global_emb_set_durations = None
     global_spk_centroids = None
     global_spk_centroids_duration = None
 
@@ -425,9 +428,11 @@ class NextformerModules(NeuralModule, Exportable):
         causal_attn_rate: float = 0,
         causal_attn_rc: int = 7,
         pred_score_threshold: float = 0.25,
-        global_emb_set_size: int = 10,
+        global_emb_set_size: int = 50,
         matching_threshold: float = 0.5,
         spk_centroid_update_min_frames: int = 0,
+        prune_min_embeddings: int = 3,
+        prune_similarity_threshold: float = 0.75,
         assignment_swap_prob: float = 0.0,
         extra_left_context: int = 0,
         extra_right_context: int = 0,
@@ -467,6 +472,8 @@ class NextformerModules(NeuralModule, Exportable):
 
         self.global_emb_set_size = global_emb_set_size
         self.spk_centroid_update_min_frames = spk_centroid_update_min_frames
+        self.prune_min_embeddings = prune_min_embeddings
+        self.prune_similarity_threshold = prune_similarity_threshold
         self.assignment_swap_prob = assignment_swap_prob
 
     @staticmethod
@@ -620,6 +627,7 @@ class NextformerModules(NeuralModule, Exportable):
         streaming_state = StreamingNextformerState()
         streaming_state.global_emb_set = torch.zeros((batch_size, self.max_num_spks, self.global_emb_set_size, self.sq_d_model), device=device)
         streaming_state.global_emb_set_lengths = torch.zeros((batch_size, self.max_num_spks), dtype=torch.long, device=device)
+        streaming_state.global_emb_set_durations = torch.zeros((batch_size, self.max_num_spks, self.global_emb_set_size), dtype=torch.float, device=device)
         streaming_state.global_spk_centroids = torch.zeros((batch_size, self.max_num_spks, self.sq_d_model), device=device)
         streaming_state.global_spk_centroids_duration = torch.zeros((batch_size, self.max_num_spks), dtype=torch.float, device=device)
         return streaming_state
@@ -1106,6 +1114,178 @@ class NextformerModules(NeuralModule, Exportable):
             # Update streaming state
             streaming_state.global_spk_centroids[batch_indices, global_idx_flat] = new_centroids
             streaming_state.global_spk_centroids_duration[batch_indices, global_idx_flat] = new_durations
+        
+        return
+
+    def _prune_speaker_buffer(self, streaming_state, batch_idx, speaker_idx, old_centroid):
+        """
+        Prune embeddings for a specific speaker based on similarity to old centroid and buffer overflow.
+        
+        Pruning strategy:
+        1. If count > prune_min_embeddings: Drop embeddings with similarity < prune_similarity_threshold
+        2. If count > buffer_size: Drop oldest embeddings (FIFO) to fit buffer
+        3. Preserve temporal order of remaining embeddings
+        
+        Args:
+            streaming_state (StreamingNextformerState): The current streaming state.
+            batch_idx (int): Batch index
+            speaker_idx (int): Speaker index
+            old_centroid (torch.Tensor): Previous centroid before update (shape: emb_dim)
+        """
+        current_count = streaming_state.global_emb_set_lengths[batch_idx, speaker_idx].item()
+        logging.info(f"pruning speaker buffer: batch_idx: {batch_idx}, speaker_idx: {speaker_idx}, current_count: {current_count}")
+        
+        # Step 1: Similarity-based pruning (remove outliers)
+        if current_count > self.prune_min_embeddings:
+            # Get all buffered embeddings
+            embs = streaming_state.global_emb_set[batch_idx, speaker_idx, :current_count]  # (count, emb_dim)
+            durs = streaming_state.global_emb_set_durations[batch_idx, speaker_idx, :current_count]  # (count,)
+            
+            # Compute cosine similarity to old centroid
+            # Normalize embeddings and centroid
+            embs_norm = F.normalize(embs, p=2, dim=1)  # (count, emb_dim)
+            centroid_norm = F.normalize(old_centroid.unsqueeze(0), p=2, dim=1)  # (1, emb_dim)
+            similarities = torch.matmul(embs_norm, centroid_norm.T).squeeze()  # (count,)
+            logging.info(f"----similarities: {similarities}")
+            
+            # Keep only embeddings with similarity >= threshold
+            keep_mask = similarities >= self.prune_similarity_threshold  # (count,)
+            
+            if keep_mask.sum() > 0:  # Ensure we keep at least some embeddings
+                kept_embs = embs[keep_mask]
+                kept_durs = durs[keep_mask]
+                new_count = keep_mask.sum().item()
+                logging.info(f"----new_count: {new_count}")
+                # Update buffer with kept embeddings (packed at the beginning)
+                streaming_state.global_emb_set[batch_idx, speaker_idx, :new_count] = kept_embs
+                streaming_state.global_emb_set_durations[batch_idx, speaker_idx, :new_count] = kept_durs
+                streaming_state.global_emb_set_lengths[batch_idx, speaker_idx] = new_count
+                current_count = new_count
+        
+        # Step 2: FIFO pruning if buffer overflow (safety check)
+        if current_count > self.global_emb_set_size:
+            logging.info(f"Achtung! This should not happen")
+            # Drop oldest embeddings (first ones) to fit buffer
+            num_to_drop = current_count - self.global_emb_set_size
+            
+            # Shift remaining embeddings to the beginning
+            kept_embs = streaming_state.global_emb_set[batch_idx, speaker_idx, num_to_drop:current_count].clone()
+            kept_durs = streaming_state.global_emb_set_durations[batch_idx, speaker_idx, num_to_drop:current_count].clone()
+            
+            streaming_state.global_emb_set[batch_idx, speaker_idx, :self.global_emb_set_size] = kept_embs
+            streaming_state.global_emb_set_durations[batch_idx, speaker_idx, :self.global_emb_set_size] = kept_durs
+            streaming_state.global_emb_set_lengths[batch_idx, speaker_idx] = self.global_emb_set_size
+
+    def update_streaming_state_buffered(self, streaming_state, spk_queries, global_spk_indices, active_frames_per_query):
+        """
+        Update the streaming state with new speaker queries based on their global indices.
+        This function collects embeddings in a buffer (global_emb_set) and recalculates speaker centroids
+        from all buffered embeddings using duration-weighted averaging.
+        To mitigate noisy queries, this function only updates the speaker centroids for queries with at least 
+        spk_centroid_update_min_frames active frames.
+        
+        After adding new embeddings, this function prunes the buffer by:
+        1. Removing outliers (embeddings with low similarity to previous centroid)
+        2. Removing oldest embeddings if buffer overflows (FIFO)
+
+        Args:
+            streaming_state (StreamingNextformerState): The current streaming state.
+            spk_queries (torch.Tensor): Speaker queries from the current chunk.
+                Shape: (B, local_num_spks, emb_dim)
+            global_spk_indices (torch.Tensor): Global speaker indices for each local query.
+                Shape: (B, local_num_spks)
+            active_frames_per_query (torch.Tensor): Number of active frames for each query.
+                Shape: (B, local_num_spks)
+
+        Returns:
+            streaming_state (StreamingNextformerState): The updated streaming state.
+        """
+        # Create mask for valid assignments (global_index != -1 and sufficient active frames)
+        valid_mask = (global_spk_indices != -1) & (active_frames_per_query >= self.spk_centroid_update_min_frames)  # (B, local_num_spks)
+        
+        if valid_mask.any():
+            # Get indices of all valid (batch, local_speaker) pairs
+            batch_indices, local_indices = torch.where(valid_mask)  # 1D tensors of length num_valid
+            
+            # Get corresponding global indices for valid pairs
+            global_idx_flat = global_spk_indices[batch_indices, local_indices]  # (num_valid,)
+
+            # Get corresponding active frames for valid pairs
+            active_frames_flat = active_frames_per_query[batch_indices, local_indices]  # (num_valid,)
+            
+            # Save old centroids before updating (needed for pruning)
+            old_centroids = streaming_state.global_spk_centroids[batch_indices, global_idx_flat].clone()  # (num_valid, emb_dim)
+            
+            # Get current counts (number of embeddings already stored for each speaker)
+            counts = streaming_state.global_emb_set_lengths[batch_indices, global_idx_flat]  # (num_valid,)
+            
+            # Proactively make space if buffer is full (FIFO: drop oldest)
+            for idx in range(len(batch_indices)):
+                b_idx = batch_indices[idx].item()
+                spk_idx = global_idx_flat[idx].item()
+                current_count = counts[idx].item()
+                
+                if current_count >= self.global_emb_set_size:
+                    # Buffer is full, drop oldest embedding (shift all left by 1)
+                    streaming_state.global_emb_set[b_idx, spk_idx, :-1] = streaming_state.global_emb_set[b_idx, spk_idx, 1:].clone()
+                    streaming_state.global_emb_set_durations[b_idx, spk_idx, :-1] = streaming_state.global_emb_set_durations[b_idx, spk_idx, 1:].clone()
+                    # Update count to make room for new embedding
+                    counts[idx] = self.global_emb_set_size - 1
+                    streaming_state.global_emb_set_lengths[b_idx, spk_idx] = self.global_emb_set_size - 1
+            
+            # Get the embeddings and durations for valid queries
+            valid_spk_queries = spk_queries[batch_indices, local_indices]  # (num_valid, emb_dim)
+            
+            # Append embeddings to buffer at position count
+            streaming_state.global_emb_set[batch_indices, global_idx_flat, counts] = valid_spk_queries
+            
+            # Append durations to buffer at position count (cast to float)
+            streaming_state.global_emb_set_durations[batch_indices, global_idx_flat, counts] = active_frames_flat.float()
+            
+            # Increment counts
+            streaming_state.global_emb_set_lengths[batch_indices, global_idx_flat] += 1
+            
+            # Prune buffers for each updated speaker
+            for idx in range(len(batch_indices)):
+                b_idx = batch_indices[idx].item()
+                spk_idx = global_idx_flat[idx].item()
+                old_centroid = old_centroids[idx]
+                self._prune_speaker_buffer(streaming_state, b_idx, spk_idx, old_centroid)
+            
+            # Recompute centroids from all buffered embeddings
+            # Get updated counts (after increment)
+            new_counts = streaming_state.global_emb_set_lengths[batch_indices, global_idx_flat]  # (num_valid,)
+            
+            # Get all buffered embeddings and durations for these speakers
+            # Shape: (num_valid, global_emb_set_size, emb_dim)
+            buffered_embs = streaming_state.global_emb_set[batch_indices, global_idx_flat]
+            # Shape: (num_valid, global_emb_set_size)
+            buffered_durations = streaming_state.global_emb_set_durations[batch_indices, global_idx_flat]
+            
+            # Create mask for valid buffered embeddings (only 0:count are valid)
+            # Shape: (num_valid, global_emb_set_size)
+            arange = torch.arange(self.global_emb_set_size, device=counts.device).unsqueeze(0)  # (1, global_emb_set_size)
+            valid_emb_mask = arange < new_counts.unsqueeze(1)  # (num_valid, global_emb_set_size)
+            
+            # Mask out invalid embeddings and durations
+            buffered_embs_masked = buffered_embs * valid_emb_mask.unsqueeze(-1)  # (num_valid, global_emb_set_size, emb_dim)
+            buffered_durations_masked = buffered_durations * valid_emb_mask  # (num_valid, global_emb_set_size)
+            
+            # Compute weighted sum: sum(emb[i] * duration[i])
+            # Shape: (num_valid, emb_dim)
+            weighted_sum = (buffered_embs_masked * buffered_durations_masked.unsqueeze(-1)).sum(dim=1)
+            
+            # Compute total duration: sum(duration[i])
+            # Shape: (num_valid,)
+            total_durations = buffered_durations_masked.sum(dim=1)
+            
+            # Compute centroids: sum(emb[i] * duration[i]) / sum(duration[i])
+            # Shape: (num_valid, emb_dim)
+            new_centroids = weighted_sum / (total_durations.unsqueeze(-1) + 1e-8)
+            
+            # Update streaming state
+            streaming_state.global_spk_centroids[batch_indices, global_idx_flat] = new_centroids
+            streaming_state.global_spk_centroids_duration[batch_indices, global_idx_flat] = total_durations
         
         return
 

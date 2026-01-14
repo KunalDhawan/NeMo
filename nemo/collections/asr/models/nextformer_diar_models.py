@@ -1123,6 +1123,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                             )
                     else:
                         # update streaming state with real centroids
+                        #self.nextformer_modules.update_streaming_state_buffered(
                         self.nextformer_modules.update_streaming_state_duration_averaged(
                             streaming_state=streaming_state,
                             spk_queries=spk_queries_chunk,
@@ -1131,6 +1132,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                         )
                         if streaming_state_oracle is not None:
                             # update streaming state with sampled centroids (curriculum learning)
+                            #self.nextformer_modules.update_streaming_state_buffered(
                             self.nextformer_modules.update_streaming_state_duration_averaged(
                                 streaming_state=streaming_state_oracle,
                                 spk_queries=spk_queries_chunk,
