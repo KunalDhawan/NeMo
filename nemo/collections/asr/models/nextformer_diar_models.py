@@ -221,6 +221,9 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.q_contrastive_duration_averaged = self._cfg.get("q_contrastive_duration_averaged", False)
         self.q_contrastive_aam = self._cfg.get("q_contrastive_aam", 0.0)
         self.q_contrastive_cross_batch = self._cfg.get("q_contrastive_cross_batch", False)
+        # Weight for combining v5 (centroid-based) and v3 (sampled centroid) losses
+        # 0.0 = only v5, 1.0 = only v3, 0.5 = equal mixture
+        self.q_contrastive_v3_weight = self._cfg.get("q_contrastive_v3_weight", 0.0)
         # Centroid-anchored contrastive loss (symmetric to query-anchored)
         self.c_contrastive_weight = self._cfg.get("c_contrastive_weight", 0.0)
         total_weight = pil_weight + ats_weight
@@ -1558,6 +1561,57 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         return local_pil_targets, local_ats_targets, local_target_lens, local_target_indices, total_logits_op
 
     def _compute_q_contrastive_loss(
+        self, 
+        local_queries: torch.Tensor, 
+        local_target_indices: torch.Tensor, 
+        active_frames_per_query: torch.Tensor,
+        current_spk_centroids: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute weighted combination of v5 (centroid-based) and v3 (sampled centroid) contrastive losses.
+        
+        The weight q_contrastive_v3_weight controls the mixture:
+        - 0.0: uses only v5 (streaming centroids from actual state)
+        - 1.0: uses only v3 (dynamically sampled centroids)
+        - 0.5: equal mixture of both
+        
+        Args:
+            local_queries (torch.Tensor): Local speaker queries
+                Shape: (B, N, emb_dim) where N = local_num_spks * L (L = num_chunks)
+            local_target_indices (torch.Tensor): Speaker indices mapping
+                Shape: (B, N)
+            active_frames_per_query (torch.Tensor): Number of active frames per query
+                Shape: (B, N)
+            current_spk_centroids (torch.Tensor): Global speaker centroids before each chunk update
+                Shape: (B, L, max_num_spks, emb_dim) where L = num_chunks
+        
+        Returns:
+            torch.Tensor: Combined contrastive loss scalar
+        """
+        v3_weight = self.q_contrastive_v3_weight
+        v5_weight = 1.0 - v3_weight
+        
+        # Compute both losses
+        if v5_weight > 0:
+            loss_v5 = self._compute_q_contrastive_loss_v5(
+                local_queries, local_target_indices, active_frames_per_query, current_spk_centroids
+            )
+        else:
+            loss_v5 = torch.tensor(0.0, device=local_queries.device, dtype=local_queries.dtype)
+        
+        if v3_weight > 0:
+            loss_v3 = self._compute_q_contrastive_loss_v3(
+                local_queries, local_target_indices, active_frames_per_query
+            )
+        else:
+            loss_v3 = torch.tensor(0.0, device=local_queries.device, dtype=local_queries.dtype)
+        
+        # Weighted combination
+        combined_loss = v5_weight * loss_v5 + v3_weight * loss_v3
+        
+        return combined_loss
+
+    def _compute_q_contrastive_loss_v5(
         self, 
         local_queries: torch.Tensor, 
         local_target_indices: torch.Tensor, 

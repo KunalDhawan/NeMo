@@ -24,6 +24,7 @@ model:
   ats_weight: 0.5 # Weight for Arrival Time Sort (ATS) loss in training the Nextformer diarizer model
   q_sim_weight: 0.0 # Weight for Query Similarity loss
   emb_sim_weight: 0.0 # Weight for Embedding Similarity loss
+  q_contrastive_v3_weight: 0.0 # Weight for Contrastive Query Similarity loss v3
   q_contrastive_weight: 0.0 # Weight for Contrastive Query Similarity loss
   c_contrastive_weight: 0.0 # Weight for Contrastive Centroid Similarity loss
   q_contrastive_temperature: 0.1 # Temperature for Contrastive Query Similarity loss
