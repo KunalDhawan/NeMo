@@ -14,6 +14,7 @@
 
 import lightning.pytorch as pl
 from lightning.pytorch import seed_everything
+from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf
 
 from nemo.collections.asr.models import NextformerEncLabelModel
@@ -47,6 +48,14 @@ def main(cfg):
     exp_manager(trainer, cfg.get("exp_manager", None))
     nextformer_model = NextformerEncLabelModel(cfg=cfg.model, trainer=trainer)
     nextformer_model.maybe_init_from_pretrained_checkpoint(cfg)
+
+    # Enable W&B gradient logging if WandbLogger is present
+    for logger in trainer.loggers:
+        if isinstance(logger, WandbLogger):
+            logger.watch(nextformer_model, log="gradients", log_freq=50)
+            logging.info("W&B gradient logging enabled (log_freq=50)")
+            break
+
     trainer.fit(nextformer_model)
 
     if hasattr(cfg.model, 'test_ds') and cfg.model.test_ds.manifest_filepath is not None:
