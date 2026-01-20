@@ -1,4 +1,4 @@
-name: "NextformerDiarizer"
+name: "NextformerDiarizer v6"
 num_workers: 18
 batch_size: 4
 
@@ -8,34 +8,10 @@ model:
   # Oracle parameters for debugging/ablation studies - use ground truth information instead of predictions
   oracle_queries_train: false # If true, use ground truth speaker activity (instead of predicted) during training for mask initialization and query generation
   oracle_queries_test: false # If true, use ground truth speaker activity (instead of predicted) during testing for mask initialization and query generation
-  oracle_centroids_train: true # If true, use ground truth speaker indices (instead of predicted) during training for updating speaker centroids
-  oracle_centroids_test: false # If true, use ground truth speaker indices (instead of predicted) during testing for updating speaker centroids
-  
-  # Oracle centroid scheduling - curriculum learning to reduce train/test mismatch
-  oracle_centroid_rate_init: 1.0 # Initial probability of using oracle indices for centroid updates (1.0 = always use oracle)
-  oracle_centroid_rate_min: 1.0 # Minimum probability floor (0.0 = eventually use only real predictions)
-  oracle_centroid_rate_decay: 0.1 # Amount to decay oracle_centroid_rate per epoch
-  oracle_centroid_rate_decay_type: "linear" # Decay type: "linear" or "exponential"
-  oracle_centroid_rate_warmup_epochs: 10 # Number of epochs to keep rate at initial value before starting decay (warmup period)
-  
-  centroid_update_period: 1 # number of frames between centroid updates
 
   pil_weight: 0.5 # Weight for Permutation Invariant Loss (PIL) used in training the Nextformer diarizer model
   ats_weight: 0.5 # Weight for Arrival Time Sort (ATS) loss in training the Nextformer diarizer model
-  q_sim_weight: 0.0 # Weight for Query Similarity loss
-  emb_sim_weight: 0.0 # Weight for Embedding Similarity loss
-  q_contrastive_v3_weight: 0.0 # Weight for Contrastive Query Similarity loss v3
-  q_contrastive_weight: 0.0 # Weight for Contrastive Query Similarity loss
-  c_contrastive_weight: 0.0 # Weight for Contrastive Centroid Similarity loss
-  q_contrastive_temperature: 0.1 # Temperature for Contrastive Query Similarity loss
-  q_contrastive_extra_positive: false # Use an explicit 0.5 margin in contrastive loss
-  q_contrastive_extra_positive_rate: 0.1 # Rate for extra positive class in contrastive loss
-  q_contrastive_aam: 0.0 # Additive Angular Margin for contrastive loss
-  q_contrastive_cross_batch: false # Use cross-batch mode for contrastive loss
-  q_contrastive_min_frames_anchor: 5 # Minimum number of active frames per query for contrastive loss to be a valid anchor
-  q_contrastive_min_frames_positive: 10 # Minimum number of active frames per query for contrastive loss to be a candidate for a positive sample
-  q_contrastive_duration_averaged: true # Use duration-averaging for contrastive loss
-  q_contrastive_max_frames: 32 # Maximum number of active frames per query for contrastive loss to be used as a weight for duration-averaged loss
+  global_pil_weight: 1.0 # Weight for Permutation Invariant Loss (PIL) used in training the Nextformer diarizer model
 
   local_num_spks: 4 # Number of speakers for local queries
   max_num_spks: 8 # Maximum number of speakers per model; currently set to 8
@@ -148,14 +124,16 @@ model:
     pred_score_threshold: 0.25 # Threshold for speaker predictions to be used in scoring
     chunk_len: 125 # Length of each chunk
     chunk_left_context: 62 # Left context for each chunk
-    chunk_right_context: 1 # Right context for each chunk
+    chunk_right_context: 10 # Right context for each chunk
     extra_left_context: 0 # Extra left context for encoder (provides additional acoustic context without requiring predictions)
     extra_right_context: 0 # Extra right context for encoder (provides additional acoustic context without requiring predictions)
     extra_silence_frames: 3 # Number of silence frames to separate extra_right from extra_left in reordered sequence
     causal_attn_rate: 0 # Causal attention rate
     causal_attn_rc: 7 # Causal attention radius
-    spk_centroid_update_min_frames: 0 # Minimum number of active frames for each query to be considered valid for updating speaker centroids
-    assignment_swap_prob: 0.0 # Probability of swapping speaker assignments during training to create train-test robustness (0.0 = no augmentation, 0.1-0.3 = recommended range)
+    sinkhorn_n_iters: 20 # Number of iterations for Sinkhorn algorithm
+    sinkhorn_dustbin_init: 0.0 # Initial value for dustbin in Sinkhorn algorithm
+    score_similarity: "cosine" # "scaled_dot" or "cosine"
+    cosine_temperature: 0.05 # Temperature for cosine similarity
 
   encoder:
     _target_: nemo.collections.asr.modules.ConformerEncoder
@@ -203,19 +181,6 @@ model:
     attn_score_dropout: 0.5
     attn_layer_dropout: 0.5
     ffn_dropout: 0.5
-    hidden_act: relu
-    pre_ln: False
-    pre_ln_final_layer_norm: True
-
-  centroid_encoder:
-    _target_: nemo.collections.asr.modules.transformer.transformer_encoders.TransformerEncoder
-    num_layers: 1
-    hidden_size: ${model.model_defaults.sq_d_model} # Needs to be multiple of num_attention_heads
-    inner_size: 768
-    num_attention_heads: 8
-    attn_score_dropout: 0.0
-    attn_layer_dropout: 0.0
-    ffn_dropout: 0.0
     hidden_act: relu
     pre_ln: False
     pre_ln_final_layer_norm: True

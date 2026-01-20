@@ -39,23 +39,13 @@ class StreamingNextformerState:
     streaming Nextformer model.
 
     Attributes:
-        global_emb_set (torch.Tensor): global speaker embeddings set to store embeddings from start.
-            Shape: (B, max_num_spks, global_emb_set_size, emb_dim)
-        global_emb_set_lengths (torch.Tensor): number of embeddings stored in the global speaker embeddings set for each speaker
-            Shape: (B, max_num_spks)
-        global_emb_set_durations (torch.Tensor): duration (in frames) for each embedding stored in global_emb_set
-            Shape: (B, max_num_spks, global_emb_set_size)
-        global_spk_centroids (torch.Tensor): global speaker centroid embeddings for each speaker
-            Shape: (B, max_num_spks, emb_dim)
-        global_spk_centroids_duration (torch.Tensor): duration of each global speaker centroid
-            Shape: (B, max_num_spks)
+        past_spk_queries (torch.Tensor): Past speaker queries.
+            Shape: (B, num_past_spk_queries, emb_dim)
+        past_spk_assignments (torch.Tensor): Past speaker assignments.
+            Shape: (B, num_past_spk_queries, max_num_spks)
     """
-    global_emb_set = None
-    global_emb_set_lengths = None
-    global_emb_set_durations = None
-    global_spk_centroids = None
-    global_spk_centroids_duration = None
-
+    past_spk_queries = None
+    past_spk_assignments = None
 
 class MaskedQueryDecoderBlock(torch.nn.Module):
     """
@@ -428,15 +418,14 @@ class NextformerModules(NeuralModule, Exportable):
         causal_attn_rate: float = 0,
         causal_attn_rc: int = 7,
         pred_score_threshold: float = 0.25,
-        global_emb_set_size: int = 50,
-        matching_threshold: float = 0.5,
-        spk_centroid_update_min_frames: int = 0,
-        prune_min_embeddings: int = 3,
-        prune_similarity_threshold: float = 0.75,
-        assignment_swap_prob: float = 0.0,
         extra_left_context: int = 0,
         extra_right_context: int = 0,
         extra_silence_frames: int = 3,
+        sinkhorn_n_iters: int = 20,
+        sinkhorn_dustbin_init: float = 0.0,
+        spk_centroid_update_min_frames: int = 0,
+        score_similarity: str = "cosine",
+        cosine_temperature: float = 0.01,
     ):
         super().__init__()
         # General params
@@ -447,7 +436,18 @@ class NextformerModules(NeuralModule, Exportable):
         self.local_num_spks = local_num_spks
         self.max_num_spks = max_num_spks
         self.pred_score_threshold = pred_score_threshold
-        self.matching_threshold = matching_threshold
+
+        # Sinkhorn parameters
+        self.sinkhorn_n_iters = sinkhorn_n_iters
+        self.sinkhorn_dustbin_val = nn.Parameter(
+            torch.tensor(float(sinkhorn_dustbin_init), dtype=torch.float32)
+        )
+        #self.sinkhorn_dustbin_val = 100 / math.sqrt(self.sq_d_model)
+        #self.sinkhorn_dustbin_val=0.5
+
+        self.spk_centroid_update_min_frames = spk_centroid_update_min_frames
+        self.score_similarity = score_similarity
+        self.cosine_temperature = cosine_temperature
 
         self.encoder_proj = nn.Linear(self.fc_d_model, self.tf_d_model)
         self.query_proj = nn.Linear(self.fc_d_model, self.sq_d_model)
@@ -469,12 +469,6 @@ class NextformerModules(NeuralModule, Exportable):
         self.extra_left_context = extra_left_context
         self.extra_right_context = extra_right_context
         self.extra_silence_frames = extra_silence_frames
-
-        self.global_emb_set_size = global_emb_set_size
-        self.spk_centroid_update_min_frames = spk_centroid_update_min_frames
-        self.prune_min_embeddings = prune_min_embeddings
-        self.prune_similarity_threshold = prune_similarity_threshold
-        self.assignment_swap_prob = assignment_swap_prob
 
     @staticmethod
     def length_to_mask(lengths, max_length: int):
@@ -625,991 +619,184 @@ class NextformerModules(NeuralModule, Exportable):
             streaming_state (StreamingNextformerState): initialized streaming state
         """
         streaming_state = StreamingNextformerState()
-        streaming_state.global_emb_set = torch.zeros((batch_size, self.max_num_spks, self.global_emb_set_size, self.sq_d_model), device=device)
-        streaming_state.global_emb_set_lengths = torch.zeros((batch_size, self.max_num_spks), dtype=torch.long, device=device)
-        streaming_state.global_emb_set_durations = torch.zeros((batch_size, self.max_num_spks, self.global_emb_set_size), dtype=torch.float, device=device)
-        streaming_state.global_spk_centroids = torch.zeros((batch_size, self.max_num_spks, self.sq_d_model), device=device)
-        streaming_state.global_spk_centroids_duration = torch.zeros((batch_size, self.max_num_spks), dtype=torch.float, device=device)
+        streaming_state.past_spk_queries = torch.zeros((batch_size, 0, self.sq_d_model), device=device)
+        streaming_state.past_spk_assignments = torch.zeros((batch_size, 0, self.max_num_spks), device=device)
         return streaming_state
 
-    def get_global_indices_v1(self, spk_queries, global_spk_centroids):
+    def update_streaming_state(self, streaming_state, spk_queries, spk_assignments):
         """
-        Get global indices for speaker queries. This function performs speaker matching between
-        local speaker queries from the current chunk and global speaker centroids maintained
-        throughout the stream. It uses cosine similarity and the Hungarian algorithm for matching.
-
-        Args:
-            spk_queries (torch.Tensor): Speaker queries for the current chunk.
-                Shape: (B, local_num_spks, emb_dim)
-            global_spk_centroids (torch.Tensor): Global speaker centroids.
-                Shape: (B, max_num_spks, emb_dim)
-
-        Returns:
-            global_spk_indices (torch.Tensor): Tensor with global speaker indices for each local query.
-                Shape: (B, local_num_spks)
-        """
-        batch_size, local_num_spks, _ = spk_queries.shape
-        device = spk_queries.device
-        global_spk_indices = torch.full((batch_size, local_num_spks), -1, dtype=torch.long, device=device)
-
-        # Calculate norms for the entire batch to find zero-vectors
-        local_norms = spk_queries.norm(dim=2)  # (B, local_num_spks)
-        global_norms = global_spk_centroids.norm(dim=2)  # (B, max_num_spks)
-
-        # OPTIMIZATION: Compute boolean masks for all batches at once
-        is_nonzero_local_all = local_norms > 1e-8  # (B, local_num_spks)
-        is_nonzero_global_all = global_norms > 1e-8  # (B, max_num_spks)
-
-        # OPTIMIZATION: Compute similarity matrix for entire batch at once
-        # Shape: (B, local_num_spks, max_num_spks)
-        sim_matrix_full = F.cosine_similarity(
-            spk_queries.unsqueeze(2),  # (B, local_num_spks, 1, emb_dim)
-            global_spk_centroids.unsqueeze(1),  # (B, 1, max_num_spks, emb_dim)
-            dim=3  # Compute similarity along embedding dimension
-        )  # Result: (B, local_num_spks, max_num_spks)
-
-        for b in range(batch_size):
-            # Extract boolean masks for this batch item
-            is_nonzero_local = is_nonzero_local_all[b]
-            is_nonzero_global = is_nonzero_global_all[b]
-            
-            # Filter out zero-norm queries (undetected speakers)
-            nonzero_local_indices = torch.where(is_nonzero_local)[0]
-            if len(nonzero_local_indices) == 0:
-                continue
-
-            # Filter out zero-norm global centroids (inactive global speakers)
-            nonzero_global_indices = torch.where(is_nonzero_global)[0]
-
-            logging.info(f"b={b}, nonzero_local_indices: {nonzero_local_indices}, nonzero_global_indices: {nonzero_global_indices}")
-
-            if len(nonzero_global_indices) > 0:
-                # Extract relevant submatrix from precomputed full similarity matrix
-                # Shape: (len(nonzero_local_indices), len(nonzero_global_indices))
-                sim_matrix = sim_matrix_full[b][nonzero_local_indices][:, nonzero_global_indices]
-
-                logging.info(f"b={b}, sim_matrix: {sim_matrix}")
-
-                # Use Hungarian algorithm to find optimal assignment
-                cost_matrix = 1 - sim_matrix
-                row_ind, col_ind = linear_sum_assignment(cost_matrix.detach().cpu().numpy())
-                hungarian_map = {r: (c, sim_matrix[r, c].item()) for r, c in zip(row_ind, col_ind)}
-
-                logging.info(f"b={b}, hungarian_map: {hungarian_map}")
-
-                # Get available slots BEFORE making assignments
-                all_global_indices = torch.arange(self.max_num_spks, device=device)
-                currently_used_mask = torch.zeros(self.max_num_spks, dtype=torch.bool, device=device)
-                if len(nonzero_global_indices) > 0:
-                    currently_used_mask[nonzero_global_indices] = True
-                available_global_indices = all_global_indices[~currently_used_mask]
-
-                # Iterate through all local speakers and decide their assignment
-                for r in range(len(nonzero_local_indices)):
-                    local_idx = nonzero_local_indices[r]
-                    if r in hungarian_map:
-                        c, sim = hungarian_map[r]
-                        global_idx = nonzero_global_indices[c]
-                        if sim > self.matching_threshold:
-                            # Strong match
-                            global_spk_indices[b, local_idx] = global_idx
-                        else:
-                            # Weak match, prefer new slot
-                            if len(available_global_indices) > 0:
-                                global_spk_indices[b, local_idx] = available_global_indices[0]
-                                available_global_indices = available_global_indices[1:]
-                            else:
-                                global_spk_indices[b, local_idx] = global_idx # Fallback
-                    else:
-                        # No match, assign to new slot
-                        if len(available_global_indices) > 0:
-                            global_spk_indices[b, local_idx] = available_global_indices[0]
-                            available_global_indices = available_global_indices[1:]
-            else:
-                # This is the first chunk with speakers, assign all to new slots
-                num_to_assign = min(len(nonzero_local_indices), self.max_num_spks)
-                for i in range(num_to_assign):
-                    global_spk_indices[b, nonzero_local_indices[i]] = i
-
-            logging.info(f"b={b}, global_spk_indices: {global_spk_indices[b]}")
-
-        return global_spk_indices
-
-    def get_global_indices(self, spk_queries, global_spk_centroids):
-        """
-        Get global indices for speaker queries (Version 2 with extended similarity matrix).
-        
-        This function performs speaker matching between local speaker queries from the current chunk 
-        and global speaker centroids maintained throughout the stream. It uses cosine similarity and 
-        the Hungarian algorithm for matching, with an extended similarity matrix that includes potential 
-        new speaker slots for optimal assignment.
-
-        Key improvements over v1:
-        - Extended similarity matrix includes "new speaker slots" as explicit options
-        - Hungarian algorithm makes globally optimal assignments in a single pass
-        - No post-hoc threshold filtering needed
-        - New speaker assignments preserve local speaker ordering
-
-        Args:
-            spk_queries (torch.Tensor): Speaker queries for the current chunk.
-                Shape: (B, local_num_spks, emb_dim)
-            global_spk_centroids (torch.Tensor): Global speaker centroids.
-                Shape: (B, max_num_spks, emb_dim)
-
-        Returns:
-            global_spk_indices (torch.Tensor): Tensor with global speaker indices for each local query.
-                Shape: (B, local_num_spks)
-        """
-        batch_size, local_num_spks, _ = spk_queries.shape
-        device = spk_queries.device
-        global_spk_indices = torch.full((batch_size, local_num_spks), -1, dtype=torch.long, device=device)
-
-        # Calculate norms for the entire batch to find zero-vectors
-        local_norms = spk_queries.norm(dim=2)  # (B, local_num_spks)
-        global_norms = global_spk_centroids.norm(dim=2)  # (B, max_num_spks)
-
-        # OPTIMIZATION: Compute boolean masks for all batches at once
-        is_nonzero_local_all = local_norms > 1e-8  # (B, local_num_spks)
-        is_nonzero_global_all = global_norms > 1e-8  # (B, max_num_spks)
-
-        # OPTIMIZATION: Compute similarity matrix for entire batch at once
-        # Shape: (B, local_num_spks, max_num_spks)
-        sim_matrix_full = F.cosine_similarity(
-            spk_queries.unsqueeze(2),  # (B, local_num_spks, 1, emb_dim)
-            global_spk_centroids.unsqueeze(1),  # (B, 1, max_num_spks, emb_dim)
-            dim=3  # Compute similarity along embedding dimension
-        )  # Result: (B, local_num_spks, max_num_spks)
-
-        for b in range(batch_size):
-            # Extract boolean masks for this batch item
-            is_nonzero_local = is_nonzero_local_all[b]
-            is_nonzero_global = is_nonzero_global_all[b]
-            
-            # Filter out zero-norm queries (undetected speakers)
-            nonzero_local_indices = torch.where(is_nonzero_local)[0]
-            if len(nonzero_local_indices) == 0:
-                continue
-
-            # Filter out zero-norm global centroids (inactive global speakers)
-            nonzero_global_indices = torch.where(is_nonzero_global)[0]
-
-            if not self.training:
-                logging.info(f"b={b}, nonzero_local_indices: {nonzero_local_indices}, nonzero_global_indices: {nonzero_global_indices}")
-
-            # Calculate available slots for potential new speakers
-            all_global_indices = torch.arange(self.max_num_spks, device=device)
-            currently_used_mask = torch.zeros(self.max_num_spks, dtype=torch.bool, device=device)
-            currently_used_mask[nonzero_global_indices] = True
-            available_global_indices = all_global_indices[~currently_used_mask]
-            num_available_slots = len(available_global_indices)
-
-            if len(nonzero_global_indices) == 0:
-                # First chunk with speakers, assign sequentially to slots 0, 1, 2, ...
-                num_to_assign = min(len(nonzero_local_indices), self.max_num_spks)
-                for i in range(num_to_assign):
-                    global_spk_indices[b, nonzero_local_indices[i]] = i
-                if not self.training:
-                    logging.info(f"b={b}, first chunk assignment, global_spk_indices: {global_spk_indices[b]}")
-                continue
-
-            # Extract similarity matrix for existing global speakers
-            # Shape: (len(nonzero_local_indices), len(nonzero_global_indices))
-            sim_matrix_existing = sim_matrix_full[b][nonzero_local_indices][:, nonzero_global_indices]
-
-            # Extend similarity matrix with new speaker slots
-            # Each new slot has similarity = matching_threshold (indifference point)
-            num_new_slots = min(len(nonzero_local_indices), num_available_slots)
-            if num_new_slots > 0:
-                new_slots_sim = torch.full(
-                    (len(nonzero_local_indices), num_new_slots),
-                    self.matching_threshold,
-                    device=device
-                )
-                extended_sim_matrix = torch.cat([sim_matrix_existing, new_slots_sim], dim=1)
-            else:
-                # No available slots, only match to existing speakers
-                extended_sim_matrix = sim_matrix_existing
-
-            if not self.training:
-                logging.info(f"b={b}, extended_sim_matrix shape: {extended_sim_matrix.shape}, "
-                        f"existing: {len(nonzero_global_indices)}, new_slots: {num_new_slots}")
-                logging.info(f"b={b}, extended_sim_matrix: {extended_sim_matrix}")
-
-            # Run Hungarian algorithm on extended cost matrix
-            cost_matrix = 1 - extended_sim_matrix
-            row_ind, col_ind = linear_sum_assignment(cost_matrix.detach().cpu().numpy())
-
-            hungarian_map = {r: (c, extended_sim_matrix[r, c].item()) for r, c in zip(row_ind, col_ind)}
-            if not self.training:
-                logging.info(f"b={b}, hungarian_map: {hungarian_map}")
-
-            # Parse Hungarian results and separate existing vs new assignments
-            assignments_to_existing = []  # (local_idx, global_idx, similarity)
-            assignments_to_new = []  # (local_idx, col_in_extended_matrix)
-            
-            for r, c in zip(row_ind, col_ind):
-                local_idx = nonzero_local_indices[r]
-                if c < len(nonzero_global_indices):
-                    # Assigned to existing global speaker
-                    global_idx = nonzero_global_indices[c]
-                    sim = extended_sim_matrix[r, c].item()
-                    assignments_to_existing.append((local_idx.item(), global_idx.item(), sim))
-                    global_spk_indices[b, local_idx] = global_idx
-                else:
-                    # Assigned to new speaker slot
-                    assignments_to_new.append((local_idx.item(), c))
-
-            # Post-process: Assign new speakers to sequential available slots
-            # Sort by local index to preserve order
-            assignments_to_new.sort(key=lambda x: x[0])
-            for i, (local_idx, _) in enumerate(assignments_to_new):
-                if i < len(available_global_indices):
-                    global_spk_indices[b, local_idx] = available_global_indices[i]
-
-            if not self.training:
-                logging.info(f"b={b}, assignments_to_existing: {assignments_to_existing}")
-                logging.info(f"b={b}, assignments_to_new (local_idx): {[x[0] for x in assignments_to_new]}")
-                logging.info(f"b={b}, global_spk_indices: {global_spk_indices[b]}")
-
-        return global_spk_indices
-
-    def update_streaming_state(self, streaming_state, spk_queries, global_spk_indices):
-        """
-        Update the streaming state with new speaker queries based on their global indices.
-        This function updates the global embedding set and recalculates speaker centroids.
+        Update the streaming state (in-place) with new speaker queries based on their soft assignments.
 
         Args:
             streaming_state (StreamingNextformerState): The current streaming state.
             spk_queries (torch.Tensor): Speaker queries from the current chunk.
                 Shape: (B, local_num_spks, emb_dim)
-            global_spk_indices (torch.Tensor): Global speaker indices for each local query.
-                Shape: (B, local_num_spks)
-
-        Returns:
-            streaming_state (StreamingNextformerState): The updated streaming state.
+            spk_assignments (torch.Tensor): Soft assignments for each local query.
+                Shape: (B, local_num_spks, max_num_spks)
         """
-        batch_size, local_num_spks, _ = spk_queries.shape
-        for b in range(batch_size):
-            for i in range(local_num_spks):
-                global_index = global_spk_indices[b, i]
-                if global_index != -1:
-                    # Update global_emb_set (circular buffer)
-                    count = streaming_state.global_emb_set_lengths[b, global_index]
-                    insert_idx = count % self.global_emb_set_size
-                    streaming_state.global_emb_set[b, global_index, insert_idx] = spk_queries[b, i]
-                    streaming_state.global_emb_set_lengths[b, global_index] += 1
-
-                    # Update global_spk_centroids
-                    num_valid_embs = min(count + 1, self.global_emb_set_size)
-                    valid_embs = streaming_state.global_emb_set[b, global_index, :num_valid_embs]
-                    streaming_state.global_spk_centroids[b, global_index] = valid_embs.mean(dim=0)
-
-        logging.info(f"updated streaming_state.global_emb_set_lengths: {streaming_state.global_emb_set_lengths}")
+        streaming_state.past_spk_queries = torch.cat([streaming_state.past_spk_queries, spk_queries], dim=1)
+        streaming_state.past_spk_assignments = torch.cat([streaming_state.past_spk_assignments, spk_assignments], dim=1)
         return streaming_state
 
-    def update_streaming_state_last(self, streaming_state, spk_queries, global_spk_indices):
-        """
-        Update the streaming state with new speaker queries based on their global indices.
-        This function updates the global embedding set and recalculates speaker centroids.
-
-        Args:
-            streaming_state (StreamingNextformerState): The current streaming state.
-            spk_queries (torch.Tensor): Speaker queries from the current chunk.
-                Shape: (B, local_num_spks, emb_dim)
-            global_spk_indices (torch.Tensor): Global speaker indices for each local query.
-                Shape: (B, local_num_spks)
-
-        Returns:
-            streaming_state (StreamingNextformerState): The updated streaming state.
-        """
-        # Vectorized version: use advanced indexing to update all valid assignments at once
-        # Create mask for valid assignments (global_index != -1)
-        valid_mask = global_spk_indices != -1  # (B, local_num_spks)
-        
-        if valid_mask.any():
-            # Get indices of all valid (batch, local_speaker) pairs
-            batch_indices, local_indices = torch.where(valid_mask)  # 1D tensors of length num_valid
-            
-            # Get corresponding global indices for valid pairs
-            global_idx_flat = global_spk_indices[batch_indices, local_indices]  # (num_valid,)
-            
-            # Vectorized assignment: update all centroids at once
-            streaming_state.global_spk_centroids[batch_indices, global_idx_flat] = spk_queries[batch_indices, local_indices]
-        
-        return
-
-    def update_streaming_state_ma(self, streaming_state, spk_queries, global_spk_indices):
-        """
-        Update the streaming state with new speaker queries based on their global indices.
-        This function updates the global embedding set and recalculates speaker centroids.
-        This function uses similarity-guided fusion to update the speaker centroids.
-        
-        Note: streaming_state is modified in-place.
-
-        Args:
-            streaming_state (StreamingNextformerState): The current streaming state.
-            spk_queries (torch.Tensor): Speaker queries from the current chunk.
-                Shape: (B, local_num_spks, emb_dim)
-            global_spk_indices (torch.Tensor): Global speaker indices for each local query.
-                Shape: (B, local_num_spks)
-        """
-        # Create mask for valid assignments (global_index != -1)
-        valid_mask = global_spk_indices != -1  # (B, local_num_spks)
-        
-        if not valid_mask.any():
-            return
-        
-        # Get indices of all valid (batch, local_speaker) pairs
-        batch_indices, local_indices = torch.where(valid_mask)  # 1D tensors of length num_valid
-        
-        # Get corresponding global indices for valid pairs
-        global_idx_flat = global_spk_indices[batch_indices, local_indices]  # (num_valid,)
-        
-        # Get current counts for valid speakers
-        counts = streaming_state.global_emb_set_lengths[batch_indices, global_idx_flat]  # (num_valid,)
-        
-        # Get the valid embeddings from global_emb_set
-        # Shape: (num_valid, global_emb_set_size, emb_dim)
-        valid_emb_sets = streaming_state.global_emb_set[batch_indices, global_idx_flat]
-        
-        # Get current speaker queries for valid pairs
-        # Shape: (num_valid, emb_dim)
-        valid_spk_queries = spk_queries[batch_indices, local_indices]
-        
-        # Compute cosine similarity between each query and its history
-        # Shape: (num_valid, global_emb_set_size)
-        sim_to_history = F.cosine_similarity(
-            valid_spk_queries.unsqueeze(1),  # (num_valid, 1, emb_dim)
-            valid_emb_sets,  # (num_valid, global_emb_set_size, emb_dim)
-            dim=2
-        )
-        
-        # Mask out invalid entries (beyond count) in the embedding set
-        # Create a mask for valid positions in the embedding set
-        arange = torch.arange(self.global_emb_set_size, device=counts.device).unsqueeze(0)  # (1, global_emb_set_size)
-        valid_emb_mask = arange < counts.unsqueeze(1)  # (num_valid, global_emb_set_size)
-        
-        # Zero out similarities for invalid positions
-        sim_to_history_masked = torch.where(valid_emb_mask, sim_to_history, torch.tensor(0.0, device=sim_to_history.device))
-        
-        # Calculate coefficients: clamp to ensure non-negative
-        # Handle division by zero by setting coef=0 when count=0 (first embedding for this speaker)
-        coef = torch.where(
-            counts > 0,
-            torch.clamp(sim_to_history_masked.sum(dim=1) / counts, min=0),
-            torch.tensor(0.0, device=counts.device)
-        )  # (num_valid,)
-        
-        # Log the coefficients if needed (optional, for debugging)
-        if self.log:
-            for idx in range(len(batch_indices)):
-                b, i = batch_indices[idx].item(), local_indices[idx].item()
-                count = counts[idx].item()
-                logging.info(f"b={b}, i={i}, count={count}, coef={coef[idx].item()}, sim_matrix: {sim_to_history[idx]}")
-        
-        # Update global_spk_centroids using vectorized operations
-        old_centroids = streaming_state.global_spk_centroids[batch_indices, global_idx_flat]  # (num_valid, emb_dim)
-        new_centroids = (1 - coef.unsqueeze(1)) * old_centroids + coef.unsqueeze(1) * valid_spk_queries
-        streaming_state.global_spk_centroids[batch_indices, global_idx_flat] = new_centroids
-        
-        # Update global_emb_set (circular buffer)
-        insert_indices = counts % self.global_emb_set_size  # (num_valid,)
-        streaming_state.global_emb_set[batch_indices, global_idx_flat, insert_indices] = valid_spk_queries
-        
-        # Increment counts for all updated speakers
-        streaming_state.global_emb_set_lengths[batch_indices, global_idx_flat] += 1
-        
-        return
-
-
-    def update_streaming_state_duration_averaged_v0(self, streaming_state, spk_queries, global_spk_indices, active_frames_per_query):
-        """
-        Update the streaming state with new speaker queries based on their global indices.
-        This function updates the global embedding set and recalculates speaker centroids based on duration-averaged method.
-
-        Args:
-            streaming_state (StreamingNextformerState): The current streaming state.
-            spk_queries (torch.Tensor): Speaker queries from the current chunk.
-                Shape: (B, local_num_spks, emb_dim)
-            global_spk_indices (torch.Tensor): Global speaker indices for each local query.
-                Shape: (B, local_num_spks)
-            active_frames_per_query (torch.Tensor): Number of active frames for each query.
-                Shape: (B, local_num_spks)
-
-        Returns:
-            streaming_state (StreamingNextformerState): The updated streaming state.
-        """
-        # Vectorized version: use advanced indexing to update all valid assignments at once
-        # Create mask for valid assignments (global_index != -1)
-        valid_mask = global_spk_indices != -1  # (B, local_num_spks)
-        
-        if valid_mask.any():
-            # Get indices of all valid (batch, local_speaker) pairs
-            batch_indices, local_indices = torch.where(valid_mask)  # 1D tensors of length num_valid
-            
-            # Get corresponding global indices for valid pairs
-            global_idx_flat = global_spk_indices[batch_indices, local_indices]  # (num_valid,)
-
-            # Get corresponding active frames for valid pairs
-            active_frames_flat = active_frames_per_query[batch_indices, local_indices]  # (num_valid,)
-            
-            # Get old centroids and durations
-            old_centroids = streaming_state.global_spk_centroids[batch_indices, global_idx_flat]  # (num_valid, emb_dim)
-            old_durations = streaming_state.global_spk_centroids_duration[batch_indices, global_idx_flat]  # (num_valid,)
-            
-            # Compute new centroids using proper weighted average formula
-            # C_new = (C_old * D_old + Q_new * d_new) / (D_old + d_new)
-            new_durations = old_durations + active_frames_flat
-            new_centroids = (old_centroids * old_durations.unsqueeze(-1) + 
-                            spk_queries[batch_indices, local_indices] * active_frames_flat.unsqueeze(-1)) / (new_durations.unsqueeze(-1) + 1e-8)
-            #logging.info(f"new centroids durations: {new_durations}")
-            # Update streaming state
-            streaming_state.global_spk_centroids[batch_indices, global_idx_flat] = new_centroids
-            streaming_state.global_spk_centroids_duration[batch_indices, global_idx_flat] = new_durations
-        
-        return
-
-    def update_streaming_state_duration_averaged(self, streaming_state, spk_queries, global_spk_indices, active_frames_per_query):
-        """
-        Update the streaming state with new speaker queries based on their global indices.
-        This function updates the global embedding set and recalculates speaker centroids based on duration-averaged method.
-        To mitigate noisy queries, this function only updates the speaker centroids for queries with at least spk_centroid_update_min_frames active frames.
-
-        Args:
-            streaming_state (StreamingNextformerState): The current streaming state.
-            spk_queries (torch.Tensor): Speaker queries from the current chunk.
-                Shape: (B, local_num_spks, emb_dim)
-            global_spk_indices (torch.Tensor): Global speaker indices for each local query.
-                Shape: (B, local_num_spks)
-            active_frames_per_query (torch.Tensor): Number of active frames for each query.
-                Shape: (B, local_num_spks)
-
-        Returns:
-            streaming_state (StreamingNextformerState): The updated streaming state.
-        """
-        # Vectorized version: use advanced indexing to update all valid assignments at once
-        # Create mask for valid assignments (global_index != -1)
-        valid_mask = (global_spk_indices != -1) & (active_frames_per_query >= self.spk_centroid_update_min_frames)  # (B, local_num_spks)
-        
-        if valid_mask.any():
-            # Get indices of all valid (batch, local_speaker) pairs
-            batch_indices, local_indices = torch.where(valid_mask)  # 1D tensors of length num_valid
-            
-            # Get corresponding global indices for valid pairs
-            global_idx_flat = global_spk_indices[batch_indices, local_indices]  # (num_valid,)
-
-            # Get corresponding active frames for valid pairs
-            active_frames_flat = active_frames_per_query[batch_indices, local_indices]  # (num_valid,)
-            
-            # Get old centroids and durations
-            old_centroids = streaming_state.global_spk_centroids[batch_indices, global_idx_flat]  # (num_valid, emb_dim)
-            old_durations = streaming_state.global_spk_centroids_duration[batch_indices, global_idx_flat]  # (num_valid,)
-            
-            # Compute new centroids using proper weighted average formula
-            # C_new = (C_old * D_old + Q_new * d_new) / (D_old + d_new)
-            new_durations = old_durations + active_frames_flat
-            new_centroids = (old_centroids * old_durations.unsqueeze(-1) + 
-                            spk_queries[batch_indices, local_indices] * active_frames_flat.unsqueeze(-1)) / (new_durations.unsqueeze(-1) + 1e-8)
-            #logging.info(f"new centroids durations: {new_durations}")
-            # Update streaming state
-            streaming_state.global_spk_centroids[batch_indices, global_idx_flat] = new_centroids
-            streaming_state.global_spk_centroids_duration[batch_indices, global_idx_flat] = new_durations
-        
-        return
-
-    def _prune_speaker_buffer(self, streaming_state, batch_idx, speaker_idx, old_centroid):
-        """
-        Prune embeddings for a specific speaker based on similarity to old centroid and buffer overflow.
-        
-        Pruning strategy:
-        1. If count > prune_min_embeddings: Drop embeddings with similarity < prune_similarity_threshold
-        2. If count > buffer_size: Drop oldest embeddings (FIFO) to fit buffer
-        3. Preserve temporal order of remaining embeddings
-        
-        Args:
-            streaming_state (StreamingNextformerState): The current streaming state.
-            batch_idx (int): Batch index
-            speaker_idx (int): Speaker index
-            old_centroid (torch.Tensor): Previous centroid before update (shape: emb_dim)
-        """
-        current_count = streaming_state.global_emb_set_lengths[batch_idx, speaker_idx].item()
-        logging.info(f"pruning speaker buffer: batch_idx: {batch_idx}, speaker_idx: {speaker_idx}, current_count: {current_count}")
-        
-        # Step 1: Similarity-based pruning (remove outliers)
-        if current_count > self.prune_min_embeddings:
-            # Get all buffered embeddings
-            embs = streaming_state.global_emb_set[batch_idx, speaker_idx, :current_count]  # (count, emb_dim)
-            durs = streaming_state.global_emb_set_durations[batch_idx, speaker_idx, :current_count]  # (count,)
-            
-            # Compute cosine similarity to old centroid
-            # Normalize embeddings and centroid
-            embs_norm = F.normalize(embs, p=2, dim=1)  # (count, emb_dim)
-            centroid_norm = F.normalize(old_centroid.unsqueeze(0), p=2, dim=1)  # (1, emb_dim)
-            similarities = torch.matmul(embs_norm, centroid_norm.T).squeeze()  # (count,)
-            logging.info(f"----similarities: {similarities}")
-            
-            # Keep only embeddings with similarity >= threshold
-            keep_mask = similarities >= self.prune_similarity_threshold  # (count,)
-            
-            if keep_mask.sum() > 0:  # Ensure we keep at least some embeddings
-                kept_embs = embs[keep_mask]
-                kept_durs = durs[keep_mask]
-                new_count = keep_mask.sum().item()
-                logging.info(f"----new_count: {new_count}")
-                # Update buffer with kept embeddings (packed at the beginning)
-                streaming_state.global_emb_set[batch_idx, speaker_idx, :new_count] = kept_embs
-                streaming_state.global_emb_set_durations[batch_idx, speaker_idx, :new_count] = kept_durs
-                streaming_state.global_emb_set_lengths[batch_idx, speaker_idx] = new_count
-                current_count = new_count
-        
-        # Step 2: FIFO pruning if buffer overflow (safety check)
-        if current_count > self.global_emb_set_size:
-            logging.info(f"Achtung! This should not happen")
-            # Drop oldest embeddings (first ones) to fit buffer
-            num_to_drop = current_count - self.global_emb_set_size
-            
-            # Shift remaining embeddings to the beginning
-            kept_embs = streaming_state.global_emb_set[batch_idx, speaker_idx, num_to_drop:current_count].clone()
-            kept_durs = streaming_state.global_emb_set_durations[batch_idx, speaker_idx, num_to_drop:current_count].clone()
-            
-            streaming_state.global_emb_set[batch_idx, speaker_idx, :self.global_emb_set_size] = kept_embs
-            streaming_state.global_emb_set_durations[batch_idx, speaker_idx, :self.global_emb_set_size] = kept_durs
-            streaming_state.global_emb_set_lengths[batch_idx, speaker_idx] = self.global_emb_set_size
-
-    def update_streaming_state_buffered(self, streaming_state, spk_queries, global_spk_indices, active_frames_per_query):
-        """
-        Update the streaming state with new speaker queries based on their global indices.
-        This function collects embeddings in a buffer (global_emb_set) and recalculates speaker centroids
-        from all buffered embeddings using duration-weighted averaging.
-        To mitigate noisy queries, this function only updates the speaker centroids for queries with at least 
-        spk_centroid_update_min_frames active frames.
-        
-        After adding new embeddings, this function prunes the buffer by:
-        1. Removing outliers (embeddings with low similarity to previous centroid)
-        2. Removing oldest embeddings if buffer overflows (FIFO)
-
-        Args:
-            streaming_state (StreamingNextformerState): The current streaming state.
-            spk_queries (torch.Tensor): Speaker queries from the current chunk.
-                Shape: (B, local_num_spks, emb_dim)
-            global_spk_indices (torch.Tensor): Global speaker indices for each local query.
-                Shape: (B, local_num_spks)
-            active_frames_per_query (torch.Tensor): Number of active frames for each query.
-                Shape: (B, local_num_spks)
-
-        Returns:
-            streaming_state (StreamingNextformerState): The updated streaming state.
-        """
-        # Create mask for valid assignments (global_index != -1 and sufficient active frames)
-        valid_mask = (global_spk_indices != -1) & (active_frames_per_query >= self.spk_centroid_update_min_frames)  # (B, local_num_spks)
-        
-        if valid_mask.any():
-            # Get indices of all valid (batch, local_speaker) pairs
-            batch_indices, local_indices = torch.where(valid_mask)  # 1D tensors of length num_valid
-            
-            # Get corresponding global indices for valid pairs
-            global_idx_flat = global_spk_indices[batch_indices, local_indices]  # (num_valid,)
-
-            # Get corresponding active frames for valid pairs
-            active_frames_flat = active_frames_per_query[batch_indices, local_indices]  # (num_valid,)
-            
-            # Save old centroids before updating (needed for pruning)
-            old_centroids = streaming_state.global_spk_centroids[batch_indices, global_idx_flat].clone()  # (num_valid, emb_dim)
-            
-            # Get current counts (number of embeddings already stored for each speaker)
-            counts = streaming_state.global_emb_set_lengths[batch_indices, global_idx_flat]  # (num_valid,)
-            
-            # Proactively make space if buffer is full (FIFO: drop oldest)
-            for idx in range(len(batch_indices)):
-                b_idx = batch_indices[idx].item()
-                spk_idx = global_idx_flat[idx].item()
-                current_count = counts[idx].item()
-                
-                if current_count >= self.global_emb_set_size:
-                    # Buffer is full, drop oldest embedding (shift all left by 1)
-                    streaming_state.global_emb_set[b_idx, spk_idx, :-1] = streaming_state.global_emb_set[b_idx, spk_idx, 1:].clone()
-                    streaming_state.global_emb_set_durations[b_idx, spk_idx, :-1] = streaming_state.global_emb_set_durations[b_idx, spk_idx, 1:].clone()
-                    # Update count to make room for new embedding
-                    counts[idx] = self.global_emb_set_size - 1
-                    streaming_state.global_emb_set_lengths[b_idx, spk_idx] = self.global_emb_set_size - 1
-            
-            # Get the embeddings and durations for valid queries
-            valid_spk_queries = spk_queries[batch_indices, local_indices]  # (num_valid, emb_dim)
-            
-            # Append embeddings to buffer at position count
-            streaming_state.global_emb_set[batch_indices, global_idx_flat, counts] = valid_spk_queries
-            
-            # Append durations to buffer at position count (cast to float)
-            streaming_state.global_emb_set_durations[batch_indices, global_idx_flat, counts] = active_frames_flat.float()
-            
-            # Increment counts
-            streaming_state.global_emb_set_lengths[batch_indices, global_idx_flat] += 1
-            
-            # Prune buffers for each updated speaker
-            for idx in range(len(batch_indices)):
-                b_idx = batch_indices[idx].item()
-                spk_idx = global_idx_flat[idx].item()
-                old_centroid = old_centroids[idx]
-                self._prune_speaker_buffer(streaming_state, b_idx, spk_idx, old_centroid)
-            
-            # Recompute centroids from all buffered embeddings
-            # Get updated counts (after increment)
-            new_counts = streaming_state.global_emb_set_lengths[batch_indices, global_idx_flat]  # (num_valid,)
-            
-            # Get all buffered embeddings and durations for these speakers
-            # Shape: (num_valid, global_emb_set_size, emb_dim)
-            buffered_embs = streaming_state.global_emb_set[batch_indices, global_idx_flat]
-            # Shape: (num_valid, global_emb_set_size)
-            buffered_durations = streaming_state.global_emb_set_durations[batch_indices, global_idx_flat]
-            
-            # Create mask for valid buffered embeddings (only 0:count are valid)
-            # Shape: (num_valid, global_emb_set_size)
-            arange = torch.arange(self.global_emb_set_size, device=counts.device).unsqueeze(0)  # (1, global_emb_set_size)
-            valid_emb_mask = arange < new_counts.unsqueeze(1)  # (num_valid, global_emb_set_size)
-            
-            # Mask out invalid embeddings and durations
-            buffered_embs_masked = buffered_embs * valid_emb_mask.unsqueeze(-1)  # (num_valid, global_emb_set_size, emb_dim)
-            buffered_durations_masked = buffered_durations * valid_emb_mask  # (num_valid, global_emb_set_size)
-            
-            # Compute weighted sum: sum(emb[i] * duration[i])
-            # Shape: (num_valid, emb_dim)
-            weighted_sum = (buffered_embs_masked * buffered_durations_masked.unsqueeze(-1)).sum(dim=1)
-            
-            # Compute total duration: sum(duration[i])
-            # Shape: (num_valid,)
-            total_durations = buffered_durations_masked.sum(dim=1)
-            
-            # Compute centroids: sum(emb[i] * duration[i]) / sum(duration[i])
-            # Shape: (num_valid, emb_dim)
-            new_centroids = weighted_sum / (total_durations.unsqueeze(-1) + 1e-8)
-            
-            # Update streaming state
-            streaming_state.global_spk_centroids[batch_indices, global_idx_flat] = new_centroids
-            streaming_state.global_spk_centroids_duration[batch_indices, global_idx_flat] = total_durations
-        
-        return
-
-    def _prefill_new_speakers(
+    def get_local_to_global_assignments(
         self,
-        centroids: torch.Tensor,  # (B, max_num_spks, emb_dim)
-        queries: torch.Tensor,     # (B, local_num_spks, emb_dim)
-        global_spk_indices: torch.Tensor  # (B, local_num_spks)
-    ) -> torch.Tensor:
+        spk_queries,
+        streaming_state,
+        dustbin_threshold: float = 0.5,
+        zero_norm_threshold: float = 1e-8,
+        zero_score: float = -10000.0,
+    ):
         """
-        Pre-fill empty centroid slots with their assigned queries.
-        This handles new speaker initialization before transformer processing.
-        
-        When a new speaker appears (empty centroid slot gets assigned a query),
-        this function initializes that slot with the query embedding so the 
-        transformer sees meaningful input instead of zeros.
+        Compute soft local-to-global assignments using partial Sinkhorn and dustbin handling.
+
+        Args:
+            spk_queries (torch.Tensor): Local speaker queries for the current chunk.
+                Shape: (B, local_num_spks, emb_dim)
+            streaming_state (StreamingNextformerState): Streaming state containing past queries and assignments.
+            dustbin_threshold (float): Threshold for dustbin score to allocate new speakers.
+            zero_norm_threshold (float): L2 norm threshold to treat a query as a zero vector.
+            zero_score (float): Score value used to mask zero-vector rows/cols.
+
+        Returns:
+            spk_assignments (torch.Tensor): Soft assignments from local queries to global speakers.
+                Shape: (B, local_num_spks, max_num_spks)
+        """
+        past_spk_queries = streaming_state.past_spk_queries
+        past_spk_assignments = streaming_state.past_spk_assignments
+        batch_size, local_num_spks, _ = spk_queries.shape
+        num_past = past_spk_queries.shape[1]
+
+        # Mask zero-vector local/past queries
+        local_zero = spk_queries.norm(dim=2) < zero_norm_threshold
+        past_zero = past_spk_queries.norm(dim=2) < zero_norm_threshold
+
+        # Scores: (B, local_num_spks, num_past)
+        if self.score_similarity == "cosine":
+            spk_queries_norm = F.normalize(spk_queries, p=2, dim=2, eps=zero_norm_threshold)
+            past_spk_queries_norm = F.normalize(past_spk_queries, p=2, dim=2, eps=zero_norm_threshold)
+            scores = torch.bmm(spk_queries_norm, past_spk_queries_norm.transpose(1, 2)) / self.cosine_temperature
+        elif self.score_similarity == "scaled_dot":
+            emb_dim = spk_queries.shape[-1]
+            scores = torch.bmm(spk_queries, past_spk_queries.transpose(1, 2)) / math.sqrt(emb_dim)
+        else:
+            raise ValueError(f"Invalid score similarity mode: {self.score_similarity}")
+
+        scores = scores.masked_fill(local_zero.unsqueeze(2), zero_score)
+        scores = scores.masked_fill(past_zero.unsqueeze(1), zero_score)
+
+        # Partial Sinkhorn: (B, local_num_spks + 1, num_past + 1)
+        #logging.info(f"scores: {scores}")
+        assign_aug = self.partial_sinkhorn(scores)
+        #logging.info(f"assign_aug: {assign_aug}")
+        local_to_past = assign_aug[:, :local_num_spks, :num_past]
+        dustbin_scores = assign_aug[:, :local_num_spks, -1]
+
+        # Local -> global via past assignments
+        if num_past > 0:
+            local_to_global = torch.bmm(local_to_past, past_spk_assignments)
+        else:
+            local_to_global = torch.zeros(
+                (batch_size, local_num_spks, self.max_num_spks),
+                device=spk_queries.device,
+                dtype=spk_queries.dtype,
+            )
+
+        spk_assignments = local_to_global.clone()
+
+        # Allocate new global slots for dustbin matches
+        if past_spk_assignments.numel() > 0:
+            used_global = past_spk_assignments.max(dim=1)[0] > 0.5
+        else:
+            used_global = torch.zeros(
+                (batch_size, self.max_num_spks),
+                device=spk_queries.device,
+                dtype=torch.bool,
+            )
+
+        #logging.info(f"dustbin_scores: {dustbin_scores}")
+        for b in range(batch_size):
+            available = torch.where(~used_global[b])[0].tolist()
+            if not available:
+                #logging.info(f"b={b}, no available global slots")
+                continue
+            for local_idx in range(local_num_spks):
+                if local_zero[b, local_idx]:
+                    continue
+                if dustbin_scores[b, local_idx] > dustbin_threshold and available:
+                    global_idx = available.pop(0)
+                    #logging.info(f"b={b}, creating new global slot for global_idx: {global_idx} for local speaker local_idx: {local_idx}")
+                    spk_assignments[b, local_idx, global_idx] += dustbin_scores[b, local_idx]
+
+        #logging.info(f"spk_assignments: {spk_assignments}")
+        return spk_assignments
+
+    def get_global_logits(self, local_logits, spk_assignments, offset: int, dur: int):
+        """
+        Build per-chunk global logits from local logits and local-to-global assignments.
+
+        Args:
+            local_logits (torch.Tensor): Local logits tensor for the current chunk.
+                Shape: (batch_size, local_frames, local_num_spks)
+            spk_assignments (torch.Tensor): Soft assignments for each local query.
+                Shape: (batch_size, local_num_spks, max_num_spks)
+            offset (int): Start offset into the local frame axis.
+            dur (int): Duration (number of frames) to update.
+
+        Returns:
+            chunk_logits (torch.Tensor): Per-chunk logits in global speaker space.
+                Shape: (batch_size, dur, max_num_spks)
+        """
+        local_logits_slice = local_logits[:, offset : offset + dur, :]
+        local_preds = torch.sigmoid(local_logits_slice)
+        global_preds = torch.bmm(local_preds, spk_assignments)
+        global_logits = torch.logit(global_preds, eps=1e-6)
+        return global_logits
+
+    def partial_sinkhorn(self, scores):
+        """
+        Perform partial Sinkhorn normalization on a log-score matrix.
         
         Args:
-            centroids: Current centroid embeddings
-                Shape: (B, max_num_spks, emb_dim)
-            queries: New query embeddings from current chunk
-                Shape: (B, local_num_spks, emb_dim)
-            global_spk_indices: Assignment of local queries to global centroid slots
-                Shape: (B, local_num_spks)
-                Values: global slot index or -1 if unassigned
+            scores: [Batch, M, N] log-scores
         
         Returns:
-            centroids_prefilled: Centroids with new speakers initialized
-                Shape: (B, max_num_spks, emb_dim)
+            Augmented normalized assignment matrix of shape [Batch, M+1, N+1]
         """
-        B, max_num_spks, emb_dim = centroids.shape
-        local_num_spks = queries.shape[1]
-        centroids_prefilled = centroids.clone()
-        
-        # Compute norms to identify empty slots (zero vectors)
-        centroid_norms = torch.norm(centroids, p=2, dim=2)  # (B, max_num_spks)
-        is_empty = centroid_norms < 1e-8  # (B, max_num_spks)
-        
-        # VECTORIZED: Find all queries assigned to empty slots
-        # Condition: global_spk_indices != -1 AND assigned slot is empty
-        valid_assignment = global_spk_indices != -1  # (B, local_num_spks)
-        
-        if valid_assignment.any():
-            # Get batch and local indices where there's a valid assignment
-            batch_indices, local_indices = torch.where(valid_assignment)  # 1D tensors
-            
-            # Get corresponding global indices
-            global_indices = global_spk_indices[batch_indices, local_indices]  # 1D tensor
-            
-            # Check which of these assigned slots are empty
-            assigned_slot_is_empty = is_empty[batch_indices, global_indices]  # 1D tensor
-            
-            # Filter to only new speaker assignments (assigned to empty slots)
-            batch_indices_new = batch_indices[assigned_slot_is_empty]
-            local_indices_new = local_indices[assigned_slot_is_empty]
-            global_indices_new = global_indices[assigned_slot_is_empty]
-            
-            # Initialize all empty slots with their assigned queries (vectorized)
-            if len(batch_indices_new) > 0:
-                centroids_prefilled[batch_indices_new, global_indices_new] = queries[batch_indices_new, local_indices_new]
-        
-        return centroids_prefilled
+        B, M, N = scores.shape
 
-    def _augment_assignments_for_mask(
-        self,
-        global_spk_indices: torch.Tensor  # (B, local_num_spks)
-    ) -> torch.Tensor:
-        """
-        Apply assignment swap augmentation during training to create train-test robustness.
+        # Create augmented container: (M+1) x (N+1) in log-space, initialized to zeros
+        aug_scores = scores.new_zeros((B, M + 1, N + 1))
+        aug_scores[:, :M, :N] = scores
         
-        This augmentation randomly swaps speaker assignments, which creates incorrect
-        attention patterns in the mask. This forces the transformer to learn to ignore
-        or downweight irrelevant query-centroid pairs, mimicking test-time assignment errors.
+        # Fill dustbin row/col with trainable log-score bias (dustbin_val)
+        if self.score_similarity == "cosine":
+            aug_scores[:, M, :] = self.sinkhorn_dustbin_val / self.cosine_temperature
+            aug_scores[:, :, N] = self.sinkhorn_dustbin_val / self.cosine_temperature
+        elif self.score_similarity == "scaled_dot":
+            aug_scores[:, M, :] = self.sinkhorn_dustbin_val
+            aug_scores[:, :, N] = self.sinkhorn_dustbin_val
+        else:
+            raise ValueError(f"Invalid score similarity mode: {self.score_similarity}")
         
-        The key insight: By training with intentionally wrong attention masks, the model
-        learns robust attention weights that can reject mismatched information at test time.
-        
-        Args:
-            global_spk_indices: Assignment of local queries to global centroid slots
-                Shape: (B, local_num_spks)
-                Values: global slot index or -1 if unassigned
-        
-        Returns:
-            augmented_indices: Possibly corrupted assignments for attention mask creation
-                Shape: (B, local_num_spks)
-        """
-        if not self.training or self.assignment_swap_prob == 0.0:
-            return global_spk_indices
-        
-        B, local_num_spks = global_spk_indices.shape
-        device = global_spk_indices.device
-        
-        # Clone to avoid modifying the original
-        augmented_indices = global_spk_indices.clone()
-        
-        # Only swap valid assignments (not -1)
-        valid_mask = global_spk_indices != -1  # (B, local_num_spks)
-        
-        # Create swap mask: which assignments should be swapped
-        swap_mask = torch.rand(B, local_num_spks, device=device) < self.assignment_swap_prob
-        apply_swap = swap_mask & valid_mask  # (B, local_num_spks)
-        
-        if apply_swap.any():
-            # Strategy: Randomly reassign to a different speaker slot
-            # This simulates the model assigning a query to the wrong speaker
-            random_slots = torch.randint(0, self.max_num_spks, (B, local_num_spks), device=device)
-            augmented_indices[apply_swap] = random_slots[apply_swap]
-        
-        return augmented_indices
+        # Define target log-marginals
+        # Real Rows/Cols sum to 1 -> log(1) = 0
+        r = aug_scores.new_zeros((B, M + 1, 1))
+        c = aug_scores.new_zeros((B, 1, N + 1))
+        # Dustbin Row sums to N -> log(N)
+        r[:, M, 0] = math.log(N) if N > 0 else -10000.0
+        # Dustbin Col sums to M -> log(M)
+        c[:, 0, N] = math.log(M) if M > 0 else -10000.0
 
-    def _create_centroid_update_mask(
-        self,
-        centroids: torch.Tensor,  # (B, max_num_spks, emb_dim)
-        queries: torch.Tensor,     # (B, local_num_spks, emb_dim)
-        global_spk_indices: torch.Tensor  # (B, local_num_spks)
-    ) -> torch.Tensor:
-        """
-        Create attention mask for transformer-based centroid update.
-        
-        The mask implements the following rules:
-        1. Zero centroids and zero queries don't participate in attention
-        2. Each centroid can attend to: itself + its assigned query (if any)
-        3. Each query can attend to: itself + its assigned centroid (if any)
-        4. Centroids cannot attend to other centroids
-        5. Queries cannot attend to other queries
-        
-        This prevents:
-        - Unassigned centroids from getting corrupted by irrelevant queries
-        - Information leakage between different speakers
-        
-        Args:
-            centroids: Current centroid embeddings (after prefilling)
-                Shape: (B, max_num_spks, emb_dim)
-            queries: New query embeddings from current chunk
-                Shape: (B, local_num_spks, emb_dim)
-            global_spk_indices: Assignment of local queries to global centroid slots
-                Shape: (B, local_num_spks)
-                Values: global slot index or -1 if unassigned
-        
-        Returns:
-            mask: Attention mask for transformer
-                Shape: (B, total_len, total_len) where total_len = max_num_spks + local_num_spks
-                Values: True = masked out (not allowed), False = allowed
-        """
-        B, max_num_spks, emb_dim = centroids.shape
-        local_num_spks = queries.shape[1]
-        total_len = max_num_spks + local_num_spks
-        device = centroids.device
-        
-        # Initialize: mask everything (True = masked out)
-        mask = torch.ones(B, total_len, total_len, dtype=torch.bool, device=device)
-        
-        # Compute norms to identify non-zero centroids and queries
-        centroid_norms = torch.norm(centroids, p=2, dim=2)  # (B, max_num_spks)
-        query_norms = torch.norm(queries, p=2, dim=2)  # (B, local_num_spks)
-        
-        is_nonzero_centroid = centroid_norms > 1e-8  # (B, max_num_spks)
-        is_nonzero_query = query_norms > 1e-8  # (B, local_num_spks)
-        
-        # Rule 1: Self-attention for non-zero centroids
-        # Set mask[b, i, i] = False where is_nonzero_centroid[b, i] = True
-        batch_idx_cent = torch.arange(B, device=device).unsqueeze(1).expand(-1, max_num_spks)  # (B, max_num_spks)
-        centroid_idx = torch.arange(max_num_spks, device=device).unsqueeze(0).expand(B, -1)  # (B, max_num_spks)
-        mask[batch_idx_cent[is_nonzero_centroid], centroid_idx[is_nonzero_centroid], centroid_idx[is_nonzero_centroid]] = False
-        
-        # Rule 2: Self-attention for non-zero queries
-        # Set mask[b, max_num_spks+j, max_num_spks+j] = False where is_nonzero_query[b, j] = True
-        batch_idx_query = torch.arange(B, device=device).unsqueeze(1).expand(-1, local_num_spks)  # (B, local_num_spks)
-        query_local_idx = torch.arange(local_num_spks, device=device).unsqueeze(0).expand(B, -1)  # (B, local_num_spks)
-        query_pos = max_num_spks + query_local_idx  # (B, local_num_spks)
-        mask[batch_idx_query[is_nonzero_query], query_pos[is_nonzero_query], query_pos[is_nonzero_query]] = False
-        
-        # Rule 3: Cross-connections based on assignment (vectorized)
-        # For each valid assignment, create bidirectional connection between centroid and query
-        
-        # Identify valid assignments: assigned AND query is non-zero
-        valid_assignment = (global_spk_indices != -1) & is_nonzero_query  # (B, local_num_spks)
-        
-        if valid_assignment.any():
-            # Get batch and local indices where assignment is valid
-            batch_indices, local_indices = torch.where(valid_assignment)  # 1D tensors
-            
-            # Get corresponding global centroid indices
-            global_indices = global_spk_indices[batch_indices, local_indices]  # 1D tensor
-            
-            # Check if assigned centroids are non-zero
-            centroid_is_nonzero = is_nonzero_centroid[batch_indices, global_indices]  # 1D tensor
-            
-            # Filter to only keep assignments where centroid is also non-zero
-            batch_indices = batch_indices[centroid_is_nonzero]
-            local_indices = local_indices[centroid_is_nonzero]
-            global_indices = global_indices[centroid_is_nonzero]
-            
-            # Compute query positions
-            query_positions = max_num_spks + local_indices
-            
-            # Set bidirectional connections (vectorized)
-            mask[batch_indices, global_indices, query_positions] = False  # Centroid -> Query
-            mask[batch_indices, query_positions, global_indices] = False  # Query -> Centroid
-        
-        return mask
+        # Sinkhorn Iterations (Direct Matrix Update in Log Space)
+        P = aug_scores
+        for _ in range(self.sinkhorn_n_iters):
+            # Row normalization: normalize each row to match target marginal r
+            P = P - torch.logsumexp(P, dim=2, keepdim=True) + r
+            # Column normalization: normalize each column to match target marginal c
+            P = P - torch.logsumexp(P, dim=1, keepdim=True) + c
 
-    def update_streaming_state_with_transformer(
-        self, 
-        streaming_state: StreamingNextformerState,
-        spk_queries: torch.Tensor,
-        global_spk_indices: torch.Tensor,
-        active_frames_per_query: torch.Tensor,
-        centroid_encoder: torch.nn.Module
-    ) -> None:
-        """
-        Update streaming state using transformer-based centroid fusion.
-        
-        This function fuses current centroids with new queries using a transformer
-        encoder with controlled attention patterns. The transformer learns how to
-        update centroids based on new observations while preventing corruption
-        from unrelated speakers.
-        
-        Args:
-            streaming_state: Current streaming state containing global centroids
-            spk_queries: New query embeddings from current chunk
-                Shape: (B, local_num_spks, emb_dim)
-            global_spk_indices: Assignment of local queries to global centroid slots
-                Shape: (B, local_num_spks)
-                Values: global slot index or -1 if unassigned
-            active_frames_per_query: Number of active frames for each query
-                Shape: (B, local_num_spks)
-            centroid_encoder: Transformer encoder module for centroid update
-        """
-        B, local_num_spks, emb_dim = spk_queries.shape
-        device = spk_queries.device
-        
-        # Step 1: Get current centroids
-        current_centroids = streaming_state.global_spk_centroids  # (B, max_num_spks, emb_dim)
-        
-        # Step 2: Pre-fill empty slots with assigned queries (solves Issue 2)
-        centroids_prefilled = self._prefill_new_speakers(
-            current_centroids, spk_queries, global_spk_indices
-        )
-        
-        # Step 3: Create input sequence [centroids, queries]
-        input_seq = torch.cat([centroids_prefilled, spk_queries], dim=1)
-        # Shape: (B, max_num_spks + local_num_spks, emb_dim)
-        
-        # Step 3.5: Apply assignment augmentation for attention mask (train-test robustness)
-        # During training, randomly swap some assignments to create incorrect attention patterns.
-        # This forces the transformer to learn to ignore/downweight mismatched query-centroid pairs.
-        global_spk_indices_for_mask = self._augment_assignments_for_mask(global_spk_indices)
-        
-        # Step 4: Create attention mask (solves Issue 1)
-        # Note: We use augmented assignments for mask but keep original for final updates
-        attn_mask_full = self._create_centroid_update_mask(
-            centroids_prefilled, spk_queries, global_spk_indices_for_mask
-        )
-        # Shape: (B, total_len, total_len)
-        # True = masked out, False = allowed
-        
-        # Step 5: Run transformer encoder with custom 2D attention masks
-        # We need full control over the attention pattern to prevent:
-        # - Centroids from attending to other centroids
-        # - Queries from attending to other queries
-        # - Unassigned centroids from getting corrupted by irrelevant queries
-        
-        # Convert our boolean mask to attention scores format
-        # Our mask: True = masked out, False = allowed
-        # Transformer expects: 0 = attend, -10000 = masked out
-        NEG_INF = -10000.0
-        attn_scores_mask = torch.where(attn_mask_full, NEG_INF, 0.0)  # (B, total_len, total_len)
-        attn_scores_mask = attn_scores_mask.unsqueeze(1)  # (B, 1, total_len, total_len) for multi-head
-        
-        # Run through transformer layers manually to apply custom mask
-        encoder_states = input_seq  # (B, total_len, emb_dim)
-        
-        for layer in centroid_encoder.layers:
-            # Each layer expects (encoder_states, encoder_attn_mask, memory_states)
-            # where encoder_attn_mask has shape (B, 1, L, L)
-            encoder_states = layer(encoder_states, attn_scores_mask, encoder_states)
-        
-        # Apply final layer norm if present
-        if centroid_encoder.final_layer_norm is not None:
-            encoder_states = centroid_encoder.final_layer_norm(encoder_states)
-        
-        output_seq = encoder_states  # (B, total_len, emb_dim)
-        
-        # Step 6: Extract updated centroids (first max_num_spks positions)
-        updated_centroids = output_seq[:, :self.max_num_spks, :]  # (B, max_num_spks, emb_dim)
-        
-        # Step 7: Selective update - only update centroids that have assigned queries
-        # with sufficient active frames. This prevents drift for unassigned centroids
-        # and avoids updating based on unreliable short-duration queries.
-        # Create mask indicating which centroids should be updated (VECTORIZED)
-        should_update_centroid = torch.zeros(B, self.max_num_spks, dtype=torch.bool, device=device)
-        
-        # Find all valid assignments (where global_spk_indices != -1 AND active_frames >= threshold)
-        valid_assignment_mask = (global_spk_indices != -1) & (active_frames_per_query >= self.spk_centroid_update_min_frames)  # (B, local_num_spks)
-        
-        if valid_assignment_mask.any():
-            # Get batch and local indices of all valid assignments
-            batch_indices, local_indices = torch.where(valid_assignment_mask)  # 1D tensors
-            
-            # Get corresponding global indices
-            global_indices = global_spk_indices[batch_indices, local_indices]  # 1D tensor
-            
-            # Set should_update_centroid[b, global_idx] = True for all valid assignments
-            should_update_centroid[batch_indices, global_indices] = True
-        
-        # Apply selective update: keep old centroids if no assignment or insufficient frames, use updated if assigned with sufficient frames
-        final_centroids = torch.where(
-            should_update_centroid.unsqueeze(-1),  # (B, max_num_spks, 1)
-            updated_centroids,                      # Use updated version
-            current_centroids                       # Keep original version
-        )
-        
-        # Step 8: Write back to streaming state
-        streaming_state.global_spk_centroids = final_centroids
-        
-        # Step 9: Update durations (for tracking/logging)
-        # Reuse valid_assignment_mask from Step 7 (same condition)
-        if valid_assignment_mask.any():
-            batch_indices, local_indices = torch.where(valid_assignment_mask)
-            global_idx_flat = global_spk_indices[batch_indices, local_indices]
-            active_frames_flat = active_frames_per_query[batch_indices, local_indices]
-            
-            # Update durations
-            streaming_state.global_spk_centroids_duration[batch_indices, global_idx_flat] += active_frames_flat
-        
-        return
+        # Final row normalization: normalize each row to match target marginal r
+        P = P - torch.logsumexp(P, dim=2, keepdim=True) + r
+
+        # Exponentiate and return the full augmented matrix
+        return P.exp()

@@ -47,7 +47,6 @@ from nemo.core.classes.common import PretrainedModelInfo
 from nemo.core.neural_types import AudioSignal, LengthsType, NeuralType, LogitsType
 from nemo.core.neural_types.elements import ProbsType
 from nemo.utils import logging
-from nemo.collections.asr.parts.utils.offline_clustering import SpeakerClustering
 
 __all__ = ['NextformerEncLabelModel']
 
@@ -131,12 +130,6 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             self.device
         )
 
-        centroid_encoder_cfg = self._cfg.get('centroid_encoder', None)
-        if centroid_encoder_cfg is not None:
-            self.centroid_encoder = NextformerEncLabelModel.from_config_dict(centroid_encoder_cfg).to(self.device)
-        else:
-            self.centroid_encoder = None
-
         self.nextformer_modules = NextformerEncLabelModel.from_config_dict(self._cfg.nextformer_modules).to(
             self.device
         )
@@ -179,27 +172,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.pil_metric = self._cfg.get("pil_metric", "bce")
         self.oracle_queries_train = self._cfg.get("oracle_queries_train", False)
         self.oracle_queries_test = self._cfg.get("oracle_queries_test", False)
-        self.oracle_centroids_train = self._cfg.get("oracle_centroids_train", False)
-        self.oracle_centroids_test = self._cfg.get("oracle_centroids_test", False)
         self.oracle_assignment = self._cfg.get("oracle_assignment", False)
-        self.clustering_assignment = self._cfg.get("clustering_assignment", False)
-        if self.clustering_assignment:
-            self.speaker_clustering = SpeakerClustering(cuda=self.cuda, device=self.device)
-        else:
-            self.speaker_clustering = None
-        # Oracle centroid scheduling parameters
-        self.oracle_centroid_rate_init = self._cfg.get("oracle_centroid_rate_init", 1.0)
-        self.oracle_centroid_rate_min = self._cfg.get("oracle_centroid_rate_min", 1.0)
-        self.oracle_centroid_rate_decay = self._cfg.get("oracle_centroid_rate_decay", 0.1)
-        self.oracle_centroid_rate_decay_type = self._cfg.get("oracle_centroid_rate_decay_type", "linear")
-        self.oracle_centroid_rate_warmup_epochs = self._cfg.get("oracle_centroid_rate_warmup_epochs", 0)
-        # Initialize current oracle centroid rate (will be decayed during training)
-        self.oracle_centroid_rate = self.oracle_centroid_rate_init
-        
-        self.q_contrastive_min_frames_positive = self._cfg.get("q_contrastive_min_frames_positive", 10)
-        self.q_contrastive_min_frames_anchor = self._cfg.get("q_contrastive_min_frames_anchor", 5)
-        self.q_contrastive_max_frames = self._cfg.get("q_contrastive_max_frames", 32)
-        self.centroid_update_period = self._cfg.get("centroid_update_period", 1)
         
         self.streaming_mode = self.cfg.get("streaming_mode", False)
         self.save_hyperparameters("cfg")
@@ -212,20 +185,6 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
     def _init_loss_weights(self):
         pil_weight = self._cfg.get("pil_weight", 1.0)
         ats_weight = self._cfg.get("ats_weight", 0.0)
-        self.q_sim_weight = self._cfg.get("q_sim_weight", 0.5)
-        self.emb_sim_weight = self._cfg.get("emb_sim_weight", 0.0)
-        self.q_contrastive_weight = self._cfg.get("q_contrastive_weight", 0.0)
-        self.q_contrastive_temperature = self._cfg.get("q_contrastive_temperature", 0.1)
-        self.q_contrastive_extra_positive = self._cfg.get("q_contrastive_extra_positive", False)
-        self.q_contrastive_extra_positive_rate = self._cfg.get("q_contrastive_extra_positive_rate", 0.1)
-        self.q_contrastive_duration_averaged = self._cfg.get("q_contrastive_duration_averaged", False)
-        self.q_contrastive_aam = self._cfg.get("q_contrastive_aam", 0.0)
-        self.q_contrastive_cross_batch = self._cfg.get("q_contrastive_cross_batch", False)
-        # Weight for combining v5 (centroid-based) and v3 (sampled centroid) losses
-        # 0.0 = only v5, 1.0 = only v3, 0.5 = equal mixture
-        self.q_contrastive_v3_weight = self._cfg.get("q_contrastive_v3_weight", 0.0)
-        # Centroid-anchored contrastive loss (symmetric to query-anchored)
-        self.c_contrastive_weight = self._cfg.get("c_contrastive_weight", 0.0)
         total_weight = pil_weight + ats_weight
         if total_weight == 0:
             raise ValueError(
@@ -233,6 +192,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             )
         self.pil_weight = pil_weight / total_weight
         self.ats_weight = ats_weight / total_weight
+        self.global_pil_weight = self._cfg.get("global_pil_weight", 1.0)
 
     def _init_eval_metrics(self):
         """
@@ -423,8 +383,6 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 Shape: (num_chunks * batch_size, local_num_spks, query_dim)
             active_frames_per_query (torch.Tensor): Tensor containing the number of active frames per query
                 Shape: (num_chunks * batch_size, local_num_spks)
-            current_spk_centroids (torch.Tensor): Tensor containing global speaker centroids before each chunk update
-                Shape: (num_chunks * batch_size, max_num_spks, query_dim)
         """
         processed_signal, processed_signal_length = self.process_signal(
             audio_signal=audio_signal, audio_signal_length=audio_signal_length
@@ -433,10 +391,10 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         if self.streaming_mode:
             raise NotImplementedError("Streaming mode is not implemented for Nextformer model.")
         else:
-            logits, emb_seq, local_logits, local_queries, active_frames_per_query, current_spk_centroids = self.forward_offline(
+            logits, local_logits, local_queries, active_frames_per_query = self.forward_offline(
                 processed_signal=processed_signal, processed_signal_length=processed_signal_length, targets=targets
             )
-            return logits, emb_seq, local_logits, local_queries, active_frames_per_query, current_spk_centroids
+            return logits, local_logits, local_queries, active_frames_per_query
 
     def _create_batch_of_chunks_extra(
         self,
@@ -690,15 +648,12 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         Returns:
             logits (torch.Tensor): Tensor containing predicted speaker labels
                 Shape: (batch_size, total_n_frames, max_num_spks)
-            emb_seq (torch.Tensor): Encoder embeddings (placeholder for now)
             local_logits (torch.Tensor): Tensor containing local speaker logits
                 Shape: (num_chunks * batch_size, lc+chunk_len+rc, local_num_spks)
             local_queries (torch.Tensor): Tensor containing local speaker queries
                 Shape: (num_chunks * batch_size, local_num_spks, query_dim)
             active_frames_per_query (torch.Tensor): Tensor containing the number of active frames per query
                 Shape: (num_chunks * batch_size, local_num_spks)
-            current_spk_centroids (torch.Tensor): Tensor containing global speaker centroids before each chunk update
-                Shape: (num_chunks * batch_size, max_num_spks, query_dim)
         """
         batch_size, ch, sig_length = processed_signal.shape
 
@@ -961,246 +916,59 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             spk_queries = spk_queries_enhanced.view(batch_size, num_chunks, local_num_spks, emb_dim).transpose(0, 1)
             spk_queries = spk_queries.reshape(num_chunks * batch_size, local_num_spks, emb_dim)
 
-        logits = torch.full(
-            (batch_size, total_n_frames, self.nextformer_modules.max_num_spks),
-            -1e9,
-            dtype=local_logits.dtype,
-            device=local_logits.device
+        # Collect per-chunk logits and concatenate for differentiable assembly
+        logits_list = []
+
+        streaming_state = self.nextformer_modules.init_streaming_state(
+            batch_size=processed_signal.shape[0], device=self.device
         )
 
-        spk_clustering_indices_list = []
-        spk_clustering_indices = None
-        if self.clustering_assignment and not self.training:
-            emb_dim = spk_queries.shape[-1]
-            spk_queries_reshaped = spk_queries.view(num_chunks, batch_size, local_num_spks, emb_dim).transpose(0, 1)
-            spk_queries_reshaped = spk_queries_reshaped.reshape(batch_size, num_chunks * local_num_spks, emb_dim)
-            spk_queries_norm = torch.norm(spk_queries_reshaped, p=2, dim=2, keepdim=True)  # (B, N, 1)
-            spk_queries_normalized = spk_queries_reshaped / (spk_queries_norm + 1e-8)  # (B, N, D)
-            
-            # Identify valid (non-zero) queries - threshold for detecting zero queries
-            valid_queries_mask = (spk_queries_norm.squeeze(2) > 1e-6)  # (B, N)
-            
-            for b in range(batch_size):
-                valid_mask_b = valid_queries_mask[b]  # (N,)
-                num_valid = valid_mask_b.sum().item()
-                logging.info(f"b={b}, num_valid: {num_valid}")
-                
-                # Initialize all indices as -1 (unmatched)
-                clustered_indices = torch.full((valid_mask_b.shape[0],), -1, dtype=torch.long, device=self.device)
-                
-                if num_valid > 0:
-                    # Extract only valid queries (already normalized)
-                    valid_indices = torch.where(valid_mask_b)[0]  # Indices of valid queries
-                    valid_queries_normalized = spk_queries_normalized[b, valid_mask_b, :]  # (num_valid, D)
-                    
-                    # Compute cosine similarity only among valid queries
-                    cos_sim_valid = torch.matmul(valid_queries_normalized, valid_queries_normalized.T)  # (num_valid, num_valid)
-                    
-                    # Run clustering on valid queries only
-                    clustered_indices_valid = self.speaker_clustering.forward_unit_infer(
-                        cos_sim_valid, max_num_speakers=self.nextformer_modules.max_num_spks
-                    )  # (num_valid,)
-                    
-                    # Ensure clustering results are on the same device as the model
-                    clustered_indices_valid = clustered_indices_valid.to(self.device)
-                    
-                    # Validate clustering results
-                    if clustered_indices_valid.min() < 0:
-                        logging.warning(f"Clustering returned negative indices (min={clustered_indices_valid.min().item()}). Clamping to 0.")
-                        clustered_indices_valid = clustered_indices_valid.clamp(min=0)
-                    
-                    if clustered_indices_valid.max() >= self.nextformer_modules.max_num_spks:
-                        logging.warning(
-                            f"Clustering returned indices >= max_num_spks "
-                            f"(max={clustered_indices_valid.max().item()}, max_num_spks={self.nextformer_modules.max_num_spks}). "
-                            f"Clamping to max_num_spks-1."
-                        )
-                        clustered_indices_valid = clustered_indices_valid.clamp(max=self.nextformer_modules.max_num_spks - 1)
-                    
-                    # Check number of unique clusters
-                    num_clusters = len(torch.unique(clustered_indices_valid))
-                    if num_clusters > self.nextformer_modules.max_num_spks:
-                        logging.warning(
-                            f"Clustering produced {num_clusters} clusters, exceeding max_num_spks={self.nextformer_modules.max_num_spks}. "
-                            f"This may indicate a clustering algorithm issue."
-                        )
-                    
-                    # Map clustering results back to original indices
-                    clustered_indices[valid_indices] = clustered_indices_valid
-                
-                logging.info(f"b={b}, clustered_indices: {clustered_indices}")
-                spk_clustering_indices_list.append(clustered_indices)
-            
-            spk_clustering_indices = torch.stack(spk_clustering_indices_list, dim=0) # (B, N)
-            spk_clustering_indices = spk_clustering_indices.view(batch_size, num_chunks, local_num_spks).transpose(0, 1)
-            spk_clustering_indices = spk_clustering_indices.reshape(num_chunks * batch_size, local_num_spks)
+        for chunk_idx in range(num_chunks):
+            start = chunk_idx * chunk_len
+            end = min(start + chunk_len, total_n_frames)
+            dur = end - start
+            offset = min(lc, start)
+            spk_queries_chunk = spk_queries[chunk_idx * batch_size:(chunk_idx + 1) * batch_size, :, :] # (batch_size, local_num_spks, emb_dim)
+            local_logits_chunk = local_logits[chunk_idx * batch_size:(chunk_idx + 1) * batch_size, :, :] # (batch_size, lc+chunk_len+rc, local_num_spks)
 
-        if True:
-            # now fill logits using streaming logic
-            # this is a streaming state with real centroids
-            streaming_state = self.nextformer_modules.init_streaming_state(
-                batch_size=processed_signal.shape[0], device=self.device
-            )
-            # this is a streaming state with oracle centroids
-            streaming_state_oracle = None
-            if (self.oracle_centroids_train and self.training) or (not self.training):
-                streaming_state_oracle = self.nextformer_modules.init_streaming_state(
-                    batch_size=processed_signal.shape[0], device=self.device
+            if self.oracle_assignment and local_target_indices is not None:
+                # Use oracle local-to-global assignments
+                global_spk_indices_oracle = local_target_indices[
+                    chunk_idx * batch_size:(chunk_idx + 1) * batch_size, :
+                ]  # (batch_size, local_num_spks)
+                valid_mask = global_spk_indices_oracle >= 0
+                safe_indices = global_spk_indices_oracle.clamp(min=0)
+                spk_assignments_chunk = F.one_hot(
+                    safe_indices, num_classes=self.nextformer_modules.max_num_spks
+                ).to(local_logits_chunk.dtype)
+                spk_assignments_chunk = spk_assignments_chunk * valid_mask.unsqueeze(-1)
+            else:
+                spk_assignments_chunk = self.nextformer_modules.get_local_to_global_assignments(
+                    spk_queries=spk_queries_chunk,
+                    streaming_state=streaming_state,
                 )
-                
-            # List to accumulate centroids before each chunk update - for loss calculation
-            current_spk_centroids_list = []
-            
-            accumulated_frames = 0
-            for chunk_idx in range(num_chunks):
-                start = chunk_idx * chunk_len
-                end = min(start + chunk_len, total_n_frames)
-                dur = end - start
-                offset = min(lc, start)
-                spk_queries_chunk = spk_queries[chunk_idx * batch_size:(chunk_idx + 1) * batch_size, :, :] # (batch_size, local_num_spks, emb_dim)
-                local_logits_chunk = local_logits[chunk_idx * batch_size:(chunk_idx + 1) * batch_size, :, :] # (batch_size, lc+chunk_len+rc, local_num_spks)
-                
-                # get global indices using real centroids
-                if self.oracle_centroids_test and not self.training:
-                    global_spk_indices = self.nextformer_modules.get_global_indices(
-                        spk_queries_chunk, streaming_state_oracle.global_spk_centroids
-                    )
-                else:
-                    global_spk_indices = self.nextformer_modules.get_global_indices(
-                        spk_queries_chunk, streaming_state.global_spk_centroids
-                    )
 
-                # get global indices using oracle information if available
-                global_spk_indices_oracle = None
-                if local_target_indices is not None:
-                    global_spk_indices_oracle = local_target_indices[chunk_idx * batch_size:(chunk_idx + 1) * batch_size, :]  # (batch_size, local_num_spks)
-                
-                # Create sampled indices for curriculum learning: mix oracle and real indices per sample
-                global_spk_indices_sampled = None
-                if streaming_state_oracle is not None and global_spk_indices_oracle is not None:
-                    if self.training:
-                        # Per-sample decision: use oracle indices with probability oracle_centroid_rate
-                        use_oracle_mask = torch.rand(batch_size, device=self.device) < self.oracle_centroid_rate
-                        use_oracle_mask = use_oracle_mask.unsqueeze(1)  # (batch_size, 1) for broadcasting over local_num_spks
-                        
-                        # Mix oracle and real indices per sample
-                        global_spk_indices_sampled = torch.where(
-                            use_oracle_mask,
-                            global_spk_indices_oracle,
-                            global_spk_indices
-                        )
-                    else:
-                        # During validation/test, use pure oracle indices if oracle_centroids_test is True
-                        global_spk_indices_sampled = global_spk_indices_oracle
+            self.nextformer_modules.update_streaming_state(
+                streaming_state=streaming_state,
+                spk_queries=spk_queries_chunk,
+                spk_assignments=spk_assignments_chunk
+            )
+            logits_chunk = self.nextformer_modules.get_global_logits(
+                local_logits=local_logits_chunk,
+                spk_assignments=spk_assignments_chunk,
+                offset=offset,
+                dur=dur
+            )
+            logits_list.append(logits_chunk)
 
-                active_frames_per_query_chunk = active_frames_per_query[chunk_idx * batch_size:(chunk_idx + 1) * batch_size] # (batch_size, local_num_spks)
-                
-                if streaming_state_oracle is not None:
-                    # store oracle centroids
-                    current_spk_centroids_list.append(streaming_state_oracle.global_spk_centroids.clone())
-                else:
-                    # store real centroids
-                    current_spk_centroids_list.append(streaming_state.global_spk_centroids.clone())
-                
-                # update streaming state if enough frames have been accumulated
-                accumulated_frames += dur
-                if accumulated_frames >= self.centroid_update_period:
-                    # Use transformer-based update if centroid_encoder is available, otherwise use averaging
-                    if hasattr(self, 'centroid_encoder') and self.centroid_encoder is not None:
-                        # update streaming state with real centroids
-                        self.nextformer_modules.update_streaming_state_with_transformer(
-                            streaming_state=streaming_state,
-                            spk_queries=spk_queries_chunk,
-                            global_spk_indices=global_spk_indices,
-                            active_frames_per_query=active_frames_per_query_chunk,
-                            centroid_encoder=self.centroid_encoder,
-                        )
-                        if streaming_state_oracle is not None:
-                            # update streaming state with sampled centroids (curriculum learning)
-                            self.nextformer_modules.update_streaming_state_with_transformer(
-                                streaming_state=streaming_state_oracle,
-                                spk_queries=spk_queries_chunk,
-                                global_spk_indices=global_spk_indices_sampled,
-                                active_frames_per_query=active_frames_per_query_chunk,
-                                centroid_encoder=self.centroid_encoder,
-                            )
-                    else:
-                        # update streaming state with real centroids
-                        #self.nextformer_modules.update_streaming_state_buffered(
-                        self.nextformer_modules.update_streaming_state_duration_averaged(
-                            streaming_state=streaming_state,
-                            spk_queries=spk_queries_chunk,
-                            global_spk_indices=global_spk_indices,
-                            active_frames_per_query=active_frames_per_query_chunk,
-                        )
-                        if streaming_state_oracle is not None:
-                            # update streaming state with sampled centroids (curriculum learning)
-                            #self.nextformer_modules.update_streaming_state_buffered(
-                            self.nextformer_modules.update_streaming_state_duration_averaged(
-                                streaming_state=streaming_state_oracle,
-                                spk_queries=spk_queries_chunk,
-                                global_spk_indices=global_spk_indices_sampled,
-                                active_frames_per_query=active_frames_per_query_chunk,
-                            )
-                    accumulated_frames = 0
-                
-                if spk_clustering_indices is not None:
-                    # Use clustering-based assignment instead of centroid matching
-                    global_spk_indices = spk_clustering_indices[chunk_idx * batch_size:(chunk_idx + 1) * batch_size, :]
-                    logging.info(f"using clustering-based assignment, global_spk_indices: {global_spk_indices}")
-                # hacky mode to use oracle assignment for all chunks
-                elif self.oracle_assignment and not self.training:
-                    global_spk_indices = global_spk_indices_oracle
-
-                # fill logits using real global_spk_indices
-                valid_mask = global_spk_indices != -1  # (batch_size, local_num_spks)
-                if valid_mask.any():
-                    # Get indices of valid (batch, local_speaker) pairs
-                    batch_indices, local_spk_indices = torch.where(valid_mask)  # 1D tensors of length num_valid
-                    global_spk_idx_flat = global_spk_indices[batch_indices, local_spk_indices]  # (num_valid,)
-                    num_valid = len(batch_indices)
-                    
-                    # Extract source slices: local_logits_chunk[b, offset:offset+dur, j] for each valid (b, j)
-                    # First, extract the time slices for all batches: (batch_size, dur, local_num_spks)
-                    time_slice = local_logits_chunk[:, offset:offset+dur, :]  # (batch_size, dur, local_num_spks)
-                    
-                    # Extract slices for valid batch indices: (num_valid, dur, local_num_spks)
-                    time_slice_valid = time_slice[batch_indices]  # (num_valid, dur, local_num_spks)
-                    
-                    # Extract the specific local speaker for each valid (batch, speaker) pair
-                    # Shape: (num_valid, dur)
-                    batch_idx_tensor = torch.arange(num_valid, device=local_logits_chunk.device)  # (num_valid,)
-                    source_slices = time_slice_valid[batch_idx_tensor, :, local_spk_indices]  # (num_valid, dur)
-                    
-                    # Create index arrays for assignment to logits[b, start:end, global_index]
-                    time_indices = torch.arange(start, end, device=local_logits_chunk.device)  # (dur,)
-                    
-                    # Expand indices: for each valid (batch, speaker) pair, assign to all time steps
-                    batch_indices_expanded = batch_indices.unsqueeze(0).expand(dur, -1)  # (dur, num_valid)
-                    time_indices_expanded = time_indices.unsqueeze(1).expand(-1, num_valid)  # (dur, num_valid)
-                    global_spk_idx_expanded = global_spk_idx_flat.unsqueeze(0).expand(dur, -1)  # (dur, num_valid)
-                    
-                    # Flatten all tensors for vectorized assignment
-                    batch_flat = batch_indices_expanded.flatten()  # (dur * num_valid,)
-                    time_flat = time_indices_expanded.flatten()  # (dur * num_valid,)
-                    global_spk_flat = global_spk_idx_expanded.flatten()  # (dur * num_valid,)
-                    source_flat = source_slices.transpose(0, 1).flatten()  # (dur * num_valid,) - transpose to match time-first order
-                    
-                    # Assign using advanced indexing for efficient vectorized assignment
-                    logits[batch_flat, time_flat, global_spk_flat] = source_flat
-
-        emb_seq = None  # Placeholder
+        logits = torch.cat(logits_list, dim=1)
         
-        # Stack and reshape captured centroids: (num_chunks, batch_size, max_num_spks, emb_dim) -> (num_chunks * batch_size, max_num_spks, emb_dim)
-        current_spk_centroids = torch.stack(current_spk_centroids_list, dim=0)  # (num_chunks, batch_size, max_num_spks, emb_dim)
-        current_spk_centroids = current_spk_centroids.reshape(num_chunks * batch_size, self.nextformer_modules.max_num_spks, -1)  # (num_chunks * batch_size, max_num_spks, emb_dim)
-
         # Remove padding from logits if necessary
         if sig_length < max_n_frames:  # Discard preds corresponding to padding
             n_frames = math.ceil(sig_length / self.encoder.subsampling_factor)
             logits = logits[:, :n_frames, :]
 
-        return logits, emb_seq, local_logits, spk_queries, active_frames_per_query, current_spk_centroids
+        return logits, local_logits, spk_queries, active_frames_per_query
 
     def forward_infer(self, emb_seq, emb_seq_length):
         """
@@ -1560,559 +1328,8 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         
         return local_pil_targets, local_ats_targets, local_target_lens, local_target_indices, total_logits_op
 
-    def _compute_q_contrastive_loss(
-        self, 
-        local_queries: torch.Tensor, 
-        local_target_indices: torch.Tensor, 
-        active_frames_per_query: torch.Tensor,
-        current_spk_centroids: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Compute weighted combination of v5 (centroid-based) and v3 (sampled centroid) contrastive losses.
-        
-        The weight q_contrastive_v3_weight controls the mixture:
-        - 0.0: uses only v5 (streaming centroids from actual state)
-        - 1.0: uses only v3 (dynamically sampled centroids)
-        - 0.5: equal mixture of both
-        
-        Args:
-            local_queries (torch.Tensor): Local speaker queries
-                Shape: (B, N, emb_dim) where N = local_num_spks * L (L = num_chunks)
-            local_target_indices (torch.Tensor): Speaker indices mapping
-                Shape: (B, N)
-            active_frames_per_query (torch.Tensor): Number of active frames per query
-                Shape: (B, N)
-            current_spk_centroids (torch.Tensor): Global speaker centroids before each chunk update
-                Shape: (B, L, max_num_spks, emb_dim) where L = num_chunks
-        
-        Returns:
-            torch.Tensor: Combined contrastive loss scalar
-        """
-        v3_weight = self.q_contrastive_v3_weight
-        v5_weight = 1.0 - v3_weight
-        
-        # Compute both losses
-        if v5_weight > 0:
-            loss_v5 = self._compute_q_contrastive_loss_v5(
-                local_queries, local_target_indices, active_frames_per_query, current_spk_centroids
-            )
-        else:
-            loss_v5 = torch.tensor(0.0, device=local_queries.device, dtype=local_queries.dtype)
-        
-        if v3_weight > 0:
-            loss_v3 = self._compute_q_contrastive_loss_v3(
-                local_queries, local_target_indices, active_frames_per_query
-            )
-        else:
-            loss_v3 = torch.tensor(0.0, device=local_queries.device, dtype=local_queries.dtype)
-        
-        # Weighted combination
-        combined_loss = v5_weight * loss_v5 + v3_weight * loss_v3
-        
-        return combined_loss
-
-    def _compute_q_contrastive_loss_v5(
-        self, 
-        local_queries: torch.Tensor, 
-        local_target_indices: torch.Tensor, 
-        active_frames_per_query: torch.Tensor,
-        current_spk_centroids: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Compute query similarity loss using InfoNCE with actual streaming centroids.
-        
-        This function uses the actual speaker centroids from the streaming state (captured before
-        each chunk update) to compute contrastive loss. For each query anchor, we:
-        - Use the centroid of the anchor's speaker from the corresponding chunk as positive
-        - Sample one centroid per speaker (from random chunks) as negatives
-        
-        The function operates in two modes:
-        - **Training mode** (self.training=True AND self.q_contrastive_cross_batch=True):
-          Cross-batch contrastive learning - negatives sampled from all batch elements
-        - **Validation/Inference mode** (self.training=False OR self.q_contrastive_cross_batch=False):
-          Within-batch contrastive learning - negatives sampled only from same batch element
-        
-        Args:
-            local_queries (torch.Tensor): Local speaker queries
-                Shape: (B, N, emb_dim) where N = local_num_spks * L (L = num_chunks)
-            local_target_indices (torch.Tensor): Speaker indices mapping
-                Shape: (B, N) where local_target_indices[b, n] is the original speaker index
-                that query n corresponds to, or -1 if unmatched
-            active_frames_per_query (torch.Tensor): Tensor containing the number of active frames per query
-                Shape: (B, N) where N = local_num_spks * L
-            current_spk_centroids (torch.Tensor): Global speaker centroids before each chunk update (reshaped)
-                Shape: (B, L, max_num_spks, emb_dim) where L = num_chunks
-        
-        Returns:
-            torch.Tensor: InfoNCE loss scalar
-        """
-        # Step 1: Extract dimensions and setup
-        B, N, D = local_queries.shape
-        device = local_queries.device
-        local_num_spks = self.nextformer_modules.local_num_spks
-        max_num_spks = self.nextformer_modules.max_num_spks
-        num_chunks = N // local_num_spks
-
-        # Step 2: Identify valid centroids and sample contrastive_samples
-        # Compute centroid norms to identify valid (non-zero) centroids
-        current_centroid_norms = torch.norm(current_spk_centroids, p=2, dim=3)  # (B, L, S)
-        valid_current_centroids = current_centroid_norms > 1e-8  # (B, L, S)
-        
-        # For each (batch, anchor, speaker), sample from valid chunks only
-        # Reshape for sampling: (B, L, S) -> (B, N, S, L) for each anchor
-        valid_probs = valid_current_centroids.unsqueeze(1).expand(-1, N, -1, -1)  # (B, N, L, S)
-        valid_probs = valid_probs.permute(0, 1, 3, 2).reshape(B * N * max_num_spks, num_chunks).float()  # (B*N*S, L)
-        
-        # Handle speakers with no valid centroids: set uniform probability to avoid error
-        has_valid = valid_probs.sum(dim=1, keepdim=True) > 0  # (B*N*S, 1)
-        valid_probs = torch.where(has_valid, valid_probs, torch.ones_like(valid_probs))
-        
-        # Sample chunk indices from valid centroids
-        sampled_chunk_flat = torch.multinomial(valid_probs, 1).squeeze(1)  # (B*N*S,)
-        sampled_chunk_indices = sampled_chunk_flat.view(B, N, max_num_spks)  # (B, N, S)
-        
-        # Override positive speaker's chunk with actual chunk (where query came from)
-        query_indices = torch.arange(N, device=device).view(1, N).expand(B, -1)  # (B, N)
-        chunk_indices = query_indices // local_num_spks  # (B, N) - which chunk each query belongs to
-        
-        # Vectorized override: for each valid anchor, set sampled_chunk[b, n, speaker_id] = chunk[b, n]
-        valid_anchors = local_target_indices != -1  # (B, N)
-        batch_idx, query_idx = torch.where(valid_anchors)
-        speaker_ids = local_target_indices[batch_idx, query_idx]
-        sampled_chunk_indices[batch_idx, query_idx, speaker_ids] = chunk_indices[batch_idx, query_idx]
-        
-        # Gather sampled centroids
-        batch_range = torch.arange(B, device=device).view(B, 1, 1).expand(-1, N, max_num_spks)
-        speaker_range = torch.arange(max_num_spks, device=device).view(1, 1, max_num_spks).expand(B, N, -1)
-        
-        contrastive_samples = current_spk_centroids[
-            batch_range, sampled_chunk_indices, speaker_range, :
-        ]  # (B, N, S, D)
-        
-        # Mark which contrastive samples are valid (speaker had valid centroids from sampled chunks)
-        valid_contrastive_samples = has_valid.view(B, N, max_num_spks)  # (B, N, S)
-        
-        # Update validity for positive speaker to reflect actual centroid validity
-        actual_centroids_valid = valid_current_centroids[batch_idx, chunk_indices[batch_idx, query_idx], speaker_ids]
-        valid_contrastive_samples[batch_idx, query_idx, speaker_ids] = actual_centroids_valid
-        # Note: valid_contrastive_samples will be expanded in cross-batch mode below
-        
-        # Step 4.5: Cross-batch expansion (if enabled and training)
-        # Expand centroids from (B, N, S, D) to (B, N, B*S, D) by gathering centroids from
-        # the same anchor position n across all batch elements
-        # Only apply cross-batch logic during training
-        if self.training and self.q_contrastive_cross_batch:
-            # For each anchor at (b, n), gather centroids from position n across all batches
-            # contrastive_samples[:, n, :, :] has shape (B, S, D) - centroids at position n from all batches
-            # We want to reshape this to (B, B*S, D) and replicate for all N positions
-            
-            # Transpose to get (N, B, S, D) so we can easily gather position n across batches
-            centroids_by_position = contrastive_samples.transpose(0, 1)  # (N, B, S, D)
-            valid_by_position = valid_contrastive_samples.transpose(0, 1)  # (N, B, S)
-            
-            # Reshape to (N, B*S, D) - concatenate all batch centroids for each position
-            centroids_cross_batch = centroids_by_position.reshape(N, B * max_num_spks, D)  # (N, B*S, D)
-            valid_cross_batch = valid_by_position.reshape(N, B * max_num_spks)  # (N, B*S)
-            
-            # Expand to (B, N, B*S, D) - replicate for all batch elements
-            contrastive_samples = centroids_cross_batch.unsqueeze(0).expand(B, -1, -1, -1)  # (B, N, B*S, D)
-            valid_contrastive_samples = valid_cross_batch.unsqueeze(0).expand(B, -1, -1)  # (B, N, B*S)
-            
-            # Update max_num_spks to reflect the new number of classes (B*S instead of S)
-            num_cross_batch_classes = B * max_num_spks
-        else:
-            num_cross_batch_classes = max_num_spks
-              
-        # Step 5: Compute similarity matrix
-        # Compute cosine similarity between each anchor and all speaker centroids
-        # sim_matrix[b, n, s] = cosine_similarity(local_queries[b, n], contrastive_samples[b, n, s])
-        
-        # Normalize local_queries (anchors)
-        queries_norm_for_sim = torch.norm(local_queries, p=2, dim=2, keepdim=True)  # (B, N, 1)
-        normalized_queries = local_queries / (queries_norm_for_sim + 1e-8)  # (B, N, D)
-        
-        # Normalize contrastive_samples (centroids)
-        # Note: in cross-batch mode, the last dimension is B*S instead of S
-        centroids_norm_for_sim = torch.norm(contrastive_samples, p=2, dim=3, keepdim=True)  # (B, N, S or B*S, 1)
-        normalized_centroids = contrastive_samples / (centroids_norm_for_sim + 1e-8)  # (B, N, S or B*S, D)
-        
-        # Compute cosine similarity using einsum for efficiency
-        # normalized_queries: (B, N, D)
-        # normalized_centroids: (B, N, S or B*S, D)
-        # Result: (B, N, S or B*S)
-        sim_matrix = torch.einsum('bnd,bnsd->bns', normalized_queries, normalized_centroids)
-        
-        # Apply additive angular margin (ArcFace-style) to positive samples
-        if self.q_contrastive_aam > 0:
-            # Identify positive samples for AAM application
-            if self.training and self.q_contrastive_cross_batch:
-                # Cross-batch mode: positive is only at index b*S + s
-                batch_indices = torch.arange(B, device=device).view(B, 1)  # (B, 1)
-                positive_indices = batch_indices * max_num_spks + local_target_indices  # (B, N)
-                centroid_indices = torch.arange(num_cross_batch_classes, device=device).view(1, 1, num_cross_batch_classes)  # (1, 1, B*S)
-                positive_indices_expanded = positive_indices.unsqueeze(2)  # (B, N, 1)
-                is_same_speaker = (centroid_indices == positive_indices_expanded)  # (B, N, B*S)
-                # Only apply to valid speakers (not -1)
-                has_valid_speaker = (local_target_indices != -1).unsqueeze(2)  # (B, N, 1)
-                is_same_speaker = is_same_speaker & has_valid_speaker  # (B, N, B*S)
-            else:
-                # Standard mode: same speaker within batch
-                anchor_speaker = local_target_indices.unsqueeze(2)  # (B, N, 1)
-                speaker_indices_for_aam = torch.arange(max_num_spks, device=device).view(1, 1, max_num_spks)  # (1, 1, S)
-                is_same_speaker = (anchor_speaker == speaker_indices_for_aam)  # (B, N, S)
-            
-            # Only apply margin to valid positive centroids
-            # Note: shape is (B, N, S) in standard mode or (B, N, B*S) in cross-batch mode
-            is_positive_for_aam = is_same_speaker & valid_contrastive_samples
-            
-            # Pre-compute trigonometric constants as Python scalars (no gradients)
-            m_scalar = float(self.q_contrastive_aam)
-            cos_m = math.cos(m_scalar)
-            sin_m = math.sin(m_scalar)
-            
-            # Compute threshold: if theta > pi - m, then theta + m > pi
-            # Since cos is decreasing on [0, pi], this means cos(theta) < cos(pi - m) = -cos(m)
-            threshold = -cos_m
-            
-            # For positive samples, compute cos(theta + m) = cos(theta)cos(m) - sin(theta)sin(m)
-            # cos(theta) is already in sim_matrix
-            # Clamp cos_theta to valid range [-1, 1] for numerical stability
-            cos_theta = torch.clamp(sim_matrix, -1.0, 1.0)
-            
-            # Compute sin(theta) = sqrt(1 - cos^2(theta))
-            # Clamp cos^2(theta) to [0, 1] for numerical stability
-            # Add epsilon to prevent gradient explosion near 0
-            cos_theta_squared = torch.clamp(cos_theta ** 2, 0.0, 1.0)
-            sin_theta = torch.sqrt(torch.clamp(1.0 - cos_theta_squared, min=1e-8))
-            
-            # Apply the angular margin formula
-            cos_theta_plus_m = cos_theta * cos_m - sin_theta * sin_m
-            
-            # If theta + m > pi, set cos(theta + m) = -1 (maximum penalty)
-            exceeds_pi = cos_theta < threshold
-            cos_theta_plus_m = torch.where(exceeds_pi, -1.0, cos_theta_plus_m)
-            
-            # Clamp result to valid cosine range [-1, 1] for any remaining numerical issues
-            cos_theta_plus_m = torch.clamp(cos_theta_plus_m, -1.0, 1.0)
-            
-            # Replace positive sample similarities with margin-adjusted values (only for valid centroids)
-            sim_matrix = torch.where(is_positive_for_aam, cos_theta_plus_m, sim_matrix)
-        
-        # Apply temperature scaling
-        sim_matrix = sim_matrix / self.q_contrastive_temperature
-        
-        # Log similarity statistics
-        #logging.info(f"Similarity matrix (min/mean/max): {sim_matrix.min().item():.4f} / "
-        #             f"{sim_matrix.mean().item():.4f} / "
-        #             f"{sim_matrix.max().item():.4f}")
-        
-        # Step 6: Create positive/negative masks
-        # Identify which centroids are positive (same speaker) vs negative (different speaker) for each anchor
-        
-        # Valid anchor mask: anchors that can participate in the loss
-        # Same criteria as in original function but for anchors (min_frames_anchor threshold)
-        valid_anchor_mask = (
-            (queries_norm_for_sim.squeeze(2) > 1e-8) & 
-            (local_target_indices != -1) & 
-            (active_frames_per_query > self.q_contrastive_min_frames_anchor)
-        )  # (B, N)
-        
-        # For each anchor, identify its positive centroid (same speaker)
-        if self.training and self.q_contrastive_cross_batch:
-            # Cross-batch mode: positive is only at index b*S + s for anchor at (b, n) with speaker s
-            # Reuse the same logic as in AAM section
-            batch_indices = torch.arange(B, device=device).view(B, 1)  # (B, 1)
-            positive_indices = batch_indices * max_num_spks + local_target_indices  # (B, N)
-            centroid_indices = torch.arange(num_cross_batch_classes, device=device).view(1, 1, num_cross_batch_classes)  # (1, 1, B*S)
-            positive_indices_expanded = positive_indices.unsqueeze(2)  # (B, N, 1)
-            is_positive_index = (centroid_indices == positive_indices_expanded)  # (B, N, B*S)
-            
-            # Only valid if centroid is valid AND anchor has a valid speaker (not -1)
-            has_valid_speaker = (local_target_indices != -1).unsqueeze(2)  # (B, N, 1)
-            positive_mask = is_positive_index & valid_contrastive_samples & has_valid_speaker  # (B, N, B*S)
-            
-            # Negative mask: all valid centroids except the positive one
-            negative_mask = (~is_positive_index) & valid_contrastive_samples  # (B, N, B*S)
-        else:
-            # Standard mode: positive is same speaker within the same batch element
-            # positive_mask[b, n, s] = True if s == local_target_indices[b, n] AND centroid is valid
-            anchor_speaker = local_target_indices.unsqueeze(2)  # (B, N, 1)
-            speaker_indices_expanded = torch.arange(max_num_spks, device=device).view(1, 1, max_num_spks)  # (1, 1, S)
-            is_positive_speaker = (anchor_speaker == speaker_indices_expanded)  # (B, N, S)
-            
-            # Positive mask: same speaker AND valid centroid
-            positive_mask = is_positive_speaker & valid_contrastive_samples  # (B, N, S)
-            
-            # Negative mask: different speaker AND valid centroid
-            negative_mask = (~is_positive_speaker) & valid_contrastive_samples  # (B, N, S)
-        
-        # Check if each anchor has a valid positive centroid
-        has_positive = positive_mask.sum(dim=2) > 0  # (B, N)
-        
-        # Final valid anchor mask: must have valid positive AND be a valid anchor
-        final_valid_anchor_mask = valid_anchor_mask & has_positive  # (B, N)
-        
-        num_valid_anchors = final_valid_anchor_mask.sum()
-        num_positives = positive_mask.sum()
-        num_negatives = negative_mask.sum()
-        
-        #logging.info(f"Valid anchors: {num_valid_anchors.item()}")
-        #logging.info(f"Positive pairs: {num_positives.item()}, Negative pairs: {num_negatives.item()}")
-        
-        # Step 7: Handle margin mode (q_contrastive_extra_positive)
-        # This adds an extra "class" representing a margin/boundary for more flexible contrastive learning
-        
-        if self.q_contrastive_extra_positive:
-            # Add an extra column to similarity matrix representing a margin class
-            # Note: sim_matrix is already temperature-scaled, so we scale the margin value too
-            margin_value = 0.5 / self.q_contrastive_temperature
-            margin_col = torch.full((B, N, 1), margin_value, device=device, dtype=sim_matrix.dtype)
-            logits = torch.cat([sim_matrix, margin_col], dim=2)  # (B, N, S+1) or (B, N, B*S+1) in cross-batch mode
-            
-            # Extend positive and negative masks with weighted margin class
-            # Weight the margin class so it's sampled at the desired rate
-            # If we want P(margin) = rate, then margin_weight = rate / (1 - rate)
-            margin_weight = self.q_contrastive_extra_positive_rate / (1.0 - self.q_contrastive_extra_positive_rate)
-            extra_col_mask = torch.full((B, N, 1), margin_weight, device=device, dtype=torch.float32)
-            pos_candidate_mask = torch.cat([positive_mask.float(), extra_col_mask], dim=2)  # (B, N, S+1) or (B, N, B*S+1)
-            extended_neg_mask = torch.cat([negative_mask, torch.ones(B, N, 1, device=device, dtype=torch.bool)], dim=2)  # (B, N, S+1) or (B, N, B*S+1)
-            
-            # Sample a ground truth label from the valid positive candidates for each anchor
-            # This randomly chooses between the actual positive speaker or the margin class
-            # with probability controlled by q_contrastive_extra_positive_rate
-            labels = torch.multinomial(pos_candidate_mask.view(-1, num_cross_batch_classes + 1), 1).squeeze(1)  # (B*N,)
-            labels_mask = torch.nn.functional.one_hot(labels, num_classes=num_cross_batch_classes + 1).bool().view(B, N, num_cross_batch_classes + 1)  # (B, N, S+1) or (B, N, B*S+1)
-            
-            # Keep only the logits that are either negative or the chosen positive
-            # This implements a more efficient form of contrastive learning
-            keep_logits_mask = extended_neg_mask | labels_mask
-            logits = logits.clone()  # Avoid in-place modification issues
-            logits[~keep_logits_mask] = -99
-            
-            # Use the original valid anchor mask (before checking for positives)
-            # because the margin class can serve as a positive
-            final_anchor_mask = valid_anchor_mask
-            num_classes = num_cross_batch_classes + 1
-            
-            #logging.info(f"Margin mode: extra class added, total classes: {num_classes}")
-        else:
-            # Standard mode without margin
-            logits = sim_matrix  # (B, N, S) or (B, N, B*S) in cross-batch mode
-            
-            if self.training and self.q_contrastive_cross_batch:
-                # In cross-batch mode, labels are b*S + speaker_id
-                batch_indices = torch.arange(B, device=device).view(B, 1)  # (B, 1)
-                labels = batch_indices * max_num_spks + local_target_indices  # (B, N)
-                
-                # Replace invalid labels (where local_target_indices == -1) with 0
-                # These will be masked out later using final_anchor_mask
-                labels = torch.where(local_target_indices >= 0, labels, torch.zeros_like(labels))
-            else:
-                # Standard mode: labels are the speaker indices for each anchor
-                labels = local_target_indices.clone()  # (B, N)
-                
-                # Replace invalid labels (-1) with 0 to avoid CUDA errors in cross_entropy
-                # These will be masked out later using final_anchor_mask
-                labels = torch.where(labels >= 0, labels, torch.zeros_like(labels))
-            
-            # Convert to flat indices for cross-entropy
-            labels = labels.view(-1)  # (B*N,)
-            
-            final_anchor_mask = final_valid_anchor_mask
-            num_classes = num_cross_batch_classes
-            
-            #logging.info(f"Standard mode: {num_classes} speaker classes")
-        
-        # Step 8: Compute InfoNCE loss
-        # Use cross-entropy loss between predicted logits and ground truth labels
-        
-        # Reshape logits from (B, N, num_classes) to (B*N, num_classes)
-        logits_flat = logits.reshape(-1, num_classes)  # (B*N, num_classes)
-        
-        # Labels are already flattened: (B*N,)
-        # Compute per-sample cross-entropy loss
-        loss_per_sample = F.cross_entropy(logits_flat, labels, reduction='none')  # (B*N,)
-        
-        # Reshape back to (B, N)
-        loss = loss_per_sample.view(B, N)  # (B, N)
-        
-        # Count valid anchors for logging
-        num_valid = final_anchor_mask.sum()
-        #logging.info(f"Computing loss for {num_valid.item()} valid anchors")
-        
-        # Check for early return if no valid anchors
-        if num_valid == 0:
-            logging.info("No valid anchors, returning zero loss")
-            return torch.tensor(0.0, device=device, dtype=local_queries.dtype)
-        
-        # Step 9: Apply duration averaging
-        # Aggregate per-anchor losses into a single scalar
-        if self.q_contrastive_duration_averaged:
-            # Weighted average using active_frames_per_query as weights
-            # Clamp weights to max_frames to prevent overly long segments from dominating
-            weights = active_frames_per_query.clamp(max=self.q_contrastive_max_frames) * final_anchor_mask.float()
-            weighted_loss = loss * weights
-            total_weight = weights.sum()
-            if total_weight == 0:
-                logging.info("Total weight is zero, returning zero loss")
-                return torch.tensor(0.0, device=device, dtype=local_queries.dtype)
-            total_loss = weighted_loss.sum() / total_weight
-        else:
-            # Simple average over valid anchors
-            loss = loss * final_anchor_mask.float()
-            if num_valid == 0:
-                logging.info("No valid anchors for simple average, returning zero loss")
-                return torch.tensor(0.0, device=device, dtype=local_queries.dtype)
-            total_loss = loss.sum() / num_valid
-        
-        return total_loss
-        
-
-    def _compute_c_contrastive_loss(
-        self,
-        local_queries: torch.Tensor,
-        local_target_indices: torch.Tensor,
-        current_spk_centroids: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Compute centroid-anchored contrastive loss using InfoNCE with margin class.
-        
-        This is the symmetric counterpart to _compute_q_contrastive_loss. Here:
-        - **Anchors**: Global speaker centroids (representing historical speaker identity)
-        - **Positive**: Local query from the same speaker, or margin class (0.5) if no match
-        - **Negatives**: All other queries (implicitly handled by cross-entropy)
-        
-        Args:
-            local_queries (torch.Tensor): Local speaker queries
-                Shape: (B, N, emb_dim) where N = local_num_spks * L (L = num_chunks)
-            local_target_indices (torch.Tensor): Speaker indices mapping
-                Shape: (B, N) where local_target_indices[b, n] is the original speaker index
-                that query n corresponds to, or -1 if unmatched
-            current_spk_centroids (torch.Tensor): Global speaker centroids before each chunk update
-                Shape: (B, L, max_num_spks, emb_dim) where L = num_chunks
-        
-        Returns:
-            torch.Tensor: InfoNCE loss scalar
-        """
-        # Step 1: Extract dimensions and setup
-        B, N, D = local_queries.shape
-        device = local_queries.device
-        local_num_spks = self.nextformer_modules.local_num_spks
-        max_num_spks = self.nextformer_modules.max_num_spks
-        num_chunks = N // local_num_spks
-        
-        # Reshape inputs to (B, L, local_num_spks, D) for easier indexing
-        local_queries_reshaped = local_queries.view(B, num_chunks, local_num_spks, D)
-        local_target_indices_reshaped = local_target_indices.view(B, num_chunks, local_num_spks)
-        
-        # Step 2: Identify valid centroids
-        centroid_norms = torch.norm(current_spk_centroids, p=2, dim=3)  # (B, L, max_num_spks)
-        valid_centroids = centroid_norms > 1e-8  # (B, L, max_num_spks)
-        
-        # Step 3: For each centroid, find its corresponding positive query
-        # Create a mapping from (batch, chunk, global_speaker) -> local_speaker_index
-        # Initialize with -1 (no match)
-        global_to_local_map = torch.full(
-            (B, num_chunks, max_num_spks), -1, dtype=torch.long, device=device
-        )  # (B, L, max_num_spks)
-        
-        # Populate the mapping: for each valid local query, map its global speaker to local position
-        valid_queries = local_target_indices_reshaped != -1  # (B, L, local_num_spks)
-        batch_idx, chunk_idx, local_idx = torch.where(valid_queries)
-        global_speaker_ids = local_target_indices_reshaped[batch_idx, chunk_idx, local_idx]
-        global_to_local_map[batch_idx, chunk_idx, global_speaker_ids] = local_idx
-        
-        # Step 4: Gather all queries for each centroid and identify positives
-        # Expand queries: (B, L, max_num_spks, local_num_spks, D)
-        queries_by_chunk = local_queries_reshaped.unsqueeze(2).expand(-1, -1, max_num_spks, -1, -1)
-        
-        # Create positive mask for AAM: positive_mask[b, l, s, j] = True if query j is positive for centroid s
-        local_spk_range = torch.arange(local_num_spks, device=device).view(1, 1, 1, local_num_spks)
-        positive_local_idx = global_to_local_map.unsqueeze(3)  # (B, L, max_num_spks, 1)
-        is_positive = (local_spk_range == positive_local_idx)  # (B, L, max_num_spks, local_num_spks)
-        valid_queries_expanded = valid_queries.unsqueeze(2).expand(-1, -1, max_num_spks, -1)
-        positive_mask = is_positive & valid_queries_expanded  # (B, L, max_num_spks, local_num_spks)
-        
-        # Step 5: Compute similarity matrix
-        # Normalize centroids (anchors)
-        centroid_norms_keepdim = torch.norm(current_spk_centroids, p=2, dim=3, keepdim=True)  # (B, L, S, 1)
-        normalized_centroids = current_spk_centroids / (centroid_norms_keepdim + 1e-8)  # (B, L, S, D)
-        
-        # Normalize queries
-        query_norms = torch.norm(queries_by_chunk, p=2, dim=4, keepdim=True)  # (B, L, S, local_num_spks, 1)
-        normalized_queries = queries_by_chunk / (query_norms + 1e-8)  # (B, L, S, local_num_spks, D)
-        
-        # Compute cosine similarity
-        # sim_matrix[b, l, s, j] = cosine_similarity(centroid[b, l, s], query[b, l, j])
-        sim_matrix = torch.einsum('blsd,blsjd->blsj', normalized_centroids, normalized_queries)
-        
-        # Step 6: Apply additive angular margin (ArcFace) to positive samples
-        if self.q_contrastive_aam > 0:
-            is_positive_for_aam = positive_mask & valid_centroids.unsqueeze(3)
-            
-            # Pre-compute trigonometric constants
-            m_scalar = float(self.q_contrastive_aam)
-            cos_m = math.cos(m_scalar)
-            sin_m = math.sin(m_scalar)
-            threshold = -cos_m
-            
-            # Apply angular margin
-            cos_theta = torch.clamp(sim_matrix, -1.0, 1.0)
-            cos_theta_squared = torch.clamp(cos_theta ** 2, 0.0, 1.0)
-            sin_theta = torch.sqrt(torch.clamp(1.0 - cos_theta_squared, min=1e-8))
-            cos_theta_plus_m = cos_theta * cos_m - sin_theta * sin_m
-            
-            # If theta + m > pi, set cos(theta + m) = -1
-            exceeds_pi = cos_theta < threshold
-            cos_theta_plus_m = torch.where(exceeds_pi, -1.0, cos_theta_plus_m)
-            cos_theta_plus_m = torch.clamp(cos_theta_plus_m, -1.0, 1.0)
-            
-            # Replace positive sample similarities with margin-adjusted values
-            sim_matrix = torch.where(is_positive_for_aam, cos_theta_plus_m, sim_matrix)
-        
-        # Apply temperature scaling
-        sim_matrix = sim_matrix / self.q_contrastive_temperature
-        
-        # Step 7: Add margin class (extra query with similarity 0.5)
-        # Centroids WITH positive query learn to exceed this margin
-        # Centroids WITHOUT positive query learn to stay below this margin
-        margin_value = 0.5 / self.q_contrastive_temperature
-        margin_col = torch.full((B, num_chunks, max_num_spks, 1), margin_value, device=device, dtype=sim_matrix.dtype)
-        logits = torch.cat([sim_matrix, margin_col], dim=3)  # (B, L, S, local_num_spks+1)
-        
-        # Step 8: Create labels
-        # For centroids WITH positive query: use the actual positive query index
-        # For centroids WITHOUT positive query: use margin class (index = local_num_spks)
-        labels = global_to_local_map.clone()  # (B, L, S) - contains -1 for no match
-        # Replace -1 (no positive) with local_num_spks (margin class index)
-        labels = torch.where(labels >= 0, labels, torch.full_like(labels, local_num_spks))
-        
-        # Step 9: Create valid anchor mask
-        # A centroid is valid if it's non-zero (regardless of whether it has a positive query)
-        valid_anchor_mask = valid_centroids  # (B, L, S)
-        
-        num_valid_anchors = valid_anchor_mask.sum()
-        if num_valid_anchors == 0:
-            logging.info("No valid centroid anchors, returning zero loss")
-            return torch.tensor(0.0, device=device, dtype=local_queries.dtype)
-        
-        # Step 10: Reshape for loss computation
-        logits_flat = logits.reshape(B * num_chunks * max_num_spks, local_num_spks + 1)
-        labels_flat = labels.reshape(B * num_chunks * max_num_spks)
-        
-        # Step 11: Compute cross-entropy loss
-        loss_per_sample = F.cross_entropy(logits_flat, labels_flat, reduction='none')
-        loss = loss_per_sample.view(B, num_chunks, max_num_spks)
-        
-        # Step 12: Average over valid anchors (no duration weighting)
-        loss = loss * valid_anchor_mask.float()
-        total_loss = loss.sum() / num_valid_anchors
-        
-        return total_loss
-
-
     def _get_aux_train_evaluations(
-        self, logits, emb_seq, local_logits, local_queries, active_frames_per_query, current_spk_centroids, targets, target_lens
+        self, logits, local_logits, local_queries, active_frames_per_query, targets, target_lens
     ) -> dict:
         """
         Compute auxiliary training evaluations including losses and metrics.
@@ -2124,16 +1341,12 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         Args:
             logits (torch.Tensor): Predicted speaker labels for the entire audio.
                 Shape: (batch_size, total_n_frames, local_num_spks)
-            emb_seq (torch.Tensor): Encoder embeddings for the entire audio.
-                Shape: (batch_size, total_n_frames, emb_dim)
             local_logits (torch.Tensor): Speaker logits for the entire audio.
                 Shape: (batch_size * num_chunks, lc+chunk_len+rc, local_num_spks)
             local_queries (torch.Tensor): Local speaker queries.
                 Shape: (batch_size * num_chunks, local_num_spks, emb_dim)
             active_frames_per_query (torch.Tensor): Tensor containing the number of active frames per query
                 Shape: (num_chunks * batch_size, local_num_spks)
-            current_spk_centroids (torch.Tensor): Tensor containing global speaker centroids before each chunk update
-                Shape: (num_chunks * batch_size, max_num_spks, query_dim)
             targets (torch.Tensor): Ground truth speaker labels.
                 Shape: (batch_size, total_n_frames, max_num_spks)
             target_lens (torch.Tensor): Lengths of target sequences.
@@ -2156,6 +1369,9 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         targets_pil, _ = get_pil_targets_hungarian(labels=targets.clone(), logits=logits, metric=self.pil_metric)
         self._accuracy_train_global(preds, targets_pil, target_lens)
         train_f1_acc_global, _, _ = self._accuracy_train_global.compute()
+      
+        global_loss_scale = logits.shape[-1] / local_logits.shape[-1]
+        global_pil_loss = global_loss_scale * self.loss(logits=logits, labels=targets_pil, target_lens=target_lens)
 
         local_pil_targets, local_ats_targets, local_target_lens, local_target_indices, total_logits_op = self._process_logits_and_targets(
             local_logits, targets, target_lens
@@ -2168,40 +1384,10 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         pil_loss = self.loss(logits=local_logits, labels=local_pil_targets, target_lens=local_target_lens)
         ats_loss = self.loss(logits=local_logits, labels=local_ats_targets, target_lens=local_target_lens)
 
-        emb_sim_loss = torch.tensor(0.0, device=pil_loss.device, dtype=pil_loss.dtype)
-        #q_sim_loss = self.q_sim_loss(q_similarity, target_similarity)
-        #q_sim_loss = self._compute_q_sim_loss(local_queries, local_target_indices)
-        q_sim_loss = torch.tensor(0.0, device=pil_loss.device, dtype=pil_loss.dtype)
-        if self.q_contrastive_weight > 0:
-            _, local_num_spks, emb_dim = local_queries.shape
-            batch_size = targets.shape[0]
-            num_chunks = local_queries.shape[0] // batch_size
-
-            local_queries = local_queries.view(num_chunks, batch_size, local_num_spks, emb_dim).transpose(0, 1).reshape(batch_size, num_chunks * local_num_spks, emb_dim)
-            local_target_indices = local_target_indices.view(num_chunks, batch_size, local_num_spks).transpose(0, 1).reshape(batch_size, num_chunks * local_num_spks)
-            #logging.info(f"local_target_indices: {local_target_indices}")
-            #logging.info(f"local_queries: {local_queries.shape}")
-            active_frames_per_query = active_frames_per_query.view(num_chunks, batch_size, local_num_spks).transpose(0, 1).reshape(batch_size, num_chunks * local_num_spks)
-            #logging.info(f"active_frames_per_query: {active_frames_per_query}")
-            current_spk_centroids = current_spk_centroids.view(num_chunks, batch_size, self.nextformer_modules.max_num_spks, emb_dim).transpose(0, 1)
-            # current_spk_centroids shape: (batch_size, num_chunks, max_num_spks, emb_dim)
-            q_contrastive_loss = self._compute_q_contrastive_loss(local_queries, local_target_indices, active_frames_per_query, current_spk_centroids)
-        else:
-            q_contrastive_loss = torch.tensor(0.0, device=pil_loss.device, dtype=pil_loss.dtype)
-
-        # Compute centroid-anchored contrastive loss (symmetric to query-anchored)
-        if self.c_contrastive_weight >= 0:
-            c_contrastive_loss = self._compute_c_contrastive_loss(local_queries, local_target_indices, current_spk_centroids)
-        else:
-            c_contrastive_loss = torch.tensor(0.0, device=pil_loss.device, dtype=pil_loss.dtype)
-
         loss = (
             self.ats_weight * ats_loss
             + self.pil_weight * pil_loss
-            + self.emb_sim_weight * emb_sim_loss
-            + self.q_sim_weight * q_sim_loss
-            + self.q_contrastive_weight * q_contrastive_loss
-            + self.c_contrastive_weight * c_contrastive_loss
+            + self.global_pil_weight * global_pil_loss
         )
 
         local_preds = torch.sigmoid(local_logits)
@@ -2215,10 +1401,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'loss': loss,
             'ats_loss': ats_loss,
             'pil_loss': pil_loss,
-            'q_sim_loss': q_sim_loss,
-            'emb_sim_loss': emb_sim_loss,
-            'q_contrastive_loss': q_contrastive_loss,
-            'c_contrastive_loss': c_contrastive_loss,
+            'global_pil_loss': global_pil_loss,
             'learning_rate': self._optimizer.param_groups[0]['lr'],
             'train_f1_acc': train_f1_acc,
             'train_f1_acc_global': train_f1_acc_global,
@@ -2245,18 +1428,19 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             (dict): A dictionary containing the 'loss' key with the calculated loss value.
         """
         audio_signal, audio_signal_length, targets, target_lens = batch
-        logits, emb_seq, local_logits, local_queries, active_frames_per_query, current_spk_centroids = self.forward(
+        logits, local_logits, local_queries, active_frames_per_query = self.forward(
             audio_signal=audio_signal, audio_signal_length=audio_signal_length, targets=targets
         )
         train_metrics = self._get_aux_train_evaluations(
-            logits, emb_seq, local_logits, local_queries, active_frames_per_query, current_spk_centroids, targets, target_lens
+            logits, local_logits, local_queries, active_frames_per_query, targets, target_lens
         )
+        logging.info(f"dustbin parameter value: {self.nextformer_modules.sinkhorn_dustbin_val.item()}")
         self._reset_train_metrics()
         self.log_dict(train_metrics, sync_dist=True, on_step=True, on_epoch=False, logger=True)
         return {'loss': train_metrics['loss']}
 
     def _get_aux_validation_evaluations(
-        self, logits, emb_seq, local_logits, local_queries, active_frames_per_query, current_spk_centroids, targets, target_lens
+        self, logits, local_logits, local_queries, active_frames_per_query, targets, target_lens
     ) -> dict:
         """
         Compute auxiliary validation evaluations including losses and metrics.
@@ -2268,16 +1452,12 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         Args:
             logits (torch.Tensor): Predicted speaker labels for the entire audio.
                 Shape: (batch_size, total_n_frames, local_num_spks)
-            emb_seq (torch.Tensor): Encoder embeddings for the entire audio.
-                Shape: (batch_size, total_n_frames, emb_dim)
             local_logits (torch.Tensor): Speaker logits for the entire audio.
                 Shape: (batch_size * num_chunks, lc+chunk_len+rc, local_num_spks)
             local_queries (torch.Tensor): Local speaker queries.
                 Shape: (batch_size * num_chunks, local_num_spks, emb_dim)
             active_frames_per_query (torch.Tensor): Tensor containing the number of active frames per query
                 Shape: (num_chunks * batch_size, local_num_spks)
-            current_spk_centroids (torch.Tensor): Tensor containing global speaker centroids before each chunk update
-                Shape: (num_chunks * batch_size, max_num_spks, query_dim)
             targets (torch.Tensor): Ground truth speaker labels.
                 Shape: (batch_size, total_n_frames, max_num_spks)
             target_lens (torch.Tensor): Lengths of target sequences.
@@ -2301,6 +1481,9 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self._accuracy_valid_global(preds, targets_pil, target_lens)
         val_f1_acc_global, _, _ = self._accuracy_valid_global.compute()
 
+        global_loss_scale = logits.shape[-1] / local_logits.shape[-1]
+        val_global_pil_loss = global_loss_scale * self.loss(logits=logits, labels=targets_pil, target_lens=target_lens)
+
         local_pil_targets, local_ats_targets, local_target_lens, local_target_indices, total_logits_op = self._process_logits_and_targets(
             local_logits, targets, target_lens
         )
@@ -2312,38 +1495,10 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         val_pil_loss = self.loss(logits=local_logits, labels=local_pil_targets, target_lens=local_target_lens)
         val_ats_loss = self.loss(logits=local_logits, labels=local_ats_targets, target_lens=local_target_lens)
 
-        val_emb_sim_loss = torch.tensor(0.0, device=val_pil_loss.device, dtype=val_pil_loss.dtype)
-        #val_q_sim_loss = self._compute_q_sim_loss(local_queries, local_target_indices)
-        val_q_sim_loss = torch.tensor(0.0, device=val_pil_loss.device, dtype=val_pil_loss.dtype)
-        if self.q_contrastive_weight > 0:
-            _, local_num_spks, emb_dim = local_queries.shape
-            batch_size = targets.shape[0]
-            num_chunks = local_queries.shape[0] // batch_size
-            local_queries = local_queries.view(num_chunks, batch_size, local_num_spks, emb_dim).transpose(0, 1).reshape(batch_size, num_chunks * local_num_spks, emb_dim)
-            local_target_indices = local_target_indices.view(num_chunks, batch_size, local_num_spks).transpose(0, 1).reshape(batch_size, num_chunks * local_num_spks)
-            #logging.info(f"local_target_indices: {local_target_indices}")
-            #logging.info(f"local_queries: {local_queries.shape}")
-            active_frames_per_query = active_frames_per_query.view(num_chunks, batch_size, local_num_spks).transpose(0, 1).reshape(batch_size, num_chunks * local_num_spks)
-            #logging.info(f"active_frames_per_query: {active_frames_per_query}")
-            current_spk_centroids = current_spk_centroids.view(num_chunks, batch_size, self.nextformer_modules.max_num_spks, emb_dim).transpose(0, 1)
-            # current_spk_centroids shape: (batch_size, num_chunks, max_num_spks, emb_dim)
-            val_q_contrastive_loss = self._compute_q_contrastive_loss(local_queries, local_target_indices, active_frames_per_query, current_spk_centroids)
-        else:
-            val_q_contrastive_loss = torch.tensor(0.0, device=val_pil_loss.device, dtype=val_pil_loss.dtype)
-
-        # Compute centroid-anchored contrastive loss (symmetric to query-anchored)
-        if self.c_contrastive_weight >= 0:
-            val_c_contrastive_loss = self._compute_c_contrastive_loss(local_queries, local_target_indices, current_spk_centroids)
-        else:
-            val_c_contrastive_loss = torch.tensor(0.0, device=val_pil_loss.device, dtype=val_pil_loss.dtype)
-
         val_loss = (
             self.ats_weight * val_ats_loss
             + self.pil_weight * val_pil_loss
-            + self.emb_sim_weight * val_emb_sim_loss
-            + self.q_sim_weight * val_q_sim_loss
-            + self.q_contrastive_weight * val_q_contrastive_loss
-            + self.c_contrastive_weight * val_c_contrastive_loss
+            + self.global_pil_weight * val_global_pil_loss
         )
 
         local_preds = torch.sigmoid(local_logits)
@@ -2362,10 +1517,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'val_loss': val_loss,
             'val_ats_loss': val_ats_loss,
             'val_pil_loss': val_pil_loss,
-            'val_q_sim_loss': val_q_sim_loss,
-            'val_emb_sim_loss': val_emb_sim_loss,
-            'val_q_contrastive_loss': val_q_contrastive_loss,
-            'val_c_contrastive_loss': val_c_contrastive_loss,
+            'val_global_pil_loss': val_global_pil_loss,
             'val_f1_acc': val_f1_acc,
             'val_f1_acc_global': val_f1_acc_global,
             'val_f1_acc_global_op': val_f1_acc_global_op,
@@ -2397,11 +1549,11 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             dict: A dictionary containing various validation metrics for this batch.
         """
         audio_signal, audio_signal_length, targets, target_lens = batch
-        logits, emb_seq, local_logits, local_queries, active_frames_per_query, current_spk_centroids = self.forward(
+        logits, local_logits, local_queries, active_frames_per_query = self.forward(
             audio_signal=audio_signal, audio_signal_length=audio_signal_length, targets=targets
         )
         val_metrics = self._get_aux_validation_evaluations(
-            logits, emb_seq, local_logits, local_queries, active_frames_per_query, current_spk_centroids, targets, target_lens
+            logits, local_logits, local_queries, active_frames_per_query, targets, target_lens
         )
         if isinstance(self.trainer.val_dataloaders, list) and len(self.trainer.val_dataloaders) > 1:
             self.validation_step_outputs[dataloader_idx].append(val_metrics)
@@ -2439,10 +1591,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         val_loss_mean = torch.stack([x['val_loss'] for x in outputs]).mean()
         val_ats_loss_mean = torch.stack([x['val_ats_loss'] for x in outputs]).mean()
         val_pil_loss_mean = torch.stack([x['val_pil_loss'] for x in outputs]).mean()
-        val_q_sim_loss_mean = torch.stack([x['val_q_sim_loss'] for x in outputs]).mean()
-        val_emb_sim_loss_mean = torch.stack([x['val_emb_sim_loss'] for x in outputs]).mean()
-        val_q_contrastive_loss_mean = torch.stack([x['val_q_contrastive_loss'] for x in outputs]).mean()
-        val_c_contrastive_loss_mean = torch.stack([x['val_c_contrastive_loss'] for x in outputs]).mean()
+        val_global_pil_loss_mean = torch.stack([x['val_global_pil_loss'] for x in outputs]).mean()
         val_f1_acc_mean = torch.stack([x['val_f1_acc'] for x in outputs]).mean()
         val_f1_acc_global_mean = torch.stack([x['val_f1_acc_global'] for x in outputs]).mean()
         val_f1_acc_global_op_mean = torch.stack([x['val_f1_acc_global_op'] for x in outputs]).mean()
@@ -2456,10 +1605,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'val_loss': val_loss_mean,
             'val_ats_loss': val_ats_loss_mean,
             'val_pil_loss': val_pil_loss_mean,
-            'val_q_sim_loss': val_q_sim_loss_mean,
-            'val_emb_sim_loss': val_emb_sim_loss_mean,
-            'val_q_contrastive_loss': val_q_contrastive_loss_mean,
-            'val_c_contrastive_loss': val_c_contrastive_loss_mean,
+            'val_global_pil_loss': val_global_pil_loss_mean,
             'val_f1_acc': val_f1_acc_mean,
             'val_f1_acc_global': val_f1_acc_global_mean,
             'val_f1_acc_global_op': val_f1_acc_global_op_mean,
@@ -2470,7 +1616,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         return {'log': multi_val_metrics}
 
     def _get_aux_test_batch_evaluations(
-        self, batch_idx: int, logits, emb_seq, local_logits, local_queries, active_frames_per_query, current_spk_centroids, targets, target_lens
+        self, batch_idx: int, logits, local_logits, local_queries, active_frames_per_query, targets, target_lens
     ):
         preds = torch.sigmoid(logits)
         targets = targets.to(preds.dtype)
@@ -2540,11 +1686,11 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 audio_signal = audio_signal.to(self.device)
                 audio_signal_length = audio_signal_length.to(self.device)
                 targets = targets.to(self.device)
-                logits, emb_seq, local_logits, local_queries, active_frames_per_query, current_spk_centroids = self.forward(
+                logits, local_logits, local_queries, active_frames_per_query = self.forward(
                     audio_signal=audio_signal, audio_signal_length=audio_signal_length, targets=targets
                 )
                 self._get_aux_test_batch_evaluations(
-                    batch_idx, logits, emb_seq, local_logits, local_queries, active_frames_per_query, current_spk_centroids, targets, target_lens
+                    batch_idx, logits, local_logits, local_queries, active_frames_per_query, targets, target_lens
                 )
                 preds = torch.sigmoid(logits).detach().to('cpu')
                 if preds.shape[0] == 1:  # batch size = 1
@@ -2557,30 +1703,6 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         logging.info(f"Batch OP-F1Acc. MEAN: {torch.mean(torch.tensor(self.batch_f1_accs_op_list))}")
         logging.info(f"Batch Local F1Acc. MEAN: {torch.mean(torch.tensor(self.batch_f1_accs_local_list))}")
         logging.info(f"Batch Local F1Acc. ATS MEAN: {torch.mean(torch.tensor(self.batch_f1_accs_local_ats_list))}")
-
-    def on_train_epoch_end(self):
-        """
-        Callback executed at the end of each training epoch.
-        Decays the oracle_centroid_rate to gradually transition from oracle to predicted centroids.
-        Respects warmup period where rate remains at initial value.
-        """
-        if self.oracle_centroids_train and self.oracle_centroid_rate_min < 1.0:
-            old_rate = self.oracle_centroid_rate
-            # Check if we're still in warmup period
-            if self.current_epoch < self.oracle_centroid_rate_warmup_epochs:
-                # During warmup, keep the rate at initial value
-                logging.info(f"Oracle centroid warmup: epoch {self.current_epoch + 1}/{self.oracle_centroid_rate_warmup_epochs}, rate={self.oracle_centroid_rate:.4f}")
-            else:
-                # After warmup, apply decay
-                if self.oracle_centroid_rate_decay_type == "exponential":
-                    # Exponential decay: multiply by (1 - decay)
-                    self.oracle_centroid_rate = self.oracle_centroid_rate * (1 - self.oracle_centroid_rate_decay)
-                else:
-                    # Linear decay: subtract decay amount
-                    self.oracle_centroid_rate = self.oracle_centroid_rate - self.oracle_centroid_rate_decay
-                # Apply minimum bound
-                self.oracle_centroid_rate = max(self.oracle_centroid_rate_min, self.oracle_centroid_rate)
-                logging.info(f"Oracle centroid rate updated: {old_rate:.4f} -> {self.oracle_centroid_rate:.4f}")
 
     def on_validation_epoch_end(self) -> Optional[dict[str, dict[str, torch.Tensor]]]:
         """Run validation with sync_dist=True."""
@@ -2625,979 +1747,3 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             verbose=verbose,
             override_config=override_config,
         )
-
-###############################################
-    def forward_streaming(
-        self,
-        processed_signal,
-        processed_signal_length,
-        targets: Optional[torch.Tensor] = None,
-    ):
-        """
-        The main forward pass for diarization inference in streaming mode.
-
-        Args:
-            processed_signal (torch.Tensor): Tensor containing audio waveform
-                Shape: (batch_size, num_samples)
-            processed_signal_length (torch.Tensor): Tensor containing lengths of audio waveforms
-                Shape: (batch_size,)
-            targets (torch.Tensor, optional): Ground truth speaker labels.
-                Shape: (batch_size, diar_frame_count, num_speakers). Defaults to None.
-        Returns:
-            total_preds (torch.Tensor): Tensor containing predicted speaker labels for the current chunk
-                and all previous chunks
-                Shape: (batch_size, pred_len, num_speakers)
-        """
-        streaming_state = self.nextformer_modules.init_streaming_state(
-            batch_size=processed_signal.shape[0], device=self.device
-        )
-
-        batch_size, ch, sig_length = processed_signal.shape
-        processed_signal_offset = torch.zeros((batch_size,), dtype=torch.long, device=self.device)
-
-        if dist.is_available() and dist.is_initialized():
-            local_tensor = torch.tensor([sig_length], device=processed_signal.device)
-            dist.all_reduce(
-                local_tensor, op=dist.ReduceOp.MAX, async_op=False
-            )  # get max feature length across all GPUs
-            max_n_frames = local_tensor.item()
-            if dist.get_rank() == 0:
-                logging.info(f"Maximum feature length across all GPUs: {max_n_frames}")
-        else:
-            max_n_frames = sig_length
-
-        if sig_length < max_n_frames:  # need padding to have the same feature length for all GPUs
-            pad_tensor = torch.full(
-                (batch_size, ch, max_n_frames - sig_length),
-                self.negative_init_val,
-                dtype=processed_signal.dtype,
-                device=processed_signal.device,
-            )
-            processed_signal = torch.cat([processed_signal, pad_tensor], dim=2)
-
-        att_mod = False
-        if self.training:
-            rand_num = random.random()
-            if rand_num < self.nextformer_modules.causal_attn_rate:
-                self.encoder.att_context_size = [-1, self.nextformer_modules.causal_attn_rc]
-                self.transformer_encoder.diag = self.nextformer_modules.causal_attn_rc
-                att_mod = True
-
-        total_logits = torch.zeros(
-            (batch_size, 0, self.nextformer_modules.max_num_spks), dtype=processed_signal.dtype, device=self.device
-        )
-        total_emb_seq = torch.zeros(
-            (batch_size, 0, self.nextformer_modules.fc_d_model), dtype=processed_signal.dtype, device=self.device
-        )
-        local_logits_list = []
-        local_queries_list = []
-        start_frame_list = []
-        end_frame_list = []
-
-        feat_len = processed_signal.shape[2]
-        num_chunks = math.ceil(
-            feat_len / (self.nextformer_modules.chunk_len * self.nextformer_modules.subsampling_factor)
-        )
-        streaming_loader = self.nextformer_modules.streaming_feat_loader(
-            feat_seq=processed_signal,
-            feat_seq_length=processed_signal_length,
-            feat_seq_offset=processed_signal_offset,
-        )
-        for chunk_idx, chunk_feat_seq_t, feat_lengths, left_offset, right_offset in tqdm(
-            streaming_loader,
-            total=num_chunks,
-            desc="Streaming Steps",
-            disable=self.training,
-        ):
-            lc = round(left_offset / self.encoder.subsampling_factor)
-            start_frame = chunk_idx * self.nextformer_modules.chunk_len - lc
-            start_frame_list.append(start_frame)
-            end_frame = start_frame + math.ceil(chunk_feat_seq_t.shape[1] / self.encoder.subsampling_factor)
-            end_frame_list.append(end_frame)
-            if targets is not None:
-                targets_chunk = targets[:,start_frame:start_frame + self.nextformer_modules.chunk_left_context + self.nextformer_modules.chunk_len + self.nextformer_modules.chunk_right_context, :]
-            else:
-                targets_chunk = None
-            streaming_state, total_logits, total_emb_seq, local_logits_list, local_queries_list = self.forward_streaming_step(
-                processed_signal=chunk_feat_seq_t,
-                processed_signal_length=feat_lengths,
-                targets=targets_chunk,
-                streaming_state=streaming_state,
-                total_logits=total_logits,
-                total_emb_seq=total_emb_seq,
-                local_logits_list=local_logits_list,
-                local_queries_list=local_queries_list,
-                left_offset=left_offset,
-                right_offset=right_offset,
-            )
-
-        if att_mod:
-            self.encoder.att_context_size = [-1, -1]
-            self.transformer_encoder.diag = None
-
-        del processed_signal, processed_signal_length
-
-        if sig_length < max_n_frames:  # Discard preds corresponding to padding
-            n_frames = math.ceil(sig_length / self.encoder.subsampling_factor)
-            total_logits = total_logits[:, :n_frames, :]
-            #total_emb_seq = total_emb_seq[:, :n_frames, :]
-        return total_logits, total_emb_seq, local_logits_list, local_queries_list, start_frame_list, end_frame_list
-
-
-    def forward_streaming_step(
-        self,
-        processed_signal,
-        processed_signal_length,
-        streaming_state,
-        total_logits,
-        total_emb_seq,
-        local_logits_list,
-        local_queries_list,
-        left_offset,
-        right_offset,
-        targets: Optional[torch.Tensor] = None,
-    ):
-        # get pre-encode embeddings for lc+chunk+rc
-        pre_encode_embs, pre_encode_lengths = self.encoder.pre_encode(
-            x=processed_signal, lengths=processed_signal_length
-        )
-        
-        # Apply raw projection if needed
-        if self.nextformer_modules.query_raw_proj is not None:
-            query_raw_proj = self.nextformer_modules.query_raw_proj(pre_encode_embs)
-        else:
-            query_raw_proj = pre_encode_embs
-        
-        # get encoder embeddings for lc+chunk+rc
-        emb_seq_enc_proj, emb_seq, emb_seq_length = self.frontend_encoder(
-            processed_signal=pre_encode_embs, processed_signal_length=pre_encode_lengths, bypass_pre_encode=True
-        )
-        
-        # Apply query projection if needed
-        if self.nextformer_modules.query_proj is not None:
-            emb_seq_query_proj = self.nextformer_modules.query_proj(emb_seq)
-        else:
-            emb_seq_query_proj = emb_seq
-        
-        #get local logits for lc+chunk+rc
-        logits = self.forward_infer(emb_seq_enc_proj, emb_seq_length)
-        logging.info(f"local logits shape: {logits.shape}")
-
-        # get speaker queries for lc+chunk+rc
-        encoder_len_mask = self.nextformer_modules.length_to_mask(emb_seq_length, emb_seq.shape[1])
-        encoder_len_mask = ~encoder_len_mask
-        logging.info(f"encoder_len_mask: {encoder_len_mask.to(int).sum(dim=1)}")
-
-        if targets is not None:
-            logits_len = min(logits.shape[1], targets.shape[1])
-            local_pil_targets, local_target_indices = get_pil_targets_hungarian(labels=targets[:, :logits_len, :], logits=logits[:,:logits_len, :], metric=self.pil_metric)
-            preds = local_pil_targets
-            logging.info(f"oracle local preds: {(preds > 0.5).to(int).sum(dim=1)}")
-            logging.info(f"oracle local indices: {local_target_indices}")
-        else:
-            preds = torch.sigmoid(logits)
-            logging.info(f"real local preds: {(preds > 0.5).to(int).sum(dim=1)}")
-
-        if self.initialize_queries:
-            init_queries = self.nextformer_modules.get_init_queries(preds, emb_seq_query_proj)
-            init_queries_raw = self.nextformer_modules.get_init_queries(preds, query_raw_proj)
-        else:
-            init_queries = None
-            init_queries_raw = None
-            
-        if self.initialize_mask:
-            encoder_query_mask = ~(preds > self.local_mask_threshold).transpose(1, 2)
-        else:
-            encoder_query_mask = None
-
-        # masks for the non-target speakers in extra cross-attention
-        # encoder_mask_extra should have False (0) on frames where current speaker is inactive and any other speaker is active
-        if (self.query_decoder_raw is not None and self.query_decoder_raw.extra_cross_attention) or (self.query_decoder is not None and self.query_decoder.extra_cross_attention):
-            any_speaker_active = (preds.max(dim=2)[0] > self.local_mask_threshold).unsqueeze(1)  # (batch, 1, n_frames)
-            any_speaker_active = any_speaker_active.expand(-1, preds.shape[2], -1)  # (batch, local_num_spks, n_frames)
-            encoder_mask_extra = ~(encoder_query_mask & any_speaker_active)
-        else:
-            encoder_mask_extra = None
-
-        lc = round(left_offset / self.encoder.subsampling_factor)
-        rc = math.ceil(right_offset / self.encoder.subsampling_factor)
-        chunk_len = logits.shape[1] - lc - rc
-        # Create query_mask for undetected speakers
-        # Check if each speaker is detected above threshold across all frames
-        # preds shape: (B, n_frames, local_num_spks)
-        # For each speaker, check if max value across frames is above threshold
-        spk_detected = preds[:, :lc+chunk_len].max(dim=1)[0] > 0.5  # (B, local_num_spks)
-        spk_not_detected = ~spk_detected  # (B, local_num_spks), True means speaker not detected
-        
-        # Create query_mask for self-attention: mask out attention to/from undetected speakers
-        # query_mask shape: (B, local_num_spks, local_num_spks)
-        local_num_spks = preds.shape[-1]
-        query_mask = None
-        if spk_not_detected.any():
-            # Expand spk_not_detected to create attention mask
-            # Mask attention FROM undetected speakers
-            query_mask_from = spk_not_detected.unsqueeze(2).expand(-1, -1, local_num_spks)  # (B, local_num_spks, local_num_spks)
-            # Mask attention TO undetected speakers
-            query_mask_to = spk_not_detected.unsqueeze(1).expand(-1, local_num_spks, -1)  # (B, local_num_spks, local_num_spks)
-            # Combine: mask if either FROM or TO an undetected speaker
-            query_mask = query_mask_from | query_mask_to
-
-        # Run both query decoders if they exist
-        if self.query_decoder is not None:
-            spk_queries = self.query_decoder(
-                encoder_states=emb_seq_query_proj,
-                encoder_len_mask=encoder_len_mask,
-                encoder_mask=encoder_query_mask,
-                encoder_mask_extra=encoder_mask_extra,
-                query_states=init_queries,
-                query_mask=query_mask
-            )
-            # Zero out queries for undetected speakers
-            spk_queries = spk_queries.masked_fill(spk_not_detected.unsqueeze(2), 0)
-        else:
-            spk_queries = None
-        
-        if self.query_decoder_raw is not None:
-            spk_queries_raw = self.query_decoder_raw(
-                encoder_states=query_raw_proj,
-                encoder_len_mask=encoder_len_mask,
-                encoder_mask=encoder_query_mask,
-                encoder_mask_extra=encoder_mask_extra,
-                query_states=init_queries_raw,
-                query_mask=query_mask
-            )
-            # Zero out queries for undetected speakers
-            spk_queries_raw = spk_queries_raw.masked_fill(spk_not_detected.unsqueeze(2), 0)
-        else:
-            spk_queries_raw = None
-        
-        # Combine queries from both decoders if both are used
-        if spk_queries is not None and spk_queries_raw is not None:
-            if self.nextformer_modules.query_combiner is not None:
-                # Store original dtype to preserve it
-                original_dtype = spk_queries.dtype
-                # Concatenate along embedding dimension and project back
-                spk_queries_combined = torch.cat([spk_queries, spk_queries_raw], dim=-1)
-                spk_queries = self.nextformer_modules.query_combiner(spk_queries_combined)
-                # Ensure output has the same dtype as input
-                if spk_queries.dtype != original_dtype:
-                    spk_queries = spk_queries.to(original_dtype)
-            else:
-                # If no combiner is provided, just use the first decoder output
-                logging.warning("Both query decoders are used but no query_combiner provided. Using only query_decoder output.")
-                spk_queries = spk_queries
-        elif spk_queries_raw is not None:
-            # Only raw decoder is used
-            spk_queries = spk_queries_raw
-        # else: only spk_queries is not None, use it as is
-
-        #logging.info(f"query_mask: {query_mask}")
-        local_logits_list.append(logits)
-        local_queries_list.append(spk_queries)
-
-        if not self.training:
-            # Step 1: get global indices for spk_queries.
-            global_spk_indices = self.nextformer_modules.get_global_indices(
-                spk_queries, streaming_state.global_spk_centroids
-            )
-
-            # Step 2: update the streaming state with the new spk_queries and global indices
-            streaming_state = self.nextformer_modules.update_streaming_state(
-                streaming_state=streaming_state,
-                spk_queries=spk_queries,
-                global_spk_indices=global_spk_indices,
-            )
-
-            # Step 3: Remap local logits to global speaker space
-            logits_chunk = logits[:, lc : lc + chunk_len, :]
-            batch_size, chunk_len_frames, _ = logits_chunk.shape
-            logits_ = torch.full(
-                (batch_size, chunk_len_frames, self.nextformer_modules.max_num_spks), -1e9, device=self.device
-            )
-            for b in range(batch_size):
-                for j in range(spk_queries.shape[1]):
-                    global_index = global_spk_indices[b, j]
-                    if global_index != -1:
-                        logits_[b, :, global_index] = logits_chunk[b, :, j]
-        else:
-            logits_ = torch.full((logits.shape[0], chunk_len, self.nextformer_modules.max_num_spks), -1e9, device=self.device)
-        
-        total_logits = torch.cat([total_logits, logits_], dim=1)
-        #emb_seq_ = emb_seq[:, lc:lc+chunk_len, :]
-        #total_emb_seq = torch.cat([total_emb_seq, emb_seq_], dim=1)
-        total_emb_seq = None
-        logging.info(f"total_logits shape: {total_logits.shape}")
-        #logging.info(f"total_emb_seq shape: {total_emb_seq.shape}")
-        return streaming_state, total_logits, total_emb_seq, local_logits_list, local_queries_list
-
-    def _process_logits_and_targets_lists(self, local_logits_list, local_queries_list, start_frame_list, end_frame_list, targets, target_lens) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Process the logits and targets lists to get the batched tensors.
-        Args:
-            local_logits_list (list): List of speaker logits for each chunk.
-                Shape: (batch_size, lc+chunk_len+rc, local_num_spks)
-            local_queries_list (list): List of local speaker queries.
-                Shape: (batch_size, local_num_spks, emb_dim)
-            start_frame_list (list): List of chunk start frames.
-                Shape: (batch_size,)
-            end_frame_list (list): List of chunk end frames.
-                Shape: (batch_size,)
-            targets (torch.Tensor): Ground truth speaker labels.
-                Shape: (batch_size, total_n_frames, max_num_spks)
-            target_lens (torch.Tensor): Lengths of target sequences.
-                Shape: (batch_size,)
-        Returns:
-            local_logits (B*L, T_max, C)
-            local_pil_targets (B*L, T_max, C)
-            local_ats_targets (B*L, T_max, C)
-            local_target_lens (B*L,)
-            local_target_indices (B, local_num_spks*L)
-            local_queries (B, local_num_spks*L, emb_dim)
-            total_logits_op (B, T, C_max)
-        """
-        # processing of lists to get tensors for local logits, local targets, and local target lengths
-        # Step 1: Ensure the three local lists have the same length and define L
-        L = len(local_logits_list)
-        if not (len(local_queries_list) == L and len(start_frame_list) == L and L > 0):
-            raise ValueError(
-                f"Inconsistent lengths: local_logits_list={L}, local_queries_list={len(local_queries_list)}, start_frame_list={len(start_frame_list)}"
-            )
-        total_logits_op = torch.full_like(targets, -1e9, dtype=local_logits_list[0].dtype, device=targets.device)
-
-        # Step 2: For each local logits, slice local targets and local target lengths
-        local_pil_targets_list: List[torch.Tensor] = []
-        local_ats_targets_list: List[torch.Tensor] = []
-        local_target_lens_list: List[torch.Tensor] = []
-        local_target_indices_list: List[torch.Tensor] = []
-        total_target_frames = targets.shape[1]
-        for idx in range(L):
-            local_logits = local_logits_list[idx]
-            logging.info(f"local logits shape: {local_logits.shape}")
-            start_frame = int(start_frame_list[idx])
-            end_frame = int(end_frame_list[idx])
-            logging.info(f"start_frame: {start_frame}, end_frame: {end_frame}")
-            local_T = local_logits.shape[1]
-            start = max(0, start_frame)
-            end = min(end_frame, total_target_frames)
-
-            local_targets = targets[:, start:end, :]
-            logging.info(f"local targets shape: {local_targets.shape}")
-            if end-start < local_logits.shape[1]:
-                local_logits = local_logits[:, :end-start, :]
-                local_logits_list[idx] = local_logits
-            local_preds = torch.sigmoid(local_logits)
-            logging.info(f"local preds shape: {local_preds.shape}")
-            local_pil_targets, local_target_indices = get_pil_targets_hungarian(labels=local_targets.clone(), logits=local_logits, metric=self.pil_metric)
-            local_ats_targets = get_ats_targets(labels=local_pil_targets.clone(), preds=local_preds, speaker_permutations=self.speaker_permutations)
-            logging.info(f"idx: {idx}, local_targets: {local_targets.to(int).sum(dim=1)}")
-            logging.info(f"idx: {idx}, local_preds: {(local_preds > 0.5).to(int).sum(dim=1)}")
-            logging.info(f"idx: {idx}, local_pil_targets: {local_pil_targets.to(int).sum(dim=1)}")
-            logging.info(f"idx: {idx}, local_ats_targets: {local_ats_targets.to(int).sum(dim=1)}")
-            local_pil_targets_list.append(local_pil_targets)
-            local_ats_targets_list.append(local_ats_targets)
-            local_target_indices_list.append(local_target_indices)
-            local_target_lens = (target_lens - start_frame).clamp(min=0, max=local_targets.shape[1])
-            logging.info(f"idx: {idx}, local_target_lens: {local_target_lens}")
-            local_target_lens_list.append(local_target_lens)
-
-            # New: Create oracle-permuted streaming logits
-            chunk_len = self.nextformer_modules.chunk_len
-            lc = idx * chunk_len - start_frame
-            if lc >= 0 and lc < local_logits.shape[1]:
-                local_logits_content = local_logits[:, lc : lc + chunk_len, :]
-                batch_size, content_len_frames, n_local_spks = local_logits_content.shape
-                permuted_chunk_content = torch.full(
-                    (batch_size, content_len_frames, targets.shape[-1]),
-                    -1e9,
-                    device=local_logits.device,
-                    dtype=local_logits.dtype,
-                )
-                for b in range(batch_size):
-                    for j in range(n_local_spks):
-                        target_idx = local_target_indices[b, j]
-                        if target_idx != -1:
-                            permuted_chunk_content[b, :, target_idx] = local_logits_content[b, :, j]
-                dest_start_frame = idx * chunk_len
-                if dest_start_frame < targets.shape[1]:
-                    dest_end_frame = min(dest_start_frame + content_len_frames, targets.shape[1])
-                    len_to_copy = dest_end_frame - dest_start_frame
-                    total_logits_op[:, dest_start_frame:dest_end_frame, :] = permuted_chunk_content[
-                        :, :len_to_copy, :
-                    ]
-
-        # Step 3: Combine local logits and targets into (B*L, T_max, C)
-        batch_size = local_logits_list[0].shape[0]
-        t_max = max(t.shape[1] for t in local_logits_list)
-        c_logits = local_logits_list[0].shape[-1]
-        c_targets = local_pil_targets_list[0].shape[-1]
-
-        # Preallocate buffers
-        logits_buf = torch.full(
-            (batch_size, L, t_max, c_logits), -1e9, dtype=local_logits_list[0].dtype, device=local_logits_list[0].device
-        )
-        pil_targets_buf = torch.zeros(
-            (batch_size, L, t_max, c_targets), dtype=local_pil_targets_list[0].dtype, device=local_pil_targets_list[0].device
-        )
-        ats_targets_buf = torch.zeros(
-            (batch_size, L, t_max, c_targets), dtype=local_ats_targets_list[0].dtype, device=local_ats_targets_list[0].device
-        )
-
-        for idx in range(L):
-            cur_logits = local_logits_list[idx]
-            cur_pil_targets = local_pil_targets_list[idx]
-            cur_ats_targets = local_ats_targets_list[idx]
-            t_i = cur_logits.shape[1]
-            logits_buf[:, idx, :t_i, :] = cur_logits
-            pil_targets_buf[:, idx, :t_i, :] = cur_pil_targets
-            ats_targets_buf[:, idx, :t_i, :] = cur_ats_targets
-
-        local_logits = logits_buf.reshape(batch_size * L, t_max, c_logits)
-        local_pil_targets = pil_targets_buf.reshape(batch_size * L, t_max, c_targets)
-        local_ats_targets = ats_targets_buf.reshape(batch_size * L, t_max, c_targets)
-        local_target_lens = torch.stack(local_target_lens_list, dim=1).reshape(batch_size * L)
-        #logging.info(f"local_logits shape: {local_logits.shape}, local_pil_targets shape: {local_pil_targets.shape}, local_ats_targets shape: {local_ats_targets.shape}, local_target_lens: {local_target_lens}")
-
-        # Concatenate local queries along speaker dimension -> (B, local_num_spks*L, emb_dim)
-        local_queries = torch.cat(local_queries_list, dim=1)
-        # Concatenate local target indices along speaker dimension -> (B, local_num_spks*L)
-        local_target_indices = torch.cat(local_target_indices_list, dim=1)
-        #logging.info(f"local_queries shape: {local_queries.shape}")
-        logging.info(f"local_target_indices shape: {local_target_indices.shape}")
-        logging.info(f"local_target_indices: {local_target_indices}")
-        return local_logits, local_pil_targets, local_ats_targets, local_target_lens, local_target_indices, local_queries, total_logits_op
-
-    def _extract_query_pairs_for_batch(self, local_queries_b: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Extract all non-zero query pairs for a single batch.
-        
-        Args:
-            local_queries_b (torch.Tensor): Query tensor for a single batch
-                Shape: (N, emb_dim) where N = local_num_spks * L (number of chunks)
-        
-        Returns:
-            query_pairs_1 (torch.Tensor): First query in each pair
-                Shape: (num_pairs, emb_dim)
-            query_pairs_2 (torch.Tensor): Second query in each pair
-                Shape: (num_pairs, emb_dim)
-            pair_indices (torch.Tensor): Indices of queries in each pair
-                Shape: (num_pairs, 2)
-        """
-        # Check which queries are non-zero (not all zeros)
-        # Sum along embedding dimension to check if query is non-zero
-        query_norms = local_queries_b.norm(dim=1)  # (N,)
-        non_zero_mask = query_norms > 1e-8  # (N,)
-        non_zero_indices = torch.nonzero(non_zero_mask, as_tuple=False).squeeze(-1)  # (num_non_zero,)
-        
-        # Handle scalar case (when only one non-zero query)
-        if non_zero_indices.dim() == 0:
-            non_zero_indices = non_zero_indices.unsqueeze(0)
-        
-        # If less than 2 non-zero queries, return empty tensors
-        if len(non_zero_indices) < 2:
-            device = local_queries_b.device
-            dtype = local_queries_b.dtype
-            emb_dim = local_queries_b.shape[-1]
-            return torch.empty((0, emb_dim), device=device, dtype=dtype), torch.empty((0, emb_dim), device=device, dtype=dtype), torch.empty((0, 2), device=device, dtype=torch.long)
-        
-        # Generate all pairs (i, j) where i >= 0, j > i and both are non-zero
-        num_non_zero = len(non_zero_indices)
-        pairs_list = []
-        for i in range(num_non_zero):
-            for j in range(i + 1, num_non_zero):
-                pairs_list.append((non_zero_indices[i].item(), non_zero_indices[j].item()))
-        
-        if len(pairs_list) == 0:
-            device = local_queries_b.device
-            dtype = local_queries_b.dtype
-            emb_dim = local_queries_b.shape[-1]
-            return torch.empty((0, emb_dim), device=device, dtype=dtype), torch.empty((0, emb_dim), device=device, dtype=dtype), torch.empty((0, 2), device=device, dtype=torch.long)
-        
-        # Extract query pairs
-        indices_1 = torch.tensor([p[0] for p in pairs_list], device=local_queries_b.device)
-        indices_2 = torch.tensor([p[1] for p in pairs_list], device=local_queries_b.device)
-        query_pairs_1 = local_queries_b[indices_1]  # (num_pairs, emb_dim)
-        query_pairs_2 = local_queries_b[indices_2]  # (num_pairs, emb_dim)
-        pair_indices = torch.stack([indices_1, indices_2], dim=1)  # (num_pairs, 2)
-        
-        return query_pairs_1, query_pairs_2, pair_indices
-
-    def _compute_q_sim_loss(self, local_queries: torch.Tensor, local_target_indices: torch.Tensor) -> torch.Tensor:
-        """
-        Compute query similarity loss using CosineEmbeddingLoss.
-        
-        Args:
-            local_queries (torch.Tensor): Local speaker queries
-                Shape: (B, N, emb_dim) where N = local_num_spks * L
-            local_target_indices (torch.Tensor): Speaker indices mapping
-                Shape: (B, N) where local_target_indices[b, n] is the original speaker index
-                that query n corresponds to, or -1 if unmatched
-        
-        Returns:
-            q_sim_loss (torch.Tensor): Query similarity loss scalar
-        """
-        batch_size = local_queries.shape[0]
-        device = local_queries.device
-        dtype = local_queries.dtype
-        
-        # Build megabatch: collect all pairs from all batches
-        all_pairs_1 = []
-        all_pairs_2 = []
-        all_targets = []
-        
-        for b in range(batch_size):
-            pairs_1, pairs_2, pair_indices = self._extract_query_pairs_for_batch(local_queries[b])
-            logging.info(f"batch index: {b}, pairs_1 shape: {pairs_1.shape}, pairs_2 shape: {pairs_2.shape}, pair_indices shape: {pair_indices.shape}")
-            if pairs_1.shape[0] > 0:  # Only add if there are pairs
-                # Get speaker indices for each query in the pair
-                spk_idx_1 = local_target_indices[b, pair_indices[:, 0]]  # (num_pairs,)
-                spk_idx_2 = local_target_indices[b, pair_indices[:, 1]]  # (num_pairs,)
-                
-                # Compute targets: 1 if same speaker, -1 if different speaker
-                # Only consider pairs where both queries are matched (spk_idx != -1)
-                valid_mask = (spk_idx_1 >= 0) & (spk_idx_2 >= 0)
-                if valid_mask.any():
-                    pair_targets = torch.where(
-                        spk_idx_1 == spk_idx_2,
-                        torch.tensor(1.0, device=device, dtype=dtype),
-                        torch.tensor(-1.0, device=device, dtype=dtype)
-                    )
-                    # Only include valid pairs
-                    all_pairs_1.append(pairs_1[valid_mask])
-                    all_pairs_2.append(pairs_2[valid_mask])
-                    all_targets.append(pair_targets[valid_mask])
-        
-        # If no pairs found across all batches, return zero loss
-        if len(all_pairs_1) == 0:
-            return torch.tensor(0.0, device=device, dtype=dtype)
-        
-        # Concatenate all pairs into megabatch
-        query_pairs_1 = torch.cat(all_pairs_1, dim=0)  # (total_pairs, emb_dim)
-        query_pairs_2 = torch.cat(all_pairs_2, dim=0)  # (total_pairs, emb_dim)
-        targets = torch.cat(all_targets, dim=0)  # (total_pairs,)
-        logging.info(f"query_pairs_1 shape: {query_pairs_1.shape}, query_pairs_2 shape: {query_pairs_2.shape}, targets shape: {targets.shape}")
-        
-        # Compute cosine embedding loss
-        q_sim_loss = self.q_sim_loss(query_pairs_1, query_pairs_2, targets)
-        
-        return q_sim_loss
-
-
-
-    def _compute_q_contrastive_loss_v3(self, local_queries: torch.Tensor, local_target_indices: torch.Tensor, active_frames_per_query: torch.Tensor) -> torch.Tensor:
-        """
-        Compute query similarity loss using InfoNCE with speaker centroids.
-        
-        This function creates speaker centroids by averaging random subsets of queries
-        for each speaker, then computes similarities between anchors and these centroids.
-        
-        The function operates in two modes depending on training state:
-        - **Training mode** (self.training=True AND self.q_contrastive_cross_batch=True):
-          Cross-batch contrastive learning - negatives include centroids from other batch elements
-        - **Validation/Inference mode** (self.training=False OR self.q_contrastive_cross_batch=False):
-          Within-batch contrastive learning - negatives only from the same batch element
-        
-        This approach:
-        - Creates a centroid (weighted average) for each speaker from a random subset of queries
-        - Computes similarity between each anchor and all speaker centroids
-        - Positive: centroid of anchor's speaker
-        - Negatives: centroids of other speakers (and cross-batch centroids if in training mode)
-        
-        Args:
-            local_queries (torch.Tensor): Local speaker queries
-                Shape: (B, N, emb_dim) where N = local_num_spks * L
-            local_target_indices (torch.Tensor): Speaker indices mapping
-                Shape: (B, N) where local_target_indices[b, n] is the original speaker index
-                that query n corresponds to, or -1 if unmatched
-            active_frames_per_query (torch.Tensor): Tensor containing the number of active frames per query
-                Shape: (B, N)
-        
-        Returns:
-            torch.Tensor: InfoNCE loss scalar
-        """
-        # Step 1: Extract dimensions and determine max_num_spks
-        B, N, D = local_queries.shape
-        device = local_queries.device
-        max_num_spks = self.nextformer_modules.max_num_spks
-
-        # Step 2: Create speaker membership masks
-        # Compute query norms to identify valid (non-zero) queries
-        queries_norm = torch.norm(local_queries, p=2, dim=2, keepdim=False)  # (B, N)
-        
-        # Create validity mask for queries that can contribute to centroids
-        # A query is valid if:
-        # - It has non-zero norm (query is not degenerate)
-        # - It's matched to a speaker (local_target_indices != -1)
-        # - It has sufficient active frames (meets min_frames_positive threshold)
-        valid_query_mask = (
-            (queries_norm > 1e-8) & 
-            (local_target_indices != -1) & 
-            (active_frames_per_query > self.q_contrastive_min_frames_positive)
-        )  # (B, N)
-        
-        # Create speaker membership masks: speaker_masks[b, n, s] = True if query n belongs to speaker s
-        # Shape: (B, N, max_num_spks)
-        speaker_indices = torch.arange(max_num_spks, device=device).view(1, 1, max_num_spks)  # (1, 1, S)
-        target_indices_expanded = local_target_indices.unsqueeze(2)  # (B, N, 1)
-        speaker_membership = (target_indices_expanded == speaker_indices)  # (B, N, S)
-        
-        # Combine speaker membership with validity: only valid queries can contribute to centroids
-        valid_speaker_masks = speaker_membership & valid_query_mask.unsqueeze(2)  # (B, N, S)
-        
-        # Count how many valid queries exist for each speaker in each batch element
-        queries_per_speaker = valid_speaker_masks.sum(dim=1)  # (B, S)
-        
-        #logging.info(f"queries_per_speaker: {queries_per_speaker}")
-        #logging.info(f"Total valid queries: {valid_query_mask.sum().item()} / {B * N}")
-        
-        # Step 3: Sample random subsets for each speaker
-        # For each anchor n and speaker s, we want to sample a random subset of queries belonging to speaker s
-        # If anchor n belongs to speaker s, we must exclude it from the sampling pool (avoid self-comparison)
-        
-        # Create identity mask to handle self-exclusion: identity[b, n, m] = (n == m)
-        identity_mask = torch.eye(N, device=device, dtype=torch.bool).unsqueeze(0).expand(B, -1, -1)  # (B, N, N)
-        
-        # Expand valid_speaker_masks from (B, N, S) to (B, N, S, N) for sampling
-        # valid_speaker_masks[b, m, s] tells us if query m belongs to speaker s
-        # We need to reshape to: eligible[b, n, s, m] = whether query m is eligible for speaker s centroid at anchor n
-        valid_speaker_expanded = valid_speaker_masks.unsqueeze(1).expand(-1, N, -1, -1)  # (B, 1, N, S) -> (B, N, N, S)
-        valid_speaker_expanded = valid_speaker_expanded.transpose(2, 3)  # (B, N, S, N)
-        
-        # For self-exclusion: if anchor n belongs to speaker s, exclude n from the pool
-        # speaker_membership is (B, N, S): speaker_membership[b, n, s] = (anchor n belongs to speaker s)
-        anchor_is_same_speaker = speaker_membership.unsqueeze(3)  # (B, N, S, 1)
-        identity_expanded = identity_mask.unsqueeze(2)  # (B, N, 1, N)
-        should_exclude = anchor_is_same_speaker & identity_expanded  # (B, N, S, N)
-        
-        # Eligible queries for sampling: valid member of speaker AND not self (if same speaker)
-        eligible_for_sampling = valid_speaker_expanded & ~should_exclude  # (B, N, S, N)
-        
-        # Sample random subsets using Bernoulli distribution with probability 0.5
-        sampling_prob = 0.5
-        random_sample = torch.rand(B, N, max_num_spks, N, device=device) < sampling_prob  # (B, N, S, N)
-        
-        # Apply sampling to eligible queries
-        sampled_queries_mask = eligible_for_sampling & random_sample  # (B, N, S, N)
-        
-        # Fallback: if no queries sampled for a speaker, use all eligible queries
-        num_sampled = sampled_queries_mask.sum(dim=3)  # (B, N, S)
-        has_samples = num_sampled > 0
-        # Where no samples, use all eligible queries instead
-        sampled_queries_mask = torch.where(
-            has_samples.unsqueeze(3),
-            sampled_queries_mask,
-            eligible_for_sampling
-        )  # (B, N, S, N)
-        
-        # Count final number of queries contributing to each centroid
-        num_queries_for_centroid = sampled_queries_mask.sum(dim=3)  # (B, N, S)
-
-        # Step 4: Compute weighted centroids
-        # For each (b, n, s), compute centroid as weighted average of sampled queries
-        # Weights are from active_frames_per_query
-        
-        # Expand active_frames_per_query to match sampling mask dimensions
-        # active_frames_per_query: (B, N) -> (B, 1, 1, N) for broadcasting
-        weights = active_frames_per_query.unsqueeze(1).unsqueeze(1)  # (B, 1, 1, N)
-        
-        # Apply sampling mask to weights: only sampled queries contribute
-        masked_weights = sampled_queries_mask.float() * weights  # (B, N, S, N)
-        
-        # Normalize weights so they sum to 1 for each centroid
-        # Sum over the query dimension (dim=3)
-        total_weight = masked_weights.sum(dim=3, keepdim=True)  # (B, N, S, 1)
-        
-        # Avoid division by zero: where total_weight is 0, use 1 (won't matter as weights are all 0)
-        total_weight = torch.where(total_weight > 0, total_weight, torch.ones_like(total_weight))
-        normalized_weights = masked_weights / total_weight  # (B, N, S, N)
-        
-        # Compute weighted average of queries
-        # local_queries: (B, N, D)
-        # normalized_weights: (B, N, S, N)
-        # We want: contrastive_samples[b, n, s, :] = sum_m(normalized_weights[b, n, s, m] * local_queries[b, m, :])
-        
-        # Reshape for batch matrix multiplication
-        # normalized_weights: (B, N, S, N) -> (B*N*S, 1, N)
-        # local_queries: (B, N, D) -> expand to (B, 1, N, D) -> (B*N*S, N, D)
-        
-        weights_reshaped = normalized_weights.reshape(B * N * max_num_spks, 1, N)  # (B*N*S, 1, N)
-        queries_expanded = local_queries.unsqueeze(1).expand(-1, N * max_num_spks, -1, -1)  # (B, N*S, N, D)
-        queries_reshaped = queries_expanded.reshape(B * N * max_num_spks, N, D)  # (B*N*S, N, D)
-        
-        # Batch matrix multiply: (B*N*S, 1, N) @ (B*N*S, N, D) -> (B*N*S, 1, D)
-        centroids_flat = torch.bmm(weights_reshaped, queries_reshaped)  # (B*N*S, 1, D)
-        
-        # Reshape back to (B, N, S, D)
-        contrastive_samples = centroids_flat.reshape(B, N, max_num_spks, D)  # (B, N, S, D)
-        
-        # Mark which centroids are valid (have at least one contributing query)
-        valid_centroids = num_queries_for_centroid > 0  # (B, N, S)
-        
-        # Step 4.5: Cross-batch expansion (if enabled and training)
-        # Expand centroids from (B, N, S, D) to (B, N, B*S, D) by gathering centroids from
-        # the same anchor position n across all batch elements
-        # Only apply cross-batch logic during training
-        if self.training and self.q_contrastive_cross_batch:
-            # For each anchor at (b, n), gather centroids from position n across all batches
-            # contrastive_samples[:, n, :, :] has shape (B, S, D) - centroids at position n from all batches
-            # We want to reshape this to (B, B*S, D) and replicate for all N positions
-            
-            # Transpose to get (N, B, S, D) so we can easily gather position n across batches
-            centroids_by_position = contrastive_samples.transpose(0, 1)  # (N, B, S, D)
-            valid_by_position = valid_centroids.transpose(0, 1)  # (N, B, S)
-            
-            # Reshape to (N, B*S, D) - concatenate all batch centroids for each position
-            centroids_cross_batch = centroids_by_position.reshape(N, B * max_num_spks, D)  # (N, B*S, D)
-            valid_cross_batch = valid_by_position.reshape(N, B * max_num_spks)  # (N, B*S)
-            
-            # Expand to (B, N, B*S, D) - replicate for all batch elements
-            contrastive_samples = centroids_cross_batch.unsqueeze(0).expand(B, -1, -1, -1)  # (B, N, B*S, D)
-            valid_centroids = valid_cross_batch.unsqueeze(0).expand(B, -1, -1)  # (B, N, B*S)
-            
-            # Update max_num_spks to reflect the new number of classes (B*S instead of S)
-            num_cross_batch_classes = B * max_num_spks
-        else:
-            num_cross_batch_classes = max_num_spks
-              
-        # Step 5: Compute similarity matrix
-        # Compute cosine similarity between each anchor and all speaker centroids
-        # sim_matrix[b, n, s] = cosine_similarity(local_queries[b, n], contrastive_samples[b, n, s])
-        
-        # Normalize local_queries (anchors)
-        queries_norm_for_sim = torch.norm(local_queries, p=2, dim=2, keepdim=True)  # (B, N, 1)
-        normalized_queries = local_queries / (queries_norm_for_sim + 1e-8)  # (B, N, D)
-        
-        # Normalize contrastive_samples (centroids)
-        # Note: in cross-batch mode, the last dimension is B*S instead of S
-        centroids_norm_for_sim = torch.norm(contrastive_samples, p=2, dim=3, keepdim=True)  # (B, N, S or B*S, 1)
-        normalized_centroids = contrastive_samples / (centroids_norm_for_sim + 1e-8)  # (B, N, S or B*S, D)
-        
-        # Compute cosine similarity using einsum for efficiency
-        # normalized_queries: (B, N, D)
-        # normalized_centroids: (B, N, S or B*S, D)
-        # Result: (B, N, S or B*S)
-        sim_matrix = torch.einsum('bnd,bnsd->bns', normalized_queries, normalized_centroids)
-        
-        # Apply additive angular margin (ArcFace-style) to positive samples
-        if self.q_contrastive_aam > 0:
-            # Identify positive samples for AAM application
-            if self.training and self.q_contrastive_cross_batch:
-                # Cross-batch mode: positive is only at index b*S + s
-                batch_indices = torch.arange(B, device=device).view(B, 1)  # (B, 1)
-                positive_indices = batch_indices * max_num_spks + local_target_indices  # (B, N)
-                centroid_indices = torch.arange(num_cross_batch_classes, device=device).view(1, 1, num_cross_batch_classes)  # (1, 1, B*S)
-                positive_indices_expanded = positive_indices.unsqueeze(2)  # (B, N, 1)
-                is_same_speaker = (centroid_indices == positive_indices_expanded)  # (B, N, B*S)
-                # Only apply to valid speakers (not -1)
-                has_valid_speaker = (local_target_indices != -1).unsqueeze(2)  # (B, N, 1)
-                is_same_speaker = is_same_speaker & has_valid_speaker  # (B, N, B*S)
-            else:
-                # Standard mode: same speaker within batch
-                anchor_speaker = local_target_indices.unsqueeze(2)  # (B, N, 1)
-                speaker_indices_for_aam = torch.arange(max_num_spks, device=device).view(1, 1, max_num_spks)  # (1, 1, S)
-                is_same_speaker = (anchor_speaker == speaker_indices_for_aam)  # (B, N, S)
-            
-            # Only apply margin to valid positive centroids
-            # Note: shape is (B, N, S) in standard mode or (B, N, B*S) in cross-batch mode
-            is_positive_for_aam = is_same_speaker & valid_centroids
-            
-            # Pre-compute trigonometric constants as Python scalars (no gradients)
-            m_scalar = float(self.q_contrastive_aam)
-            cos_m = math.cos(m_scalar)
-            sin_m = math.sin(m_scalar)
-            
-            # Compute threshold: if theta > pi - m, then theta + m > pi
-            # Since cos is decreasing on [0, pi], this means cos(theta) < cos(pi - m) = -cos(m)
-            threshold = -cos_m
-            
-            # For positive samples, compute cos(theta + m) = cos(theta)cos(m) - sin(theta)sin(m)
-            # cos(theta) is already in sim_matrix
-            # Clamp cos_theta to valid range [-1, 1] for numerical stability
-            cos_theta = torch.clamp(sim_matrix, -1.0, 1.0)
-            
-            # Compute sin(theta) = sqrt(1 - cos^2(theta))
-            # Clamp cos^2(theta) to [0, 1] for numerical stability
-            # Add epsilon to prevent gradient explosion near 0
-            cos_theta_squared = torch.clamp(cos_theta ** 2, 0.0, 1.0)
-            sin_theta = torch.sqrt(torch.clamp(1.0 - cos_theta_squared, min=1e-8))
-            
-            # Apply the angular margin formula
-            cos_theta_plus_m = cos_theta * cos_m - sin_theta * sin_m
-            
-            # If theta + m > pi, set cos(theta + m) = -1 (maximum penalty)
-            exceeds_pi = cos_theta < threshold
-            cos_theta_plus_m = torch.where(exceeds_pi, -1.0, cos_theta_plus_m)
-            
-            # Clamp result to valid cosine range [-1, 1] for any remaining numerical issues
-            cos_theta_plus_m = torch.clamp(cos_theta_plus_m, -1.0, 1.0)
-            
-            # Replace positive sample similarities with margin-adjusted values (only for valid centroids)
-            sim_matrix = torch.where(is_positive_for_aam, cos_theta_plus_m, sim_matrix)
-        
-        # Apply temperature scaling
-        sim_matrix = sim_matrix / self.q_contrastive_temperature
-        
-        # Log similarity statistics
-        #logging.info(f"Similarity matrix (min/mean/max): {sim_matrix.min().item():.4f} / "
-        #             f"{sim_matrix.mean().item():.4f} / "
-        #             f"{sim_matrix.max().item():.4f}")
-        
-        # Step 6: Create positive/negative masks
-        # Identify which centroids are positive (same speaker) vs negative (different speaker) for each anchor
-        
-        # Valid anchor mask: anchors that can participate in the loss
-        # Same criteria as in original function but for anchors (min_frames_anchor threshold)
-        valid_anchor_mask = (
-            (queries_norm_for_sim.squeeze(2) > 1e-8) & 
-            (local_target_indices != -1) & 
-            (active_frames_per_query > self.q_contrastive_min_frames_anchor)
-        )  # (B, N)
-        
-        # For each anchor, identify its positive centroid (same speaker)
-        if self.training and self.q_contrastive_cross_batch:
-            # Cross-batch mode: positive is only at index b*S + s for anchor at (b, n) with speaker s
-            # Reuse the same logic as in AAM section
-            batch_indices = torch.arange(B, device=device).view(B, 1)  # (B, 1)
-            positive_indices = batch_indices * max_num_spks + local_target_indices  # (B, N)
-            centroid_indices = torch.arange(num_cross_batch_classes, device=device).view(1, 1, num_cross_batch_classes)  # (1, 1, B*S)
-            positive_indices_expanded = positive_indices.unsqueeze(2)  # (B, N, 1)
-            is_positive_index = (centroid_indices == positive_indices_expanded)  # (B, N, B*S)
-            
-            # Only valid if centroid is valid AND anchor has a valid speaker (not -1)
-            has_valid_speaker = (local_target_indices != -1).unsqueeze(2)  # (B, N, 1)
-            positive_mask = is_positive_index & valid_centroids & has_valid_speaker  # (B, N, B*S)
-            
-            # Negative mask: all valid centroids except the positive one
-            negative_mask = (~is_positive_index) & valid_centroids  # (B, N, B*S)
-        else:
-            # Standard mode: positive is same speaker within the same batch element
-            # positive_mask[b, n, s] = True if s == local_target_indices[b, n] AND centroid is valid
-            anchor_speaker = local_target_indices.unsqueeze(2)  # (B, N, 1)
-            speaker_indices_expanded = torch.arange(max_num_spks, device=device).view(1, 1, max_num_spks)  # (1, 1, S)
-            is_positive_speaker = (anchor_speaker == speaker_indices_expanded)  # (B, N, S)
-            
-            # Positive mask: same speaker AND valid centroid
-            positive_mask = is_positive_speaker & valid_centroids  # (B, N, S)
-            
-            # Negative mask: different speaker AND valid centroid
-            negative_mask = (~is_positive_speaker) & valid_centroids  # (B, N, S)
-        
-        # Check if each anchor has a valid positive centroid
-        has_positive = positive_mask.sum(dim=2) > 0  # (B, N)
-        
-        # Final valid anchor mask: must have valid positive AND be a valid anchor
-        final_valid_anchor_mask = valid_anchor_mask & has_positive  # (B, N)
-        
-        num_valid_anchors = final_valid_anchor_mask.sum()
-        num_positives = positive_mask.sum()
-        num_negatives = negative_mask.sum()
-        
-        #logging.info(f"Valid anchors: {num_valid_anchors.item()}")
-        #logging.info(f"Positive pairs: {num_positives.item()}, Negative pairs: {num_negatives.item()}")
-        
-        # Step 7: Handle margin mode (q_contrastive_extra_positive)
-        # This adds an extra "class" representing a margin/boundary for more flexible contrastive learning
-        
-        if self.q_contrastive_extra_positive:
-            # Add an extra column to similarity matrix representing a margin class
-            # Note: sim_matrix is already temperature-scaled, so we scale the margin value too
-            margin_value = 0.5 / self.q_contrastive_temperature
-            margin_col = torch.full((B, N, 1), margin_value, device=device, dtype=sim_matrix.dtype)
-            logits = torch.cat([sim_matrix, margin_col], dim=2)  # (B, N, S+1) or (B, N, B*S+1) in cross-batch mode
-            
-            # Extend positive and negative masks with weighted margin class
-            # Weight the margin class so it's sampled at the desired rate
-            # If we want P(margin) = rate, then margin_weight = rate / (1 - rate)
-            margin_weight = self.q_contrastive_extra_positive_rate / (1.0 - self.q_contrastive_extra_positive_rate)
-            extra_col_mask = torch.full((B, N, 1), margin_weight, device=device, dtype=torch.float32)
-            pos_candidate_mask = torch.cat([positive_mask.float(), extra_col_mask], dim=2)  # (B, N, S+1) or (B, N, B*S+1)
-            extended_neg_mask = torch.cat([negative_mask, torch.ones(B, N, 1, device=device, dtype=torch.bool)], dim=2)  # (B, N, S+1) or (B, N, B*S+1)
-            
-            # Sample a ground truth label from the valid positive candidates for each anchor
-            # This randomly chooses between the actual positive speaker or the margin class
-            # with probability controlled by q_contrastive_extra_positive_rate
-            labels = torch.multinomial(pos_candidate_mask.view(-1, num_cross_batch_classes + 1), 1).squeeze(1)  # (B*N,)
-            labels_mask = torch.nn.functional.one_hot(labels, num_classes=num_cross_batch_classes + 1).bool().view(B, N, num_cross_batch_classes + 1)  # (B, N, S+1) or (B, N, B*S+1)
-            
-            # Keep only the logits that are either negative or the chosen positive
-            # This implements a more efficient form of contrastive learning
-            keep_logits_mask = extended_neg_mask | labels_mask
-            logits = logits.clone()  # Avoid in-place modification issues
-            logits[~keep_logits_mask] = -99
-            
-            # Use the original valid anchor mask (before checking for positives)
-            # because the margin class can serve as a positive
-            final_anchor_mask = valid_anchor_mask
-            num_classes = num_cross_batch_classes + 1
-            
-            #logging.info(f"Margin mode: extra class added, total classes: {num_classes}")
-        else:
-            # Standard mode without margin
-            logits = sim_matrix  # (B, N, S) or (B, N, B*S) in cross-batch mode
-            
-            if self.training and self.q_contrastive_cross_batch:
-                # In cross-batch mode, labels are b*S + speaker_id
-                batch_indices = torch.arange(B, device=device).view(B, 1)  # (B, 1)
-                labels = batch_indices * max_num_spks + local_target_indices  # (B, N)
-                
-                # Replace invalid labels (where local_target_indices == -1) with 0
-                # These will be masked out later using final_anchor_mask
-                labels = torch.where(local_target_indices >= 0, labels, torch.zeros_like(labels))
-            else:
-                # Standard mode: labels are the speaker indices for each anchor
-                labels = local_target_indices.clone()  # (B, N)
-                
-                # Replace invalid labels (-1) with 0 to avoid CUDA errors in cross_entropy
-                # These will be masked out later using final_anchor_mask
-                labels = torch.where(labels >= 0, labels, torch.zeros_like(labels))
-            
-            # Convert to flat indices for cross-entropy
-            labels = labels.view(-1)  # (B*N,)
-            
-            final_anchor_mask = final_valid_anchor_mask
-            num_classes = num_cross_batch_classes
-            
-            #logging.info(f"Standard mode: {num_classes} speaker classes")
-        
-        # Step 8: Compute InfoNCE loss
-        # Use cross-entropy loss between predicted logits and ground truth labels
-        
-        # Reshape logits from (B, N, num_classes) to (B*N, num_classes)
-        logits_flat = logits.reshape(-1, num_classes)  # (B*N, num_classes)
-        
-        # Labels are already flattened: (B*N,)
-        # Compute per-sample cross-entropy loss
-        loss_per_sample = F.cross_entropy(logits_flat, labels, reduction='none')  # (B*N,)
-        
-        # Reshape back to (B, N)
-        loss = loss_per_sample.view(B, N)  # (B, N)
-        
-        # Count valid anchors for logging
-        num_valid = final_anchor_mask.sum()
-        #logging.info(f"Computing loss for {num_valid.item()} valid anchors")
-        
-        # Check for early return if no valid anchors
-        if num_valid == 0:
-            logging.info("No valid anchors, returning zero loss")
-            return torch.tensor(0.0, device=device, dtype=local_queries.dtype)
-        
-        # Step 9: Apply duration averaging
-        # Aggregate per-anchor losses into a single scalar
-        if self.q_contrastive_duration_averaged:
-            # Weighted average using active_frames_per_query as weights
-            # Clamp weights to max_frames to prevent overly long segments from dominating
-            weights = active_frames_per_query.clamp(max=self.q_contrastive_max_frames) * final_anchor_mask.float()
-            weighted_loss = loss * weights
-            total_weight = weights.sum()
-            if total_weight == 0:
-                logging.info("Total weight is zero, returning zero loss")
-                return torch.tensor(0.0, device=device, dtype=local_queries.dtype)
-            total_loss = weighted_loss.sum() / total_weight
-        else:
-            # Simple average over valid anchors
-            loss = loss * final_anchor_mask.float()
-            if num_valid == 0:
-                logging.info("No valid anchors for simple average, returning zero loss")
-                return torch.tensor(0.0, device=device, dtype=local_queries.dtype)
-            total_loss = loss.sum() / num_valid
-        
-        return total_loss
