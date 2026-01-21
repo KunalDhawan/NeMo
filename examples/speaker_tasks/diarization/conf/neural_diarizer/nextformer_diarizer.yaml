@@ -134,6 +134,7 @@ model:
     sinkhorn_dustbin_init: 0.0 # Initial value for dustbin in Sinkhorn algorithm
     score_similarity: "cosine" # "scaled_dot" or "cosine"
     cosine_temperature: 0.05 # Temperature for cosine similarity
+    hard_history_assignments: false # If true, convert soft assignments to hard one-hot before storing in history (prevents gradient flow through history and probability dilution)
 
   encoder:
     _target_: nemo.collections.asr.modules.ConformerEncoder

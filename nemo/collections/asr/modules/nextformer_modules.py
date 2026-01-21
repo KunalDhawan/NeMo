@@ -426,6 +426,7 @@ class NextformerModules(NeuralModule, Exportable):
         spk_centroid_update_min_frames: int = 0,
         score_similarity: str = "cosine",
         cosine_temperature: float = 0.01,
+        hard_history_assignments: bool = False,
     ):
         super().__init__()
         # General params
@@ -448,6 +449,7 @@ class NextformerModules(NeuralModule, Exportable):
         self.spk_centroid_update_min_frames = spk_centroid_update_min_frames
         self.score_similarity = score_similarity
         self.cosine_temperature = cosine_temperature
+        self.hard_history_assignments = hard_history_assignments
 
         self.encoder_proj = nn.Linear(self.fc_d_model, self.tf_d_model)
         self.query_proj = nn.Linear(self.fc_d_model, self.sq_d_model)
@@ -635,7 +637,20 @@ class NextformerModules(NeuralModule, Exportable):
                 Shape: (B, local_num_spks, max_num_spks)
         """
         streaming_state.past_spk_queries = torch.cat([streaming_state.past_spk_queries, spk_queries], dim=1)
-        streaming_state.past_spk_assignments = torch.cat([streaming_state.past_spk_assignments, spk_assignments], dim=1)
+        logging.info(f"spk_assignments: {spk_assignments}")
+        if self.hard_history_assignments or not self.training:
+            # Convert soft assignments to hard one-hot and detach from computation graph.
+            # This prevents gradient flow through history and avoids probability dilution
+            # from repeated soft matrix multiplications.
+            spk_assignments_hard = F.one_hot(
+                spk_assignments.argmax(dim=-1), 
+                num_classes=self.max_num_spks
+            ).to(spk_assignments.dtype).detach()
+            spk_assignments = spk_assignments_hard
+
+        streaming_state.past_spk_assignments = torch.cat(
+            [streaming_state.past_spk_assignments, spk_assignments], dim=1
+        )
         return streaming_state
 
     def get_local_to_global_assignments(
