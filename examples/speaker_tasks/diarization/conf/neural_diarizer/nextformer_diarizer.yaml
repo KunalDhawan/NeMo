@@ -282,6 +282,8 @@ trainer:
   logger: False
   log_every_n_steps: 1  # Interval of logging.
   val_check_interval: 1.0  # Set to 0.25 to check 4 times per epoch, or an int for number of iterations
+  gradient_clip_val: 1.0  # Clip gradients to max norm of 1.0
+  gradient_clip_algorithm: "norm"  # "norm" clips total gradient norm, "value" clips each element
 
 exp_manager:
   use_datetime_version: False
