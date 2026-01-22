@@ -948,10 +948,12 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                     streaming_state=streaming_state,
                 )
 
+            active_frames_chunk = active_frames_per_query[chunk_idx * batch_size:(chunk_idx + 1) * batch_size, :]
             self.nextformer_modules.update_streaming_state(
                 streaming_state=streaming_state,
                 spk_queries=spk_queries_chunk,
-                spk_assignments=spk_assignments_chunk
+                spk_assignments=spk_assignments_chunk,
+                active_frames_per_query=active_frames_chunk
             )
             logits_chunk = self.nextformer_modules.get_global_logits(
                 local_logits=local_logits_chunk,

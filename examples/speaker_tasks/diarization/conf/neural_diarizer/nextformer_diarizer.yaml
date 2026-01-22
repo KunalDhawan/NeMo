@@ -135,6 +135,7 @@ model:
     score_similarity: "cosine" # "scaled_dot" or "cosine"
     cosine_temperature: 0.05 # Temperature for cosine similarity
     hard_history_assignments: false # If true, convert soft assignments to hard one-hot before storing in history (prevents gradient flow through history and probability dilution)
+    spk_query_min_frames: 0 # Minimum number of active frames required for a speaker query to be added to history (0 = disabled)
 
   encoder:
     _target_: nemo.collections.asr.modules.ConformerEncoder

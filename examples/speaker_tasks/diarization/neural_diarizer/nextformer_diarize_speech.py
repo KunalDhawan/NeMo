@@ -107,7 +107,7 @@ class DiarizationConfig:
     extra_right_context: int = 0
     extra_silence_frames: int = 3
     max_num_spks: int = 8
-    spk_centroid_update_min_frames: int = 0
+    spk_query_min_frames: int = 0
     oracle_queries: bool = False
     oracle_centroids: bool = False
     oracle_assignment: bool = False
@@ -407,7 +407,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     diar_model.nextformer_modules.extra_left_context = cfg.extra_left_context
     diar_model.nextformer_modules.extra_right_context = cfg.extra_right_context
     diar_model.nextformer_modules.extra_silence_frames = cfg.extra_silence_frames
-    diar_model.nextformer_modules.spk_centroid_update_min_frames = cfg.spk_centroid_update_min_frames
+    diar_model.nextformer_modules.spk_query_min_frames = cfg.spk_query_min_frames
     diar_model.nextformer_modules.log = cfg.log
     diar_model.oracle_queries_test = cfg.oracle_queries
     diar_model.oracle_centroids_test = cfg.oracle_centroids

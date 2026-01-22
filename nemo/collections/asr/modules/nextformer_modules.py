@@ -423,7 +423,7 @@ class NextformerModules(NeuralModule, Exportable):
         extra_silence_frames: int = 3,
         sinkhorn_n_iters: int = 20,
         sinkhorn_dustbin_init: float = 0.0,
-        spk_centroid_update_min_frames: int = 0,
+        spk_query_min_frames: int = 0,
         score_similarity: str = "cosine",
         cosine_temperature: float = 0.01,
         hard_history_assignments: bool = False,
@@ -446,7 +446,7 @@ class NextformerModules(NeuralModule, Exportable):
         #self.sinkhorn_dustbin_val = 100 / math.sqrt(self.sq_d_model)
         #self.sinkhorn_dustbin_val=0.5
 
-        self.spk_centroid_update_min_frames = spk_centroid_update_min_frames
+        self.spk_query_min_frames = spk_query_min_frames
         self.score_similarity = score_similarity
         self.cosine_temperature = cosine_temperature
         self.hard_history_assignments = hard_history_assignments
@@ -625,7 +625,7 @@ class NextformerModules(NeuralModule, Exportable):
         streaming_state.past_spk_assignments = torch.zeros((batch_size, 0, self.max_num_spks), device=device)
         return streaming_state
 
-    def update_streaming_state(self, streaming_state, spk_queries, spk_assignments):
+    def update_streaming_state(self, streaming_state, spk_queries, spk_assignments, active_frames_per_query=None):
         """
         Update the streaming state (in-place) with new speaker queries based on their soft assignments.
 
@@ -635,7 +635,16 @@ class NextformerModules(NeuralModule, Exportable):
                 Shape: (B, local_num_spks, emb_dim)
             spk_assignments (torch.Tensor): Soft assignments for each local query.
                 Shape: (B, local_num_spks, max_num_spks)
+            active_frames_per_query (torch.Tensor, optional): Number of active frames per query.
+                Shape: (B, local_num_spks). Used to filter out short, unreliable queries.
         """
+        # Filter out queries that don't meet the minimum frame threshold
+        if active_frames_per_query is not None and self.spk_query_min_frames > 0:
+            insufficient_frames = active_frames_per_query < self.spk_query_min_frames
+            # Zero out queries and assignments for speakers with insufficient frames
+            spk_queries = spk_queries.masked_fill(insufficient_frames.unsqueeze(-1), 0)
+            spk_assignments = spk_assignments.masked_fill(insufficient_frames.unsqueeze(-1), 0)
+            
         streaming_state.past_spk_queries = torch.cat([streaming_state.past_spk_queries, spk_queries], dim=1)
         logging.info(f"spk_assignments: {spk_assignments}")
         if self.hard_history_assignments or not self.training:
