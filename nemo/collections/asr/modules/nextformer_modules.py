@@ -424,9 +424,13 @@ class NextformerModules(NeuralModule, Exportable):
         sinkhorn_n_iters: int = 20,
         sinkhorn_dustbin_init: float = 0.0,
         spk_query_min_frames: int = 0,
+        spk_centroid_update_min_frames: int = 0,
+        spk_assignment_min_prob: float = 0.5,
         score_similarity: str = "cosine",
-        cosine_temperature: float = 0.01,
+        cosine_temperature: float = 0.05,
         hard_history_assignments: bool = False,
+        logsumexp_temperature: float = 1.0,
+        assignment_swap_prob: float = 0.0,
     ):
         super().__init__()
         # General params
@@ -447,9 +451,11 @@ class NextformerModules(NeuralModule, Exportable):
         #self.sinkhorn_dustbin_val=0.5
 
         self.spk_query_min_frames = spk_query_min_frames
+        self.spk_assignment_min_prob = spk_assignment_min_prob
         self.score_similarity = score_similarity
         self.cosine_temperature = cosine_temperature
         self.hard_history_assignments = hard_history_assignments
+        self.logsumexp_temperature = logsumexp_temperature
 
         self.encoder_proj = nn.Linear(self.fc_d_model, self.tf_d_model)
         self.query_proj = nn.Linear(self.fc_d_model, self.sq_d_model)
@@ -644,7 +650,15 @@ class NextformerModules(NeuralModule, Exportable):
             # Zero out queries and assignments for speakers with insufficient frames
             spk_queries = spk_queries.masked_fill(insufficient_frames.unsqueeze(-1), 0)
             spk_assignments = spk_assignments.masked_fill(insufficient_frames.unsqueeze(-1), 0)
-            
+
+        # Filter out queries with low assignment probability
+        if self.spk_assignment_min_prob > 0:
+            max_assignment_prob = spk_assignments.max(dim=-1)[0]  # (B, local_num_spks)
+            low_prob = max_assignment_prob < self.spk_assignment_min_prob
+            # Zero out queries and assignments for low-probability speakers
+            spk_queries = spk_queries.masked_fill(low_prob.unsqueeze(-1), 0)
+            spk_assignments = spk_assignments.masked_fill(low_prob.unsqueeze(-1), 0)
+
         streaming_state.past_spk_queries = torch.cat([streaming_state.past_spk_queries, spk_queries], dim=1)
         #logging.info(f"spk_assignments: {spk_assignments}")
         if self.hard_history_assignments or not self.training:
@@ -717,10 +731,10 @@ class NextformerModules(NeuralModule, Exportable):
             full_scores = full_scores.masked_fill(local_zero.unsqueeze(2), zero_score)
             full_scores = full_scores.masked_fill(past_zero.unsqueeze(1), zero_score)
 
-            # Aggregate by global speaker using max pooling
-            # For each (local_query, global_speaker) pair, take the max score
-            # over all past queries belonging to that global speaker.
-            # This preserves the "memory bank" concept while fixing Sinkhorn column constraints.
+            # Aggregate by global speaker using LogSumExp (smooth differentiable approximation to max)
+            # For each (local_query, global_speaker) pair, aggregate scores over all past queries
+            # belonging to that global speaker. LogSumExp provides dense gradients for training
+            # while behaving like max when temperature is low.
 
             # Expand for broadcasting:
             # full_scores: (B, local_num_spks, num_past) -> (B, local_num_spks, num_past, 1)
@@ -732,13 +746,27 @@ class NextformerModules(NeuralModule, Exportable):
             belongs_to_g = assignments_expanded > 0.5  # (B, 1, num_past, max_num_spks)
 
             # Broadcast scores and apply mask
-            # Where past query j doesn't belong to global speaker g, set score to zero_score
+            # Where past query j doesn't belong to global speaker g, set score to zero_score for LogSumExp
             scores_broadcasted = scores_expanded.expand(-1, -1, -1, self.max_num_spks)
-            masked_scores = torch.where(belongs_to_g, scores_broadcasted, torch.tensor(zero_score, device=spk_queries.device, dtype=spk_queries.dtype))
+            belongs_to_g_expanded = belongs_to_g.expand(-1, local_num_spks, -1, -1)
+            masked_scores = torch.where(
+                belongs_to_g_expanded,
+                scores_broadcasted,
+                zero_score  # -10000.0 effectively acts like -inf in LogSumExp
+            )
             # Shape: (B, local_num_spks, num_past, max_num_spks)
 
-            # Max over past queries for each global speaker
-            aggregated_scores = masked_scores.max(dim=2)[0]  # (B, local_num_spks, max_num_spks)
+            # Count valid elements per (local_query, global_speaker) pair for normalization
+            num_valid = belongs_to_g_expanded.sum(dim=2).clamp(min=1).float()
+            # Shape: (B, local_num_spks, max_num_spks)
+
+            # LogMeanExp over past queries for each global speaker (generalized mean in log-space)
+            # This is count-normalized to avoid bias towards speakers with more history
+            # temperature controls smoothness: low = sharp (like max), high = smooth (like mean)
+            aggregated_scores = self.logsumexp_temperature * (
+                torch.logsumexp(masked_scores / self.logsumexp_temperature, dim=2)
+                - torch.log(num_valid)
+            )  # (B, local_num_spks, max_num_spks)
 
             # Determine which global speakers are active (have at least one past query)
             global_active = past_spk_assignments.max(dim=1)[0] > 0.5  # (B, max_num_spks)

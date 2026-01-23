@@ -182,6 +182,22 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         self.max_batch_dur = self._cfg.get("max_batch_dur", 20000)
 
+    def load_state_dict(self, state_dict, strict=True):
+        """
+        Override load_state_dict to handle backward compatibility with old checkpoints
+        that don't have newer parameters like sinkhorn_dustbin_val.
+        """
+        # Handle missing sinkhorn_dustbin_val for old checkpoints
+        dustbin_key = "nextformer_modules.sinkhorn_dustbin_val"
+        if dustbin_key not in state_dict:
+            logging.warning(
+                f"'{dustbin_key}' not found in checkpoint. "
+                f"Adding default value 0.0 for backward compatibility."
+            )
+            state_dict[dustbin_key] = torch.tensor(0.5)
+        
+        return super().load_state_dict(state_dict, strict=strict)
+
     def _init_loss_weights(self):
         pil_weight = self._cfg.get("pil_weight", 1.0)
         ats_weight = self._cfg.get("ats_weight", 0.0)
