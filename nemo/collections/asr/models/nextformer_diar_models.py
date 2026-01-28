@@ -20,6 +20,7 @@ import random
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple, Union
 import torch.nn.functional as F
+import torch.nn as nn
 
 import numpy as np
 import torch
@@ -146,6 +147,25 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.oracle_assignment = self._cfg.get("oracle_assignment", False)
         
         self.streaming_mode = self.cfg.get("streaming_mode", False)
+        self.backend = self._cfg.get("backend", "trff")  # "trff", "dotp", or "isd"
+        if self.backend not in ["trff", "dotp", "isd"]:
+            raise ValueError(f"Invalid backend '{self.backend}'. Must be 'trff', 'dotp', or 'isd'.")
+        logging.info(f"Using backend: {self.backend}")
+
+        # Optional ISD backend modules
+        if self.backend == "isd":
+            if not hasattr(self._cfg, "isd_encoder"):
+                raise ValueError("isd backend requires 'isd_encoder' config")
+            self.isd_encoder = NextformerEncLabelModel.from_config_dict(self._cfg.isd_encoder).to(self.device)
+            self.isd_input_proj = nn.Linear(
+                self._cfg.model_defaults.tf_d_model + self._cfg.model_defaults.se_d_model,
+                self._cfg.model_defaults.tf_d_model,
+            ).to(self.device)
+            self.isd_output_proj = nn.Linear(self._cfg.model_defaults.tf_d_model, 1).to(self.device)
+        else:
+            self.isd_encoder = None
+            self.isd_input_proj = None
+            self.isd_output_proj = None
         self.save_hyperparameters("cfg")
         self._init_eval_metrics()
         speaker_inds = list(range(self._cfg.local_num_spks))
@@ -734,9 +754,15 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             emb_seq_enc_proj = self.nextformer_modules.encoder_proj(emb_seq)
         else:
             emb_seq_enc_proj = emb_seq
+        
+        # Compute spk_embs early (needed for dotp backend, and used later for assignment)
+        local_num_spks = self._cfg.local_num_spks
+        spk_embs = cls_embs[:, :local_num_spks, :]
+        if self.nextformer_modules.spk_emb_proj is not None:
+            spk_embs = self.nextformer_modules.spk_emb_proj(spk_embs)
             
         # Get local logits for all chunks
-        local_logits = self.forward_infer(emb_seq_enc_proj, emb_seq_length)
+        local_logits = self.forward_backend(emb_seq_enc_proj, emb_seq_length, spk_embs=spk_embs)
         # (batch_size * num_chunks, chunk_total, local_num_spks)
 
         # Handle oracle mode (targets) if provided
@@ -771,17 +797,11 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             )
 
         preds = torch.sigmoid(local_logits)
-        local_num_spks = preds.shape[-1]
         active_frames_per_spk = (preds > self.local_mask_threshold).to(int).sum(dim=1) # (num_chunks * batch_size, local_num_spks)
         spk_detected = active_frames_per_spk > 0 # (num_chunks * batch_size, local_num_spks)
         spk_not_detected = ~spk_detected # (num_chunks * batch_size, local_num_spks)
 
-        # Get first local_num_spks CLS embeddings as local speaker embeddings
-        spk_embs = cls_embs[:, :local_num_spks, :]
-        if self.nextformer_modules.spk_emb_proj is not None:
-            spk_embs = self.nextformer_modules.spk_emb_proj(spk_embs)
-
-        # Zero out embeddings for undetected speakers
+        # Zero out embeddings for undetected speakers (spk_embs already computed earlier)
         spk_embs = spk_embs.masked_fill(spk_not_detected.unsqueeze(2), 0)
 
         if att_mod:
@@ -854,25 +874,124 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         return logits, local_logits, spk_embs, active_frames_per_spk
 
-    def forward_infer(self, emb_seq, emb_seq_length):
+    def forward_backend(self, emb_seq, emb_seq_length, spk_embs=None):
         """
         The main forward pass for diarization for offline diarization inference.
+        Dispatches to the appropriate backend based on self.backend.
 
         Args:
             emb_seq (torch.Tensor): Tensor containing FastConformer encoder states (embedding vectors).
                 Shape: (batch_size, diar_frame_count, emb_dim)
             emb_seq_length (torch.Tensor): Tensor containing lengths of FastConformer encoder states.
                 Shape: (batch_size,)
+            spk_embs (torch.Tensor, optional): Speaker embeddings from CLS tokens.
+                Shape: (batch_size, local_num_spks, emb_dim). Required for "dotp" backend.
 
         Returns:
             logits (torch.Tensor): Tensor containing local speaker logits.
                 Shape: (batch_size, diar_frame_count, num_speakers)
         """
+        if self.backend == "trff":
+            logits = self.backend_trff(emb_seq, emb_seq_length)
+        elif self.backend == "dotp":
+            if spk_embs is None:
+                raise ValueError("spk_embs is required for 'dotp' backend")
+            logits = self.backend_dotp(emb_seq, spk_embs)
+        elif self.backend == "isd":
+            if spk_embs is None:
+                raise ValueError("spk_embs is required for 'isd' backend")
+            logits = self.backend_isd(emb_seq, emb_seq_length, spk_embs)
+        else:
+            raise ValueError(f"Unknown backend: {self.backend}")
+        
+        # Apply length mask (common to all backends)
+        encoder_mask = self.nextformer_modules.length_to_mask(emb_seq_length, emb_seq.shape[1])
+        mask = encoder_mask.unsqueeze(-1)
+        logits = logits.masked_fill(~mask, -1e9)
+        return logits
+
+    def backend_trff(self, emb_seq, emb_seq_length):
+        """
+        Transformer + feedforward backend for computing local speaker logits.
+
+        Args:
+            emb_seq (torch.Tensor): Tensor containing encoder states.
+                Shape: (batch_size, diar_frame_count, emb_dim)
+            emb_seq_length (torch.Tensor): Tensor containing lengths of encoder states.
+                Shape: (batch_size,)
+
+        Returns:
+            logits (torch.Tensor): Tensor containing local speaker logits (unmasked).
+                Shape: (batch_size, diar_frame_count, local_num_spks)
+        """
         encoder_mask = self.nextformer_modules.length_to_mask(emb_seq_length, emb_seq.shape[1])
         trans_emb_seq = self.transformer_encoder(encoder_states=emb_seq, encoder_mask=encoder_mask)
         logits = self.nextformer_modules.forward_spk_logits(trans_emb_seq)
-        mask = encoder_mask.unsqueeze(-1)
-        logits = logits.masked_fill(~mask, -1e9)
+        return logits
+
+    def backend_dotp(self, emb_seq, spk_embs):
+        """
+        Dot product backend for computing local speaker logits.
+        Computes logits as dot product between frame embeddings and speaker embeddings.
+
+        Args:
+            emb_seq (torch.Tensor): Tensor containing encoder states (projected).
+                Shape: (batch_size, diar_frame_count, emb_dim)
+            spk_embs (torch.Tensor): Speaker embeddings from CLS tokens (projected).
+                Shape: (batch_size, local_num_spks, emb_dim)
+
+        Returns:
+            logits (torch.Tensor): Tensor containing local speaker logits (unmasked).
+                Shape: (batch_size, diar_frame_count, local_num_spks)
+        """
+        # Compute dot product: (B, T, D) @ (B, D, local_num_spks) -> (B, T, local_num_spks)
+        logits = torch.bmm(emb_seq, spk_embs.transpose(1, 2))
+        return logits
+
+    def backend_isd(self, emb_seq, emb_seq_length, spk_embs):
+        """
+        Individual Speaker Detection (ISD) backend for computing local speaker logits.
+        Concatenates per-speaker embeddings with frame embeddings and runs a dedicated encoder.
+
+        Args:
+            emb_seq (torch.Tensor): Tensor containing encoder states (projected).
+                Shape: (batch_size, diar_frame_count, tf_d_model)
+            emb_seq_length (torch.Tensor): Tensor containing lengths of encoder states.
+                Shape: (batch_size,)
+            spk_embs (torch.Tensor): Speaker embeddings from CLS tokens (projected).
+                Shape: (batch_size, local_num_spks, se_d_model)
+
+        Returns:
+            logits (torch.Tensor): Tensor containing local speaker logits (unmasked).
+                Shape: (batch_size, diar_frame_count, local_num_spks)
+        """
+        if self.isd_encoder is None or self.isd_input_proj is None or self.isd_output_proj is None:
+            raise RuntimeError("ISD backend modules are not initialized")
+
+        batch_size, diar_len, _ = emb_seq.shape
+        local_num_spks = spk_embs.shape[1]
+
+        # Expand to per-speaker sequences
+        emb_seq_expanded = emb_seq.unsqueeze(1).expand(-1, local_num_spks, -1, -1)
+        spk_embs_expanded = spk_embs.unsqueeze(2).expand(-1, -1, diar_len, -1)
+
+        # Concatenate and project back to tf_d_model
+        combined = torch.cat([emb_seq_expanded, spk_embs_expanded], dim=-1)
+        combined = self.isd_input_proj(combined)
+
+        # Reshape to (B * local_num_spks, T, tf_d_model)
+        combined = combined.reshape(batch_size * local_num_spks, diar_len, -1)
+
+        # Repeat lengths for each speaker
+        isd_lengths = emb_seq_length.unsqueeze(1).expand(-1, local_num_spks).reshape(-1)
+        encoder_mask = self.nextformer_modules.length_to_mask(isd_lengths, diar_len)
+
+        # Run ISD encoder and output projection
+        encoded = self.isd_encoder(encoder_states=combined, encoder_mask=encoder_mask)
+        logits = self.isd_output_proj(encoded)  # (B * local_num_spks, T, 1)
+
+        # Reshape back to (B, T, local_num_spks)
+        logits = logits.reshape(batch_size, local_num_spks, diar_len, 1).squeeze(-1).transpose(1, 2)
         return logits
 
     def _diarize_forward(self, batch: Any):

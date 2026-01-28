@@ -12,6 +12,7 @@ model:
   local_num_spks: 4 # Number of speakers for local diarization
   max_num_spks: 8 # Maximum number of speakers per model; currently set to 8
   streaming_mode: False
+  backend: "trff"  # Backend for local logits: "trff", "dotp", or "isd"
   pil_metric: "dot_product"
 
   model_defaults:
@@ -182,6 +183,19 @@ model:
     attn_score_dropout: 0.5
     attn_layer_dropout: 0.5
     ffn_dropout: 0.5
+    hidden_act: relu
+    pre_ln: False
+    pre_ln_final_layer_norm: True
+
+  isd_encoder:
+    _target_: nemo.collections.asr.modules.transformer.transformer_encoders.TransformerEncoder
+    num_layers: 6
+    hidden_size: ${model.model_defaults.tf_d_model} # Needs to be multiple of num_attention_heads
+    inner_size: 768
+    num_attention_heads: 8
+    attn_score_dropout: 0.1
+    attn_layer_dropout: 0.1
+    ffn_dropout: 0.1
     hidden_act: relu
     pre_ln: False
     pre_ln_final_layer_norm: True
