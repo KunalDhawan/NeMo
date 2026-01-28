@@ -26,7 +26,7 @@ from torch import nn
 from nemo.collections.asr.models.configs import CacheAwareStreamingConfig
 from nemo.collections.asr.parts.mixins.streaming import StreamingEncoder
 from nemo.collections.asr.parts.submodules.causal_convs import CausalConv1D
-from nemo.collections.asr.parts.submodules.conformer_modules import ConformerLayer
+from nemo.collections.asr.parts.submodules.conformer_modules import ConformerLayer, ConformerLayerWithCLS
 from nemo.collections.asr.parts.submodules.multi_head_attention import (
     LocalAttRelPositionalEncoding,
     MultiHeadAttention,
@@ -56,7 +56,7 @@ from nemo.core.neural_types import (
 )
 from nemo.utils import logging
 
-__all__ = ['ConformerEncoder']
+__all__ = ['ConformerEncoder', 'ConformerEncoderWithCLS']
 
 
 class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
@@ -1345,6 +1345,468 @@ class ConformerMultiLayerFeatureExtractor(NeuralModule, Exportable, AccessMixin)
             return self.aggregator(encoded_list, encoded_len_list)  # Tensor[B,D*L,T], Tensor[B]
         else:
             return encoded_list, encoded_len_list  # List[Tensor[B,D,T]], List[Tensor[B]]
+
+
+class ConformerEncoderWithCLS(ConformerEncoder):
+    """ConformerEncoder with CLS tokens for speaker query aggregation.
+    
+    This encoder extends ConformerEncoder to support CLS tokens that are prepended 
+    to the audio sequence. CLS tokens aggregate speaker information through 
+    self-attention and can be used as speaker queries for diarization.
+    
+    Key features:
+      - CLS tokens are prepended to the sequence after pre_encode
+      - Convolution is applied only to audio frames, CLS tokens skip conv
+      - Returns (audio_embeddings, length, cls_embeddings) separately
+      - Supports multiple positional encoding modes for CLS tokens
+    
+    Args:
+        num_cls_tokens (int): Number of CLS tokens to prepend
+        cls_pos_mode (str): Positional encoding mode for CLS tokens.
+            'query_key': Learned CLS pos on both query and key (default)
+            'query_only': Learned CLS pos on query only
+            'rel_pos': Use standard relative positional encoding
+            'none': No positional encoding for CLS tokens
+        allow_content_to_cls (bool): Whether non-CLS tokens can attend to CLS tokens. Default True.
+        cls_embedding_shared (bool): If True, use one shared CLS embedding for all slots.
+            If False, use a distinct embedding per CLS slot. Default True.
+        feat_in (int): Input feature dimension
+        n_layers (int): Number of conformer layers
+        d_model (int): Model dimension
+        ... (other args same as ConformerEncoder)
+    """
+    
+    def __init__(
+        self,
+        num_cls_tokens,
+        cls_pos_mode='query_key',
+        allow_content_to_cls=True,
+        cls_embedding_shared: bool = True,
+        feat_in=80,
+        n_layers=16,
+        d_model=256,
+        feat_out=-1,
+        causal_downsampling=False,
+        subsampling='striding',
+        subsampling_factor=4,
+        subsampling_conv_chunking_factor=1,
+        subsampling_conv_channels=-1,
+        reduction=None,
+        reduction_position=None,
+        reduction_factor=1,
+        ff_expansion_factor=4,
+        self_attention_model='rel_pos',
+        n_heads=4,
+        att_context_size=None,
+        att_context_probs=None,
+        att_context_style='regular',
+        xscaling=True,
+        untie_biases=True,
+        pos_emb_max_len=5000,
+        conv_kernel_size=31,
+        conv_norm_type='batch_norm',
+        conv_context_size=None,
+        use_bias=True,
+        dropout=0.1,
+        dropout_pre_encoder=0.1,
+        dropout_emb=0.1,
+        dropout_att=0.0,
+        stochastic_depth_drop_prob: float = 0.0,
+        stochastic_depth_mode: str = "linear",
+        stochastic_depth_start_layer: int = 1,
+        global_tokens: int = 0,
+        global_tokens_spacing: int = 1,
+        global_attn_separate: bool = False,
+        use_pytorch_sdpa: bool = False,
+        use_pytorch_sdpa_backends=None,
+        sync_max_audio_length: bool = True,
+    ):
+        if self_attention_model != "rel_pos":
+            raise ValueError("ConformerEncoderWithCLS currently supports only self_attention_model='rel_pos'.")
+        if use_pytorch_sdpa:
+            raise NotImplementedError(
+                "use_pytorch_sdpa is not supported for ConformerEncoderWithCLS. "
+                "RelPositionMultiHeadAttentionWithCLS does not support this mode yet."
+            )
+        # Initialize parent class first
+        super().__init__(
+            feat_in=feat_in,
+            n_layers=n_layers,
+            d_model=d_model,
+            feat_out=feat_out,
+            causal_downsampling=causal_downsampling,
+            subsampling=subsampling,
+            subsampling_factor=subsampling_factor,
+            subsampling_conv_chunking_factor=subsampling_conv_chunking_factor,
+            subsampling_conv_channels=subsampling_conv_channels,
+            reduction=reduction,
+            reduction_position=reduction_position,
+            reduction_factor=reduction_factor,
+            ff_expansion_factor=ff_expansion_factor,
+            self_attention_model=self_attention_model,
+            n_heads=n_heads,
+            att_context_size=att_context_size,
+            att_context_probs=att_context_probs,
+            att_context_style=att_context_style,
+            xscaling=xscaling,
+            untie_biases=untie_biases,
+            pos_emb_max_len=pos_emb_max_len,
+            conv_kernel_size=conv_kernel_size,
+            conv_norm_type=conv_norm_type,
+            conv_context_size=conv_context_size,
+            use_bias=use_bias,
+            dropout=dropout,
+            dropout_pre_encoder=dropout_pre_encoder,
+            dropout_emb=dropout_emb,
+            dropout_att=dropout_att,
+            stochastic_depth_drop_prob=stochastic_depth_drop_prob,
+            stochastic_depth_mode=stochastic_depth_mode,
+            stochastic_depth_start_layer=stochastic_depth_start_layer,
+            global_tokens=global_tokens,
+            global_tokens_spacing=global_tokens_spacing,
+            global_attn_separate=global_attn_separate,
+            use_pytorch_sdpa=use_pytorch_sdpa,
+            use_pytorch_sdpa_backends=use_pytorch_sdpa_backends,
+            sync_max_audio_length=sync_max_audio_length,
+        )
+        
+        self.num_cls_tokens = num_cls_tokens
+        self.cls_pos_mode = cls_pos_mode
+        self.allow_content_to_cls = allow_content_to_cls
+        self.cls_embedding_shared = cls_embedding_shared
+        
+        # Learnable CLS content embedding (shared or per-slot)
+        if self.cls_embedding_shared:
+            # Single vector that gets broadcast to all slots
+            self.cls_embedding = nn.Parameter(torch.zeros(1, 1, d_model))
+        else:
+            # One embedding per CLS slot
+            self.cls_embedding = nn.Parameter(torch.zeros(1, num_cls_tokens, d_model))
+        nn.init.normal_(self.cls_embedding, std=0.02)
+        
+        # Get positional biases from parent (for passing to CLS layers)
+        if not untie_biases and self_attention_model == "rel_pos":
+            pos_bias_u = self.layers[0].self_attn.pos_bias_u
+            pos_bias_v = self.layers[0].self_attn.pos_bias_v
+        else:
+            pos_bias_u = None
+            pos_bias_v = None
+        
+        # Replace layers with CLS-aware versions
+        d_ff = d_model * ff_expansion_factor
+        self.layers = nn.ModuleList()
+        for i in range(n_layers):
+            layer = ConformerLayerWithCLS(
+                num_cls_tokens=num_cls_tokens,
+                cls_pos_mode=cls_pos_mode,
+                allow_content_to_cls=allow_content_to_cls,
+                d_model=d_model,
+                d_ff=d_ff,
+                n_heads=n_heads,
+                conv_kernel_size=conv_kernel_size,
+                conv_norm_type=conv_norm_type,
+                conv_context_size=self.conv_context_size,
+                dropout=dropout,
+                dropout_att=dropout_att,
+                pos_bias_u=pos_bias_u,
+                pos_bias_v=pos_bias_v,
+                att_context_size=self.att_context_size,
+                use_bias=use_bias,
+                use_pytorch_sdpa=use_pytorch_sdpa,
+                use_pytorch_sdpa_backends=use_pytorch_sdpa_backends if use_pytorch_sdpa_backends else [],
+            )
+            self.layers.append(layer)
+        
+        # Recompute stochastic depth probabilities for new layers
+        self.layer_drop_probs = compute_stochastic_depth_drop_probs(
+            len(self.layers), stochastic_depth_drop_prob, stochastic_depth_mode, stochastic_depth_start_layer
+        )
+        
+        logging.info(
+            f"ConformerEncoderWithCLS initialized with {num_cls_tokens} CLS tokens, "
+            f"cls_pos_mode='{cls_pos_mode}', allow_content_to_cls={allow_content_to_cls}, "
+            f"cls_embedding_shared={cls_embedding_shared}"
+        )
+    
+    def load_state_dict(self, state_dict, strict=True):
+        """Override to log warnings about new CLS parameters and use strict=False."""
+        missing_cls_params = []
+        
+        # Check for CLS-specific parameters that won't be in pretrained checkpoints
+        if 'cls_embedding' not in state_dict:
+            missing_cls_params.append('cls_embedding')
+        
+        # Check layers for CLS attention params
+        for i in range(self.n_layers):
+            if self.cls_pos_mode in ['query_key', 'query_only']:
+                cls_attn_key_q = f'layers.{i}.self_attn.cls_pos_q'
+                if cls_attn_key_q not in state_dict:
+                    missing_cls_params.append(cls_attn_key_q)
+            if self.cls_pos_mode == 'query_key':
+                cls_attn_key_k = f'layers.{i}.self_attn.cls_pos_k'
+                if cls_attn_key_k not in state_dict:
+                    missing_cls_params.append(cls_attn_key_k)
+        
+        if missing_cls_params:
+            logging.info(f"CLS parameters initialized randomly (not found in checkpoint): {missing_cls_params}")
+        
+        # Use strict=False to allow loading pretrained weights
+        return super().load_state_dict(state_dict, strict=False)
+
+    @property
+    def output_types(self):
+        """Returns definitions of module output ports."""
+        return OrderedDict(
+            {
+                "outputs": NeuralType(('B', 'D', 'T'), AcousticEncodedRepresentation()),
+                "encoded_lengths": NeuralType(tuple('B'), LengthsType()),
+                "cls_outputs": NeuralType(('B', 'C', 'D'), AcousticEncodedRepresentation()),
+            }
+        )
+
+    @property
+    def output_types_for_export(self):
+        """Returns definitions of module output ports."""
+        return self.output_types
+    
+    def forward_internal(
+        self,
+        audio_signal,
+        length,
+        cache_last_channel=None,
+        cache_last_time=None,
+        cache_last_channel_len=None,
+        bypass_pre_encode=False,
+    ):
+        """Forward pass with CLS token handling.
+        
+        Args:
+            audio_signal: Input audio features (B, feat_in, T) or pre-encoded (B, T, d_model)
+            length: Lengths of audio sequences (B,)
+            cache_last_channel: Cache for attention layers
+            cache_last_time: Cache for conv layers  
+            cache_last_channel_len: Cache lengths
+            bypass_pre_encode: If True, audio_signal is already pre-encoded
+            
+        Returns:
+            audio_output: Audio embeddings (B, D, T) 
+            length: Audio lengths (B,)
+            cls_output: CLS token embeddings (B, num_cls, D)
+        """
+        if length is None:
+            length = audio_signal.new_full(
+                (audio_signal.size(0),), audio_signal.size(-1), dtype=torch.int64, device=audio_signal.device
+            )
+        
+        # Select attention context size
+        if self.training and len(self.att_context_size_all) > 1:
+            cur_att_context_size = random.choices(self.att_context_size_all, weights=self.att_context_probs)[0]
+        else:
+            cur_att_context_size = self.att_context_size
+        
+        # Pre-encode audio
+        if not bypass_pre_encode:
+            audio_signal = torch.transpose(audio_signal, 1, 2)
+            
+            if isinstance(self.pre_encode, nn.Linear):
+                audio_signal = self.pre_encode(audio_signal)
+            else:
+                audio_signal, length = self.pre_encode(x=audio_signal, lengths=length)
+                length = length.to(torch.int64)
+                if self.streaming_cfg.drop_extra_pre_encoded > 0 and cache_last_channel is not None:
+                    audio_signal = audio_signal[:, self.streaming_cfg.drop_extra_pre_encoded :, :]
+                    length = (length - self.streaming_cfg.drop_extra_pre_encoded).clamp(min=0)
+            
+            if self.reduction_position is not None and cache_last_channel is not None:
+                raise ValueError("Caching with reduction feature is not supported yet!")
+        
+        batch_size = audio_signal.size(0)
+        audio_len = audio_signal.size(1)
+        
+        # Prepend CLS tokens (shared or per-slot embeddings)
+        if self.cls_embedding_shared:
+            cls_tokens = self.cls_embedding.expand(batch_size, self.num_cls_tokens, -1)
+        else:
+            cls_tokens = self.cls_embedding.expand(batch_size, -1, -1)
+        x = torch.cat([cls_tokens, audio_signal], dim=1)
+        
+        # Update lengths to include CLS tokens
+        length_with_cls = length + self.num_cls_tokens
+        
+        max_audio_length = x.size(1)
+        if cache_last_channel is not None:
+            cache_len = self.streaming_cfg.last_channel_cache_size
+            cache_keep_size = max_audio_length - self.streaming_cfg.cache_drop_size
+            max_audio_length = max_audio_length + cache_len
+            padding_length = length_with_cls + cache_len
+            offset = torch.neg(cache_last_channel_len) + cache_len
+        else:
+            padding_length = length_with_cls
+            cache_last_channel_next = None
+            cache_len = 0
+            offset = None
+        
+        # Apply positional encoding to full sequence (CLS + audio)
+        x, pos_emb = self.pos_enc(x=x, cache_len=cache_len)
+        
+        # Create masks with CLS handling
+        pad_mask, att_mask = self._create_masks(
+            att_context_size=cur_att_context_size,
+            padding_length=padding_length,
+            max_audio_length=max_audio_length,
+            offset=offset,
+            device=x.device,
+        )
+        
+        # CLS tokens are never padded - ensure they're marked as valid
+        if pad_mask is not None:
+            pad_mask[:, :self.num_cls_tokens] = False  # False means not padded
+        
+        if cache_last_channel is not None:
+            pad_mask = pad_mask[:, cache_len:]
+            if att_mask is not None:
+                att_mask = att_mask[:, cache_len:]
+            cache_last_time_next = []
+            cache_last_channel_next = []
+        
+        # Run through CLS-aware layers
+        for lth, (drop_prob, layer) in enumerate(zip(self.layer_drop_probs, self.layers)):
+            original_signal = x
+            if cache_last_channel is not None:
+                cache_last_channel_cur = cache_last_channel[lth]
+                cache_last_time_cur = cache_last_time[lth]
+            else:
+                cache_last_channel_cur = None
+                cache_last_time_cur = None
+            
+            x = layer(
+                x=x,
+                att_mask=att_mask,
+                pos_emb=pos_emb,
+                pad_mask=pad_mask,
+                cache_last_channel=cache_last_channel_cur,
+                cache_last_time=cache_last_time_cur,
+            )
+            
+            if cache_last_channel_cur is not None:
+                (x, cache_last_channel_cur, cache_last_time_cur) = x
+                cache_last_channel_next.append(cache_last_channel_cur)
+                cache_last_time_next.append(cache_last_time_cur)
+            
+            # Stochastic depth
+            if self.training and drop_prob > 0.0:
+                should_drop = torch.rand(1) < drop_prob
+                if should_drop:
+                    x = x * 0.0 + original_signal
+                else:
+                    x = (x - original_signal) / (1.0 - drop_prob) + original_signal
+            
+            # Reduction (applied to audio only, but we handle full sequence)
+            if self.reduction_position == lth:
+                # Split, reduce audio only, recombine
+                cls_part = x[:, :self.num_cls_tokens, :]
+                audio_part = x[:, self.num_cls_tokens:, :]
+                audio_part, length = self.reduction_subsampling(x=audio_part, lengths=length)
+                x = torch.cat([cls_part, audio_part], dim=1)
+                
+                max_audio_length = x.size(1)
+                _, pos_emb = self.pos_enc(x=x, cache_len=cache_len)
+                length_with_cls = length + self.num_cls_tokens
+                pad_mask, att_mask = self._create_masks(
+                    att_context_size=cur_att_context_size,
+                    padding_length=length_with_cls,
+                    max_audio_length=max_audio_length,
+                    offset=offset,
+                    device=x.device,
+                )
+                if pad_mask is not None:
+                    pad_mask[:, :self.num_cls_tokens] = False
+        
+        # Apply output projection if exists
+        if self.out_proj is not None:
+            x = self.out_proj(x)
+        
+        # Reduction at the end
+        if self.reduction_position == -1:
+            cls_part = x[:, :self.num_cls_tokens, :]
+            audio_part = x[:, self.num_cls_tokens:, :]
+            audio_part, length = self.reduction_subsampling(x=audio_part, lengths=length)
+            x = torch.cat([cls_part, audio_part], dim=1)
+        
+        # Split output: CLS tokens and audio
+        cls_output = x[:, :self.num_cls_tokens, :]  # (B, num_cls, D)
+        audio_output = x[:, self.num_cls_tokens:, :]  # (B, T, D)
+        
+        # Transpose audio to match expected format (B, D, T)
+        audio_output = torch.transpose(audio_output, 1, 2)
+        length = length.to(dtype=torch.int64)
+        
+        return audio_output, length, cls_output
+    
+    @typecheck()
+    def forward(
+        self,
+        audio_signal,
+        length,
+        cache_last_channel=None,
+        cache_last_time=None,
+        cache_last_channel_len=None,
+        bypass_pre_encode=False,
+    ):
+        """Forward pass returning audio embeddings and CLS embeddings separately.
+        
+        Returns:
+            audio_output: (B, D, T) audio frame embeddings
+            length: (B,) audio lengths
+            cls_output: (B, num_cls_tokens, D) CLS token embeddings (speaker queries)
+        """
+        if not bypass_pre_encode and audio_signal.shape[-2] != self._feat_in:
+            raise ValueError(
+                f"If bypass_pre_encode is False, audio_signal should have shape "
+                f"(batch, {self._feat_in}, n_frame) but got dimension {audio_signal.shape[-2]}."
+            )
+        if bypass_pre_encode and audio_signal.shape[-1] != self.d_model:
+            raise ValueError(
+                f"If bypass_pre_encode is True, audio_signal should have shape "
+                f"(batch, n_frame, {self.d_model}) but got last dimension {audio_signal.shape[-1]}."
+            )
+        
+        if bypass_pre_encode:
+            self.update_max_seq_length(
+                seq_length=audio_signal.size(1) + self.num_cls_tokens, device=audio_signal.device
+            )
+        else:
+            self.update_max_seq_length(
+                seq_length=audio_signal.size(2) + self.num_cls_tokens, device=audio_signal.device
+            )
+        
+        if cache_last_channel is not None or cache_last_time is not None:
+            raise NotImplementedError("Caching is not supported in ConformerEncoderWithCLS.")
+
+        return self.forward_internal(
+            audio_signal,
+            length,
+            cache_last_channel=cache_last_channel,
+            cache_last_time=cache_last_time,
+            cache_last_channel_len=cache_last_channel_len,
+            bypass_pre_encode=bypass_pre_encode,
+        )
+
+    def forward_for_export(
+        self, audio_signal, length, cache_last_channel=None, cache_last_time=None, cache_last_channel_len=None
+    ):
+        """
+        Forward function for model export. Please see `forward()` for more details.
+        """
+        if cache_last_channel is not None or cache_last_time is not None:
+            raise NotImplementedError("Caching is not supported in ConformerEncoderWithCLS.")
+        return self.forward_internal(
+            audio_signal,
+            length,
+            cache_last_channel=cache_last_channel,
+            cache_last_time=cache_last_time,
+            cache_last_channel_len=cache_last_channel_len,
+        )
 
 
 # Register any additional information

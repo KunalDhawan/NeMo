@@ -45,6 +45,7 @@ from nemo.utils import avoid_float16_autocast_context
 
 __all__ = [
     'RelPositionMultiHeadAttention',
+    'RelPositionMultiHeadAttentionWithCLS',
     'RelPositionalEncoding',
     'PositionalEncoding',
 ]
@@ -348,6 +349,168 @@ class RelPositionMultiHeadAttention(MultiHeadAttention):
                 scores = (matrix_ac + matrix_bd) / self.s_d_k  # (batch, head, time1, time2)
                 out = self.forward_attention(v, scores, mask)
 
+        if cache is None:
+            return out
+        else:
+            return out, cache
+
+
+class RelPositionMultiHeadAttentionWithCLS(RelPositionMultiHeadAttention):
+    """Multi-Head Attention layer with special handling for CLS tokens.
+    
+    Extends RelPositionMultiHeadAttention to support CLS tokens that use learned 
+    positional embeddings instead of sinusoidal relative positional encoding.
+    
+    Supports four positional encoding modes for CLS tokens:
+      - 'query_key': CLS pos applied to both query and key (default)
+      - 'query_only': CLS pos applied to query only (audio attends to CLS by content)
+      - 'rel_pos': Use standard relative positional encoding for CLS
+      - 'none': No positional encoding for CLS tokens
+    
+    Args:
+        num_cls_tokens (int): Number of CLS tokens prepended to the sequence
+        cls_pos_mode (str): Positional encoding mode for CLS tokens
+        allow_content_to_cls (bool): Whether non-CLS tokens can attend to CLS tokens
+        n_head (int): Number of attention heads
+        n_feat (int): Size of the features (d_model)
+        dropout_rate (float): Dropout rate
+        pos_bias_u: Positional bias u (shared or per-layer)
+        pos_bias_v: Positional bias v (shared or per-layer)
+        max_cache_len (int): Maximum cache length for streaming
+        use_bias (bool): Whether to use bias in linear layers
+    """
+    
+    def __init__(
+        self,
+        num_cls_tokens,
+        cls_pos_mode='query_key',
+        allow_content_to_cls=True,
+        n_head=4,
+        n_feat=256,
+        dropout_rate=0.0,
+        pos_bias_u=None,
+        pos_bias_v=None,
+        max_cache_len=0,
+        use_bias=True,
+        use_pytorch_sdpa=False,
+        use_pytorch_sdpa_backends=None,
+    ):
+        """Construct a RelPositionMultiHeadAttentionWithCLS object."""
+        super().__init__(
+            n_head=n_head,
+            n_feat=n_feat,
+            dropout_rate=dropout_rate,
+            pos_bias_u=pos_bias_u,
+            pos_bias_v=pos_bias_v,
+            max_cache_len=max_cache_len,
+            use_bias=use_bias,
+            use_pytorch_sdpa=use_pytorch_sdpa,
+            use_pytorch_sdpa_backends=use_pytorch_sdpa_backends,
+        )
+        
+        self.num_cls_tokens = num_cls_tokens
+        self.cls_pos_mode = cls_pos_mode
+        self.allow_content_to_cls = allow_content_to_cls
+        
+        # Learned positional embeddings for CLS tokens (per-head)
+        if cls_pos_mode in ['query_key', 'query_only']:
+            # Shape: (n_head, num_cls_tokens, d_k)
+            self.cls_pos_q = nn.Parameter(torch.zeros(self.h, num_cls_tokens, self.d_k))
+            nn.init.normal_(self.cls_pos_q, std=0.02)
+            if cls_pos_mode == 'query_key':
+                self.cls_pos_k = nn.Parameter(torch.zeros(self.h, num_cls_tokens, self.d_k))
+                nn.init.normal_(self.cls_pos_k, std=0.02)
+            else:
+                self.cls_pos_k = None
+        else:
+            self.cls_pos_q = None
+            self.cls_pos_k = None
+    
+    def forward(self, query, key, value, mask, pos_emb, cache=None):
+        """Compute attention with special CLS token handling.
+        
+        Args:
+            query (torch.Tensor): (batch, time1, size) where time1 = num_cls + seq_len
+            key (torch.Tensor): (batch, time2, size)
+            value (torch.Tensor): (batch, time2, size)
+            mask (torch.Tensor): (batch, time1, time2)
+            pos_emb (torch.Tensor): (1, 2*time-1, size) relative positional embeddings
+            cache (torch.Tensor): Optional cache for streaming
+            
+        Returns:
+            output (torch.Tensor): (batch, time1, d_model)
+            cache (torch.Tensor): Updated cache if provided
+        """
+        if self.use_pytorch_sdpa:
+            raise NotImplementedError("use_pytorch_sdpa mode is not supported for RelPositionMultiHeadAttentionWithCLS yet")
+        # For 'rel_pos' mode, use the parent implementation, but still apply
+        # allow_content_to_cls masking when requested.
+        if self.cls_pos_mode == 'rel_pos':
+            if (not self.allow_content_to_cls) and self.num_cls_tokens > 0:
+                if mask is None:
+                    time1 = query.size(1)
+                    time2 = key.size(1) + (cache.size(1) if cache is not None else 0)
+                    mask = torch.zeros((query.size(0), time1, time2), dtype=torch.bool, device=query.device)
+                else:
+                    mask = mask.clone()
+                mask[:, self.num_cls_tokens :, : self.num_cls_tokens] = True
+            return super().forward(query, key, value, mask, pos_emb, cache)
+        
+        key, value, query, cache = self.update_cache(key=key, value=value, query=query, cache=cache)
+        
+        if torch.is_autocast_enabled():
+            query, key, value = query.to(torch.float32), key.to(torch.float32), value.to(torch.float32)
+        
+        with avoid_float16_autocast_context():
+            q, k, v = self.forward_qkv(query, key, value)
+
+            # Add learnable CLS positional embeddings to q/k
+            if self.cls_pos_mode in ['query_key', 'query_only'] and self.num_cls_tokens > 0:
+                q = q.clone()
+                q[:, :, : self.num_cls_tokens, :] = q[:, :, : self.num_cls_tokens, :] + self.cls_pos_q.unsqueeze(0)
+                if self.cls_pos_mode == 'query_key' and self.cls_pos_k is not None:
+                    k = k.clone()
+                    k[:, :, : self.num_cls_tokens, :] = k[:, :, : self.num_cls_tokens, :] + self.cls_pos_k.unsqueeze(0)
+
+            # Relative positional embeddings # (batch, head, time1, d_k)
+            n_batch_pos = pos_emb.size(0)
+            p = self.linear_pos(pos_emb).view(n_batch_pos, -1, self.h, self.d_k).transpose(1, 2)
+
+            # (batch, head, time1, d_k)
+            q_with_bias_u = q + self.pos_bias_u.unsqueeze(1)
+            # (batch, head, time1, d_k)
+            q_with_bias_v = q + self.pos_bias_v.unsqueeze(1) 
+
+            # Content-based attention (matrix_ac)
+            # (batch, head, time1, time2)            
+            matrix_ac = torch.matmul(q_with_bias_u, k.transpose(-2, -1)) 
+
+            # Position-based attention (matrix_bd) using rel-pos
+            # (batch, head, time1, time2)
+            matrix_bd = torch.matmul(q_with_bias_v, p.transpose(-2, -1))
+            matrix_bd = self.rel_shift(matrix_bd)
+            matrix_bd = matrix_bd[:, :, :, : matrix_ac.size(-1)]
+
+            # CLS tokens do not use sinusoidal relative positions
+            if self.cls_pos_mode in ['query_key', 'query_only', 'none']:
+                if self.num_cls_tokens > 0:
+                    matrix_bd[:, :, : self.num_cls_tokens, :] = 0
+                    matrix_bd[:, :, :, : self.num_cls_tokens] = 0
+
+            # Combine content and position scores
+            scores = (matrix_ac + matrix_bd) / self.s_d_k  # (batch, head, time1, time2)
+            
+            # Apply allow_content_to_cls masking if needed
+            if not self.allow_content_to_cls:
+                # Mask non-CLS queries from attending to CLS keys
+                content_to_cls_mask = torch.zeros(
+                    1, 1, matrix_ac.size(-2), matrix_ac.size(-1), dtype=torch.bool, device=scores.device
+                )
+                content_to_cls_mask[:, :, self.num_cls_tokens:, :self.num_cls_tokens] = True
+                scores = scores.masked_fill(content_to_cls_mask, -INF_VAL)
+            
+            out = self.forward_attention(v, scores, mask)
+        
         if cache is None:
             return out
         else:

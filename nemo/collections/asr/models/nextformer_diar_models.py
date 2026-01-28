@@ -103,28 +103,19 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         self.encoder = NextformerEncLabelModel.from_config_dict(self._cfg.encoder).to(self.device)
         
-        # Get dual decoder mode before decoder initialization
-        self.dual_decoder_mode = self._cfg.get("dual_decoder_mode", "concat")  # "concat" or "init" or "init_concat"
-        
-        # Handle optional query_decoder
-        query_decoder_cfg = self._cfg.get('query_decoder', None)
-        if query_decoder_cfg is not None:
-            self.query_decoder = NextformerEncLabelModel.from_config_dict(query_decoder_cfg).to(self.device)
-        else:
-            self.query_decoder = None
-            
-        # Handle optional query_decoder_raw
-        query_decoder_raw_cfg = self._cfg.get('query_decoder_raw', None)
-        if query_decoder_raw_cfg is not None:
-            self.query_decoder_raw = NextformerEncLabelModel.from_config_dict(query_decoder_raw_cfg).to(self.device)
-        else:
-            self.query_decoder_raw = None
+        if not hasattr(self.encoder, 'num_cls_tokens') or self.encoder.num_cls_tokens < self._cfg.local_num_spks:
+            raise ValueError("CLS-based encoder must be specified in the config and have at least local_num_spks CLS tokens")
 
-        query_enhancer_cfg = self._cfg.get('query_enhancer', None)
-        if query_enhancer_cfg is not None:
-            self.query_enhancer = NextformerEncLabelModel.from_config_dict(query_enhancer_cfg).to(self.device)
+        logging.info(
+            f"Using CLS-based speaker embeddings from encoder (num_cls_tokens={self.encoder.num_cls_tokens}, "
+            f"cls_pos_mode='{self.encoder.cls_pos_mode}')"
+        )
+
+        spk_embs_enhancer_cfg = self._cfg.get('spk_embs_enhancer', None)
+        if spk_embs_enhancer_cfg is not None:
+            self.spk_embs_enhancer = NextformerEncLabelModel.from_config_dict(spk_embs_enhancer_cfg).to(self.device)
         else:
-            self.query_enhancer = None
+            self.spk_embs_enhancer = None
             
         self.transformer_encoder = NextformerEncLabelModel.from_config_dict(self._cfg.transformer_encoder).to(
             self.device
@@ -137,27 +128,11 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             self.nextformer_modules.encoder_proj = self.nextformer_modules.encoder_proj.to(self.device)
         else:
             self.nextformer_modules.encoder_proj = None
-        if self.query_decoder is not None:
-            self.nextformer_modules.query_proj = self.nextformer_modules.query_proj.to(self.device)
+        
+        if self._cfg.encoder.d_model != self._cfg.model_defaults.se_d_model:
+            self.nextformer_modules.spk_emb_proj = self.nextformer_modules.spk_emb_proj.to(self.device)
         else:
-            self.nextformer_modules.query_proj = None
-        if self.query_decoder_raw is not None:
-            self.nextformer_modules.query_raw_proj = self.nextformer_modules.query_raw_proj.to(self.device)
-        else:
-            self.nextformer_modules.query_raw_proj = None
-        if self.query_decoder is not None and self.query_decoder_raw is not None and self.dual_decoder_mode != "init":
-            self.nextformer_modules.query_combiner = self.nextformer_modules.query_combiner.to(self.device)
-            logging.info(f"Both query_decoder and query_decoder_raw are enabled with mode '{self.dual_decoder_mode}'. Using query_combiner to merge outputs.")
-        else:
-            self.nextformer_modules.query_combiner = None
-            if self.query_decoder is None and self.query_decoder_raw is None:
-                raise ValueError("At least one of query_decoder or query_decoder_raw must be specified in the config.")
-            elif self.query_decoder is not None and self.query_decoder_raw is not None:
-                logging.info(f"Both query_decoder and query_decoder_raw are enabled with mode '{self.dual_decoder_mode}' (init mode - no combiner).")
-            elif self.query_decoder is not None:
-                logging.info("Using only query_decoder (query_decoder_raw not specified).")
-            else:
-                logging.info("Using only query_decoder_raw (query_decoder not specified).")
+            self.nextformer_modules.spk_emb_proj = None
         
         self._init_loss_weights()
 
@@ -167,11 +142,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.q_sim_loss = instantiate(self._cfg.q_sim_loss)
         self.emb_sim_loss = instantiate(self._cfg.emb_sim_loss)
         self.local_mask_threshold = self._cfg.get("local_mask_threshold", 0.5)
-        self.initialize_queries = self._cfg.get("initialize_queries", True)
-        self.initialize_mask = self._cfg.get("initialize_mask", True)
         self.pil_metric = self._cfg.get("pil_metric", "bce")
-        self.oracle_queries_train = self._cfg.get("oracle_queries_train", False)
-        self.oracle_queries_test = self._cfg.get("oracle_queries_test", False)
         self.oracle_assignment = self._cfg.get("oracle_assignment", False)
         
         self.streaming_mode = self.cfg.get("streaming_mode", False)
@@ -358,20 +329,21 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         Returns:
             emb_seq (torch.Tensor):
-                tensor containing encoder outputs.
+                tensor containing encoder outputs (B, T, D).
             emb_seq_length (torch.Tensor):
                 tensor containing lengths of encoder outputs.
-        """
-        # Spec augment is not applied during evaluation/testing
-        if self.spec_augmentation is not None and self.training:
-            processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
-        emb_seq, emb_seq_length = self.encoder(
+            cls_embs (torch.Tensor or None):
+                CLS token embeddings if using CLS-based encoder, None otherwise.
+                Shape: (B, num_cls_tokens, D)
+        """      
+        # CLS-based encoder returns (audio_emb, length, cls_emb)
+        emb_seq, emb_seq_length, cls_embs = self.encoder(
             audio_signal=processed_signal,
             length=processed_signal_length,
             bypass_pre_encode=bypass_pre_encode,
         )
-        emb_seq = emb_seq.transpose(1, 2)
-        return emb_seq, emb_seq_length
+        emb_seq = emb_seq.transpose(1, 2)  # (B, D, T) -> (B, T, D)
+        return emb_seq, emb_seq_length, cls_embs
 
     def forward(
         self,
@@ -395,9 +367,9 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 Shape: (batch_size, max. diar frame count, max_num_speakers)
             local_logits (torch.Tensor): Tensor containing local speaker logits.
                 Shape: (num_chunks * batch_size, lc+chunk_len+rc, local_num_spks)
-            local_queries (torch.Tensor): Tensor containing local speaker queries.
-                Shape: (num_chunks * batch_size, local_num_spks, query_dim)
-            active_frames_per_query (torch.Tensor): Tensor containing the number of active frames per query
+            spk_embs (torch.Tensor): Tensor containing local speaker embeddings.
+                Shape: (num_chunks * batch_size, local_num_spks, spk_emb_dim)
+            active_frames_per_spk (torch.Tensor): Tensor containing the number of active frames per speaker
                 Shape: (num_chunks * batch_size, local_num_spks)
         """
         processed_signal, processed_signal_length = self.process_signal(
@@ -407,10 +379,10 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         if self.streaming_mode:
             raise NotImplementedError("Streaming mode is not implemented for Nextformer model.")
         else:
-            logits, local_logits, local_queries, active_frames_per_query = self.forward_offline(
+            logits, local_logits, spk_embs, active_frames_per_spk = self.forward_offline(
                 processed_signal=processed_signal, processed_signal_length=processed_signal_length, targets=targets
             )
-            return logits, local_logits, local_queries, active_frames_per_query
+            return logits, local_logits, spk_embs, active_frames_per_spk
 
     def _create_batch_of_chunks_extra(
         self,
@@ -666,9 +638,9 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 Shape: (batch_size, total_n_frames, max_num_spks)
             local_logits (torch.Tensor): Tensor containing local speaker logits
                 Shape: (num_chunks * batch_size, lc+chunk_len+rc, local_num_spks)
-            local_queries (torch.Tensor): Tensor containing local speaker queries
-                Shape: (num_chunks * batch_size, local_num_spks, query_dim)
-            active_frames_per_query (torch.Tensor): Tensor containing the number of active frames per query
+            spk_embs (torch.Tensor): Tensor containing local speaker embeddings
+                Shape: (num_chunks * batch_size, local_num_spks, spk_emb_dim)
+            active_frames_per_spk (torch.Tensor): Tensor containing the number of active frames per speaker
                 Shape: (num_chunks * batch_size, local_num_spks)
         """
         batch_size, ch, sig_length = processed_signal.shape
@@ -704,6 +676,10 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         # Step 2: Get pre_encode_embs and pre_encode_lengths for the whole batch
         # Transpose to (batch_size, feature_length, channels) for pre_encode
+        # Spec augment is not applied during evaluation/testing
+        if self.spec_augmentation is not None and self.training:
+            processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
+
         processed_signal_t = processed_signal.transpose(1, 2)
         pre_encode_embs, pre_encode_lengths = self.encoder.pre_encode(
             x=processed_signal_t, lengths=processed_signal_length
@@ -731,10 +707,6 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 extra_rc=extra_rc,
                 silence_frames=self.nextformer_modules.extra_silence_frames,
             )
-            #logging.info(f"batch_chunks shape: {batch_chunks.shape}")
-            #logging.info(f"batch_chunk_lengths: {batch_chunk_lengths}")
-            #logging.info(f"batch_chunk_prediction_lengths: {batch_chunk_prediction_lengths}")
-            #logging.info(f"num_chunks: {num_chunks}")
         else:
             batch_chunks, batch_chunk_lengths, num_chunks = self._create_batch_of_chunks(
                 input_tensor=pre_encode_embs,
@@ -745,22 +717,9 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             )
             batch_chunk_prediction_lengths = batch_chunk_lengths  # Same as full length when no extra context
         
-        # Extract prediction window from reordered chunks (if using extra contexts)
-        if extra_lc > 0 or extra_rc > 0:
-            prediction_window_size = lc + chunk_len + rc
-            batch_chunks_prediction_window = batch_chunks[:, :prediction_window_size, :]
-        else:
-            batch_chunks_prediction_window = batch_chunks
-        
-        # Apply query_raw_proj if available
-        if self.nextformer_modules.query_raw_proj is not None:
-            query_raw_proj = self.nextformer_modules.query_raw_proj(batch_chunks_prediction_window)
-        else:
-            query_raw_proj = batch_chunks_prediction_window
-
-        # Step 5: Run frontend_encoder, forward_infer, query_decoder in one pass
-        # Get encoder embeddings for all chunks
-        emb_seq, emb_seq_length = self.frontend_encoder(
+        # Step 5: Run frontend_encoder and forward_infer in one pass
+        # Get encoder and CLS embeddings for all chunks
+        emb_seq, emb_seq_length, cls_embs = self.frontend_encoder(
             processed_signal=batch_chunks, processed_signal_length=batch_chunk_lengths, bypass_pre_encode=True
         )
         
@@ -770,29 +729,15 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             prediction_window_size = lc + chunk_len + rc
             emb_seq = emb_seq[:, :prediction_window_size, :]  # Extract only prediction window
             emb_seq_length = batch_chunk_prediction_lengths  # Use prediction window lengths
-            #logging.info(f"emb_seq shape: {emb_seq.shape}")
-            #logging.info(f"emb_seq_length: {emb_seq_length}")
         
         if self.nextformer_modules.encoder_proj is not None:
             emb_seq_enc_proj = self.nextformer_modules.encoder_proj(emb_seq)
         else:
             emb_seq_enc_proj = emb_seq
-
-        if self.nextformer_modules.query_proj is not None:
-            emb_seq_query_proj = self.nextformer_modules.query_proj(emb_seq)
-        else:
-            emb_seq_query_proj = emb_seq
-        
+            
         # Get local logits for all chunks
         local_logits = self.forward_infer(emb_seq_enc_proj, emb_seq_length)
-        #logging.info(f"local logits shape: {local_logits.shape}")
-        #logging.info(f"emb_seq_length: {emb_seq_length}")
-        # logits shape: (batch_size * num_chunks, chunk_total, local_num_spks)
-
-        # Get speaker queries for all chunks
-        encoder_len_mask = self.nextformer_modules.length_to_mask(emb_seq_length, emb_seq.shape[1])
-        encoder_len_mask = ~encoder_len_mask
-        #logging.info(f"encoder_len_mask: {encoder_len_mask.to(int).sum(dim=1)}")
+        # (batch_size * num_chunks, chunk_total, local_num_spks)
 
         # Handle oracle mode (targets) if provided
         local_target_indices = None
@@ -819,118 +764,39 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             
             # Get oracle predictions using Hungarian algorithm
             logits_len = min(local_logits.shape[1], batch_targets.shape[1])
-            local_pil_targets, local_target_indices = get_pil_targets_hungarian(
+            _, local_target_indices = get_pil_targets_hungarian(
                 labels=batch_targets[:, :logits_len, :],
                 logits=local_logits[:, :logits_len, :],
                 metric=self.pil_metric
             )
-            if (self.oracle_queries_train and self.training) or (self.oracle_queries_test and not self.training):
-                preds = local_pil_targets
-            else:
-                preds = torch.sigmoid(local_logits)
-        else:
-            preds = torch.sigmoid(local_logits)
 
-        # masks for the target speaker and non-target speakers in extra cross-attention
-        # encoder_mask_extra should have False (0) on frames where current speaker is inactive and any other speaker is active
-        if self.initialize_mask:
-            encoder_query_mask = ~(preds > self.local_mask_threshold).transpose(1, 2)  # (batch, local_num_spks, n_frames)
-            any_speaker_active = (preds.max(dim=2)[0] > self.local_mask_threshold).unsqueeze(1)  # (batch, 1, n_frames)
-            any_speaker_active = any_speaker_active.expand(-1, preds.shape[2], -1)  # (batch, local_num_spks, n_frames)
-            encoder_mask_extra = ~(encoder_query_mask & any_speaker_active)
-            #logging.info(f"encoder_mask_extra: {encoder_mask_extra.to(int)[0, :, :20]}")
-            #logging.info(f"encoder_query_mask: {encoder_query_mask.to(int)[0, :, :20]}")
-        else:
-            encoder_query_mask = None
-            encoder_mask_extra = None
-          
+        preds = torch.sigmoid(local_logits)
         local_num_spks = preds.shape[-1]
-        active_frames_per_query = (preds > self.local_mask_threshold).to(int).sum(dim=1) # (num_chunks * batch_size, local_num_spks)
-        #logging.info(f"active frames per query: {active_frames_per_query}")
-        spk_detected = active_frames_per_query > 0 # (num_chunks * batch_size, local_num_spks)
+        active_frames_per_spk = (preds > self.local_mask_threshold).to(int).sum(dim=1) # (num_chunks * batch_size, local_num_spks)
+        spk_detected = active_frames_per_spk > 0 # (num_chunks * batch_size, local_num_spks)
         spk_not_detected = ~spk_detected # (num_chunks * batch_size, local_num_spks)
-        query_mask_from = spk_not_detected.unsqueeze(2).expand(-1, -1, local_num_spks)  # (num_chunks * batch_size, local_num_spks, local_num_spks)
-        query_mask_to = spk_not_detected.unsqueeze(1).expand(-1, local_num_spks, -1)  # (num_chunks * batch_size, local_num_spks, local_num_spks)
-        query_mask = query_mask_from | query_mask_to  # (num_chunks * batch_size, local_num_spks, local_num_spks)
-        #logging.info(f"query_mask: {query_mask}")
-        #logging.info(f"spk_not_detected: {spk_not_detected.to(int).sum(dim=1)}")
 
-        # Step 3: Run both query_decoder and query_decoder_raw with query_mask
-        if self.query_decoder_raw is not None:
-            if self.initialize_queries:
-                init_queries_raw = self.nextformer_modules.get_init_queries(preds, query_raw_proj)
-            else:
-                init_queries_raw = None
-            spk_queries_raw = self.query_decoder_raw(
-                encoder_states=query_raw_proj,
-                encoder_len_mask=encoder_len_mask,
-                encoder_mask=encoder_query_mask,
-                encoder_mask_extra=encoder_mask_extra,
-                query_states=init_queries_raw,
-                query_mask=query_mask
-            )
-            # spk_queries_raw shape: (num_chunks * batch_size, local_num_spks, emb_dim)
-            # Zero out queries for undetected speakers
-            spk_queries_raw = spk_queries_raw.masked_fill(spk_not_detected.unsqueeze(2), 0)
-        else:
-            spk_queries_raw = None
+        # Get first local_num_spks CLS embeddings as local speaker embeddings
+        spk_embs = cls_embs[:, :local_num_spks, :]
+        if self.nextformer_modules.spk_emb_proj is not None:
+            spk_embs = self.nextformer_modules.spk_emb_proj(spk_embs)
 
-        if self.query_decoder is not None:
-            if spk_queries_raw is not None and (self.dual_decoder_mode == "init" or self.dual_decoder_mode == "init_concat"):
-                init_queries = spk_queries_raw
-            elif self.initialize_queries:
-                init_queries = self.nextformer_modules.get_init_queries(preds, emb_seq_query_proj)                    
-            else:
-                init_queries = None
-
-            spk_queries = self.query_decoder(
-                encoder_states=emb_seq_query_proj,
-                encoder_len_mask=encoder_len_mask,
-                encoder_mask=encoder_query_mask,
-                encoder_mask_extra=encoder_mask_extra,
-                query_states=init_queries,
-                query_mask=query_mask
-            )
-            # spk_queries shape: (num_chunks * batch_size, local_num_spks, emb_dim)
-            # Zero out queries for undetected speakers
-            spk_queries = spk_queries.masked_fill(spk_not_detected.unsqueeze(2), 0)
-        else:
-            spk_queries = None
-
-        # Combine queries from both decoders if both are used
-        if spk_queries is not None and spk_queries_raw is not None:
-            if self.nextformer_modules.query_combiner is not None:
-                # Store original dtype to preserve it
-                original_dtype = spk_queries.dtype
-                # Concatenate along embedding dimension and project back
-                spk_queries_combined = torch.cat([spk_queries, spk_queries_raw], dim=-1)
-                spk_queries = self.nextformer_modules.query_combiner(spk_queries_combined)
-                # Ensure output has the same dtype as input
-                if spk_queries.dtype != original_dtype:
-                    spk_queries = spk_queries.to(original_dtype)
-            else:
-                # If no combiner is provided, just use the first decoder output
-                # (alternatively could raise an error or average the two)
-                logging.warning("Both query decoders are used but no query_combiner provided. Using only query_decoder output.")
-                spk_queries = spk_queries
-        elif spk_queries_raw is not None:
-            # Only raw decoder is used
-            spk_queries = spk_queries_raw
-        # else: only spk_queries is not None, use it as is
+        # Zero out embeddings for undetected speakers
+        spk_embs = spk_embs.masked_fill(spk_not_detected.unsqueeze(2), 0)
 
         if att_mod:
             self.encoder.att_context_size = [-1, -1]
             self.transformer_encoder.diag = None
 
-        if self.query_enhancer is not None:
-            emb_dim = spk_queries.shape[-1]
-            spk_queries_reshaped = spk_queries.view(num_chunks, batch_size, local_num_spks, emb_dim).transpose(0, 1)
-            spk_queries_reshaped = spk_queries_reshaped.reshape(batch_size, num_chunks * local_num_spks, emb_dim)
-            valid_query_mask = spk_detected.view(num_chunks, batch_size, local_num_spks).transpose(0, 1).reshape(batch_size, num_chunks * local_num_spks)
-            spk_queries_enhanced = self.query_enhancer(encoder_states=spk_queries_reshaped, encoder_mask=valid_query_mask)
-            spk_queries_enhanced = spk_queries_enhanced.masked_fill(~valid_query_mask.unsqueeze(-1), 0)
-            spk_queries = spk_queries_enhanced.view(batch_size, num_chunks, local_num_spks, emb_dim).transpose(0, 1)
-            spk_queries = spk_queries.reshape(num_chunks * batch_size, local_num_spks, emb_dim)
+        if self.spk_embs_enhancer is not None:
+            emb_dim = spk_embs.shape[-1]
+            spk_embs_reshaped = spk_embs.view(num_chunks, batch_size, local_num_spks, emb_dim).transpose(0, 1)
+            spk_embs_reshaped = spk_embs_reshaped.reshape(batch_size, num_chunks * local_num_spks, emb_dim)
+            valid_spk_mask = spk_detected.view(num_chunks, batch_size, local_num_spks).transpose(0, 1).reshape(batch_size, num_chunks * local_num_spks)
+            spk_embs_enhanced = self.spk_embs_enhancer(encoder_states=spk_embs_reshaped, encoder_mask=valid_spk_mask)
+            spk_embs_enhanced = spk_embs_enhanced.masked_fill(~valid_spk_mask.unsqueeze(-1), 0)
+            spk_embs = spk_embs_enhanced.view(batch_size, num_chunks, local_num_spks, emb_dim).transpose(0, 1)
+            spk_embs = spk_embs.reshape(num_chunks * batch_size, local_num_spks, emb_dim)
 
         # Collect per-chunk logits and concatenate for differentiable assembly
         logits_list = []
@@ -944,7 +810,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             end = min(start + chunk_len, total_n_frames)
             dur = end - start
             offset = min(lc, start)
-            spk_queries_chunk = spk_queries[chunk_idx * batch_size:(chunk_idx + 1) * batch_size, :, :] # (batch_size, local_num_spks, emb_dim)
+            spk_embs_chunk = spk_embs[chunk_idx * batch_size:(chunk_idx + 1) * batch_size, :, :] # (batch_size, local_num_spks, emb_dim)
             local_logits_chunk = local_logits[chunk_idx * batch_size:(chunk_idx + 1) * batch_size, :, :] # (batch_size, lc+chunk_len+rc, local_num_spks)
 
             if self.oracle_assignment and local_target_indices is not None:
@@ -960,16 +826,16 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 spk_assignments_chunk = spk_assignments_chunk * valid_mask.unsqueeze(-1)
             else:
                 spk_assignments_chunk = self.nextformer_modules.get_local_to_global_assignments(
-                    spk_queries=spk_queries_chunk,
+                    spk_embs=spk_embs_chunk,
                     streaming_state=streaming_state,
                 )
 
-            active_frames_chunk = active_frames_per_query[chunk_idx * batch_size:(chunk_idx + 1) * batch_size, :]
+            active_frames_chunk = active_frames_per_spk[chunk_idx * batch_size:(chunk_idx + 1) * batch_size, :]
             self.nextformer_modules.update_streaming_state(
                 streaming_state=streaming_state,
-                spk_queries=spk_queries_chunk,
+                spk_embs=spk_embs_chunk,
                 spk_assignments=spk_assignments_chunk,
-                active_frames_per_query=active_frames_chunk
+                active_frames_per_spk=active_frames_chunk
             )
             logits_chunk = self.nextformer_modules.get_global_logits(
                 local_logits=local_logits_chunk,
@@ -986,7 +852,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             n_frames = math.ceil(sig_length / self.encoder.subsampling_factor)
             logits = logits[:, :n_frames, :]
 
-        return logits, local_logits, spk_queries, active_frames_per_query
+        return logits, local_logits, spk_embs, active_frames_per_spk
 
     def forward_infer(self, emb_seq, emb_seq_length):
         """
@@ -1347,7 +1213,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         return local_pil_targets, local_ats_targets, local_target_lens, local_target_indices, total_logits_op
 
     def _get_aux_train_evaluations(
-        self, logits, local_logits, local_queries, active_frames_per_query, targets, target_lens
+        self, logits, local_logits, spk_embs, active_frames_per_spk, targets, target_lens
     ) -> dict:
         """
         Compute auxiliary training evaluations including losses and metrics.
@@ -1361,9 +1227,9 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 Shape: (batch_size, total_n_frames, local_num_spks)
             local_logits (torch.Tensor): Speaker logits for the entire audio.
                 Shape: (batch_size * num_chunks, lc+chunk_len+rc, local_num_spks)
-            local_queries (torch.Tensor): Local speaker queries.
+            spk_embs (torch.Tensor): Local speaker embeddings.
                 Shape: (batch_size * num_chunks, local_num_spks, emb_dim)
-            active_frames_per_query (torch.Tensor): Tensor containing the number of active frames per query
+            active_frames_per_spk (torch.Tensor): Tensor containing the number of active frames per speaker
                 Shape: (num_chunks * batch_size, local_num_spks)
             targets (torch.Tensor): Ground truth speaker labels.
                 Shape: (batch_size, total_n_frames, max_num_spks)
@@ -1446,11 +1312,11 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             (dict): A dictionary containing the 'loss' key with the calculated loss value.
         """
         audio_signal, audio_signal_length, targets, target_lens = batch
-        logits, local_logits, local_queries, active_frames_per_query = self.forward(
+        logits, local_logits, spk_embs, active_frames_per_spk = self.forward(
             audio_signal=audio_signal, audio_signal_length=audio_signal_length, targets=targets
         )
         train_metrics = self._get_aux_train_evaluations(
-            logits, local_logits, local_queries, active_frames_per_query, targets, target_lens
+            logits, local_logits, spk_embs, active_frames_per_spk, targets, target_lens
         )
         logging.info(f"dustbin parameter value: {self.nextformer_modules.sinkhorn_dustbin_val.item()}")
         self._reset_train_metrics()
@@ -1458,7 +1324,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         return {'loss': train_metrics['loss']}
 
     def _get_aux_validation_evaluations(
-        self, logits, local_logits, local_queries, active_frames_per_query, targets, target_lens
+        self, logits, local_logits, spk_embs, active_frames_per_spk, targets, target_lens
     ) -> dict:
         """
         Compute auxiliary validation evaluations including losses and metrics.
@@ -1472,9 +1338,9 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 Shape: (batch_size, total_n_frames, local_num_spks)
             local_logits (torch.Tensor): Speaker logits for the entire audio.
                 Shape: (batch_size * num_chunks, lc+chunk_len+rc, local_num_spks)
-            local_queries (torch.Tensor): Local speaker queries.
+            spk_embs (torch.Tensor): Local speaker embeddings.
                 Shape: (batch_size * num_chunks, local_num_spks, emb_dim)
-            active_frames_per_query (torch.Tensor): Tensor containing the number of active frames per query
+            active_frames_per_spk (torch.Tensor): Tensor containing the number of active frames per speaker
                 Shape: (num_chunks * batch_size, local_num_spks)
             targets (torch.Tensor): Ground truth speaker labels.
                 Shape: (batch_size, total_n_frames, max_num_spks)
@@ -1567,11 +1433,11 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             dict: A dictionary containing various validation metrics for this batch.
         """
         audio_signal, audio_signal_length, targets, target_lens = batch
-        logits, local_logits, local_queries, active_frames_per_query = self.forward(
+        logits, local_logits, spk_embs, active_frames_per_spk = self.forward(
             audio_signal=audio_signal, audio_signal_length=audio_signal_length, targets=targets
         )
         val_metrics = self._get_aux_validation_evaluations(
-            logits, local_logits, local_queries, active_frames_per_query, targets, target_lens
+            logits, local_logits, spk_embs, active_frames_per_spk, targets, target_lens
         )
         if isinstance(self.trainer.val_dataloaders, list) and len(self.trainer.val_dataloaders) > 1:
             self.validation_step_outputs[dataloader_idx].append(val_metrics)
@@ -1634,7 +1500,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         return {'log': multi_val_metrics}
 
     def _get_aux_test_batch_evaluations(
-        self, batch_idx: int, logits, local_logits, local_queries, active_frames_per_query, targets, target_lens
+        self, batch_idx: int, logits, local_logits, spk_embs, active_frames_per_spk, targets, target_lens
     ):
         preds = torch.sigmoid(logits)
         targets = targets.to(preds.dtype)
@@ -1704,11 +1570,11 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 audio_signal = audio_signal.to(self.device)
                 audio_signal_length = audio_signal_length.to(self.device)
                 targets = targets.to(self.device)
-                logits, local_logits, local_queries, active_frames_per_query = self.forward(
+                logits, local_logits, spk_embs, active_frames_per_spk = self.forward(
                     audio_signal=audio_signal, audio_signal_length=audio_signal_length, targets=targets
                 )
                 self._get_aux_test_batch_evaluations(
-                    batch_idx, logits, local_logits, local_queries, active_frames_per_query, targets, target_lens
+                    batch_idx, logits, local_logits, spk_embs, active_frames_per_spk, targets, target_lens
                 )
                 preds = torch.sigmoid(logits).detach().to('cpu')
                 if preds.shape[0] == 1:  # batch size = 1

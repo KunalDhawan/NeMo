@@ -1,30 +1,23 @@
-name: "NextformerDiarizer v6"
+name: "NextformerDiarizer v7"
 num_workers: 18
 batch_size: 4
 
 model: 
   sample_rate: 16000
   
-  # Oracle parameters for debugging/ablation studies - use ground truth information instead of predictions
-  oracle_queries_train: false # If true, use ground truth speaker activity (instead of predicted) during training for mask initialization and query generation
-  oracle_queries_test: false # If true, use ground truth speaker activity (instead of predicted) during testing for mask initialization and query generation
-
   pil_weight: 0.5 # Weight for Permutation Invariant Loss (PIL) used in training the Nextformer diarizer model
   ats_weight: 0.5 # Weight for Arrival Time Sort (ATS) loss in training the Nextformer diarizer model
   global_pil_weight: 1.0 # Weight for Permutation Invariant Loss (PIL) used in training the Nextformer diarizer model
 
-  local_num_spks: 4 # Number of speakers for local queries
+  local_num_spks: 4 # Number of speakers for local diarization
   max_num_spks: 8 # Maximum number of speakers per model; currently set to 8
-  initialize_queries: true # If True, use mean of encoder embeddings over local predictions as initial queries, otherwise use zeros.
-  initialize_mask: true # If True, use local predictions as initial encoder mask, otherwise use. (not recommended setting to False!)
-  dual_decoder_mode: "concat" # "concat" or "init" or "init_concat"
   streaming_mode: False
   pil_metric: "dot_product"
 
   model_defaults:
     fc_d_model: 512 # Hidden dimension size of the Fast-conformer Encoder
     tf_d_model: 192 # Hidden dimension size of the Transformer Encoder
-    sq_d_model: 192 # Hidden dimension size of the Spk Query Decoder
+    se_d_model: 192 # Hidden dimension size of the speaker embeddings
 
   train_ds:
     manifest_filepath: ???
@@ -118,8 +111,8 @@ model:
     ff_dropout_rate: 0.5 # Dropout rate
     fc_d_model: ${model.model_defaults.fc_d_model} # Hidden dimension size for Fast Conformer encoder
     tf_d_model: ${model.model_defaults.tf_d_model} # Hidden dimension size for Transformer encoder
-    sq_d_model: ${model.model_defaults.sq_d_model} # Hidden dimension size for Spk Query decoder
-    local_num_spks: ${model.local_num_spks} # Number of speakers for local queries
+    se_d_model: ${model.model_defaults.se_d_model} # Hidden dimension size for speaker embeddings
+    local_num_spks: ${model.local_num_spks} # Number of speakers for local embeddings
     max_num_spks: ${model.max_num_spks} # Maximum number of speakers per model
     pred_score_threshold: 0.25 # Threshold for speaker predictions to be used in scoring
     chunk_len: 125 # Length of each chunk
@@ -136,10 +129,15 @@ model:
     cosine_temperature: 0.05 # Temperature for cosine similarity
     hard_history_assignments: false # If true, convert soft assignments to hard one-hot before storing in history (prevents gradient flow through history and probability dilution)
     logsumexp_temperature: 1.0 # Temperature for LogSumExp aggregation over history (higher = smoother gradients, lower = sharper like max)
-    spk_query_min_frames: 0 # Minimum number of active frames required for a speaker query to be added to history (0 = disabled)
+    spk_emb_update_min_frames: 0 # Minimum number of active frames required to update speaker embeddings (0 = disabled)
 
   encoder:
-    _target_: nemo.collections.asr.modules.ConformerEncoder
+    _target_: nemo.collections.asr.modules.ConformerEncoderWithCLS
+    # CLS token configuration
+    num_cls_tokens: 4  # One CLS token per speaker slot, the rest are to aggregate additional information
+    cls_pos_mode: query_key  # Options: 'query_key', 'query_only', 'rel_pos', 'none'
+    allow_content_to_cls: true  # Whether non-CLS tokens can attend to CLS tokens
+    cls_embedding_shared: true  # If true, all CLS slots share one embedding
     feat_in: ${model.preprocessor.features}
     feat_out: -1
     n_layers: 17
@@ -188,50 +186,10 @@ model:
     pre_ln: False
     pre_ln_final_layer_norm: True
 
-  query_decoder:
-    _target_: nemo.collections.asr.modules.nextformer_modules.MaskedQueryDecoder
-    num_layers: 4
-    hidden_size: ${model.model_defaults.sq_d_model} # Needs to be multiple of num_attention_heads
-    inner_size: 768
-    num_queries: ${model.local_num_spks}
-    extra_cross_attention: False
-    num_cross_attention_heads: 4
-    num_self_attention_heads: 4
-    cross_attn_dropout: 0.0
-    self_attn_dropout: 0.0
-    ffn_dropout: 0.0
-    hidden_act: relu
-    pre_ln: False
-    pre_ln_final_layer_norm: True
-    use_learned_init: False # If True, use learned embeddings for query content initialization
-    use_query_pos_emb: False # If True, use learned positional embeddings in self-attention
-    use_encoder_pos_emb: False
-    encoder_pos_emb_max_len: 5000
-
-  query_decoder_raw:
-    _target_: nemo.collections.asr.modules.nextformer_modules.MaskedQueryDecoder
-    num_layers: 4
-    hidden_size: ${model.model_defaults.sq_d_model} # Needs to be multiple of num_attention_heads
-    inner_size: 768
-    num_queries: ${model.local_num_spks}
-    extra_cross_attention: False
-    num_cross_attention_heads: 4
-    num_self_attention_heads: 4
-    cross_attn_dropout: 0.0
-    self_attn_dropout: 0.0
-    ffn_dropout: 0.0
-    hidden_act: relu
-    pre_ln: False
-    pre_ln_final_layer_norm: True
-    use_learned_init: False # If True, use learned embeddings for query content initialization
-    use_query_pos_emb: False # If True, use learned positional embeddings in self-attention
-    use_encoder_pos_emb: False
-    encoder_pos_emb_max_len: 5000
-
-  query_enhancer:
+  spk_embs_enhancer:
     _target_: nemo.collections.asr.modules.transformer.transformer_encoders.TransformerEncoder
     num_layers: 1
-    hidden_size: ${model.model_defaults.sq_d_model} # Needs to be multiple of num_attention_heads
+    hidden_size: ${model.model_defaults.se_d_model} # Needs to be multiple of num_attention_heads
     inner_size: 768
     num_attention_heads: 8
     attn_score_dropout: 0.1

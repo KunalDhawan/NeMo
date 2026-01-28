@@ -39,12 +39,12 @@ class StreamingNextformerState:
     streaming Nextformer model.
 
     Attributes:
-        past_spk_queries (torch.Tensor): Past speaker queries.
-            Shape: (B, num_past_spk_queries, emb_dim)
+        past_spk_embs (torch.Tensor): Past speaker embeddings.
+            Shape: (B, num_past_spk_embs, emb_dim)
         past_spk_assignments (torch.Tensor): Past speaker assignments.
-            Shape: (B, num_past_spk_queries, max_num_spks)
+            Shape: (B, num_past_spk_embs, max_num_spks)
     """
-    past_spk_queries = None
+    past_spk_embs = None
     past_spk_assignments = None
 
 class MaskedQueryDecoderBlock(torch.nn.Module):
@@ -408,7 +408,7 @@ class NextformerModules(NeuralModule, Exportable):
         ff_dropout_rate: float = 0.5,
         fc_d_model: int = 512,
         tf_d_model: int = 192,  
-        sq_d_model: int = 192,
+        se_d_model: int = 192,
         subsampling_factor: int = 8,
         local_num_spks: int = 4,
         max_num_spks: int = 4,
@@ -423,7 +423,7 @@ class NextformerModules(NeuralModule, Exportable):
         extra_silence_frames: int = 3,
         sinkhorn_n_iters: int = 20,
         sinkhorn_dustbin_init: float = 0.0,
-        spk_query_min_frames: int = 0,
+        spk_emb_update_min_frames: int = 0,
         spk_centroid_update_min_frames: int = 0,
         spk_assignment_min_prob: float = 0.5,
         score_similarity: str = "cosine",
@@ -437,7 +437,7 @@ class NextformerModules(NeuralModule, Exportable):
         self.subsampling_factor = subsampling_factor
         self.fc_d_model = fc_d_model
         self.tf_d_model = tf_d_model
-        self.sq_d_model = sq_d_model
+        self.se_d_model = se_d_model
         self.local_num_spks = local_num_spks
         self.max_num_spks = max_num_spks
         self.pred_score_threshold = pred_score_threshold
@@ -447,10 +447,10 @@ class NextformerModules(NeuralModule, Exportable):
         self.sinkhorn_dustbin_val = nn.Parameter(
             torch.tensor(float(sinkhorn_dustbin_init), dtype=torch.float32)
         )
-        #self.sinkhorn_dustbin_val = 100 / math.sqrt(self.sq_d_model)
+        #self.sinkhorn_dustbin_val = 100 / math.sqrt(self.se_d_model)
         #self.sinkhorn_dustbin_val=0.5
 
-        self.spk_query_min_frames = spk_query_min_frames
+        self.spk_emb_update_min_frames = spk_emb_update_min_frames
         self.spk_assignment_min_prob = spk_assignment_min_prob
         self.score_similarity = score_similarity
         self.cosine_temperature = cosine_temperature
@@ -458,9 +458,7 @@ class NextformerModules(NeuralModule, Exportable):
         self.logsumexp_temperature = logsumexp_temperature
 
         self.encoder_proj = nn.Linear(self.fc_d_model, self.tf_d_model)
-        self.query_proj = nn.Linear(self.fc_d_model, self.sq_d_model)
-        self.query_raw_proj = nn.Linear(self.fc_d_model, self.sq_d_model)
-        self.query_combiner = nn.Linear(2 * self.sq_d_model, self.sq_d_model)
+        self.spk_emb_proj = nn.Linear(self.fc_d_model, self.se_d_model)
         self.first_hidden_to_hidden = nn.Linear(self.tf_d_model, self.tf_d_model)
         self.single_hidden_to_spks = nn.Linear(self.tf_d_model, self.local_num_spks)
         self.dropout = nn.Dropout(ff_dropout_rate)
@@ -627,39 +625,39 @@ class NextformerModules(NeuralModule, Exportable):
             streaming_state (StreamingNextformerState): initialized streaming state
         """
         streaming_state = StreamingNextformerState()
-        streaming_state.past_spk_queries = torch.zeros((batch_size, 0, self.sq_d_model), device=device)
+        streaming_state.past_spk_embs = torch.zeros((batch_size, 0, self.se_d_model), device=device)
         streaming_state.past_spk_assignments = torch.zeros((batch_size, 0, self.max_num_spks), device=device)
         return streaming_state
 
-    def update_streaming_state(self, streaming_state, spk_queries, spk_assignments, active_frames_per_query=None):
+    def update_streaming_state(self, streaming_state, spk_embs, spk_assignments, active_frames_per_spk=None):
         """
-        Update the streaming state (in-place) with new speaker queries based on their soft assignments.
+        Update the streaming state (in-place) with new speaker embeddings based on their soft assignments.
 
         Args:
             streaming_state (StreamingNextformerState): The current streaming state.
-            spk_queries (torch.Tensor): Speaker queries from the current chunk.
+            spk_embs (torch.Tensor): Speaker embeddings from the current chunk.
                 Shape: (B, local_num_spks, emb_dim)
-            spk_assignments (torch.Tensor): Soft assignments for each local query.
+            spk_assignments (torch.Tensor): Soft assignments for each local spk embedding.
                 Shape: (B, local_num_spks, max_num_spks)
-            active_frames_per_query (torch.Tensor, optional): Number of active frames per query.
-                Shape: (B, local_num_spks). Used to filter out short, unreliable queries.
+            active_frames_per_spk (torch.Tensor, optional): Number of active frames per speaker.
+                Shape: (B, local_num_spks). Used to filter out short, unreliable spk embeddings.
         """
-        # Filter out queries that don't meet the minimum frame threshold
-        if active_frames_per_query is not None and self.spk_query_min_frames > 0:
-            insufficient_frames = active_frames_per_query < self.spk_query_min_frames
-            # Zero out queries and assignments for speakers with insufficient frames
-            spk_queries = spk_queries.masked_fill(insufficient_frames.unsqueeze(-1), 0)
+        # Filter out spk embeddings that don't meet the minimum frame threshold
+        if active_frames_per_spk is not None and self.spk_emb_update_min_frames > 0:
+            insufficient_frames = active_frames_per_spk < self.spk_emb_update_min_frames
+            # Zero out embeddings and assignments for speakers with insufficient frames
+            spk_embs = spk_embs.masked_fill(insufficient_frames.unsqueeze(-1), 0)
             spk_assignments = spk_assignments.masked_fill(insufficient_frames.unsqueeze(-1), 0)
 
-        # Filter out queries with low assignment probability
+        # Filter out spk embeddings with low assignment probability
         if self.spk_assignment_min_prob > 0:
             max_assignment_prob = spk_assignments.max(dim=-1)[0]  # (B, local_num_spks)
             low_prob = max_assignment_prob < self.spk_assignment_min_prob
-            # Zero out queries and assignments for low-probability speakers
-            spk_queries = spk_queries.masked_fill(low_prob.unsqueeze(-1), 0)
+            # Zero out spk embeddings and assignments for low-probability speakers
+            spk_embs = spk_embs.masked_fill(low_prob.unsqueeze(-1), 0)
             spk_assignments = spk_assignments.masked_fill(low_prob.unsqueeze(-1), 0)
 
-        streaming_state.past_spk_queries = torch.cat([streaming_state.past_spk_queries, spk_queries], dim=1)
+        streaming_state.past_spk_embs = torch.cat([streaming_state.past_spk_embs, spk_embs], dim=1)
         #logging.info(f"spk_assignments: {spk_assignments}")
         if self.hard_history_assignments or not self.training:
             # Convert soft assignments to hard one-hot and detach from computation graph.
@@ -678,7 +676,7 @@ class NextformerModules(NeuralModule, Exportable):
 
     def get_local_to_global_assignments(
         self,
-        spk_queries,
+        spk_embs,
         streaming_state,
         dustbin_threshold: float = 0.5,
         zero_norm_threshold: float = 1e-8,
@@ -687,52 +685,52 @@ class NextformerModules(NeuralModule, Exportable):
         """
         Compute soft local-to-global assignments using partial Sinkhorn and dustbin handling.
 
-        This function aggregates past queries by global speaker BEFORE applying Sinkhorn,
+        This function aggregates past local spk embedding by global speaker BEFORE applying Sinkhorn,
         ensuring that the column constraints apply to distinct global speakers rather than
-        individual past queries. This prevents the issue where two local queries could be
-        incorrectly assigned to the same global speaker through different past queries.
+        individual past local spk embeddings. This prevents the issue where two local spk embeddings could be
+        incorrectly assigned to the same global speaker through different past local spk embeddings.
 
         Args:
-            spk_queries (torch.Tensor): Local speaker queries for the current chunk.
+            spk_embs (torch.Tensor): Local speaker embeddings for the current chunk.
                 Shape: (B, local_num_spks, emb_dim)
-            streaming_state (StreamingNextformerState): Streaming state containing past queries and assignments.
+            streaming_state (StreamingNextformerState): Streaming state containing past spk embeddings and assignments.
             dustbin_threshold (float): Threshold for dustbin score to allocate new speakers.
-            zero_norm_threshold (float): L2 norm threshold to treat a query as a zero vector.
+            zero_norm_threshold (float): L2 norm threshold to treat a local spk embedding as a zero vector.
             zero_score (float): Score value used to mask zero-vector rows/cols.
 
         Returns:
-            spk_assignments (torch.Tensor): Soft assignments from local queries to global speakers.
+            spk_assignments (torch.Tensor): Soft assignments from local spk embeddings to global speakers.
                 Shape: (B, local_num_spks, max_num_spks)
         """
-        past_spk_queries = streaming_state.past_spk_queries
+        past_spk_embs = streaming_state.past_spk_embs
         past_spk_assignments = streaming_state.past_spk_assignments
-        batch_size, local_num_spks, _ = spk_queries.shape
-        num_past = past_spk_queries.shape[1]
+        batch_size, local_num_spks, _ = spk_embs.shape
+        num_past = past_spk_embs.shape[1]
 
-        # Mask zero-vector local queries
-        local_zero = spk_queries.norm(dim=2) < zero_norm_threshold
+        # Mask zero-vector local spk embeddings
+        local_zero = spk_embs.norm(dim=2) < zero_norm_threshold
 
         if num_past > 0:
-            # Mask zero-vector past queries
-            past_zero = past_spk_queries.norm(dim=2) < zero_norm_threshold
+            # Mask zero-vector past spk embeddings
+            past_zero = past_spk_embs.norm(dim=2) < zero_norm_threshold
 
             # Compute full scores: (B, local_num_spks, num_past)
             if self.score_similarity == "cosine":
-                spk_queries_norm = F.normalize(spk_queries, p=2, dim=2, eps=zero_norm_threshold)
-                past_spk_queries_norm = F.normalize(past_spk_queries, p=2, dim=2, eps=zero_norm_threshold)
-                full_scores = torch.bmm(spk_queries_norm, past_spk_queries_norm.transpose(1, 2)) / self.cosine_temperature
+                spk_embs_norm = F.normalize(spk_embs, p=2, dim=2, eps=zero_norm_threshold)
+                past_spk_embs_norm = F.normalize(past_spk_embs, p=2, dim=2, eps=zero_norm_threshold)
+                full_scores = torch.bmm(spk_embs_norm, past_spk_embs_norm.transpose(1, 2)) / self.cosine_temperature
             elif self.score_similarity == "scaled_dot":
-                emb_dim = spk_queries.shape[-1]
-                full_scores = torch.bmm(spk_queries, past_spk_queries.transpose(1, 2)) / math.sqrt(emb_dim)
+                emb_dim = spk_embs.shape[-1]
+                full_scores = torch.bmm(spk_embs, past_spk_embs.transpose(1, 2)) / math.sqrt(emb_dim)
             else:
                 raise ValueError(f"Invalid score similarity mode: {self.score_similarity}")
 
-            # Mask zero-vector queries in full scores
+            # Mask zero-vector spk embeddings in full scores
             full_scores = full_scores.masked_fill(local_zero.unsqueeze(2), zero_score)
             full_scores = full_scores.masked_fill(past_zero.unsqueeze(1), zero_score)
 
             # Aggregate by global speaker using LogSumExp (smooth differentiable approximation to max)
-            # For each (local_query, global_speaker) pair, aggregate scores over all past queries
+            # For each (local_spk_emb, global_speaker) pair, aggregate scores over all past spk embeddings
             # belonging to that global speaker. LogSumExp provides dense gradients for training
             # while behaving like max when temperature is low.
 
@@ -742,11 +740,11 @@ class NextformerModules(NeuralModule, Exportable):
             scores_expanded = full_scores.unsqueeze(-1)  # (B, local_num_spks, num_past, 1)
             assignments_expanded = past_spk_assignments.unsqueeze(1)  # (B, 1, num_past, max_num_spks)
 
-            # Boolean mask: which past queries belong to each global speaker
+            # Boolean mask: which past spk embeddings belong to each global speaker
             belongs_to_g = assignments_expanded > 0.5  # (B, 1, num_past, max_num_spks)
 
             # Broadcast scores and apply mask
-            # Where past query j doesn't belong to global speaker g, set score to zero_score for LogSumExp
+            # Where past spk embedding j doesn't belong to global speaker g, set score to zero_score for LogSumExp
             scores_broadcasted = scores_expanded.expand(-1, -1, -1, self.max_num_spks)
             belongs_to_g_expanded = belongs_to_g.expand(-1, local_num_spks, -1, -1)
             masked_scores = torch.where(
@@ -756,11 +754,11 @@ class NextformerModules(NeuralModule, Exportable):
             )
             # Shape: (B, local_num_spks, num_past, max_num_spks)
 
-            # Count valid elements per (local_query, global_speaker) pair for normalization
+            # Count valid elements per (local_spk_emb, global_speaker) pair for normalization
             num_valid = belongs_to_g_expanded.sum(dim=2).clamp(min=1).float()
             # Shape: (B, local_num_spks, max_num_spks)
 
-            # LogMeanExp over past queries for each global speaker (generalized mean in log-space)
+            # LogMeanExp over past spk embeddings for each global speaker (generalized mean in log-space)
             # This is count-normalized to avoid bias towards speakers with more history
             # temperature controls smoothness: low = sharp (like max), high = smooth (like mean)
             aggregated_scores = self.logsumexp_temperature * (
@@ -768,27 +766,27 @@ class NextformerModules(NeuralModule, Exportable):
                 - torch.log(num_valid)
             )  # (B, local_num_spks, max_num_spks)
 
-            # Determine which global speakers are active (have at least one past query)
+            # Determine which global speakers are active (have at least one past spk embedding)
             global_active = past_spk_assignments.max(dim=1)[0] > 0.5  # (B, max_num_spks)
 
-            # Mask inactive global speakers (no past queries for them)
+            # Mask inactive global speakers (no past spk embeddings for them)
             aggregated_scores = aggregated_scores.masked_fill(~global_active.unsqueeze(1), zero_score)
 
         else:
-            # No past queries - all scores are zero_score (will go to dustbin)
+            # No past spk embeddings - all scores are zero_score (will go to dustbin)
             aggregated_scores = torch.full(
                 (batch_size, local_num_spks, self.max_num_spks),
                 zero_score,
-                device=spk_queries.device,
-                dtype=spk_queries.dtype,
+                device=spk_embs.device,
+                dtype=spk_embs.dtype,
             )
             global_active = torch.zeros(
                 (batch_size, self.max_num_spks),
-                device=spk_queries.device,
+                device=spk_embs.device,
                 dtype=torch.bool,
             )
 
-        # Mask zero local queries in aggregated scores
+        # Mask zero local spk embeddings in aggregated scores
         aggregated_scores = aggregated_scores.masked_fill(local_zero.unsqueeze(2), zero_score)
         #logging.info(f"aggregated_scores: {aggregated_scores}")
 
@@ -828,7 +826,7 @@ class NextformerModules(NeuralModule, Exportable):
         Args:
             local_logits (torch.Tensor): Local logits tensor for the current chunk.
                 Shape: (batch_size, local_frames, local_num_spks)
-            spk_assignments (torch.Tensor): Soft assignments for each local query.
+            spk_assignments (torch.Tensor): Soft assignments for each local spk embedding.
                 Shape: (batch_size, local_num_spks, max_num_spks)
             offset (int): Start offset into the local frame axis.
             dur (int): Duration (number of frames) to update.
