@@ -147,9 +147,9 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.oracle_assignment = self._cfg.get("oracle_assignment", False)
         
         self.streaming_mode = self.cfg.get("streaming_mode", False)
-        self.backend = self._cfg.get("backend", "trff")  # "trff", "dotp", or "isd"
-        if self.backend not in ["trff", "dotp", "isd"]:
-            raise ValueError(f"Invalid backend '{self.backend}'. Must be 'trff', 'dotp', or 'isd'.")
+        self.backend = self._cfg.get("backend", "trff")  # "trff", "dotp", "isd", or "jsd"
+        if self.backend not in ["trff", "dotp", "isd", "jsd"]:
+            raise ValueError(f"Invalid backend '{self.backend}'. Must be 'trff', 'dotp', 'isd', or 'jsd'.")
         logging.info(f"Using backend: {self.backend}")
 
         # Optional ISD backend modules
@@ -166,6 +166,21 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             self.isd_encoder = None
             self.isd_input_proj = None
             self.isd_output_proj = None
+
+        # Optional JSD (Joint Speaker Detection) backend modules
+        if self.backend == "jsd":
+            if not hasattr(self._cfg, "jsd_encoder"):
+                raise ValueError("jsd backend requires 'jsd_encoder' config")
+            self.jsd_encoder = NextformerEncLabelModel.from_config_dict(self._cfg.jsd_encoder).to(self.device)
+            self.jsd_input_proj = nn.Linear(
+                self._cfg.model_defaults.tf_d_model + self._cfg.model_defaults.se_d_model,
+                self._cfg.model_defaults.tf_d_model,
+            ).to(self.device)
+            self.jsd_output_proj = nn.Linear(self._cfg.model_defaults.tf_d_model, 1).to(self.device)
+        else:
+            self.jsd_encoder = None
+            self.jsd_input_proj = None
+            self.jsd_output_proj = None
         self.save_hyperparameters("cfg")
         self._init_eval_metrics()
         speaker_inds = list(range(self._cfg.local_num_spks))
@@ -901,6 +916,10 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             if spk_embs is None:
                 raise ValueError("spk_embs is required for 'isd' backend")
             logits = self.backend_isd(emb_seq, emb_seq_length, spk_embs)
+        elif self.backend == "jsd":
+            if spk_embs is None:
+                raise ValueError("spk_embs is required for 'jsd' backend")
+            logits = self.backend_jsd(emb_seq, emb_seq_length, spk_embs)
         else:
             raise ValueError(f"Unknown backend: {self.backend}")
         
@@ -992,6 +1011,46 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         # Reshape back to (B, T, local_num_spks)
         logits = logits.reshape(batch_size, local_num_spks, diar_len, 1).squeeze(-1).transpose(1, 2)
+        return logits
+
+    def backend_jsd(self, emb_seq, emb_seq_length, spk_embs):
+        """
+        Joint Speaker Detection (JSD) backend for computing local speaker logits.
+        Alternates time-wise and speaker-wise self-attention to model both
+        temporal patterns and speaker interactions jointly.
+
+        Args:
+            emb_seq (torch.Tensor): Tensor containing encoder states (projected).
+                Shape: (batch_size, diar_frame_count, tf_d_model)
+            emb_seq_length (torch.Tensor): Tensor containing lengths of encoder states.
+                Shape: (batch_size,)
+            spk_embs (torch.Tensor): Speaker embeddings from CLS tokens (projected).
+                Shape: (batch_size, local_num_spks, se_d_model)
+
+        Returns:
+            logits (torch.Tensor): Tensor containing local speaker logits (unmasked).
+                Shape: (batch_size, diar_frame_count, local_num_spks)
+        """
+        if self.jsd_encoder is None or self.jsd_input_proj is None or self.jsd_output_proj is None:
+            raise RuntimeError("JSD backend modules are not initialized")
+
+        batch_size, diar_len, _ = emb_seq.shape
+        local_num_spks = spk_embs.shape[1]
+
+        # Expand to per-speaker sequences: (B, S, T, tf_d_model) and (B, S, T, se_d_model)
+        emb_seq_expanded = emb_seq.unsqueeze(1).expand(-1, local_num_spks, -1, -1)
+        spk_embs_expanded = spk_embs.unsqueeze(2).expand(-1, -1, diar_len, -1)
+
+        # Concatenate and project back to tf_d_model
+        combined = torch.cat([emb_seq_expanded, spk_embs_expanded], dim=-1)  # (B, S, T, tf+se)
+        combined = self.jsd_input_proj(combined)  # (B, S, T, tf_d_model)
+
+        # Run JSD encoder - input/output is (B, S, T, D)
+        encoded = self.jsd_encoder(combined, time_lengths=emb_seq_length)  # (B, S, T, D)
+
+        # Project to logits
+        logits = self.jsd_output_proj(encoded)  # (B, S, T, 1)
+        logits = logits.squeeze(-1).transpose(1, 2)  # (B, T, S)
         return logits
 
     def _diarize_forward(self, batch: Any):

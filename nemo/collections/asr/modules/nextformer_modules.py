@@ -28,9 +28,14 @@ from nemo.core.classes.exportable import Exportable
 from nemo.core.classes.module import NeuralModule
 from nemo.utils import logging
 from nemo.collections.asr.modules.transformer.transformer_modules import PositionWiseFF
-from nemo.collections.asr.parts.submodules.multi_head_attention import PositionalEncoding, MultiHeadAttention
+from nemo.collections.asr.parts.submodules.multi_head_attention import (
+    PositionalEncoding,
+    MultiHeadAttention,
+    RelPositionMultiHeadAttention,
+    RelPositionalEncoding,
+)
 
-__all__ = ['NextformerModules', 'MaskedQueryDecoder']
+__all__ = ['NextformerModules', 'MaskedQueryDecoder', 'JointTimeSpeakerEncoder', 'JointTimeSpeakerEncoderBlock']
 
 @dataclass
 class StreamingNextformerState:
@@ -889,3 +894,337 @@ class NextformerModules(NeuralModule, Exportable):
 
         # Exponentiate and return the full augmented matrix
         return P.exp()
+
+
+class JointTimeSpeakerEncoderBlock(nn.Module):
+    """
+    A single block of the Joint Time-Speaker Encoder.
+    
+    This block alternates between:
+    1. Time-wise self-attention (with relative positional encoding)
+    2. Speaker-wise self-attention (no positional encoding - speaker slots are permutation-invariant)
+    3. Feed-forward network
+    
+    Args:
+        hidden_size (int): Size of the hidden dimension (d_model)
+        inner_size (int): Size of the feed-forward inner dimension
+        num_attention_heads_t (int): Number of attention heads for time-wise attention
+        num_attention_heads_s (int): Number of attention heads for speaker-wise attention
+        attn_score_dropout_t (float): Dropout rate for time-wise attention scores
+        attn_score_dropout_s (float): Dropout rate for speaker-wise attention scores
+        attn_layer_dropout_t (float): Dropout rate for time-wise attention layer output
+        attn_layer_dropout_s (float): Dropout rate for speaker-wise attention layer output
+        ffn_dropout (float): Dropout rate for feed-forward network
+        hidden_act (str): Activation function for feed-forward network
+        pre_ln (bool): Whether to use pre-LayerNorm (True) or post-LayerNorm (False)
+        pos_bias_u: Shared positional bias u for relative attention
+        pos_bias_v: Shared positional bias v for relative attention
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        inner_size: int,
+        num_attention_heads_t: int = 4,
+        num_attention_heads_s: int = 4,
+        attn_score_dropout_t: float = 0.0,
+        attn_score_dropout_s: float = 0.0,
+        attn_layer_dropout_t: float = 0.0,
+        attn_layer_dropout_s: float = 0.0,
+        ffn_dropout: float = 0.0,
+        hidden_act: str = "relu",
+        pre_ln: bool = True,
+        pos_bias_u=None,
+        pos_bias_v=None,
+    ):
+        super().__init__()
+        self.pre_ln = pre_ln
+        self.hidden_size = hidden_size
+
+        # Time-wise self-attention with relative positional encoding
+        self.norm_time = nn.LayerNorm(hidden_size, eps=1e-5)
+        self.time_attn = RelPositionMultiHeadAttention(
+            n_head=num_attention_heads_t,
+            n_feat=hidden_size,
+            dropout_rate=attn_score_dropout_t,
+            pos_bias_u=pos_bias_u,
+            pos_bias_v=pos_bias_v,
+        )
+        self.time_dropout = nn.Dropout(attn_layer_dropout_t)
+
+        # Speaker-wise self-attention (no positional encoding)
+        self.norm_speaker = nn.LayerNorm(hidden_size, eps=1e-5)
+        self.speaker_attn = MultiHeadAttention(
+            n_head=num_attention_heads_s,
+            n_feat=hidden_size,
+            dropout_rate=attn_score_dropout_s,
+        )
+        self.speaker_dropout = nn.Dropout(attn_layer_dropout_s)
+
+        # Feed-forward network
+        self.norm_ff = nn.LayerNorm(hidden_size, eps=1e-5)
+        self.ffn = PositionWiseFF(hidden_size, inner_size, ffn_dropout, hidden_act)
+
+    def forward_preln(
+        self,
+        x: torch.Tensor,
+        time_mask: Optional[torch.Tensor] = None,
+        speaker_mask: Optional[torch.Tensor] = None,
+        pos_emb: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Pre-LayerNorm forward pass.
+        
+        Args:
+            x: Input tensor of shape (B, S, T, D)
+            time_mask: Mask for time attention (B*S, T, T) or (B*S, 1, T), True means masked
+            speaker_mask: Mask for speaker attention (B*T, S, S) or (B*T, 1, S), True means masked
+            pos_emb: Relative positional embeddings for time attention
+            
+        Returns:
+            Output tensor of shape (B, S, T, D)
+        """
+        batch_size, num_speakers, seq_len, _ = x.shape
+        # Reshape for time-wise attention: (B, S, T, D) -> (B*S, T, D)
+        x_time = x.reshape(batch_size * num_speakers, seq_len, self.hidden_size)
+
+        # Time-wise self-attention with relative positional encoding
+        residual = x_time
+        x_time = self.norm_time(x_time)
+        x_time = self.time_attn(query=x_time, key=x_time, value=x_time, mask=time_mask, pos_emb=pos_emb)
+        x_time = self.time_dropout(x_time) + residual
+
+        # Reshape for speaker-wise attention: (B*S, T, D) -> (B, S, T, D) -> (B, T, S, D) -> (B*T, S, D)
+        x_spk = x_time.view(batch_size, num_speakers, seq_len, self.hidden_size)
+        x_spk = x_spk.permute(0, 2, 1, 3)  # (B, T, S, D)
+        x_spk = x_spk.reshape(batch_size * seq_len, num_speakers, self.hidden_size)
+
+        # Speaker-wise self-attention (no positional encoding)
+        residual = x_spk
+        x_spk = self.norm_speaker(x_spk)
+        x_spk = self.speaker_attn(query=x_spk, key=x_spk, value=x_spk, mask=speaker_mask)
+        x_spk = self.speaker_dropout(x_spk) + residual
+
+        # Reshape back: (B*T, S, D) -> (B, T, S, D) -> (B, S, T, D)
+        x = x_spk.view(batch_size, seq_len, num_speakers, self.hidden_size)
+        x = x.permute(0, 2, 1, 3)  # (B, S, T, D)
+
+        # Feed-forward network (reshape to 3D for efficiency)
+        x_flat = x.reshape(batch_size * num_speakers, seq_len, self.hidden_size)
+        residual = x_flat
+        x_flat = self.norm_ff(x_flat)
+        x_flat = self.ffn(x_flat)
+        x_flat = x_flat + residual
+
+        # Reshape back to (B, S, T, D)
+        x = x_flat.view(batch_size, num_speakers, seq_len, self.hidden_size)
+        return x
+
+    def forward_postln(
+        self,
+        x: torch.Tensor,
+        time_mask: Optional[torch.Tensor] = None,
+        speaker_mask: Optional[torch.Tensor] = None,
+        pos_emb: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Post-LayerNorm forward pass.
+        
+        Args:
+            x: Input tensor of shape (B, S, T, D)
+            time_mask: Mask for time attention (B*S, T, T) or (B*S, 1, T), True means masked
+            speaker_mask: Mask for speaker attention (B*T, S, S) or (B*T, 1, S), True means masked
+            pos_emb: Relative positional embeddings for time attention
+            
+        Returns:
+            Output tensor of shape (B, S, T, D)
+        """
+        batch_size, num_speakers, seq_len, _ = x.shape
+        # Reshape for time-wise attention: (B, S, T, D) -> (B*S, T, D)
+        x_time = x.reshape(batch_size * num_speakers, seq_len, self.hidden_size)
+
+        # Time-wise self-attention with relative positional encoding
+        residual = x_time
+        x_time = self.time_attn(query=x_time, key=x_time, value=x_time, mask=time_mask, pos_emb=pos_emb)
+        x_time = self.norm_time(self.time_dropout(x_time) + residual)
+
+        # Reshape for speaker-wise attention: (B*S, T, D) -> (B, S, T, D) -> (B, T, S, D) -> (B*T, S, D)
+        x_spk = x_time.view(batch_size, num_speakers, seq_len, self.hidden_size)
+        x_spk = x_spk.permute(0, 2, 1, 3)  # (B, T, S, D)
+        x_spk = x_spk.reshape(batch_size * seq_len, num_speakers, self.hidden_size)
+
+        # Speaker-wise self-attention (no positional encoding)
+        residual = x_spk
+        x_spk = self.speaker_attn(query=x_spk, key=x_spk, value=x_spk, mask=speaker_mask)
+        x_spk = self.norm_speaker(self.speaker_dropout(x_spk) + residual)
+
+        # Reshape back: (B*T, S, D) -> (B, T, S, D) -> (B, S, T, D)
+        x = x_spk.view(batch_size, seq_len, num_speakers, self.hidden_size)
+        x = x.permute(0, 2, 1, 3)  # (B, S, T, D)
+
+        # Feed-forward network (reshape to 3D for efficiency)
+        x_flat = x.reshape(batch_size * num_speakers, seq_len, self.hidden_size)
+        residual = x_flat
+        x_flat = self.ffn(x_flat)
+        x_flat = self.norm_ff(x_flat + residual)
+
+        # Reshape back to (B, S, T, D)
+        x = x_flat.view(batch_size, num_speakers, seq_len, self.hidden_size)
+        return x
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        time_mask: Optional[torch.Tensor] = None,
+        speaker_mask: Optional[torch.Tensor] = None,
+        pos_emb: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Forward pass.
+        
+        Args:
+            x: Input tensor of shape (B, S, T, D)
+            time_mask: Mask for time attention (B*S, T, T) or (B*S, 1, T), True means masked
+            speaker_mask: Mask for speaker attention (B*T, S, S) or (B*T, 1, S), True means masked
+            pos_emb: Relative positional embeddings for time attention
+            
+        Returns:
+            Output tensor of shape (B, S, T, D)
+        """
+        if self.pre_ln:
+            return self.forward_preln(x, time_mask, speaker_mask, pos_emb)
+        else:
+            return self.forward_postln(x, time_mask, speaker_mask, pos_emb)
+
+
+class JointTimeSpeakerEncoder(nn.Module):
+    """
+    Joint Time-Speaker Encoder for speaker diarization.
+    
+    This encoder alternates between time-wise and speaker-wise self-attention,
+    allowing the model to learn both temporal patterns and speaker interactions.
+    
+    - Time-wise attention uses relative positional encoding (like Conformer)
+    - Speaker-wise attention has no positional encoding (speaker slots are permutation-invariant)
+    
+    Args:
+        num_layers (int): Number of encoder blocks
+        hidden_size (int): Size of the hidden dimension (d_model)
+        inner_size (int): Size of the feed-forward inner dimension
+        num_attention_heads_t (int): Number of attention heads for time-wise attention
+        num_attention_heads_s (int): Number of attention heads for speaker-wise attention
+        attn_score_dropout_t (float): Dropout rate for time-wise attention scores
+        attn_score_dropout_s (float): Dropout rate for speaker-wise attention scores
+        attn_layer_dropout_t (float): Dropout rate for time-wise attention layer output
+        attn_layer_dropout_s (float): Dropout rate for speaker-wise attention layer output
+        ffn_dropout (float): Dropout rate for feed-forward network
+        hidden_act (str): Activation function for feed-forward network
+        pre_ln (bool): Whether to use pre-LayerNorm (True) or post-LayerNorm (False)
+        pre_ln_final_layer_norm (bool): Whether to apply final layer norm when using pre-LN
+    """
+
+    def __init__(
+        self,
+        num_layers: int,
+        hidden_size: int,
+        inner_size: int,
+        num_attention_heads_t: int = 4,
+        num_attention_heads_s: int = 4,
+        attn_score_dropout_t: float = 0.0,
+        attn_score_dropout_s: float = 0.0,
+        attn_layer_dropout_t: float = 0.0,
+        attn_layer_dropout_s: float = 0.0,
+        ffn_dropout: float = 0.0,
+        hidden_act: str = "relu",
+        pre_ln: bool = True,
+        pre_ln_final_layer_norm: bool = True,
+    ):
+        super().__init__()
+        self.num_layers = num_layers
+        self.hidden_size = hidden_size
+        self.pre_ln = pre_ln
+
+        # Final layer norm for pre-LN
+        if pre_ln and pre_ln_final_layer_norm:
+            self.final_layer_norm = nn.LayerNorm(hidden_size, eps=1e-5)
+        else:
+            self.final_layer_norm = None
+
+        # Relative positional encoding for time-wise attention
+        self.pos_enc = RelPositionalEncoding(
+            d_model=hidden_size,
+            dropout_rate=0.0,
+            max_len=5000,
+        )
+
+        # Create encoder blocks
+        self.layers = nn.ModuleList([
+            JointTimeSpeakerEncoderBlock(
+                hidden_size=hidden_size,
+                inner_size=inner_size,
+                num_attention_heads_t=num_attention_heads_t,
+                num_attention_heads_s=num_attention_heads_s,
+                attn_score_dropout_t=attn_score_dropout_t,
+                attn_score_dropout_s=attn_score_dropout_s,
+                attn_layer_dropout_t=attn_layer_dropout_t,
+                attn_layer_dropout_s=attn_layer_dropout_s,
+                ffn_dropout=ffn_dropout,
+                hidden_act=hidden_act,
+                pre_ln=pre_ln,
+                pos_bias_u=None,
+                pos_bias_v=None,
+            )
+            for _ in range(num_layers)
+        ])
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        time_lengths: Optional[torch.Tensor] = None,
+        speaker_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Forward pass.
+        
+        Args:
+            x: Input tensor of shape (B, S, T, D)
+            time_lengths: Lengths of valid time frames for each batch item, shape (B,)
+            speaker_mask: Optional mask for speaker attention (B*T, S, S), True means masked
+            
+        Returns:
+            Output tensor of shape (B, S, T, D)
+        """
+        batch_size, num_speakers, seq_len, _ = x.shape
+
+        # Generate relative positional embeddings for time-wise attention
+        # pos_enc expects (B, T, D) and returns (x, pos_emb)
+        # We use a dummy input just to get pos_emb
+        self.pos_enc.extend_pe(seq_len, x.device, x.dtype)
+        dummy_time = x[:, 0, :, :].clone()  # (B, T, D)
+        _, pos_emb = self.pos_enc(x=dummy_time)  # pos_emb: (1, 2*T-1, D) or similar
+
+        # Create time mask from lengths if provided
+        time_mask = None
+        if time_lengths is not None:
+            # Create mask: True where position >= length (i.e., padding positions)
+            # Shape: (B, T)
+            arange = torch.arange(seq_len, device=x.device)
+            time_len_mask = arange.unsqueeze(0) >= time_lengths.unsqueeze(1)  # (B, T)
+            # Expand for all speakers: (B, T) -> (B, 1, T) -> (B, S, T) -> (B*S, 1, T)
+            time_mask = time_len_mask.unsqueeze(1).expand(-1, num_speakers, -1)
+            time_mask = time_mask.reshape(batch_size * num_speakers, 1, seq_len)
+
+        # Forward through all layers
+        for layer in self.layers:
+            x = layer(
+                x=x,
+                time_mask=time_mask,
+                speaker_mask=speaker_mask,
+                pos_emb=pos_emb,
+            )
+
+        # Apply final layer norm if using pre-LN
+        if self.final_layer_norm is not None:
+            x = self.final_layer_norm(x)
+
+        return x
