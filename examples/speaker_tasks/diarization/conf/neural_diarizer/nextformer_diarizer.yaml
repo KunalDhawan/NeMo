@@ -13,6 +13,7 @@ model:
   max_num_spks: 8 # Maximum number of speakers per model; currently set to 8
   streaming_mode: False
   backend: "trff"  # Backend for local logits: "trff", "dotp", "isd", or "jsd"
+  fusion_type: "concat"  # Fusion type for ISD/JSD backends: "concat", "film", "gated", "hadamard", "add"
   pil_metric: "dot_product"
 
   model_defaults:

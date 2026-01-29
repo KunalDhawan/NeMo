@@ -152,35 +152,36 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             raise ValueError(f"Invalid backend '{self.backend}'. Must be 'trff', 'dotp', 'isd', or 'jsd'.")
         logging.info(f"Using backend: {self.backend}")
 
+        # Fusion type for ISD/JSD backends (shared since they are mutually exclusive)
+        self.fusion_type = self._cfg.get("fusion_type", "concat")
+
         # Optional ISD backend modules
         if self.backend == "isd":
             if not hasattr(self._cfg, "isd_encoder"):
                 raise ValueError("isd backend requires 'isd_encoder' config")
             self.isd_encoder = NextformerEncLabelModel.from_config_dict(self._cfg.isd_encoder).to(self.device)
-            self.isd_input_proj = nn.Linear(
-                self._cfg.model_defaults.tf_d_model + self._cfg.model_defaults.se_d_model,
-                self._cfg.model_defaults.tf_d_model,
-            ).to(self.device)
-            self.isd_output_proj = nn.Linear(self._cfg.model_defaults.tf_d_model, 1).to(self.device)
         else:
             self.isd_encoder = None
-            self.isd_input_proj = None
-            self.isd_output_proj = None
 
         # Optional JSD (Joint Speaker Detection) backend modules
         if self.backend == "jsd":
             if not hasattr(self._cfg, "jsd_encoder"):
                 raise ValueError("jsd backend requires 'jsd_encoder' config")
             self.jsd_encoder = NextformerEncLabelModel.from_config_dict(self._cfg.jsd_encoder).to(self.device)
-            self.jsd_input_proj = nn.Linear(
-                self._cfg.model_defaults.tf_d_model + self._cfg.model_defaults.se_d_model,
-                self._cfg.model_defaults.tf_d_model,
-            ).to(self.device)
-            self.jsd_output_proj = nn.Linear(self._cfg.model_defaults.tf_d_model, 1).to(self.device)
         else:
             self.jsd_encoder = None
-            self.jsd_input_proj = None
-            self.jsd_output_proj = None
+
+        # Shared fusion layers and output projection for ISD/JSD backends
+        if self.backend in ["isd", "jsd"]:
+            self._init_fusion_layers(
+                fusion_type=self.fusion_type,
+                tf_d_model=self._cfg.model_defaults.tf_d_model,
+                se_d_model=self._cfg.model_defaults.se_d_model,
+            )
+            self.backend_output_proj = nn.Linear(self._cfg.model_defaults.tf_d_model, 1).to(self.device)
+            logging.info(f"{self.backend.upper()} backend initialized with fusion_type: {self.fusion_type}")
+        else:
+            self.backend_output_proj = None
         self.save_hyperparameters("cfg")
         self._init_eval_metrics()
         speaker_inds = list(range(self._cfg.local_num_spks))
@@ -215,6 +216,94 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.pil_weight = pil_weight / total_weight
         self.ats_weight = ats_weight / total_weight
         self.global_pil_weight = self._cfg.get("global_pil_weight", 1.0)
+
+    def _init_fusion_layers(self, fusion_type: str, tf_d_model: int, se_d_model: int):
+        """
+        Initialize fusion layers for combining frame embeddings and speaker embeddings.
+        Used by both ISD and JSD backends (which are mutually exclusive).
+        
+        Args:
+            fusion_type: str - one of "concat", "film", "gated", "hadamard", "add"
+            tf_d_model: int - dimension of transformer/frame embeddings
+            se_d_model: int - dimension of speaker embeddings
+        """
+        if fusion_type == "concat":
+            self.fusion_input_proj = nn.Linear(tf_d_model + se_d_model, tf_d_model).to(self.device)
+        elif fusion_type == "film":
+            self.fusion_film_gamma = nn.Linear(se_d_model, tf_d_model).to(self.device)
+            self.fusion_film_beta = nn.Linear(se_d_model, tf_d_model).to(self.device)
+        elif fusion_type == "gated":
+            self.fusion_gate_proj = nn.Linear(tf_d_model + se_d_model, tf_d_model).to(self.device)
+            self.fusion_emb_proj = nn.Linear(tf_d_model, tf_d_model).to(self.device)
+            self.fusion_spk_proj = nn.Linear(se_d_model, tf_d_model).to(self.device)
+        elif fusion_type == "hadamard":
+            self.fusion_emb_proj = nn.Linear(tf_d_model, tf_d_model).to(self.device)
+            self.fusion_spk_proj = nn.Linear(se_d_model, tf_d_model).to(self.device)
+        elif fusion_type == "add":
+            self.fusion_emb_proj = nn.Linear(tf_d_model, tf_d_model).to(self.device)
+            self.fusion_spk_proj = nn.Linear(se_d_model, tf_d_model).to(self.device)
+        else:
+            raise ValueError(f"Unknown fusion_type: {fusion_type}. Must be one of: concat, film, gated, hadamard, add")
+
+    def _apply_fusion(
+        self,
+        emb_seq_expanded: torch.Tensor,
+        spk_embs: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Apply fusion between frame embeddings and speaker embeddings.
+        Used by both ISD and JSD backends (which are mutually exclusive).
+        
+        Args:
+            emb_seq_expanded: Frame embeddings expanded for speakers.
+                Shape: (B, S, T, tf_d_model)
+            spk_embs: Speaker embeddings (not expanded).
+                Shape: (B, S, se_d_model)
+        
+        Returns:
+            combined: Fused embeddings.
+                Shape: (B, S, T, tf_d_model)
+        """
+        seq_len = emb_seq_expanded.shape[2]
+        
+        if self.fusion_type == "concat":
+            # Expand speaker embeddings to match time dimension
+            spk_embs_expanded = spk_embs.unsqueeze(2).expand(-1, -1, seq_len, -1)
+            combined = torch.cat([emb_seq_expanded, spk_embs_expanded], dim=-1)
+            combined = self.fusion_input_proj(combined)
+        
+        elif self.fusion_type == "film":
+            # FiLM: Feature-wise Linear Modulation
+            # Speaker embedding generates scale (gamma) and shift (beta) to modulate frame embeddings
+            gamma = self.fusion_film_gamma(spk_embs)  # (B, S, tf_d_model)
+            beta = self.fusion_film_beta(spk_embs)    # (B, S, tf_d_model)
+            # Expand for time dimension: (B, S, 1, tf_d_model)
+            gamma = gamma.unsqueeze(2)
+            beta = beta.unsqueeze(2)
+            # Modulate frame embeddings: gamma * x + beta
+            combined = gamma * emb_seq_expanded + beta
+        
+        elif self.fusion_type == "gated":
+            # Gated fusion: learn a data-dependent gate to combine both modalities
+            spk_embs_expanded = spk_embs.unsqueeze(2).expand(-1, -1, seq_len, -1)
+            concat = torch.cat([emb_seq_expanded, spk_embs_expanded], dim=-1)
+            gate = torch.sigmoid(self.fusion_gate_proj(concat))
+            combined = gate * self.fusion_emb_proj(emb_seq_expanded) + (1 - gate) * self.fusion_spk_proj(spk_embs_expanded)
+        
+        elif self.fusion_type == "hadamard":
+            # Hadamard (element-wise) product after projecting both to same space
+            spk_embs_expanded = spk_embs.unsqueeze(2).expand(-1, -1, seq_len, -1)
+            combined = self.fusion_emb_proj(emb_seq_expanded) * self.fusion_spk_proj(spk_embs_expanded)
+        
+        elif self.fusion_type == "add":
+            # Additive fusion after projection
+            spk_embs_expanded = spk_embs.unsqueeze(2).expand(-1, -1, seq_len, -1)
+            combined = self.fusion_emb_proj(emb_seq_expanded) + self.fusion_spk_proj(spk_embs_expanded)
+        
+        else:
+            raise ValueError(f"Unknown fusion_type: {self.fusion_type}")
+        
+        return combined
 
     def _init_eval_metrics(self):
         """
@@ -906,8 +995,10 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             logits (torch.Tensor): Tensor containing local speaker logits.
                 Shape: (batch_size, diar_frame_count, num_speakers)
         """
+        encoder_mask = self.nextformer_modules.length_to_mask(emb_seq_length, emb_seq.shape[1])
+
         if self.backend == "trff":
-            logits = self.backend_trff(emb_seq, emb_seq_length)
+            logits = self.backend_trff(emb_seq, encoder_mask)
         elif self.backend == "dotp":
             if spk_embs is None:
                 raise ValueError("spk_embs is required for 'dotp' backend")
@@ -924,26 +1015,24 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             raise ValueError(f"Unknown backend: {self.backend}")
         
         # Apply length mask (common to all backends)
-        encoder_mask = self.nextformer_modules.length_to_mask(emb_seq_length, emb_seq.shape[1])
         mask = encoder_mask.unsqueeze(-1)
         logits = logits.masked_fill(~mask, -1e9)
         return logits
 
-    def backend_trff(self, emb_seq, emb_seq_length):
+    def backend_trff(self, emb_seq, encoder_mask):
         """
         Transformer + feedforward backend for computing local speaker logits.
 
         Args:
             emb_seq (torch.Tensor): Tensor containing encoder states.
                 Shape: (batch_size, diar_frame_count, emb_dim)
-            emb_seq_length (torch.Tensor): Tensor containing lengths of encoder states.
-                Shape: (batch_size,)
+            encoder_mask (torch.Tensor): Boolean mask for encoder states.
+                Shape: (batch_size, diar_frame_count)
 
         Returns:
             logits (torch.Tensor): Tensor containing local speaker logits (unmasked).
                 Shape: (batch_size, diar_frame_count, local_num_spks)
         """
-        encoder_mask = self.nextformer_modules.length_to_mask(emb_seq_length, emb_seq.shape[1])
         trans_emb_seq = self.transformer_encoder(encoder_states=emb_seq, encoder_mask=encoder_mask)
         logits = self.nextformer_modules.forward_spk_logits(trans_emb_seq)
         return logits
@@ -970,7 +1059,8 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
     def backend_isd(self, emb_seq, emb_seq_length, spk_embs):
         """
         Individual Speaker Detection (ISD) backend for computing local speaker logits.
-        Concatenates per-speaker embeddings with frame embeddings and runs a dedicated encoder.
+        Fuses per-speaker embeddings with frame embeddings using configurable fusion
+        and runs a dedicated encoder.
 
         Args:
             emb_seq (torch.Tensor): Tensor containing encoder states (projected).
@@ -984,33 +1074,31 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             logits (torch.Tensor): Tensor containing local speaker logits (unmasked).
                 Shape: (batch_size, diar_frame_count, local_num_spks)
         """
-        if self.isd_encoder is None or self.isd_input_proj is None or self.isd_output_proj is None:
+        if self.isd_encoder is None or self.backend_output_proj is None:
             raise RuntimeError("ISD backend modules are not initialized")
 
-        batch_size, diar_len, _ = emb_seq.shape
+        batch_size, seq_len, _ = emb_seq.shape
         local_num_spks = spk_embs.shape[1]
 
-        # Expand to per-speaker sequences
+        # Expand frame embeddings to per-speaker sequences: (B, S, T, tf_d_model)
         emb_seq_expanded = emb_seq.unsqueeze(1).expand(-1, local_num_spks, -1, -1)
-        spk_embs_expanded = spk_embs.unsqueeze(2).expand(-1, -1, diar_len, -1)
 
-        # Concatenate and project back to tf_d_model
-        combined = torch.cat([emb_seq_expanded, spk_embs_expanded], dim=-1)
-        combined = self.isd_input_proj(combined)
+        # Apply configurable fusion
+        combined = self._apply_fusion(emb_seq_expanded, spk_embs)
 
         # Reshape to (B * local_num_spks, T, tf_d_model)
-        combined = combined.reshape(batch_size * local_num_spks, diar_len, -1)
+        combined = combined.reshape(batch_size * local_num_spks, seq_len, -1)
 
         # Repeat lengths for each speaker
         isd_lengths = emb_seq_length.unsqueeze(1).expand(-1, local_num_spks).reshape(-1)
-        encoder_mask = self.nextformer_modules.length_to_mask(isd_lengths, diar_len)
+        encoder_mask = self.nextformer_modules.length_to_mask(isd_lengths, seq_len)
 
         # Run ISD encoder and output projection
         encoded = self.isd_encoder(encoder_states=combined, encoder_mask=encoder_mask)
-        logits = self.isd_output_proj(encoded)  # (B * local_num_spks, T, 1)
+        logits = self.backend_output_proj(encoded)  # (B * local_num_spks, T, 1)
 
         # Reshape back to (B, T, local_num_spks)
-        logits = logits.reshape(batch_size, local_num_spks, diar_len, 1).squeeze(-1).transpose(1, 2)
+        logits = logits.reshape(batch_size, local_num_spks, seq_len, 1).squeeze(-1).transpose(1, 2)
         return logits
 
     def backend_jsd(self, emb_seq, emb_seq_length, spk_embs):
@@ -1031,25 +1119,22 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             logits (torch.Tensor): Tensor containing local speaker logits (unmasked).
                 Shape: (batch_size, diar_frame_count, local_num_spks)
         """
-        if self.jsd_encoder is None or self.jsd_input_proj is None or self.jsd_output_proj is None:
+        if self.jsd_encoder is None or self.backend_output_proj is None:
             raise RuntimeError("JSD backend modules are not initialized")
 
-        batch_size, diar_len, _ = emb_seq.shape
         local_num_spks = spk_embs.shape[1]
 
-        # Expand to per-speaker sequences: (B, S, T, tf_d_model) and (B, S, T, se_d_model)
+        # Expand frame embeddings to per-speaker sequences: (B, S, T, tf_d_model)
         emb_seq_expanded = emb_seq.unsqueeze(1).expand(-1, local_num_spks, -1, -1)
-        spk_embs_expanded = spk_embs.unsqueeze(2).expand(-1, -1, diar_len, -1)
 
-        # Concatenate and project back to tf_d_model
-        combined = torch.cat([emb_seq_expanded, spk_embs_expanded], dim=-1)  # (B, S, T, tf+se)
-        combined = self.jsd_input_proj(combined)  # (B, S, T, tf_d_model)
+        # Apply configurable fusion
+        combined = self._apply_fusion(emb_seq_expanded, spk_embs)  # (B, S, T, tf_d_model)
 
         # Run JSD encoder - input/output is (B, S, T, D)
         encoded = self.jsd_encoder(combined, time_lengths=emb_seq_length)  # (B, S, T, D)
 
         # Project to logits
-        logits = self.jsd_output_proj(encoded)  # (B, S, T, 1)
+        logits = self.backend_output_proj(encoded)  # (B, S, T, 1)
         logits = logits.squeeze(-1).transpose(1, 2)  # (B, T, S)
         return logits
 
