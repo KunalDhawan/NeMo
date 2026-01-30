@@ -1355,13 +1355,19 @@ class ConformerEncoderWithCLS(ConformerEncoder):
     self-attention and can be used as speaker queries for diarization.
     
     Key features:
-      - CLS tokens are prepended to the sequence after pre_encode
+      - CLS tokens can be inserted at any layer (controlled by cls_start_layer)
+      - Layers before cls_start_layer use regular ConformerLayer (audio only)
+      - Layers from cls_start_layer onwards use ConformerLayerWithCLS
       - Convolution is applied only to audio frames, CLS tokens skip conv
       - Returns (audio_embeddings, length, cls_embeddings) separately
       - Supports multiple positional encoding modes for CLS tokens
     
     Args:
         num_cls_tokens (int): Number of CLS tokens to prepend
+        cls_start_layer (int): Layer index at which to insert CLS tokens. Default 0.
+            - 0: CLS tokens from the start (original behavior)
+            - N: CLS tokens inserted before layer N, allowing early layers to 
+              process audio only before CLS tokens attend to refined representations.
         cls_pos_mode (str): Positional encoding mode for CLS tokens.
             'query_key': Learned CLS pos on both query and key (default)
             'query_only': Learned CLS pos on query only
@@ -1379,6 +1385,7 @@ class ConformerEncoderWithCLS(ConformerEncoder):
     def __init__(
         self,
         num_cls_tokens,
+        cls_start_layer: int = 0,
         cls_pos_mode='query_key',
         allow_content_to_cls=True,
         cls_embedding_shared: bool = True,
@@ -1475,6 +1482,13 @@ class ConformerEncoderWithCLS(ConformerEncoder):
         self.allow_content_to_cls = allow_content_to_cls
         self.cls_embedding_shared = cls_embedding_shared
         
+        # Validate cls_start_layer
+        if cls_start_layer < 0 or cls_start_layer >= n_layers:
+            raise ValueError(
+                f"cls_start_layer must be in [0, {n_layers - 1}], got {cls_start_layer}"
+            )
+        self.cls_start_layer = cls_start_layer
+        
         # Learnable CLS content embedding (shared or per-slot)
         if self.cls_embedding_shared:
             # Single vector that gets broadcast to all slots
@@ -1492,29 +1506,54 @@ class ConformerEncoderWithCLS(ConformerEncoder):
             pos_bias_u = None
             pos_bias_v = None
         
-        # Replace layers with CLS-aware versions
+        # Create layers: regular ConformerLayer before cls_start_layer, 
+        # ConformerLayerWithCLS from cls_start_layer onwards
         d_ff = d_model * ff_expansion_factor
         self.layers = nn.ModuleList()
         for i in range(n_layers):
-            layer = ConformerLayerWithCLS(
-                num_cls_tokens=num_cls_tokens,
-                cls_pos_mode=cls_pos_mode,
-                allow_content_to_cls=allow_content_to_cls,
-                d_model=d_model,
-                d_ff=d_ff,
-                n_heads=n_heads,
-                conv_kernel_size=conv_kernel_size,
-                conv_norm_type=conv_norm_type,
-                conv_context_size=self.conv_context_size,
-                dropout=dropout,
-                dropout_att=dropout_att,
-                pos_bias_u=pos_bias_u,
-                pos_bias_v=pos_bias_v,
-                att_context_size=self.att_context_size,
-                use_bias=use_bias,
-                use_pytorch_sdpa=use_pytorch_sdpa,
-                use_pytorch_sdpa_backends=use_pytorch_sdpa_backends if use_pytorch_sdpa_backends else [],
-            )
+            if i < cls_start_layer:
+                # Regular layer without CLS handling
+                layer = ConformerLayer(
+                    d_model=d_model,
+                    d_ff=d_ff,
+                    self_attention_model=self_attention_model,
+                    global_tokens=global_tokens,
+                    global_tokens_spacing=global_tokens_spacing,
+                    global_attn_separate=global_attn_separate,
+                    n_heads=n_heads,
+                    conv_kernel_size=conv_kernel_size,
+                    conv_norm_type=conv_norm_type,
+                    conv_context_size=self.conv_context_size,
+                    dropout=dropout,
+                    dropout_att=dropout_att,
+                    pos_bias_u=pos_bias_u,
+                    pos_bias_v=pos_bias_v,
+                    att_context_size=self.att_context_size,
+                    use_bias=use_bias,
+                    use_pytorch_sdpa=use_pytorch_sdpa,
+                    use_pytorch_sdpa_backends=use_pytorch_sdpa_backends if use_pytorch_sdpa_backends else [],
+                )
+            else:
+                # CLS-aware layer
+                layer = ConformerLayerWithCLS(
+                    num_cls_tokens=num_cls_tokens,
+                    cls_pos_mode=cls_pos_mode,
+                    allow_content_to_cls=allow_content_to_cls,
+                    d_model=d_model,
+                    d_ff=d_ff,
+                    n_heads=n_heads,
+                    conv_kernel_size=conv_kernel_size,
+                    conv_norm_type=conv_norm_type,
+                    conv_context_size=self.conv_context_size,
+                    dropout=dropout,
+                    dropout_att=dropout_att,
+                    pos_bias_u=pos_bias_u,
+                    pos_bias_v=pos_bias_v,
+                    att_context_size=self.att_context_size,
+                    use_bias=use_bias,
+                    use_pytorch_sdpa=use_pytorch_sdpa,
+                    use_pytorch_sdpa_backends=use_pytorch_sdpa_backends if use_pytorch_sdpa_backends else [],
+                )
             self.layers.append(layer)
         
         # Recompute stochastic depth probabilities for new layers
@@ -1524,8 +1563,8 @@ class ConformerEncoderWithCLS(ConformerEncoder):
         
         logging.info(
             f"ConformerEncoderWithCLS initialized with {num_cls_tokens} CLS tokens, "
-            f"cls_pos_mode='{cls_pos_mode}', allow_content_to_cls={allow_content_to_cls}, "
-            f"cls_embedding_shared={cls_embedding_shared}"
+            f"cls_start_layer={cls_start_layer}, cls_pos_mode='{cls_pos_mode}', "
+            f"allow_content_to_cls={allow_content_to_cls}, cls_embedding_shared={cls_embedding_shared}"
         )
     
     def load_state_dict(self, state_dict, strict=True):
@@ -1536,8 +1575,8 @@ class ConformerEncoderWithCLS(ConformerEncoder):
         if 'cls_embedding' not in state_dict:
             missing_cls_params.append('cls_embedding')
         
-        # Check layers for CLS attention params
-        for i in range(self.n_layers):
+        # Check layers for CLS attention params (only for layers >= cls_start_layer)
+        for i in range(self.cls_start_layer, self.n_layers):
             if self.cls_pos_mode in ['query_key', 'query_only']:
                 cls_attn_key_q = f'layers.{i}.self_attn.cls_pos_q'
                 if cls_attn_key_q not in state_dict:
@@ -1580,6 +1619,9 @@ class ConformerEncoderWithCLS(ConformerEncoder):
     ):
         """Forward pass with CLS token handling.
         
+        CLS tokens are inserted at layer `cls_start_layer`. Layers before that
+        process audio only using regular ConformerLayer.
+        
         Args:
             audio_signal: Input audio features (B, feat_in, T) or pre-encoded (B, T, d_model)
             length: Lengths of audio sequences (B,)
@@ -1621,35 +1663,32 @@ class ConformerEncoderWithCLS(ConformerEncoder):
                 raise ValueError("Caching with reduction feature is not supported yet!")
         
         batch_size = audio_signal.size(0)
-        audio_len = audio_signal.size(1)
         
-        # Prepend CLS tokens (shared or per-slot embeddings)
-        if self.cls_embedding_shared:
-            cls_tokens = self.cls_embedding.expand(batch_size, self.num_cls_tokens, -1)
-        else:
-            cls_tokens = self.cls_embedding.expand(batch_size, -1, -1)
-        x = torch.cat([cls_tokens, audio_signal], dim=1)
+        # Track whether CLS tokens have been added
+        cls_added = False
+        cache_len = 0
+        offset = None
+        cache_last_channel_next = None
         
-        # Update lengths to include CLS tokens
-        length_with_cls = length + self.num_cls_tokens
+        # Start with audio only
+        x = audio_signal
         
+        # Initial positional encoding and masks (audio only)
         max_audio_length = x.size(1)
         if cache_last_channel is not None:
             cache_len = self.streaming_cfg.last_channel_cache_size
             cache_keep_size = max_audio_length - self.streaming_cfg.cache_drop_size
             max_audio_length = max_audio_length + cache_len
-            padding_length = length_with_cls + cache_len
+            padding_length = length + cache_len
             offset = torch.neg(cache_last_channel_len) + cache_len
         else:
-            padding_length = length_with_cls
+            padding_length = length
             cache_last_channel_next = None
             cache_len = 0
             offset = None
         
-        # Apply positional encoding to full sequence (CLS + audio)
         x, pos_emb = self.pos_enc(x=x, cache_len=cache_len)
         
-        # Create masks with CLS handling
         pad_mask, att_mask = self._create_masks(
             att_context_size=cur_att_context_size,
             padding_length=padding_length,
@@ -1658,10 +1697,6 @@ class ConformerEncoderWithCLS(ConformerEncoder):
             device=x.device,
         )
         
-        # CLS tokens are never padded - ensure they're marked as valid
-        if pad_mask is not None:
-            pad_mask[:, :self.num_cls_tokens] = False  # False means not padded
-        
         if cache_last_channel is not None:
             pad_mask = pad_mask[:, cache_len:]
             if att_mask is not None:
@@ -1669,8 +1704,57 @@ class ConformerEncoderWithCLS(ConformerEncoder):
             cache_last_time_next = []
             cache_last_channel_next = []
         
-        # Run through CLS-aware layers
+        # Run through layers
         for lth, (drop_prob, layer) in enumerate(zip(self.layer_drop_probs, self.layers)):
+            
+            # Insert CLS tokens when we reach cls_start_layer
+            if lth == self.cls_start_layer and not cls_added:
+                # Prepend CLS tokens (shared or per-slot embeddings)
+                if self.cls_embedding_shared:
+                    cls_tokens = self.cls_embedding.expand(batch_size, self.num_cls_tokens, -1)
+                else:
+                    cls_tokens = self.cls_embedding.expand(batch_size, -1, -1)
+                x = torch.cat([cls_tokens, x], dim=1)
+                cls_added = True
+                
+                # Update lengths and recompute positional encoding and masks
+                length_with_cls = length + self.num_cls_tokens
+                max_seq_length = x.size(1)
+                
+                if cache_last_channel is not None:
+                    max_seq_length = max_seq_length + cache_len
+                    padding_length = length_with_cls + cache_len
+                else:
+                    padding_length = length_with_cls
+                
+                # Get updated pos_emb for extended sequence without re-scaling x
+                # (audio already has scaling/dropout from initial pos_enc call,
+                #  CLS tokens are learnable embeddings that don't need scaling)
+                input_len = x.size(1) + cache_len
+                center_pos = self.pos_enc.pe.size(1) // 2 + 1
+                start_pos = center_pos - input_len
+                end_pos = center_pos + input_len - 1
+                pos_emb = self.pos_enc.pe[:, start_pos:end_pos]
+                if self.pos_enc.dropout_emb:
+                    pos_emb = self.pos_enc.dropout_emb(pos_emb)
+                
+                pad_mask, att_mask = self._create_masks(
+                    att_context_size=cur_att_context_size,
+                    padding_length=padding_length,
+                    max_audio_length=max_seq_length,
+                    offset=offset,
+                    device=x.device,
+                )
+                
+                # CLS tokens are never padded
+                if pad_mask is not None:
+                    pad_mask[:, :self.num_cls_tokens] = False
+                
+                if cache_last_channel is not None:
+                    pad_mask = pad_mask[:, cache_len:]
+                    if att_mask is not None:
+                        att_mask = att_mask[:, cache_len:]
+            
             original_signal = x
             if cache_last_channel is not None:
                 cache_last_channel_cur = cache_last_channel[lth]
@@ -1701,26 +1785,39 @@ class ConformerEncoderWithCLS(ConformerEncoder):
                 else:
                     x = (x - original_signal) / (1.0 - drop_prob) + original_signal
             
-            # Reduction (applied to audio only, but we handle full sequence)
+            # Reduction (applied to audio only)
             if self.reduction_position == lth:
-                # Split, reduce audio only, recombine
-                cls_part = x[:, :self.num_cls_tokens, :]
-                audio_part = x[:, self.num_cls_tokens:, :]
-                audio_part, length = self.reduction_subsampling(x=audio_part, lengths=length)
-                x = torch.cat([cls_part, audio_part], dim=1)
-                
-                max_audio_length = x.size(1)
-                _, pos_emb = self.pos_enc(x=x, cache_len=cache_len)
-                length_with_cls = length + self.num_cls_tokens
-                pad_mask, att_mask = self._create_masks(
-                    att_context_size=cur_att_context_size,
-                    padding_length=length_with_cls,
-                    max_audio_length=max_audio_length,
-                    offset=offset,
-                    device=x.device,
-                )
-                if pad_mask is not None:
-                    pad_mask[:, :self.num_cls_tokens] = False
+                if cls_added:
+                    # Split, reduce audio only, recombine
+                    cls_part = x[:, :self.num_cls_tokens, :]
+                    audio_part = x[:, self.num_cls_tokens:, :]
+                    audio_part, length = self.reduction_subsampling(x=audio_part, lengths=length)
+                    x = torch.cat([cls_part, audio_part], dim=1)
+                    
+                    max_seq_length = x.size(1)
+                    _, pos_emb = self.pos_enc(x=x, cache_len=cache_len)
+                    length_with_cls = length + self.num_cls_tokens
+                    pad_mask, att_mask = self._create_masks(
+                        att_context_size=cur_att_context_size,
+                        padding_length=length_with_cls,
+                        max_audio_length=max_seq_length,
+                        offset=offset,
+                        device=x.device,
+                    )
+                    if pad_mask is not None:
+                        pad_mask[:, :self.num_cls_tokens] = False
+                else:
+                    # No CLS yet, just reduce audio
+                    x, length = self.reduction_subsampling(x=x, lengths=length)
+                    max_seq_length = x.size(1)
+                    _, pos_emb = self.pos_enc(x=x, cache_len=cache_len)
+                    pad_mask, att_mask = self._create_masks(
+                        att_context_size=cur_att_context_size,
+                        padding_length=length,
+                        max_audio_length=max_seq_length,
+                        offset=offset,
+                        device=x.device,
+                    )
         
         # Apply output projection if exists
         if self.out_proj is not None:

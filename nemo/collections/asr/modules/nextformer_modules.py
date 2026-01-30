@@ -436,16 +436,28 @@ class NextformerModules(NeuralModule, Exportable):
         hard_history_assignments: bool = False,
         logsumexp_temperature: float = 1.0,
         assignment_swap_prob: float = 0.0,
+        backend: str = "trff",
+        fusion_type: str = "concat",
+        fusion_lnorm: bool = False,
+        spk_extra_proj: bool = False,
     ):
         super().__init__()
         # General params
         self.subsampling_factor = subsampling_factor
         self.fc_d_model = fc_d_model
         self.tf_d_model = tf_d_model
-        self.se_d_model = se_d_model
+        self.spk_extra_proj = spk_extra_proj
+        # When not using separate SE projections, force se_d_model = tf_d_model
+        # to avoid dimension mismatch when reusing TF projections
+        self.se_d_model = se_d_model if spk_extra_proj else tf_d_model
         self.local_num_spks = local_num_spks
         self.max_num_spks = max_num_spks
         self.pred_score_threshold = pred_score_threshold
+
+        # Backend and fusion params
+        self.backend = backend
+        self.fusion_type = fusion_type
+        self.fusion_lnorm = fusion_lnorm
 
         # Sinkhorn parameters
         self.sinkhorn_n_iters = sinkhorn_n_iters
@@ -462,12 +474,30 @@ class NextformerModules(NeuralModule, Exportable):
         self.hard_history_assignments = hard_history_assignments
         self.logsumexp_temperature = logsumexp_temperature
 
-        self.encoder_proj = nn.Linear(self.fc_d_model, self.tf_d_model)
-        self.spk_emb_proj = nn.Linear(self.fc_d_model, self.se_d_model)
+        self.encoder_proj_tf = nn.Linear(self.fc_d_model, self.tf_d_model)
+        self.spk_emb_proj_tf = nn.Linear(self.fc_d_model, self.tf_d_model)
+        
+        # Only create separate SE projections when spk_extra_proj is enabled
+        if self.spk_extra_proj:
+            self.encoder_proj_se = nn.Linear(self.fc_d_model, self.se_d_model)
+            self.spk_emb_proj_se = nn.Linear(self.fc_d_model, self.se_d_model)
+        else:
+            self.encoder_proj_se = None
+            self.spk_emb_proj_se = None
+
         self.first_hidden_to_hidden = nn.Linear(self.tf_d_model, self.tf_d_model)
         self.single_hidden_to_spks = nn.Linear(self.tf_d_model, self.local_num_spks)
         self.dropout = nn.Dropout(ff_dropout_rate)
         self.log = False
+
+        # Initialize fusion layers for ISD/JSD backends
+        self._init_fusion_layers()
+
+        # Initialize backend output projection for ISD/JSD backends
+        if self.backend in ["isd", "jsd"]:
+            self.backend_output_proj = nn.Linear(self.tf_d_model, 1)
+        else:
+            self.backend_output_proj = None
 
         # Streaming-related params
         self.chunk_len = chunk_len
@@ -480,6 +510,132 @@ class NextformerModules(NeuralModule, Exportable):
         self.extra_left_context = extra_left_context
         self.extra_right_context = extra_right_context
         self.extra_silence_frames = extra_silence_frames
+
+    def _init_fusion_layers(self):
+        """
+        Initialize fusion layers for combining frame embeddings and speaker embeddings.
+
+        Fusion types:
+            - 'concat': Concatenates frame and speaker embeddings, then projects back to d_model.
+            - 'film': Feature-wise Linear Modulation - learns affine transformation (gamma, beta)
+                      conditioned on speaker embeddings.
+            - 'hdm': Hadamard (element-wise) product - no learnable parameters required.
+
+        Note:
+            Only used by ISD and JSD backends. For other backends, all fusion attributes
+            are set to None.
+        """
+        # Initialize all fusion attributes to None by default
+        self.fusion_input_proj = None
+        self.fusion_film_gamma = None
+        self.fusion_film_beta = None
+        self.fusion_layer_norm = None
+
+        if self.backend not in ("isd", "jsd"):
+            return
+
+        d_model = self.tf_d_model
+
+        if self.fusion_type == "concat":
+            # Concatenate embeddings [frame; speaker] and project back to d_model
+            self.fusion_input_proj = nn.Linear(2 * d_model, d_model)
+        elif self.fusion_type == "film":
+            # FiLM: output = gamma(speaker) * frame + beta(speaker)
+            self.fusion_film_gamma = nn.Linear(d_model, d_model)
+            self.fusion_film_beta = nn.Linear(d_model, d_model)
+        elif self.fusion_type == "hdm":
+            # Hadamard: element-wise product, no additional parameters needed
+            pass
+        else:
+            raise ValueError(
+                f"Invalid fusion_type '{self.fusion_type}'. Expected one of: 'concat', 'film', 'hdm'."
+            )
+
+        if self.fusion_lnorm:
+            self.fusion_layer_norm = nn.LayerNorm(d_model)
+
+    def apply_fusion(
+        self,
+        emb_seq_expanded: torch.Tensor,
+        spk_embs: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Apply fusion between frame embeddings and speaker embeddings.
+        Used by ISD and JSD backends.
+        
+        Args:
+            emb_seq_expanded: Frame embeddings expanded for speakers.
+                Shape: (B, S, T, tf_d_model)
+            spk_embs: Speaker embeddings (not expanded).
+                Shape: (B, S, tf_d_model)
+        
+        Returns:
+            combined: Fused embeddings.
+                Shape: (B, S, T, tf_d_model)
+        """
+        seq_len = emb_seq_expanded.shape[2]
+        
+        if self.fusion_type == "concat":
+            # Expand speaker embeddings to match time dimension
+            spk_embs_expanded = spk_embs.unsqueeze(2).expand(-1, -1, seq_len, -1)
+            combined = torch.cat([emb_seq_expanded, spk_embs_expanded], dim=-1)
+            combined = self.fusion_input_proj(combined)
+        
+        elif self.fusion_type == "film":
+            # FiLM: Feature-wise Linear Modulation
+            # Speaker embedding generates scale (gamma) and shift (beta) to modulate frame embeddings
+            gamma = self.fusion_film_gamma(spk_embs)  # (B, S, tf_d_model)
+            beta = self.fusion_film_beta(spk_embs)    # (B, S, tf_d_model)
+            # Expand for time dimension: (B, S, 1, tf_d_model)
+            gamma = gamma.unsqueeze(2)
+            beta = beta.unsqueeze(2)
+            # Modulate frame embeddings: gamma * x + beta
+            combined = gamma * emb_seq_expanded + beta
+        
+        elif self.fusion_type == "hdm":
+            # Hadamard (element-wise) product after projecting both to same space
+            spk_embs_expanded = spk_embs.unsqueeze(2).expand(-1, -1, seq_len, -1)
+            combined = emb_seq_expanded * spk_embs_expanded
+
+        else:
+            raise ValueError(f"Unknown fusion_type: {self.fusion_type}")
+
+        if self.fusion_lnorm and self.fusion_layer_norm is not None:
+            combined = self.fusion_layer_norm(combined)
+
+        return combined
+
+    def project_encoder_for_se(self, emb_seq: torch.Tensor) -> torch.Tensor:
+        """
+        Project encoder embeddings for speaker embedding matching.
+        Uses separate SE projection if spk_extra_proj is enabled, otherwise reuses TF projection.
+        
+        Args:
+            emb_seq: Encoder embeddings of shape (B, T, fc_d_model)
+        
+        Returns:
+            Projected embeddings of shape (B, T, se_d_model) or (B, T, tf_d_model)
+        """
+        if self.spk_extra_proj:
+            return self.encoder_proj_se(emb_seq)
+        else:
+            return self.encoder_proj_tf(emb_seq)
+
+    def project_spk_embs_for_se(self, spk_embs: torch.Tensor) -> torch.Tensor:
+        """
+        Project speaker embeddings for speaker embedding matching.
+        Uses separate SE projection if spk_extra_proj is enabled, otherwise reuses TF projection.
+        
+        Args:
+            spk_embs: Speaker embeddings of shape (B, num_spks, fc_d_model)
+        
+        Returns:
+            Projected embeddings of shape (B, num_spks, se_d_model) or (B, num_spks, tf_d_model)
+        """
+        if self.spk_extra_proj:
+            return self.spk_emb_proj_se(spk_embs)
+        else:
+            return self.spk_emb_proj_tf(spk_embs)
 
     @staticmethod
     def length_to_mask(lengths, max_length: int):

@@ -12,8 +12,6 @@ model:
   local_num_spks: 4 # Number of speakers for local diarization
   max_num_spks: 8 # Maximum number of speakers per model; currently set to 8
   streaming_mode: False
-  backend: "trff"  # Backend for local logits: "trff", "dotp", "isd", or "jsd"
-  fusion_type: "concat"  # Fusion type for ISD/JSD backends: "concat", "film", "gated", "hadamard", "add"
   pil_metric: "dot_product"
 
   model_defaults:
@@ -132,11 +130,16 @@ model:
     hard_history_assignments: false # If true, convert soft assignments to hard one-hot before storing in history (prevents gradient flow through history and probability dilution)
     logsumexp_temperature: 1.0 # Temperature for LogSumExp aggregation over history (higher = smoother gradients, lower = sharper like max)
     spk_emb_update_min_frames: 0 # Minimum number of active frames required to update speaker embeddings (0 = disabled)
+    backend: "dotp" # Backend for local logits: "trff", "dotp", "isd", or "jsd"
+    fusion_type: "hdm" # Fusion type for ISD/JSD backends: "concat", "film", "hdm"
+    fusion_lnorm: true # Layer normalization after fusion
+    spk_extra_proj: false # If true, use separate projections (encoder_proj_se, spk_emb_proj_se) for speaker embedding matching; if false, reuse tf projections
 
   encoder:
     _target_: nemo.collections.asr.modules.ConformerEncoderWithCLS
     # CLS token configuration
     num_cls_tokens: 4  # One CLS token per speaker slot, the rest are to aggregate additional information
+    cls_start_layer: 0  # Layer index to insert CLS tokens (0 = from start)
     cls_pos_mode: query_key  # Options: 'query_key', 'query_only', 'rel_pos', 'none'
     allow_content_to_cls: true  # Whether non-CLS tokens can attend to CLS tokens
     cls_embedding_shared: true  # If true, all CLS slots share one embedding

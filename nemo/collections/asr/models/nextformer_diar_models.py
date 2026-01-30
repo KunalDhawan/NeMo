@@ -133,16 +133,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.nextformer_modules = NextformerEncLabelModel.from_config_dict(self._cfg.nextformer_modules).to(
             self.device
         )
-        if self._cfg.encoder.d_model != self._cfg.model_defaults.tf_d_model:
-            self.nextformer_modules.encoder_proj = self.nextformer_modules.encoder_proj.to(self.device)
-        else:
-            self.nextformer_modules.encoder_proj = None
-        
-        if self._cfg.encoder.d_model != self._cfg.model_defaults.se_d_model:
-            self.nextformer_modules.spk_emb_proj = self.nextformer_modules.spk_emb_proj.to(self.device)
-        else:
-            self.nextformer_modules.spk_emb_proj = None
-        
+       
         self._init_loss_weights()
 
         self.eps = 1e-3
@@ -155,16 +146,12 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.oracle_assignment = self._cfg.get("oracle_assignment", False)
         
         self.streaming_mode = self.cfg.get("streaming_mode", False)
-        self.backend = self._cfg.get("backend", "trff")  # "trff", "dotp", "isd", or "jsd"
-        if self.backend not in ["trff", "dotp", "isd", "jsd"]:
-            raise ValueError(f"Invalid backend '{self.backend}'. Must be 'trff', 'dotp', 'isd', or 'jsd'.")
-        logging.info(f"Using backend: {self.backend}")
 
-        # Fusion type for ISD/JSD backends (shared since they are mutually exclusive)
-        self.fusion_type = self._cfg.get("fusion_type", "concat")
+        # Backend and fusion settings come from NextformerModules config
+        logging.info(f"Using backend: {self.nextformer_modules.backend}")
 
         # Optional ISD backend modules
-        if self.backend == "isd":
+        if self.nextformer_modules.backend == "isd":
             if not hasattr(self._cfg, "isd_encoder"):
                 raise ValueError("isd backend requires 'isd_encoder' config")
             self.isd_encoder = NextformerEncLabelModel.from_config_dict(self._cfg.isd_encoder).to(self.device)
@@ -172,24 +159,19 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             self.isd_encoder = None
 
         # Optional JSD (Joint Speaker Detection) backend modules
-        if self.backend == "jsd":
+        if self.nextformer_modules.backend == "jsd":
             if not hasattr(self._cfg, "jsd_encoder"):
                 raise ValueError("jsd backend requires 'jsd_encoder' config")
             self.jsd_encoder = NextformerEncLabelModel.from_config_dict(self._cfg.jsd_encoder).to(self.device)
         else:
             self.jsd_encoder = None
 
-        # Shared fusion layers and output projection for ISD/JSD backends
-        if self.backend in ["isd", "jsd"]:
-            self._init_fusion_layers(
-                fusion_type=self.fusion_type,
-                tf_d_model=self._cfg.model_defaults.tf_d_model,
-                se_d_model=self._cfg.model_defaults.se_d_model,
+        # Log ISD/JSD backend configuration (fusion layers are in nextformer_modules)
+        if self.nextformer_modules.backend in ["isd", "jsd"]:
+            logging.info(
+                f"{self.nextformer_modules.backend.upper()} backend initialized with fusion_type: "
+                f"{self.nextformer_modules.fusion_type}"
             )
-            self.backend_output_proj = nn.Linear(self._cfg.model_defaults.tf_d_model, 1).to(self.device)
-            logging.info(f"{self.backend.upper()} backend initialized with fusion_type: {self.fusion_type}")
-        else:
-            self.backend_output_proj = None
         self.save_hyperparameters("cfg")
         self._init_eval_metrics()
         speaker_inds = list(range(self._cfg.local_num_spks))
@@ -208,103 +190,6 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.pil_weight = pil_weight / total_weight
         self.ats_weight = ats_weight / total_weight
         self.global_pil_weight = self._cfg.get("global_pil_weight", 1.0)
-
-    def _init_fusion_layers(self, fusion_type: str, tf_d_model: int, se_d_model: int):
-        """
-        Initialize fusion layers for combining frame embeddings and speaker embeddings.
-        Used by both ISD and JSD backends (which are mutually exclusive).
-        
-        Args:
-            fusion_type: str - one of "concat", "film", "gated", "hadamard", "rhadamard", "add"
-            tf_d_model: int - dimension of transformer/frame embeddings
-            se_d_model: int - dimension of speaker embeddings
-        """
-        if fusion_type == "concat":
-            self.fusion_input_proj = nn.Linear(tf_d_model + se_d_model, tf_d_model).to(self.device)
-        elif fusion_type == "film":
-            self.fusion_film_gamma = nn.Linear(se_d_model, tf_d_model).to(self.device)
-            self.fusion_film_beta = nn.Linear(se_d_model, tf_d_model).to(self.device)
-        elif fusion_type == "gated":
-            self.fusion_gate_proj = nn.Linear(tf_d_model + se_d_model, tf_d_model).to(self.device)
-            self.fusion_emb_proj = nn.Linear(tf_d_model, tf_d_model).to(self.device)
-            self.fusion_spk_proj = nn.Linear(se_d_model, tf_d_model).to(self.device)
-        elif fusion_type == "hadamard":
-            self.fusion_emb_proj = nn.Linear(tf_d_model, tf_d_model).to(self.device)
-            self.fusion_spk_proj = nn.Linear(se_d_model, tf_d_model).to(self.device)
-        elif fusion_type == "add":
-            self.fusion_emb_proj = nn.Linear(tf_d_model, tf_d_model).to(self.device)
-            self.fusion_spk_proj = nn.Linear(se_d_model, tf_d_model).to(self.device)
-        elif fusion_type == "rhadamard":
-            self.fusion_emb_proj = nn.Linear(tf_d_model, tf_d_model).to(self.device)
-            self.fusion_spk_proj = nn.Linear(se_d_model, tf_d_model).to(self.device)
-        else:
-            raise ValueError(f"Unknown fusion_type: {fusion_type}. Must be one of: concat, film, gated, hadamard, rhadamard, add")
-
-    def _apply_fusion(
-        self,
-        emb_seq_expanded: torch.Tensor,
-        spk_embs: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Apply fusion between frame embeddings and speaker embeddings.
-        Used by both ISD and JSD backends (which are mutually exclusive).
-        
-        Args:
-            emb_seq_expanded: Frame embeddings expanded for speakers.
-                Shape: (B, S, T, tf_d_model)
-            spk_embs: Speaker embeddings (not expanded).
-                Shape: (B, S, se_d_model)
-        
-        Returns:
-            combined: Fused embeddings.
-                Shape: (B, S, T, tf_d_model)
-        """
-        seq_len = emb_seq_expanded.shape[2]
-        
-        if self.fusion_type == "concat":
-            # Expand speaker embeddings to match time dimension
-            spk_embs_expanded = spk_embs.unsqueeze(2).expand(-1, -1, seq_len, -1)
-            combined = torch.cat([emb_seq_expanded, spk_embs_expanded], dim=-1)
-            combined = self.fusion_input_proj(combined)
-        
-        elif self.fusion_type == "film":
-            # FiLM: Feature-wise Linear Modulation
-            # Speaker embedding generates scale (gamma) and shift (beta) to modulate frame embeddings
-            gamma = self.fusion_film_gamma(spk_embs)  # (B, S, tf_d_model)
-            beta = self.fusion_film_beta(spk_embs)    # (B, S, tf_d_model)
-            # Expand for time dimension: (B, S, 1, tf_d_model)
-            gamma = gamma.unsqueeze(2)
-            beta = beta.unsqueeze(2)
-            # Modulate frame embeddings: gamma * x + beta
-            combined = gamma * emb_seq_expanded + beta
-        
-        elif self.fusion_type == "gated":
-            # Gated fusion: learn a data-dependent gate to combine both modalities
-            spk_embs_expanded = spk_embs.unsqueeze(2).expand(-1, -1, seq_len, -1)
-            concat = torch.cat([emb_seq_expanded, spk_embs_expanded], dim=-1)
-            gate = torch.sigmoid(self.fusion_gate_proj(concat))
-            combined = gate * self.fusion_emb_proj(emb_seq_expanded) + (1 - gate) * self.fusion_spk_proj(spk_embs_expanded)
-        
-        elif self.fusion_type == "hadamard":
-            # Hadamard (element-wise) product after projecting both to same space
-            spk_embs_expanded = spk_embs.unsqueeze(2).expand(-1, -1, seq_len, -1)
-            combined = self.fusion_emb_proj(emb_seq_expanded) * self.fusion_spk_proj(spk_embs_expanded)
-        
-        elif self.fusion_type == "rhadamard":
-            # Hadamard (element-wise) product after projecting both to same space
-            spk_embs_expanded = spk_embs.unsqueeze(2).expand(-1, -1, seq_len, -1)
-            combined = self.fusion_emb_proj(emb_seq_expanded) * self.fusion_spk_proj(spk_embs_expanded)
-            combined = F.relu(combined)
-
-        elif self.fusion_type == "add":
-            # Additive fusion after projection
-            spk_embs_expanded = spk_embs.unsqueeze(2).expand(-1, -1, seq_len, -1)
-            combined = self.fusion_emb_proj(emb_seq_expanded) + self.fusion_spk_proj(spk_embs_expanded)
-        
-        else:
-            raise ValueError(f"Unknown fusion_type: {self.fusion_type}")
-        
-        return combined
 
     def _init_eval_metrics(self):
         """
@@ -855,38 +740,29 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             emb_seq = emb_seq[:, :prediction_window_size, :]  # Extract only prediction window
             emb_seq_length = batch_chunk_prediction_lengths  # Use prediction window lengths
         
-        if self.nextformer_modules.encoder_proj is not None:
-            emb_seq_enc_proj = self.nextformer_modules.encoder_proj(emb_seq)
-            cls_embs_enc_proj = self.nextformer_modules.encoder_proj(cls_embs)
-        else:
-            emb_seq_enc_proj = emb_seq
-            cls_embs_enc_proj = cls_embs
-        
-        if self.nextformer_modules.spk_emb_proj is not None:
-            emb_seq_spk_proj = self.nextformer_modules.spk_emb_proj(emb_seq)
-            cls_embs_spk_proj = self.nextformer_modules.spk_emb_proj(cls_embs)
-        else:
-            emb_seq_spk_proj = emb_seq
-            cls_embs_spk_proj = cls_embs
-
         local_num_spks = self._cfg.local_num_spks
-        spk_embs_enc_proj = cls_embs_enc_proj[:, :local_num_spks, :]
+        # tf projections are for backend
+        emb_seq_proj_tf = self.nextformer_modules.encoder_proj_tf(emb_seq)
+        spk_embs_proj_tf = self.nextformer_modules.spk_emb_proj_tf(cls_embs[:, :local_num_spks, :])
+     
+        # Get local logits for all chunks
+        local_logits = self.forward_backend(emb_seq_proj_tf, emb_seq_length, spk_embs=spk_embs_proj_tf)
+        # (batch_size * num_chunks, chunk_total, local_num_spks)
 
+        # se projections are for between-chunk spk embs matching
+        cls_embs_proj_se = self.nextformer_modules.project_spk_embs_for_se(cls_embs)
         if self.spk_embs_decoder is not None:
-            encoder_len_mask = self.nextformer_modules.length_to_mask(emb_seq_length, emb_seq_enc_proj.shape[1])
+            emb_seq_proj_se = self.nextformer_modules.project_encoder_for_se(emb_seq)
+            encoder_len_mask = self.nextformer_modules.length_to_mask(emb_seq_length, emb_seq_proj_se.shape[1])
             encoder_len_mask = ~encoder_len_mask
             cls_embs_decoded = self.spk_embs_decoder(
-                encoder_states=emb_seq_spk_proj,
+                encoder_states=emb_seq_proj_se,
                 encoder_len_mask=encoder_len_mask,
-                query_states=cls_embs_spk_proj,
+                query_states=cls_embs_proj_se,
             )
             spk_embs = cls_embs_decoded[:, :local_num_spks, :]
         else:
-            spk_embs = cls_embs_spk_proj[:, :local_num_spks, :]
-
-        # Get local logits for all chunks
-        local_logits = self.forward_backend(emb_seq_enc_proj, emb_seq_length, spk_embs=spk_embs_enc_proj)
-        # (batch_size * num_chunks, chunk_total, local_num_spks)
+            spk_embs = cls_embs_proj_se[:, :local_num_spks, :]
 
         # Handle oracle mode (targets) if provided
         local_target_indices = None
@@ -1001,7 +877,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
     def forward_backend(self, emb_seq, emb_seq_length, spk_embs=None):
         """
         The main forward pass for diarization for offline diarization inference.
-        Dispatches to the appropriate backend based on self.backend.
+        Dispatches to the appropriate backend based on nextformer_modules.backend.
 
         Args:
             emb_seq (torch.Tensor): Tensor containing FastConformer encoder states (embedding vectors).
@@ -1017,22 +893,22 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         """
         encoder_mask = self.nextformer_modules.length_to_mask(emb_seq_length, emb_seq.shape[1])
 
-        if self.backend == "trff":
+        if self.nextformer_modules.backend == "trff":
             logits = self.backend_trff(emb_seq, encoder_mask)
-        elif self.backend == "dotp":
+        elif self.nextformer_modules.backend == "dotp":
             if spk_embs is None:
                 raise ValueError("spk_embs is required for 'dotp' backend")
             logits = self.backend_dotp(emb_seq, spk_embs)
-        elif self.backend == "isd":
+        elif self.nextformer_modules.backend == "isd":
             if spk_embs is None:
                 raise ValueError("spk_embs is required for 'isd' backend")
             logits = self.backend_isd(emb_seq, emb_seq_length, spk_embs)
-        elif self.backend == "jsd":
+        elif self.nextformer_modules.backend == "jsd":
             if spk_embs is None:
                 raise ValueError("spk_embs is required for 'jsd' backend")
             logits = self.backend_jsd(emb_seq, emb_seq_length, spk_embs)
         else:
-            raise ValueError(f"Unknown backend: {self.backend}")
+            raise ValueError(f"Unknown backend: {self.nextformer_modules.backend}")
         
         # Apply length mask (common to all backends)
         mask = encoder_mask.unsqueeze(-1)
@@ -1054,8 +930,8 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 Shape: (batch_size, diar_frame_count, local_num_spks)
         """
         if self.transformer_encoder is not None:
-            trans_emb_seq = self.transformer_encoder(encoder_states=emb_seq, encoder_mask=encoder_mask)
-        logits = self.nextformer_modules.forward_spk_logits(trans_emb_seq)
+            emb_seq = self.transformer_encoder(encoder_states=emb_seq, encoder_mask=encoder_mask)
+        logits = self.nextformer_modules.forward_spk_logits(emb_seq)
         return logits
 
     def backend_dotp(self, emb_seq, spk_embs):
@@ -1095,7 +971,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             logits (torch.Tensor): Tensor containing local speaker logits (unmasked).
                 Shape: (batch_size, diar_frame_count, local_num_spks)
         """
-        if self.isd_encoder is None or self.backend_output_proj is None:
+        if self.isd_encoder is None or self.nextformer_modules.backend_output_proj is None:
             raise RuntimeError("ISD backend modules are not initialized")
 
         batch_size, seq_len, _ = emb_seq.shape
@@ -1105,7 +981,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         emb_seq_expanded = emb_seq.unsqueeze(1).expand(-1, local_num_spks, -1, -1)
 
         # Apply configurable fusion
-        combined = self._apply_fusion(emb_seq_expanded, spk_embs)
+        combined = self.nextformer_modules.apply_fusion(emb_seq_expanded, spk_embs)
 
         # Reshape to (B * local_num_spks, T, tf_d_model)
         combined = combined.reshape(batch_size * local_num_spks, seq_len, -1)
@@ -1116,7 +992,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         # Run ISD encoder and output projection
         encoded = self.isd_encoder(encoder_states=combined, encoder_mask=encoder_mask)
-        logits = self.backend_output_proj(encoded)  # (B * local_num_spks, T, 1)
+        logits = self.nextformer_modules.backend_output_proj(encoded)  # (B * local_num_spks, T, 1)
 
         # Reshape back to (B, T, local_num_spks)
         logits = logits.reshape(batch_size, local_num_spks, seq_len, 1).squeeze(-1).transpose(1, 2)
@@ -1140,7 +1016,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             logits (torch.Tensor): Tensor containing local speaker logits (unmasked).
                 Shape: (batch_size, diar_frame_count, local_num_spks)
         """
-        if self.jsd_encoder is None or self.backend_output_proj is None:
+        if self.jsd_encoder is None or self.nextformer_modules.backend_output_proj is None:
             raise RuntimeError("JSD backend modules are not initialized")
 
         local_num_spks = spk_embs.shape[1]
@@ -1149,13 +1025,13 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         emb_seq_expanded = emb_seq.unsqueeze(1).expand(-1, local_num_spks, -1, -1)
 
         # Apply configurable fusion
-        combined = self._apply_fusion(emb_seq_expanded, spk_embs)  # (B, S, T, tf_d_model)
+        combined = self.nextformer_modules.apply_fusion(emb_seq_expanded, spk_embs)  # (B, S, T, tf_d_model)
 
         # Run JSD encoder - input/output is (B, S, T, D)
         encoded = self.jsd_encoder(combined, time_lengths=emb_seq_length)  # (B, S, T, D)
 
         # Project to logits
-        logits = self.backend_output_proj(encoded)  # (B, S, T, 1)
+        logits = self.nextformer_modules.backend_output_proj(encoded)  # (B, S, T, 1)
         logits = logits.squeeze(-1).transpose(1, 2)  # (B, T, S)
         return logits
 
@@ -1173,7 +1049,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 Shape: (batch_size, diar_frame_count, num_speakers)
         """
         with torch.no_grad():
-            _, logits, _, _, _, _ = self.forward(audio_signal=batch[0], audio_signal_length=batch[1])
+            logits, _, _, _ = self.forward(audio_signal=batch[0], audio_signal_length=batch[1])
             preds = torch.sigmoid(logits)
             preds = preds.to('cpu')
             torch.cuda.empty_cache()
