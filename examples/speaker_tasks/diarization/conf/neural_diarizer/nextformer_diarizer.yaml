@@ -216,6 +216,26 @@ model:
     pre_ln: False
     pre_ln_final_layer_norm: True
 
+  spk_embs_decoder:
+    _target_: nemo.collections.asr.modules.nextformer_modules.MaskedQueryDecoder
+    num_layers: 4
+    hidden_size: ${model.model_defaults.se_d_model} # Needs to be multiple of num_attention_heads
+    inner_size: 768
+    num_queries: ${model.encoder.num_cls_tokens}
+    extra_cross_attention: False
+    num_cross_attention_heads: 4
+    num_self_attention_heads: 4
+    cross_attn_dropout: 0.0
+    self_attn_dropout: 0.0
+    ffn_dropout: 0.0
+    hidden_act: relu
+    pre_ln: False
+    pre_ln_final_layer_norm: True
+    use_learned_init: False # If True, use learned embeddings for query content initialization
+    use_query_pos_emb: False # If True, use learned positional embeddings in self-attention
+    use_encoder_pos_emb: False
+    encoder_pos_emb_max_len: 5000
+
   spk_embs_enhancer:
     _target_: nemo.collections.asr.modules.transformer.transformer_encoders.TransformerEncoder
     num_layers: 1

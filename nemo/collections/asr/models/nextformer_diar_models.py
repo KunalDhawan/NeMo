@@ -112,15 +112,23 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             f"cls_pos_mode='{self.encoder.cls_pos_mode}')"
         )
 
+        spk_embs_decoder_cfg = self._cfg.get('spk_embs_decoder', None)
+        if spk_embs_decoder_cfg is not None and spk_embs_decoder_cfg.get('num_layers', 0) > 0:
+            self.spk_embs_decoder = NextformerEncLabelModel.from_config_dict(spk_embs_decoder_cfg).to(self.device)
+        else:
+            self.spk_embs_decoder = None
+
         spk_embs_enhancer_cfg = self._cfg.get('spk_embs_enhancer', None)
-        if spk_embs_enhancer_cfg is not None:
+        if spk_embs_enhancer_cfg is not None and spk_embs_enhancer_cfg.get('num_layers', 0) > 0:
             self.spk_embs_enhancer = NextformerEncLabelModel.from_config_dict(spk_embs_enhancer_cfg).to(self.device)
         else:
             self.spk_embs_enhancer = None
             
-        self.transformer_encoder = NextformerEncLabelModel.from_config_dict(self._cfg.transformer_encoder).to(
-            self.device
-        )
+        transformer_encoder_cfg = self._cfg.get('transformer_encoder', None)
+        if transformer_encoder_cfg is not None and transformer_encoder_cfg.get('num_layers', 0) > 0:
+            self.transformer_encoder = NextformerEncLabelModel.from_config_dict(transformer_encoder_cfg).to(self.device)
+        else:
+            self.transformer_encoder = None
 
         self.nextformer_modules = NextformerEncLabelModel.from_config_dict(self._cfg.nextformer_modules).to(
             self.device
@@ -189,22 +197,6 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         self.max_batch_dur = self._cfg.get("max_batch_dur", 20000)
 
-    def load_state_dict(self, state_dict, strict=True):
-        """
-        Override load_state_dict to handle backward compatibility with old checkpoints
-        that don't have newer parameters like sinkhorn_dustbin_val.
-        """
-        # Handle missing sinkhorn_dustbin_val for old checkpoints
-        dustbin_key = "nextformer_modules.sinkhorn_dustbin_val"
-        if dustbin_key not in state_dict:
-            logging.warning(
-                f"'{dustbin_key}' not found in checkpoint. "
-                f"Adding default value 0.0 for backward compatibility."
-            )
-            state_dict[dustbin_key] = torch.tensor(0.5)
-        
-        return super().load_state_dict(state_dict, strict=strict)
-
     def _init_loss_weights(self):
         pil_weight = self._cfg.get("pil_weight", 1.0)
         ats_weight = self._cfg.get("ats_weight", 0.0)
@@ -223,7 +215,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         Used by both ISD and JSD backends (which are mutually exclusive).
         
         Args:
-            fusion_type: str - one of "concat", "film", "gated", "hadamard", "add"
+            fusion_type: str - one of "concat", "film", "gated", "hadamard", "rhadamard", "add"
             tf_d_model: int - dimension of transformer/frame embeddings
             se_d_model: int - dimension of speaker embeddings
         """
@@ -242,8 +234,11 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         elif fusion_type == "add":
             self.fusion_emb_proj = nn.Linear(tf_d_model, tf_d_model).to(self.device)
             self.fusion_spk_proj = nn.Linear(se_d_model, tf_d_model).to(self.device)
+        elif fusion_type == "rhadamard":
+            self.fusion_emb_proj = nn.Linear(tf_d_model, tf_d_model).to(self.device)
+            self.fusion_spk_proj = nn.Linear(se_d_model, tf_d_model).to(self.device)
         else:
-            raise ValueError(f"Unknown fusion_type: {fusion_type}. Must be one of: concat, film, gated, hadamard, add")
+            raise ValueError(f"Unknown fusion_type: {fusion_type}. Must be one of: concat, film, gated, hadamard, rhadamard, add")
 
     def _apply_fusion(
         self,
@@ -295,6 +290,12 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             spk_embs_expanded = spk_embs.unsqueeze(2).expand(-1, -1, seq_len, -1)
             combined = self.fusion_emb_proj(emb_seq_expanded) * self.fusion_spk_proj(spk_embs_expanded)
         
+        elif self.fusion_type == "rhadamard":
+            # Hadamard (element-wise) product after projecting both to same space
+            spk_embs_expanded = spk_embs.unsqueeze(2).expand(-1, -1, seq_len, -1)
+            combined = self.fusion_emb_proj(emb_seq_expanded) * self.fusion_spk_proj(spk_embs_expanded)
+            combined = F.relu(combined)
+
         elif self.fusion_type == "add":
             # Additive fusion after projection
             spk_embs_expanded = spk_embs.unsqueeze(2).expand(-1, -1, seq_len, -1)
@@ -856,17 +857,35 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         
         if self.nextformer_modules.encoder_proj is not None:
             emb_seq_enc_proj = self.nextformer_modules.encoder_proj(emb_seq)
+            cls_embs_enc_proj = self.nextformer_modules.encoder_proj(cls_embs)
         else:
             emb_seq_enc_proj = emb_seq
+            cls_embs_enc_proj = cls_embs
         
-        # Compute spk_embs early (needed for dotp backend, and used later for assignment)
-        local_num_spks = self._cfg.local_num_spks
-        spk_embs = cls_embs[:, :local_num_spks, :]
         if self.nextformer_modules.spk_emb_proj is not None:
-            spk_embs = self.nextformer_modules.spk_emb_proj(spk_embs)
-            
+            emb_seq_spk_proj = self.nextformer_modules.spk_emb_proj(emb_seq)
+            cls_embs_spk_proj = self.nextformer_modules.spk_emb_proj(cls_embs)
+        else:
+            emb_seq_spk_proj = emb_seq
+            cls_embs_spk_proj = cls_embs
+
+        local_num_spks = self._cfg.local_num_spks
+        spk_embs_enc_proj = cls_embs_enc_proj[:, :local_num_spks, :]
+
+        if self.spk_embs_decoder is not None:
+            encoder_len_mask = self.nextformer_modules.length_to_mask(emb_seq_length, emb_seq_enc_proj.shape[1])
+            encoder_len_mask = ~encoder_len_mask
+            cls_embs_decoded = self.spk_embs_decoder(
+                encoder_states=emb_seq_spk_proj,
+                encoder_len_mask=encoder_len_mask,
+                query_states=cls_embs_spk_proj,
+            )
+            spk_embs = cls_embs_decoded[:, :local_num_spks, :]
+        else:
+            spk_embs = cls_embs_spk_proj[:, :local_num_spks, :]
+
         # Get local logits for all chunks
-        local_logits = self.forward_backend(emb_seq_enc_proj, emb_seq_length, spk_embs=spk_embs)
+        local_logits = self.forward_backend(emb_seq_enc_proj, emb_seq_length, spk_embs=spk_embs_enc_proj)
         # (batch_size * num_chunks, chunk_total, local_num_spks)
 
         # Handle oracle mode (targets) if provided
@@ -910,7 +929,8 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         if att_mod:
             self.encoder.att_context_size = [-1, -1]
-            self.transformer_encoder.diag = None
+            if self.transformer_encoder is not None:
+                self.transformer_encoder.diag = None
 
         if self.spk_embs_enhancer is not None:
             emb_dim = spk_embs.shape[-1]
@@ -1033,7 +1053,8 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             logits (torch.Tensor): Tensor containing local speaker logits (unmasked).
                 Shape: (batch_size, diar_frame_count, local_num_spks)
         """
-        trans_emb_seq = self.transformer_encoder(encoder_states=emb_seq, encoder_mask=encoder_mask)
+        if self.transformer_encoder is not None:
+            trans_emb_seq = self.transformer_encoder(encoder_states=emb_seq, encoder_mask=encoder_mask)
         logits = self.nextformer_modules.forward_spk_logits(trans_emb_seq)
         return logits
 
