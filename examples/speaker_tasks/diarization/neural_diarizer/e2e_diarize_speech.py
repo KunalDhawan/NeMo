@@ -62,6 +62,7 @@ from nemo.collections.asr.parts.utils.vad_utils import (
     PostProcessingParams,
     load_postprocessing_from_yaml,
     predlist_to_timestamps,
+    predlist_to_timestamps_fast,
 )
 from nemo.collections.common.parts.preprocessing.manifest import get_full_path
 from nemo.core.config import hydra_runner
@@ -280,13 +281,21 @@ def convert_pred_mat_to_segments(
     """
     all_hypothesis, all_reference, all_uems = [], [], []
     cfg_vad_params = OmegaConf.structured(postprocessing_cfg)
-    total_speaker_timestamps = predlist_to_timestamps(
-        batch_preds_list=batch_preds_list,
-        audio_rttm_map_dict=audio_rttm_map_dict,
-        cfg_vad_params=cfg_vad_params,
-        unit_10ms_frame_count=unit_10ms_frame_count,
-        bypass_postprocessing=bypass_postprocessing,
-    )
+    if bypass_postprocessing:
+        total_speaker_timestamps = predlist_to_timestamps_fast(
+            batch_preds_list=batch_preds_list,
+            audio_rttm_map_dict=audio_rttm_map_dict,
+            unit_10ms_frame_count=unit_10ms_frame_count,
+            threshold=0.5,
+        )
+    else:
+        total_speaker_timestamps = predlist_to_timestamps(
+            batch_preds_list=batch_preds_list,
+            audio_rttm_map_dict=audio_rttm_map_dict,
+            cfg_vad_params=cfg_vad_params,
+            unit_10ms_frame_count=unit_10ms_frame_count,
+            bypass_postprocessing=bypass_postprocessing,
+        )
     for sample_idx, (uniq_id, audio_rttm_values) in enumerate(audio_rttm_map_dict.items()):
         speaker_timestamps = total_speaker_timestamps[sample_idx]
         if uniq_id is None:
@@ -345,6 +354,15 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         diar_model = SortformerEncLabelModel.restore_from(restore_path=cfg.model_path, map_location=map_location)
     else:
         raise ValueError("cfg.model_path must end with.ckpt or.nemo!")
+
+    # Ensure test_ds exists in the model config (some models may not have it)
+    if not hasattr(diar_model._cfg, 'test_ds') or diar_model._cfg.test_ds is None:
+        OmegaConf.set_struct(diar_model._cfg, False)
+        if hasattr(diar_model._cfg, 'validation_ds') and diar_model._cfg.validation_ds is not None:
+            diar_model._cfg.test_ds = diar_model._cfg.validation_ds.copy()
+        else:
+            diar_model._cfg.test_ds = OmegaConf.create({})
+        OmegaConf.set_struct(diar_model._cfg, True)
 
     diar_model._cfg.test_ds.session_len_sec = cfg.session_len_sec
     trainer = pl.Trainer(devices=device, accelerator=accelerator, precision=cfg.precision)
