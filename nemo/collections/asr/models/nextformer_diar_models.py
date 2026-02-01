@@ -124,12 +124,6 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         else:
             self.spk_embs_enhancer = None
             
-        transformer_encoder_cfg = self._cfg.get('transformer_encoder', None)
-        if transformer_encoder_cfg is not None and transformer_encoder_cfg.get('num_layers', 0) > 0:
-            self.transformer_encoder = NextformerEncLabelModel.from_config_dict(transformer_encoder_cfg).to(self.device)
-        else:
-            self.transformer_encoder = None
-
         self.nextformer_modules = NextformerEncLabelModel.from_config_dict(self._cfg.nextformer_modules).to(
             self.device
         )
@@ -149,6 +143,14 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         # Backend and fusion settings come from NextformerModules config
         logging.info(f"Using backend: {self.nextformer_modules.backend}")
+
+        # Optional Transformer backend modules
+        if self.nextformer_modules.backend == "trff":
+            if not hasattr(self._cfg, "transformer_encoder"):
+                raise ValueError("transformer backend requires 'transformer_encoder' config")
+            self.transformer_encoder = NextformerEncLabelModel.from_config_dict(self._cfg.transformer_encoder).to(self.device)
+        else:
+            self.transformer_encoder = None
 
         # Optional ISD backend modules
         if self.nextformer_modules.backend == "isd":
