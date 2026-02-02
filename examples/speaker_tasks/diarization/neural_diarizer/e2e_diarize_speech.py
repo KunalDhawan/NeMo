@@ -22,6 +22,12 @@ Please refer to the NeMo Library Documentation for more details on data preparat
 https://docs.nvidia.com/nemo-framework/user-guide/latest/nemotoolkit
 /asr/speaker_diarization/datasets.html#data-preparation-for-inference
 
+Supported model types:
+    - SortformerEncLabelModel: Original Sortformer with transformer+feedforward backend
+    - SortformerCLSEncLabelModel: CLS-based Sortformer with multiple backend support (trff, dotp, isd, jsd)
+
+The script automatically detects the model type from the checkpoint/nemo file.
+
 Usage for diarization inference:
 
 The end-to-end speaker diarization model can be specified by "model_path".
@@ -51,7 +57,7 @@ from omegaconf import OmegaConf
 from pytorch_lightning import seed_everything
 
 from nemo.collections.asr.metrics.der import score_labels
-from nemo.collections.asr.models import SortformerEncLabelModel
+from nemo.collections.asr.models import SortformerCLSEncLabelModel, SortformerEncLabelModel
 from nemo.collections.asr.parts.utils.speaker_utils import (
     audio_rttm_map,
     get_uniqname_from_filepath,
@@ -69,6 +75,52 @@ from nemo.core.config import hydra_runner
 
 seed_everything(42)
 torch.backends.cudnn.deterministic = True
+
+
+def get_sortformer_model_class(model_path: str):
+    """
+    Determine the appropriate Sortformer model class based on the checkpoint/nemo file.
+    
+    Args:
+        model_path (str): Path to the .ckpt or .nemo model file.
+        
+    Returns:
+        Model class: Either SortformerCLSEncLabelModel or SortformerEncLabelModel.
+    """
+    if model_path.endswith(".nemo"):
+        # For .nemo files, extract and check the config
+        import tarfile
+        import tempfile
+        with tarfile.open(model_path, 'r') as tar:
+            # Try to extract the config file
+            try:
+                config_member = None
+                for member in tar.getmembers():
+                    if member.name.endswith('model_config.yaml'):
+                        config_member = member
+                        break
+                if config_member is not None:
+                    with tempfile.TemporaryDirectory() as tmpdir:
+                        tar.extract(config_member, tmpdir)
+                        config_path = os.path.join(tmpdir, config_member.name)
+                        model_cfg = OmegaConf.load(config_path)
+                        if hasattr(model_cfg, 'sortformer_cls_modules'):
+                            return SortformerCLSEncLabelModel
+            except Exception:
+                pass
+        return SortformerEncLabelModel
+    elif model_path.endswith(".ckpt"):
+        # For .ckpt files, load the checkpoint and check the config
+        checkpoint = torch.load(model_path, map_location='cpu')
+        if 'hyper_parameters' in checkpoint and 'cfg' in checkpoint['hyper_parameters']:
+            cfg = checkpoint['hyper_parameters']['cfg']
+            if isinstance(cfg, dict):
+                cfg = OmegaConf.create(cfg)
+            if hasattr(cfg, 'sortformer_cls_modules'):
+                return SortformerCLSEncLabelModel
+        return SortformerEncLabelModel
+    else:
+        raise ValueError(f"Unsupported model file format: {model_path}")
 
 
 @dataclass
@@ -346,14 +398,18 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         accelerator = 'gpu'
         map_location = torch.device(f'cuda:{cfg.cuda}')
 
+    # Detect model type (SortformerCLS or Sortformer) and load accordingly
+    model_class = get_sortformer_model_class(cfg.model_path)
+    logging.info(f"Detected model type: {model_class.__name__}")
+    
     if cfg.model_path.endswith(".ckpt"):
-        diar_model = SortformerEncLabelModel.load_from_checkpoint(
+        diar_model = model_class.load_from_checkpoint(
             checkpoint_path=cfg.model_path, map_location=map_location, strict=False
         )
     elif cfg.model_path.endswith(".nemo"):
-        diar_model = SortformerEncLabelModel.restore_from(restore_path=cfg.model_path, map_location=map_location)
+        diar_model = model_class.restore_from(restore_path=cfg.model_path, map_location=map_location)
     else:
-        raise ValueError("cfg.model_path must end with.ckpt or.nemo!")
+        raise ValueError("cfg.model_path must end with .ckpt or .nemo!")
 
     # Ensure test_ds exists in the model config (some models may not have it)
     if not hasattr(diar_model._cfg, 'test_ds') or diar_model._cfg.test_ds is None:
@@ -405,14 +461,16 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     # Streaming mode setup (only if enabled)
     if diar_model.streaming_mode:
         diar_model.async_streaming = cfg.async_streaming
-        diar_model.sortformer_modules.chunk_len = cfg.chunk_len
-        diar_model.sortformer_modules.spkcache_len = cfg.spkcache_len
-        diar_model.sortformer_modules.chunk_left_context = cfg.chunk_left_context
-        diar_model.sortformer_modules.chunk_right_context = cfg.chunk_right_context
-        diar_model.sortformer_modules.fifo_len = cfg.fifo_len
-        diar_model.sortformer_modules.log = cfg.log
-        diar_model.sortformer_modules.spkcache_update_period = cfg.spkcache_update_period
-        diar_model.sortformer_modules._check_streaming_parameters()
+        # Handle both SortformerCLS (sortformer_cls_modules) and Sortformer (sortformer_modules)
+        modules = getattr(diar_model, 'sortformer_cls_modules', None) or diar_model.sortformer_modules
+        modules.chunk_len = cfg.chunk_len
+        modules.spkcache_len = cfg.spkcache_len
+        modules.chunk_left_context = cfg.chunk_left_context
+        modules.chunk_right_context = cfg.chunk_right_context
+        modules.fifo_len = cfg.fifo_len
+        modules.log = cfg.log
+        modules.spkcache_update_period = cfg.spkcache_update_period
+        modules._check_streaming_parameters()
 
     postprocessing_cfg = load_postprocessing_from_yaml(cfg.postprocessing_yaml)
     tensor_path, model_id, tensor_filename = get_tensor_path(cfg)
