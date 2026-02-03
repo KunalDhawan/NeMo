@@ -130,7 +130,7 @@ model:
     weak_boost_rate: 1.5 # Rate determining number of frames per speaker that receive weak score boosting
     min_pos_scores_rate: 0.5 # Rate threshold for dropping overlapping frames when enough non-overlapping exist
     # Self-attention parameters (training only)
-    causal_attn_rate: 0 # Proportion of batches that use self-attention with limited right context
+    causal_attn_rate: 0.5 # Proportion of batches that use self-attention with limited right context
     causal_attn_rc: 7 # Right context size for self-attention with limited right context
 
   encoder:

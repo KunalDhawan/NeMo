@@ -1750,6 +1750,12 @@ class ConformerEncoderWithCLS(ConformerEncoder):
                 if pad_mask is not None:
                     pad_mask[:, :self.num_cls_tokens] = False
                 
+                # Allow CLS tokens to attend to all non-padded positions (bypass causal masking)
+                # In att_mask: True = masked out (can't attend), False = allowed
+                # In pad_mask: True = padded position, False = valid position
+                if att_mask is not None:
+                    att_mask[:, :self.num_cls_tokens, :] = pad_mask.unsqueeze(1)
+                
                 if cache_last_channel is not None:
                     pad_mask = pad_mask[:, cache_len:]
                     if att_mask is not None:
@@ -1806,6 +1812,11 @@ class ConformerEncoderWithCLS(ConformerEncoder):
                     )
                     if pad_mask is not None:
                         pad_mask[:, :self.num_cls_tokens] = False
+                    # Allow CLS tokens to attend to all non-padded positions (bypass causal masking)
+                    # In att_mask: True = masked out (can't attend), False = allowed
+                    # In pad_mask: True = padded position, False = valid position
+                    if att_mask is not None:
+                        att_mask[:, :self.num_cls_tokens, :] = pad_mask.unsqueeze(1)
                 else:
                     # No CLS yet, just reduce audio
                     x, length = self.reduction_subsampling(x=x, lengths=length)
