@@ -827,8 +827,7 @@ class NextformerModules(NeuralModule, Exportable):
         # Update total confidence
         streaming_state.global_spk_total_confidence = total_conf
 
-        logging.info(f"streaming_state.global_spk_embs: {streaming_state.global_spk_embs[:,0:17,:].norm(dim=2)}")
-        logging.info(f"streaming_state.global_spk_total_confidence: {streaming_state.global_spk_total_confidence[:,0:17]}")
+        logging.info(f"streaming_state.global_spk_total_confidence: {streaming_state.global_spk_total_confidence[0,0:17]}")
 
         return streaming_state
 
@@ -904,16 +903,13 @@ class NextformerModules(NeuralModule, Exportable):
 
         # Mask zero local spk embeddings in scores
         scores = scores.masked_fill(local_zero.unsqueeze(2), zero_score)
-        logging.info(f"scores: {scores[:,:,0:17]}")
+        logging.info(f"scores: {scores[0,:,0:17]}")
         logging.info(f"scores before sinkhorn: min={scores.min()}, max={scores.max()}, nan={torch.isnan(scores).any()}")
-        logging.info(f"has_active_globals: {has_active_globals}")
-        logging.info(f"global_active count: {global_active.sum()}")
-        logging.info(f"global_active: {global_active[:,0:17]}")
 
         # Apply Sinkhorn on scores: (B, local_num_spks, max_num_spks)
         # Returns: (B, local_num_spks + 1, max_num_spks + 1)
         assign_aug = self.partial_sinkhorn(scores)
-        logging.info(f"assign_aug: {assign_aug[:,:,0:17]}")
+        logging.info(f"assign_aug: {assign_aug[0,:,0:17]}")
 
         # Extract assignments and dustbin scores
         local_to_global = assign_aug[:, :local_num_spks, :self.max_num_spks]
