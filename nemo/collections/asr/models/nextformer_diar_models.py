@@ -753,8 +753,8 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         # se projections are for between-chunk spk embs matching
         cls_embs_proj_se = self.nextformer_modules.project_spk_embs_for_se(cls_embs)
+        emb_seq_proj_se = self.nextformer_modules.project_encoder_for_se(emb_seq)
         if self.spk_embs_decoder is not None:
-            emb_seq_proj_se = self.nextformer_modules.project_encoder_for_se(emb_seq)
             encoder_len_mask = self.nextformer_modules.length_to_mask(emb_seq_length, emb_seq_proj_se.shape[1])
             encoder_len_mask = ~encoder_len_mask
             cls_embs_decoded = self.spk_embs_decoder(
@@ -834,6 +834,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             offset = min(lc, start)
             spk_embs_chunk = spk_embs[chunk_idx * batch_size:(chunk_idx + 1) * batch_size, :, :] # (batch_size, local_num_spks, emb_dim)
             local_logits_chunk = local_logits[chunk_idx * batch_size:(chunk_idx + 1) * batch_size, :, :] # (batch_size, lc+chunk_len+rc, local_num_spks)
+            emb_seq_proj_se_chunk = emb_seq_proj_se[chunk_idx * batch_size:(chunk_idx + 1) * batch_size, :, :] # (batch_size, lc+chunk_len+rc, se_d_model)
 
             if self.oracle_assignment and local_target_indices is not None:
                 # Use oracle local-to-global assignments
@@ -853,11 +854,23 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 )
 
             active_frames_chunk = active_frames_per_spk[chunk_idx * batch_size:(chunk_idx + 1) * batch_size, :]
+
+            # Slice to prediction window for streaming state update
+            #local_logits_pred_window = local_logits_chunk[:, offset:offset+dur, :]  # (batch_size, dur, local_num_spks)
+            #emb_seq_proj_se_pred_window = emb_seq_proj_se_chunk[:, offset:offset+dur, :]  # (batch_size, dur, se_d_model)
+            #active_frames_chunk = active_frames_chunk[:, offset:offset+dur, :]
+
+            # Use full chunk for logits and projected embeddings
+            local_logits_pred_window = local_logits_chunk
+            emb_seq_proj_se_pred_window = emb_seq_proj_se_chunk
+            
+
             self.nextformer_modules.update_streaming_state(
                 streaming_state=streaming_state,
-                spk_embs=spk_embs_chunk,
+                emb_seq_proj=emb_seq_proj_se_pred_window,
+                local_logits=local_logits_pred_window,
                 spk_assignments=spk_assignments_chunk,
-                active_frames_per_spk=active_frames_chunk
+                active_frames_per_spk=active_frames_chunk,
             )
             logits_chunk = self.nextformer_modules.get_global_logits(
                 local_logits=local_logits_chunk,

@@ -114,7 +114,6 @@ model:
     se_d_model: ${model.model_defaults.se_d_model} # Hidden dimension size for speaker embeddings
     local_num_spks: ${model.local_num_spks} # Number of speakers for local embeddings
     max_num_spks: ${model.max_num_spks} # Maximum number of speakers per model
-    pred_score_threshold: 0.25 # Threshold for speaker predictions to be used in scoring
     chunk_len: 125 # Length of each chunk
     chunk_left_context: 62 # Left context for each chunk
     chunk_right_context: 10 # Right context for each chunk
@@ -128,8 +127,7 @@ model:
     score_similarity: "cosine" # "scaled_dot" or "cosine"
     cosine_temperature: 0.05 # Temperature for cosine similarity
     hard_history_assignments: false # If true, convert soft assignments to hard one-hot before storing in history (prevents gradient flow through history and probability dilution)
-    logsumexp_temperature: 1.0 # Temperature for LogSumExp aggregation over history (higher = smoother gradients, lower = sharper like max)
-    spk_emb_update_min_frames: 0 # Minimum number of active frames required to update speaker embeddings (0 = disabled)
+    spk_emb_update_min_frames: 10 # Minimum number of active frames required to update speaker embeddings (0 = disabled)
     backend: "dotp" # Backend for local logits: "trff", "dotp", "isd", or "jsd"
     fusion_type: "hdm" # Fusion type for ISD/JSD backends: "concat", "film", "hdm"
     fusion_lnorm: true # Layer normalization after fusion
