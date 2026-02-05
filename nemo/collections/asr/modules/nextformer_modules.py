@@ -784,6 +784,10 @@ class NextformerModules(NeuralModule, Exportable):
         preds = torch.sigmoid(local_logits)  # (B, T, local_num_spks)
         local_confidence = self._get_confidence(preds)  # (B, T, local_num_spks)
 
+        # Only use frames where speaker is predicted as active (preds > 0.5)
+        inactive_mask = preds <= 0.5  # (B, T, local_num_spks)
+        local_confidence = local_confidence.masked_fill(inactive_mask, 0)
+
         # Filter out local speakers that don't meet the minimum frame threshold
         if active_frames_per_spk is not None and self.spk_emb_update_min_frames > 0:
             insufficient_frames = active_frames_per_spk < self.spk_emb_update_min_frames  # (B, local_num_spks)
@@ -792,11 +796,15 @@ class NextformerModules(NeuralModule, Exportable):
 
         # Convert soft assignments to hard one-hot during inference or when configured
         if self.hard_history_assignments or not self.training:
+            # Identify local speakers with uncertain assignments (max prob < 0.5)
+            #uncertain_mask = spk_assignments.max(dim=-1).values < 0.5  # (B, local_num_spks)
             # Hard assignments prevent gradient flow through history and avoid probability dilution
             spk_assignments_hard = F.one_hot(
                 spk_assignments.argmax(dim=-1),
                 num_classes=self.max_num_spks
             ).to(spk_assignments.dtype).detach()
+            # Zero out assignments for uncertain local speakers to avoid corrupting global_spk_embs
+            #spk_assignments_hard = spk_assignments_hard.masked_fill(uncertain_mask.unsqueeze(-1), 0)
             spk_assignments = spk_assignments_hard
 
         # Transform to global speaker space: (B, T, local_num_spks) @ (B, local_num_spks, max_num_spks) -> (B, T, max_num_spks)
