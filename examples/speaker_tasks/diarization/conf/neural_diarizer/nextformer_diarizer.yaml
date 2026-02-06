@@ -13,6 +13,9 @@ model:
   max_num_spks: 8 # Maximum number of speakers per model; currently set to 8
   streaming_mode: False
   pil_metric: "dot_product"
+  oracle_assignment: False
+  oracle_centroids_train: True
+  oracle_centroids_test: False
 
   model_defaults:
     fc_d_model: 512 # Hidden dimension size of the Fast-conformer Encoder

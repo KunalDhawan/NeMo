@@ -138,7 +138,8 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.local_mask_threshold = self._cfg.get("local_mask_threshold", 0.5)
         self.pil_metric = self._cfg.get("pil_metric", "bce")
         self.oracle_assignment = self._cfg.get("oracle_assignment", False)
-        
+        self.oracle_centroids_train = self._cfg.get("oracle_centroids_train", False)
+        self.oracle_centroids_test = self._cfg.get("oracle_centroids_test", False)
         self.streaming_mode = self.cfg.get("streaming_mode", False)
 
         # Backend and fusion settings come from NextformerModules config
@@ -836,22 +837,33 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             local_logits_chunk = local_logits[chunk_idx * batch_size:(chunk_idx + 1) * batch_size, :, :] # (batch_size, lc+chunk_len+rc, local_num_spks)
             emb_seq_proj_se_chunk = emb_seq_proj_se[chunk_idx * batch_size:(chunk_idx + 1) * batch_size, :, :] # (batch_size, lc+chunk_len+rc, se_d_model)
 
-            if self.oracle_assignment and local_target_indices is not None:
+            if local_target_indices is not None:
                 # Use oracle local-to-global assignments
                 global_spk_indices_oracle = local_target_indices[
                     chunk_idx * batch_size:(chunk_idx + 1) * batch_size, :
                 ]  # (batch_size, local_num_spks)
                 valid_mask = global_spk_indices_oracle >= 0
                 safe_indices = global_spk_indices_oracle.clamp(min=0)
-                spk_assignments_chunk = F.one_hot(
+                oracle_spk_assignments_chunk = F.one_hot(
                     safe_indices, num_classes=self.nextformer_modules.max_num_spks
                 ).to(local_logits_chunk.dtype)
-                spk_assignments_chunk = spk_assignments_chunk * valid_mask.unsqueeze(-1)
+                oracle_spk_assignments_chunk = oracle_spk_assignments_chunk * valid_mask.unsqueeze(-1)
             else:
+                raise ValueError("local_target_indices is None")
+
+            if self.oracle_assignment:  
+                centroid_spk_assignments_chunk = oracle_spk_assignments_chunk
+                spk_assignments_chunk = oracle_spk_assignments_chunk
+            else:
+                # get real local-to-global assignments
                 spk_assignments_chunk = self.nextformer_modules.get_local_to_global_assignments(
                     spk_embs=spk_embs_chunk,
                     streaming_state=streaming_state,
                 )
+                if (self.oracle_centroids_train and self.training) or (self.oracle_centroids_test and not self.training):
+                    centroid_spk_assignments_chunk = oracle_spk_assignments_chunk
+                else:
+                    centroid_spk_assignments_chunk = spk_assignments_chunk
 
             active_frames_chunk = active_frames_per_spk[chunk_idx * batch_size:(chunk_idx + 1) * batch_size, :]
 
@@ -869,7 +881,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 streaming_state=streaming_state,
                 emb_seq_proj=emb_seq_proj_se_pred_window,
                 local_logits=local_logits_pred_window,
-                spk_assignments=spk_assignments_chunk,
+                spk_assignments=centroid_spk_assignments_chunk,
                 active_frames_per_spk=active_frames_chunk,
             )
             logits_chunk = self.nextformer_modules.get_global_logits(
