@@ -17,6 +17,10 @@ model:
   oracle_centroids_train: True
   oracle_centroids_test: False
 
+  # Cross-chunk speaker embedding swap augmentation
+  cross_chunk_swap_p: 0.5  # Probability of swapping each speaker embedding with same speaker's embedding from another chunk
+  cross_chunk_swap_detach: true  # Whether to detach swapped embeddings from computation graph
+
   model_defaults:
     fc_d_model: 512 # Hidden dimension size of the Fast-conformer Encoder
     tf_d_model: 192 # Hidden dimension size of the Transformer Encoder

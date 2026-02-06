@@ -142,6 +142,10 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.oracle_centroids_test = self._cfg.get("oracle_centroids_test", False)
         self.streaming_mode = self.cfg.get("streaming_mode", False)
 
+        # Cross-chunk speaker embedding swap augmentation
+        self.cross_chunk_swap_p = self._cfg.get("cross_chunk_swap_p", 0.0)
+        self.cross_chunk_swap_detach = self._cfg.get("cross_chunk_swap_detach", True)
+
         # Backend and fusion settings come from NextformerModules config
         logging.info(f"Using backend: {self.nextformer_modules.backend}")
 
@@ -628,6 +632,86 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         
         return batch_chunks, batch_chunk_lengths, num_chunks
 
+    def _create_swapped_embeddings(
+        self,
+        spk_embs: torch.Tensor,
+        local_target_indices: torch.Tensor,
+        batch_size: int,
+        num_chunks: int,
+        p_swap: float = 0.5,
+        detach: bool = True,
+    ) -> torch.Tensor:
+        """
+        Create cross-chunk swapped speaker embeddings for augmentation.
+
+        For each active local speaker, with probability p_swap, replace its embedding
+        with the embedding of the same global speaker from a randomly selected different chunk.
+        This breaks the positional shortcut where CLS tokens encode speaker arrival order
+        rather than speaker identity.
+
+        Args:
+            spk_embs (torch.Tensor): Speaker embeddings for all chunks.
+                Shape: (num_chunks * batch_size, local_num_spks, emb_dim)
+            local_target_indices (torch.Tensor): Global speaker index for each local speaker.
+                Shape: (num_chunks * batch_size, local_num_spks)
+                Value of -1 means unmatched/inactive.
+            batch_size (int): Batch size.
+            num_chunks (int): Number of chunks.
+            p_swap (float): Probability of swapping each embedding. Default: 0.5.
+            detach (bool): Whether to detach swapped embeddings from the computation graph.
+                If True, only the backend receives gradients (regularizer mode).
+                If False, the source embedding also receives gradients. Default: True.
+
+        Returns:
+            swapped_embs (torch.Tensor): Speaker embeddings with some entries swapped.
+                Shape: (num_chunks * batch_size, local_num_spks, emb_dim)
+        """
+        local_num_spks = spk_embs.shape[1]
+        emb_dim = spk_embs.shape[2]
+
+        # Clone to avoid modifying original
+        swapped_embs = spk_embs.clone()
+
+        # Reshape for easier indexing: (num_chunks, batch_size, local_num_spks, ...)
+        indices_view = local_target_indices.view(num_chunks, batch_size, local_num_spks)
+        embs_view = spk_embs.view(num_chunks, batch_size, local_num_spks, emb_dim)
+        swapped_view = swapped_embs.view(num_chunks, batch_size, local_num_spks, emb_dim)
+
+        for b in range(batch_size):
+            # Build lookup: global_spk_id -> [(chunk_idx, local_slot_idx)]
+            spk_to_locations: dict = {}
+            for c in range(num_chunks):
+                for s in range(local_num_spks):
+                    g = indices_view[c, b, s].item()
+                    if g < 0:
+                        continue
+                    if g not in spk_to_locations:
+                        spk_to_locations[g] = []
+                    spk_to_locations[g].append((c, s))
+
+            # For each location, potentially swap
+            for c in range(num_chunks):
+                for s in range(local_num_spks):
+                    g = indices_view[c, b, s].item()
+                    if g < 0:
+                        continue
+
+                    if random.random() >= p_swap:
+                        continue
+
+                    # Find alternative locations for the same global speaker
+                    other_locations = [(cc, ss) for (cc, ss) in spk_to_locations[g] if cc != c]
+                    if not other_locations:
+                        continue  # Speaker appears in only one chunk
+
+                    src_c, src_s = random.choice(other_locations)
+                    src_emb = embs_view[src_c, b, src_s, :]
+                    if detach:
+                        src_emb = src_emb.detach()
+                    swapped_view[c, b, s, :] = src_emb
+
+        return swapped_embs
+
     def forward_offline(
         self,
         processed_signal,
@@ -898,6 +982,30 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         if sig_length < max_n_frames:  # Discard preds corresponding to padding
             n_frames = math.ceil(sig_length / self.encoder.subsampling_factor)
             logits = logits[:, :n_frames, :]
+
+        # Cross-chunk speaker embedding swap augmentation (training only, non-trff backends).
+        # Recompute local_logits with swapped embeddings so the regular local loss (PIL + ATS)
+        # is computed on augmented inputs. This breaks the positional shortcut where CLS tokens
+        # encode speaker arrival order instead of speaker identity.
+        # Done after the chunk loop so global logits assembly uses original local_logits.
+        if (
+            self.training
+            and self.cross_chunk_swap_p > 0
+            and local_target_indices is not None
+            and self.nextformer_modules.backend != "trff"
+            and num_chunks > 1
+        ):
+            swapped_spk_embs_proj_tf = self._create_swapped_embeddings(
+                spk_embs=spk_embs_proj_tf,
+                local_target_indices=local_target_indices,
+                batch_size=batch_size,
+                num_chunks=num_chunks,
+                p_swap=self.cross_chunk_swap_p,
+                detach=self.cross_chunk_swap_detach,
+            )
+            local_logits = self.forward_backend(
+                emb_seq_proj_tf, emb_seq_length, spk_embs=swapped_spk_embs_proj_tf
+            )
 
         return logits, local_logits, spk_embs, active_frames_per_spk
 
@@ -1414,6 +1522,9 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 Shape: (batch_size, total_n_frames, local_num_spks)
             local_logits (torch.Tensor): Speaker logits for the entire audio.
                 Shape: (batch_size * num_chunks, lc+chunk_len+rc, local_num_spks)
+                When cross-chunk swap augmentation is active, these are computed with
+                swapped speaker embeddings (some slots use same-speaker embeddings
+                from different chunks).
             spk_embs (torch.Tensor): Local speaker embeddings.
                 Shape: (batch_size * num_chunks, local_num_spks, emb_dim)
             active_frames_per_spk (torch.Tensor): Tensor containing the number of active frames per speaker
