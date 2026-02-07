@@ -14,13 +14,13 @@ model:
   streaming_mode: False
   pil_metric: "dot_product"
   oracle_assignment: False
-  oracle_centroids_train: True
+  oracle_centroids_train: False
   oracle_centroids_test: False
 
   # Cross-chunk speaker embedding swap augmentation
-  cross_chunk_swap_p: 0.5  # Probability of swapping each speaker embedding with same speaker's embedding from another chunk
-  cross_chunk_swap_detach: true  # Whether to detach swapped embeddings from computation graph
-  cross_chunk_swap_min_frames: 0  # Minimum active frames a source speaker must have to be eligible as a swap source (0 = no filtering)
+  cross_chunk_swap_p: 0  # Probability of swapping each speaker embedding with same speaker's embedding from another chunk
+  cross_chunk_swap_detach: false  # Whether to detach swapped embeddings from computation graph
+  cross_chunk_swap_min_frames: 25  # Minimum active frames a source speaker must have to be eligible as a swap source (0 = no filtering)
 
   model_defaults:
     fc_d_model: 512 # Hidden dimension size of the Fast-conformer Encoder
@@ -127,7 +127,7 @@ model:
     chunk_right_context: 10 # Right context for each chunk
     extra_left_context: 0 # Extra left context for encoder (provides additional acoustic context without requiring predictions)
     extra_right_context: 0 # Extra right context for encoder (provides additional acoustic context without requiring predictions)
-    extra_silence_frames: 3 # Number of silence frames to separate extra_right from extra_left in reordered sequence
+    extra_silence_frames: 4 # Number of silence frames to separate extra_right from extra_left in reordered sequence
     causal_attn_rate: 0 # Causal attention rate
     causal_attn_rc: 7 # Causal attention radius
     sinkhorn_n_iters: 20 # Number of iterations for Sinkhorn algorithm
@@ -146,7 +146,7 @@ model:
     # CLS token configuration
     num_cls_tokens: 4  # One CLS token per speaker slot, the rest are to aggregate additional information
     cls_start_layer: 0  # Layer index to insert CLS tokens (0 = from start)
-    cls_pos_mode: query_key  # Options: 'query_key', 'query_only', 'rel_pos', 'none'
+    cls_pos_mode: rel_pos  # Options: 'query_key', 'query_only', 'rel_pos', 'none'
     allow_content_to_cls: true  # Whether non-CLS tokens can attend to CLS tokens
     cls_embedding_shared: true  # If true, all CLS slots share one embedding
     feat_in: ${model.preprocessor.features}
