@@ -946,6 +946,19 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 )
                 if (self.oracle_centroids_train and self.training) or (self.oracle_centroids_test and not self.training):
                     centroid_spk_assignments_chunk = oracle_spk_assignments_chunk
+                    # On the first chunk the streaming state is empty, so the
+                    # centroid has no history — it just allocates speakers to
+                    # the first available global slots (sequential).  These
+                    # sequential columns can differ from the target-column
+                    # indices the oracle uses, causing a column mismatch: the
+                    # streaming state is built at oracle columns while the logit
+                    # assembly uses centroid columns.  Subsequent chunks' centroid
+                    # matching then follows the oracle-built profiles, swapping
+                    # speakers relative to the first chunk.
+                    # Fix: also use oracle for the first chunk's logit assembly
+                    # so the column convention is consistent from the start.
+                    if chunk_idx == 0:
+                        spk_assignments_chunk = oracle_spk_assignments_chunk
                 else:
                     centroid_spk_assignments_chunk = spk_assignments_chunk
 
