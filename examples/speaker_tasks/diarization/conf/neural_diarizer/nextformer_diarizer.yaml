@@ -20,6 +20,7 @@ model:
   # Cross-chunk speaker embedding swap augmentation
   cross_chunk_swap_p: 0.5  # Probability of swapping each speaker embedding with same speaker's embedding from another chunk
   cross_chunk_swap_detach: true  # Whether to detach swapped embeddings from computation graph
+  cross_chunk_swap_min_frames: 0  # Minimum active frames a source speaker must have to be eligible as a swap source (0 = no filtering)
 
   model_defaults:
     fc_d_model: 512 # Hidden dimension size of the Fast-conformer Encoder

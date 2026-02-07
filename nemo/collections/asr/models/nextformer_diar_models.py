@@ -145,6 +145,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         # Cross-chunk speaker embedding swap augmentation
         self.cross_chunk_swap_p = self._cfg.get("cross_chunk_swap_p", 0.0)
         self.cross_chunk_swap_detach = self._cfg.get("cross_chunk_swap_detach", True)
+        self.cross_chunk_swap_min_frames = self._cfg.get("cross_chunk_swap_min_frames", 0)
 
         # Backend and fusion settings come from NextformerModules config
         logging.info(f"Using backend: {self.nextformer_modules.backend}")
@@ -636,10 +637,12 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self,
         spk_embs: torch.Tensor,
         local_target_indices: torch.Tensor,
+        active_frames_per_spk: torch.Tensor,
         batch_size: int,
         num_chunks: int,
         p_swap: float = 0.5,
         detach: bool = True,
+        min_src_frames: int = 0,
     ) -> torch.Tensor:
         """
         Create cross-chunk swapped speaker embeddings for augmentation.
@@ -655,12 +658,18 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             local_target_indices (torch.Tensor): Global speaker index for each local speaker.
                 Shape: (num_chunks * batch_size, local_num_spks)
                 Value of -1 means unmatched/inactive.
+            active_frames_per_spk (torch.Tensor): Number of active frames per local speaker.
+                Shape: (num_chunks * batch_size, local_num_spks)
+                Used to filter out unreliable source embeddings.
             batch_size (int): Batch size.
             num_chunks (int): Number of chunks.
             p_swap (float): Probability of swapping each embedding. Default: 0.5.
             detach (bool): Whether to detach swapped embeddings from the computation graph.
                 If True, only the backend receives gradients (regularizer mode).
                 If False, the source embedding also receives gradients. Default: True.
+            min_src_frames (int): Minimum number of active frames a source speaker must
+                have to be eligible as a swap source. Embeddings from speakers with fewer
+                active frames are unreliable and can destabilize training. Default: 0.
 
         Returns:
             swapped_embs (torch.Tensor): Speaker embeddings with some entries swapped.
@@ -676,18 +685,20 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         indices_view = local_target_indices.view(num_chunks, batch_size, local_num_spks)
         embs_view = spk_embs.view(num_chunks, batch_size, local_num_spks, emb_dim)
         swapped_view = swapped_embs.view(num_chunks, batch_size, local_num_spks, emb_dim)
+        af_view = active_frames_per_spk.view(num_chunks, batch_size, local_num_spks)
 
         for b in range(batch_size):
-            # Build lookup: global_spk_id -> [(chunk_idx, local_slot_idx)]
+            # Build lookup: global_spk_id -> [(chunk_idx, local_slot_idx, active_frames)]
             spk_to_locations: dict = {}
             for c in range(num_chunks):
                 for s in range(local_num_spks):
                     g = indices_view[c, b, s].item()
                     if g < 0:
                         continue
+                    af = af_view[c, b, s].item()
                     if g not in spk_to_locations:
                         spk_to_locations[g] = []
-                    spk_to_locations[g].append((c, s))
+                    spk_to_locations[g].append((c, s, af))
 
             # For each location, potentially swap
             for c in range(num_chunks):
@@ -700,9 +711,13 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                         continue
 
                     # Find alternative locations for the same global speaker
-                    other_locations = [(cc, ss) for (cc, ss) in spk_to_locations[g] if cc != c]
+                    # that have enough active frames to be a reliable source
+                    other_locations = [
+                        (cc, ss) for (cc, ss, af) in spk_to_locations[g]
+                        if cc != c and af >= min_src_frames
+                    ]
                     if not other_locations:
-                        continue  # Speaker appears in only one chunk
+                        continue
 
                     src_c, src_s = random.choice(other_locations)
                     src_emb = embs_view[src_c, b, src_s, :]
@@ -1011,10 +1026,12 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             swapped_spk_embs_proj_tf = self._create_swapped_embeddings(
                 spk_embs=spk_embs_proj_tf,
                 local_target_indices=local_target_indices,
+                active_frames_per_spk=active_frames_per_spk,
                 batch_size=batch_size,
                 num_chunks=num_chunks,
                 p_swap=self.cross_chunk_swap_p,
                 detach=self.cross_chunk_swap_detach,
+                min_src_frames=self.cross_chunk_swap_min_frames,
             )
             local_logits = self.forward_backend(
                 emb_seq_proj_tf, emb_seq_length, spk_embs=swapped_spk_embs_proj_tf
