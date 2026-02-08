@@ -259,6 +259,19 @@ model:
     pre_ln_final_layer_norm: True
     mask_future: True
 
+  profile_updater:
+    _target_: nemo.collections.asr.modules.nextformer_modules.SinkhornMaskedProfileUpdater
+    num_layers: 2  # Number of self-attention + FFN blocks
+    hidden_size: ${model.model_defaults.se_d_model}  # Must match se_d_model (global profile / local embedding dimension)
+    inner_size: 384
+    num_attention_heads: 4
+    attn_dropout: 0.0
+    ffn_dropout: 0.0
+    hidden_act: relu
+    pre_ln: true
+    pre_ln_final_layer_norm: true
+    log_score_clamp_min: -20.0  # Floor for log(sinkhorn_scores); controls minimum attention bias
+
   loss: 
     _target_: nemo.collections.asr.losses.bce_loss.BCEWithLogitsLoss
     reduction: mean

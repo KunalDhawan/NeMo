@@ -123,7 +123,13 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             self.spk_embs_enhancer = NextformerEncLabelModel.from_config_dict(spk_embs_enhancer_cfg).to(self.device)
         else:
             self.spk_embs_enhancer = None
-            
+
+        profile_updater_cfg = self._cfg.get('profile_updater', None)
+        if profile_updater_cfg is not None and profile_updater_cfg.get('num_layers', 0) > 0:
+            self.profile_updater = NextformerEncLabelModel.from_config_dict(profile_updater_cfg).to(self.device)
+        else:
+            self.profile_updater = None
+
         self.nextformer_modules = NextformerEncLabelModel.from_config_dict(self._cfg.nextformer_modules).to(
             self.device
         )
@@ -953,14 +959,16 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             if self.oracle_assignment:  
                 centroid_spk_assignments_chunk = oracle_spk_assignments_chunk
                 spk_assignments_chunk = oracle_spk_assignments_chunk
+                profile_sinkhorn_scores = oracle_spk_assignments_chunk
             else:
                 # get real local-to-global assignments
-                spk_assignments_chunk = self.nextformer_modules.get_local_to_global_assignments(
+                spk_assignments_chunk, sinkhorn_scores_chunk = self.nextformer_modules.get_local_to_global_assignments(
                     spk_embs=spk_embs_chunk,
                     streaming_state=streaming_state,
                 )
                 if (self.oracle_centroids_train and self.training) or (self.oracle_centroids_test and not self.training):
                     centroid_spk_assignments_chunk = oracle_spk_assignments_chunk
+                    profile_sinkhorn_scores = oracle_spk_assignments_chunk
                     # On the first chunk the streaming state is empty, so the
                     # centroid has no history — it just allocates speakers to
                     # the first available global slots (sequential).  These
@@ -976,26 +984,63 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                         spk_assignments_chunk = oracle_spk_assignments_chunk
                 else:
                     centroid_spk_assignments_chunk = spk_assignments_chunk
+                    profile_sinkhorn_scores = sinkhorn_scores_chunk
 
             active_frames_chunk = active_frames_per_spk[chunk_idx * batch_size:(chunk_idx + 1) * batch_size, :]
 
-            # Slice to prediction window for streaming state update
-            #local_logits_pred_window = local_logits_chunk[:, offset:offset+dur, :]  # (batch_size, dur, local_num_spks)
-            #emb_seq_proj_se_pred_window = emb_seq_proj_se_chunk[:, offset:offset+dur, :]  # (batch_size, dur, se_d_model)
-            #active_frames_chunk = active_frames_chunk[:, offset:offset+dur, :]
+            if self.profile_updater is not None:
+                # --- Sinkhorn-masked self-attention profile update ---
+                was_active = streaming_state.global_spk_total_confidence > 0  # (B, max_num_spks)
 
-            # Use full chunk for logits and projected embeddings
-            local_logits_pred_window = local_logits_chunk
-            emb_seq_proj_se_pred_window = emb_seq_proj_se_chunk
-            
+                updated_profiles, updated_local_embs = self.profile_updater(
+                    global_profiles=streaming_state.global_spk_embs,
+                    local_embs=spk_embs_chunk,
+                    sinkhorn_scores=profile_sinkhorn_scores,
+                )
+                streaming_state.global_spk_embs = updated_profiles
 
-            self.nextformer_modules.update_streaming_state(
-                streaming_state=streaming_state,
-                emb_seq_proj=emb_seq_proj_se_pred_window,
-                local_logits=local_logits_pred_window,
-                spk_assignments=centroid_spk_assignments_chunk,
-                active_frames_per_spk=active_frames_chunk,
-            )
+                # Handle new speakers: find local speakers assigned to previously-inactive global slots
+                _local_num_spks = spk_embs_chunk.shape[1]
+                assigned_globals = centroid_spk_assignments_chunk.argmax(dim=2)  # (B, local_num_spks)
+                logging.info(f"assigned_globals: {assigned_globals[0,0:17]}")
+                has_assignment = centroid_spk_assignments_chunk.max(dim=2).values > 0.01
+                _batch_idx = torch.arange(batch_size, device=spk_embs_chunk.device).unsqueeze(1).expand(-1, _local_num_spks)
+                is_new_speaker = has_assignment & ~was_active[_batch_idx, assigned_globals]
+                logging.info(f"is_new_speaker: {is_new_speaker[0,0:17]}")
+
+                if is_new_speaker.any():
+                    new_b, new_s = torch.where(is_new_speaker)
+                    new_g = assigned_globals[new_b, new_s]
+                    # Initialize new global slot with the (self-attention-refined) local embedding
+                    streaming_state.global_spk_embs[new_b, new_g] = updated_local_embs[new_b, new_s]
+                    streaming_state.global_spk_total_confidence[new_b, new_g] = 1.0
+
+                # Mark existing assigned speakers as active (increment confidence counter)
+                is_existing = has_assignment & was_active[_batch_idx, assigned_globals]
+                if is_existing.any():
+                    ex_b, ex_s = torch.where(is_existing)
+                    ex_g = assigned_globals[ex_b, ex_s]
+                    streaming_state.global_spk_total_confidence[ex_b, ex_g] = (
+                        streaming_state.global_spk_total_confidence[ex_b, ex_g] + 1.0
+                    )
+
+                logging.info(
+                    f"streaming_state.global_spk_total_confidence: "
+                    f"{streaming_state.global_spk_total_confidence[0, 0:17]}"
+                )
+            else:
+                # --- Legacy: confidence-weighted average profile update ---
+                # Use full chunk for logits and projected embeddings
+                local_logits_pred_window = local_logits_chunk
+                emb_seq_proj_se_pred_window = emb_seq_proj_se_chunk
+
+                self.nextformer_modules.update_streaming_state(
+                    streaming_state=streaming_state,
+                    emb_seq_proj=emb_seq_proj_se_pred_window,
+                    local_logits=local_logits_pred_window,
+                    spk_assignments=centroid_spk_assignments_chunk,
+                    active_frames_per_spk=active_frames_chunk,
+                )
             logits_chunk = self.nextformer_modules.get_global_logits(
                 local_logits=local_logits_chunk,
                 spk_assignments=spk_assignments_chunk,

@@ -35,7 +35,7 @@ from nemo.collections.asr.parts.submodules.multi_head_attention import (
     RelPositionalEncoding,
 )
 
-__all__ = ['NextformerModules', 'MaskedQueryDecoder', 'JointTimeSpeakerEncoder', 'JointTimeSpeakerEncoderBlock']
+__all__ = ['NextformerModules', 'MaskedQueryDecoder', 'SinkhornMaskedProfileUpdater', 'JointTimeSpeakerEncoder', 'JointTimeSpeakerEncoderBlock']
 
 @dataclass
 class StreamingNextformerState:
@@ -923,6 +923,9 @@ class NextformerModules(NeuralModule, Exportable):
         local_to_global = assign_aug[:, :local_num_spks, :self.max_num_spks]
         dustbin_scores = assign_aug[:, :local_num_spks, -1]
 
+        # Raw Sinkhorn scores before dustbin allocation (used by profile updater)
+        sinkhorn_scores = local_to_global.clone()
+
         spk_assignments = local_to_global.clone()
 
         # Allocate new global slots for dustbin matches
@@ -939,7 +942,7 @@ class NextformerModules(NeuralModule, Exportable):
                     global_idx = available.pop(0)
                     spk_assignments[b, local_idx, global_idx] += dustbin_scores[b, local_idx]
 
-        return spk_assignments
+        return spk_assignments, sinkhorn_scores
 
     def get_global_logits(self, local_logits, spk_assignments, offset: int, dur: int):
         """
@@ -1011,6 +1014,308 @@ class NextformerModules(NeuralModule, Exportable):
 
         # Exponentiate and return the full augmented matrix
         return P.exp()
+
+
+class SinkhornMaskedProfileUpdaterBlock(nn.Module):
+    """
+    Single self-attention + FFN block with additive attention bias support.
+    Used within SinkhornMaskedProfileUpdater for Sinkhorn-gated profile updates.
+
+    The block computes standard multi-head self-attention, but adds an externally
+    provided bias matrix to the attention logits before softmax.  This allows the
+    caller to inject structural priors (e.g. log-Sinkhorn scores) that gate which
+    tokens can exchange information.
+
+    Args:
+        hidden_size: Size of hidden dimension (d_model)
+        inner_size: Size of FFN inner dimension
+        num_attention_heads: Number of attention heads
+        attn_dropout: Dropout rate for attention scores
+        ffn_dropout: Dropout rate for FFN
+        hidden_act: Activation function for FFN
+        pre_ln: Whether to use pre-LayerNorm (True) or post-LayerNorm (False)
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        inner_size: int,
+        num_attention_heads: int = 4,
+        attn_dropout: float = 0.0,
+        ffn_dropout: float = 0.0,
+        hidden_act: str = "relu",
+        pre_ln: bool = True,
+    ):
+        super().__init__()
+        self.pre_ln = pre_ln
+        self.hidden_size = hidden_size
+        self.num_heads = num_attention_heads
+        assert hidden_size % num_attention_heads == 0, (
+            f"hidden_size ({hidden_size}) must be divisible by "
+            f"num_attention_heads ({num_attention_heads})"
+        )
+        self.head_dim = hidden_size // num_attention_heads
+        self.scale = self.head_dim ** -0.5
+
+        # Self-attention
+        self.norm_attn = nn.LayerNorm(hidden_size, eps=1e-5)
+        self.q_proj = nn.Linear(hidden_size, hidden_size)
+        self.k_proj = nn.Linear(hidden_size, hidden_size)
+        self.v_proj = nn.Linear(hidden_size, hidden_size)
+        self.out_proj = nn.Linear(hidden_size, hidden_size)
+        self.attn_dropout = nn.Dropout(attn_dropout)
+
+        # FFN
+        self.norm_ff = nn.LayerNorm(hidden_size, eps=1e-5)
+        self.ffn = PositionWiseFF(hidden_size, inner_size, ffn_dropout, hidden_act)
+
+    def _self_attention(self, x: torch.Tensor, attn_bias: torch.Tensor) -> torch.Tensor:
+        """
+        Multi-head self-attention with additive attention bias.
+
+        Args:
+            x: Input tensor of shape (B, T, D)
+            attn_bias: Additive bias for attention logits, shape (B, T, T).
+                       Broadcast across heads.
+
+        Returns:
+            Output tensor of shape (B, T, D)
+        """
+        B, T, D = x.shape
+        H = self.num_heads
+        hd = self.head_dim
+
+        q = self.q_proj(x).view(B, T, H, hd).transpose(1, 2)  # (B, H, T, hd)
+        k = self.k_proj(x).view(B, T, H, hd).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, H, hd).transpose(1, 2)
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (B, H, T, T)
+        scores = scores + attn_bias.unsqueeze(1)  # broadcast (B, 1, T, T)
+
+        attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = self.attn_dropout(attn_weights)
+
+        out = torch.matmul(attn_weights, v)  # (B, H, T, hd)
+        out = out.transpose(1, 2).reshape(B, T, D)
+        out = self.out_proj(out)
+        return out
+
+    def forward(self, x: torch.Tensor, attn_bias: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass.
+
+        Args:
+            x: Input tensor (B, T, D)
+            attn_bias: Additive attention bias (B, T, T)
+
+        Returns:
+            Output tensor (B, T, D)
+        """
+        if self.pre_ln:
+            # Pre-LN: Norm → Attn → Residual → Norm → FFN → Residual
+            residual = x
+            x = self.norm_attn(x)
+            x = self._self_attention(x, attn_bias)
+            x = x + residual
+
+            residual = x
+            x = self.norm_ff(x)
+            x = self.ffn(x)
+            x = x + residual
+        else:
+            # Post-LN: Attn → Residual → Norm → FFN → Residual → Norm
+            residual = x
+            x = self._self_attention(x, attn_bias)
+            x = self.norm_attn(x + residual)
+
+            residual = x
+            x = self.ffn(x)
+            x = self.norm_ff(x + residual)
+
+        return x
+
+
+class SinkhornMaskedProfileUpdater(nn.Module):
+    """
+    Updates global speaker profiles and refines local speaker embeddings
+    using self-attention with Sinkhorn-derived attention biases.
+
+    Architecture overview
+    ---------------------
+    Given global profiles  g[0 .. M-1]  and local speaker embeddings  q[0 .. S-1],
+    the module concatenates them into a single sequence
+
+        [g_0, g_1, …, g_{M-1}, q_0, q_1, …, q_{S-1}]
+
+    and runs multi-layer self-attention whose attention logits receive an additive
+    bias matrix constructed from Sinkhorn assignment probabilities:
+
+        ┌──────────────────┬──────────────────┐
+        │  g → g           │  g → q           │
+        │  diagonal only   │  log(sinkhorn)   │
+        │  (self, 0)       │                  │
+        ├──────────────────┼──────────────────┤
+        │  q → g           │  q → q           │
+        │  log(sinkhorn)   │  diagonal only   │
+        │                  │  (self, 0)       │
+        └──────────────────┴──────────────────┘
+
+    Off-diagonal entries in the g→g and q→q blocks are set to -inf, preventing
+    cross-contamination between different global profiles and between different
+    local speakers.  The log(sinkhorn) bias smoothly gates cross-type attention:
+
+        * sinkhorn ≈ 1  →  log(1) = 0   →  full attention (strong match)
+        * sinkhorn ≈ 0  →  log(ε) → -∞  →  masked out     (no match)
+
+    After the self-attention stack, the module returns:
+        * **updated_profiles**  –  global profiles enriched by matched local embeddings
+        * **updated_local_embs** – local embeddings refined with historical global context
+
+    Args:
+        hidden_size: Embedding dimension (must match se_d_model)
+        inner_size: FFN inner dimension
+        num_layers: Number of self-attention + FFN blocks
+        num_attention_heads: Number of attention heads
+        attn_dropout: Dropout rate for attention scores
+        ffn_dropout: Dropout rate for FFN
+        hidden_act: Activation function for FFN
+        pre_ln: Whether to use pre-LayerNorm
+        pre_ln_final_layer_norm: Whether to add final LayerNorm when using pre-LN
+        log_score_clamp_min: Floor for clamped log(sinkhorn_scores), controls
+            the minimum attention bias for near-zero assignment probabilities
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        inner_size: int,
+        num_layers: int = 2,
+        num_attention_heads: int = 4,
+        attn_dropout: float = 0.0,
+        ffn_dropout: float = 0.0,
+        hidden_act: str = "relu",
+        pre_ln: bool = True,
+        pre_ln_final_layer_norm: bool = True,
+        log_score_clamp_min: float = -20.0,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.log_score_clamp_min = log_score_clamp_min
+
+        self.layers = nn.ModuleList([
+            SinkhornMaskedProfileUpdaterBlock(
+                hidden_size=hidden_size,
+                inner_size=inner_size,
+                num_attention_heads=num_attention_heads,
+                attn_dropout=attn_dropout,
+                ffn_dropout=ffn_dropout,
+                hidden_act=hidden_act,
+                pre_ln=pre_ln,
+            )
+            for _ in range(num_layers)
+        ])
+
+        if pre_ln and pre_ln_final_layer_norm:
+            self.final_layer_norm = nn.LayerNorm(hidden_size, eps=1e-5)
+        else:
+            self.final_layer_norm = None
+
+    def _build_attention_bias(
+        self,
+        sinkhorn_scores: torch.Tensor,
+        max_num_spks: int,
+        local_num_spks: int,
+    ) -> torch.Tensor:
+        """
+        Build the structured attention bias matrix.
+
+        Args:
+            sinkhorn_scores: Soft assignment probabilities from Sinkhorn.
+                Shape: (B, local_num_spks, max_num_spks)
+            max_num_spks: Number of global speaker slots (M)
+            local_num_spks: Number of local speakers (S)
+
+        Returns:
+            attn_bias: Attention bias matrix.
+                Shape: (B, M+S, M+S)
+        """
+        B = sinkhorn_scores.shape[0]
+        M = max_num_spks
+        S = local_num_spks
+        total = M + S
+        NEG_INF = -10000.0
+
+        # Start with everything blocked
+        attn_bias = sinkhorn_scores.new_full((B, total, total), NEG_INF)
+
+        # Diagonal: every token can attend to itself
+        diag_idx = torch.arange(total, device=sinkhorn_scores.device)
+        attn_bias[:, diag_idx, diag_idx] = 0.0
+
+        # Log sinkhorn scores, clamped for numerical stability
+        log_scores = torch.log(
+            sinkhorn_scores.clamp(min=math.exp(self.log_score_clamp_min))
+        ).clamp(min=self.log_score_clamp_min)
+        # log_scores shape: (B, S, M)
+
+        # Top-right block: g_j attends to q_i
+        # bias[b, j, M+i] = log(sinkhorn[b, i, j])
+        attn_bias[:, :M, M:total] = log_scores.transpose(1, 2)  # (B, M, S)
+
+        # Bottom-left block: q_i attends to g_j
+        # bias[b, M+i, j] = log(sinkhorn[b, i, j])
+        attn_bias[:, M:total, :M] = log_scores  # (B, S, M)
+
+        return attn_bias
+
+    def forward(
+        self,
+        global_profiles: torch.Tensor,
+        local_embs: torch.Tensor,
+        sinkhorn_scores: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Update global profiles and refine local embeddings via
+        Sinkhorn-masked self-attention.
+
+        Args:
+            global_profiles: Current global speaker profiles.
+                Shape: (B, max_num_spks, hidden_size)
+            local_embs: Local speaker embeddings from current chunk.
+                Shape: (B, local_num_spks, hidden_size)
+            sinkhorn_scores: Soft assignment probabilities.
+                Shape: (B, local_num_spks, max_num_spks)
+
+        Returns:
+            updated_profiles: Updated global speaker profiles.
+                Shape: (B, max_num_spks, hidden_size)
+            updated_local_embs: Refined local speaker embeddings.
+                Shape: (B, local_num_spks, hidden_size)
+        """
+        B, M, D = global_profiles.shape
+        S = local_embs.shape[1]
+
+        # Concatenate: [g_0, ..., g_{M-1}, q_0, ..., q_{S-1}]
+        x = torch.cat([global_profiles, local_embs], dim=1)  # (B, M+S, D)
+
+        # Build attention bias
+        attn_bias = self._build_attention_bias(sinkhorn_scores, M, S)  # (B, M+S, M+S)
+        logging.info(f"attn_bias: {attn_bias[0,0:20,0:20]}")
+
+        # Run through self-attention layers
+        for layer in self.layers:
+            x = layer(x, attn_bias)
+
+        # Final layer norm
+        if self.final_layer_norm is not None:
+            x = self.final_layer_norm(x)
+
+        # Split back
+        updated_profiles = x[:, :M, :]
+        updated_local_embs = x[:, M:, :]
+
+        return updated_profiles, updated_local_embs
 
 
 class JointTimeSpeakerEncoderBlock(nn.Module):
