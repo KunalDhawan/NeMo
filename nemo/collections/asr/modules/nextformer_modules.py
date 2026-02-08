@@ -1045,6 +1045,7 @@ class SinkhornMaskedProfileUpdaterBlock(nn.Module):
         ffn_dropout: float = 0.0,
         hidden_act: str = "relu",
         pre_ln: bool = True,
+        zero_init_residual: bool = False,
     ):
         super().__init__()
         self.pre_ln = pre_ln
@@ -1068,6 +1069,13 @@ class SinkhornMaskedProfileUpdaterBlock(nn.Module):
         # FFN
         self.norm_ff = nn.LayerNorm(hidden_size, eps=1e-5)
         self.ffn = PositionWiseFF(hidden_size, inner_size, ffn_dropout, hidden_act)
+
+        # Zero-initialize residual paths so the block starts as identity
+        if zero_init_residual:
+            nn.init.zeros_(self.out_proj.weight)
+            nn.init.zeros_(self.out_proj.bias)
+            nn.init.zeros_(self.ffn.dense_out.weight)
+            nn.init.zeros_(self.ffn.dense_out.bias)
 
     def _self_attention(self, x: torch.Tensor, attn_bias: torch.Tensor) -> torch.Tensor:
         """
@@ -1183,6 +1191,10 @@ class SinkhornMaskedProfileUpdater(nn.Module):
         pre_ln_final_layer_norm: Whether to add final LayerNorm when using pre-LN
         log_score_clamp_min: Floor for clamped log(sinkhorn_scores), controls
             the minimum attention bias for near-zero assignment probabilities
+        zero_init_residual: If True, zero-initialize the output projections of
+            self-attention (out_proj) and FFN (dense_out) in each block so the
+            module starts as an identity function.  The updater then gradually
+            learns to make useful modifications during training.
     """
 
     def __init__(
@@ -1197,6 +1209,7 @@ class SinkhornMaskedProfileUpdater(nn.Module):
         pre_ln: bool = True,
         pre_ln_final_layer_norm: bool = True,
         log_score_clamp_min: float = -20.0,
+        zero_init_residual: bool = False,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -1212,6 +1225,7 @@ class SinkhornMaskedProfileUpdater(nn.Module):
                 ffn_dropout=ffn_dropout,
                 hidden_act=hidden_act,
                 pre_ln=pre_ln,
+                zero_init_residual=zero_init_residual,
             )
             for _ in range(num_layers)
         ])

@@ -17,6 +17,8 @@ model:
   oracle_centroids_train: False
   oracle_centroids_test: False
 
+  profile_updater_detach_inputs: false  # If true, detach all inputs to the profile updater (breaks gradient chain to encoder, isolates updater training)
+
   # Cross-chunk speaker embedding swap augmentation
   cross_chunk_swap_p: 0  # Probability of swapping each speaker embedding with same speaker's embedding from another chunk
   cross_chunk_swap_detach: false  # Whether to detach swapped embeddings from computation graph
@@ -271,6 +273,7 @@ model:
     pre_ln: true
     pre_ln_final_layer_norm: true
     log_score_clamp_min: -20.0  # Floor for log(sinkhorn_scores); controls minimum attention bias
+    zero_init_residual: false  # If true, zero-init out_proj and FFN output so the updater starts as identity
 
   loss: 
     _target_: nemo.collections.asr.losses.bce_loss.BCEWithLogitsLoss

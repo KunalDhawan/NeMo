@@ -129,6 +129,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             self.profile_updater = NextformerEncLabelModel.from_config_dict(profile_updater_cfg).to(self.device)
         else:
             self.profile_updater = None
+        self.profile_updater_detach_inputs = self._cfg.get('profile_updater_detach_inputs', False)
 
         self.nextformer_modules = NextformerEncLabelModel.from_config_dict(self._cfg.nextformer_modules).to(
             self.device
@@ -1004,10 +1005,19 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 updater_sinkhorn = profile_sinkhorn_scores.clone()
                 updater_sinkhorn[~reliable_spk] = 0.0
 
+                if self.profile_updater_detach_inputs:
+                    pu_global = streaming_state.global_spk_embs.detach()
+                    pu_local = updater_spk_embs.detach()
+                    pu_sinkhorn = updater_sinkhorn.detach()
+                else:
+                    pu_global = streaming_state.global_spk_embs
+                    pu_local = updater_spk_embs
+                    pu_sinkhorn = updater_sinkhorn
+
                 updated_profiles, updated_local_embs = self.profile_updater(
-                    global_profiles=streaming_state.global_spk_embs,
-                    local_embs=updater_spk_embs,
-                    sinkhorn_scores=updater_sinkhorn,
+                    global_profiles=pu_global,
+                    local_embs=pu_local,
+                    sinkhorn_scores=pu_sinkhorn,
                 )
                 # Clone to avoid in-place autograd issues when initializing new speakers below
                 streaming_state.global_spk_embs = updated_profiles.clone()
