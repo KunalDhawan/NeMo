@@ -992,21 +992,34 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 # --- Sinkhorn-masked self-attention profile update ---
                 was_active = streaming_state.global_spk_total_confidence > 0  # (B, max_num_spks)
 
+                # Filter unreliable speakers (too few active frames) for the profile
+                # updater only.  Sinkhorn matching and get_global_logits still see
+                # the original embeddings, so local predictions are preserved.
+                min_frames = self.nextformer_modules.spk_emb_update_min_frames
+                reliable_spk = active_frames_chunk >= max(min_frames, 1)  # (B, local_num_spks)
+
+                updater_spk_embs = spk_embs_chunk.clone()
+                updater_spk_embs[~reliable_spk] = 0.0
+
+                updater_sinkhorn = profile_sinkhorn_scores.clone()
+                updater_sinkhorn[~reliable_spk] = 0.0
+
                 updated_profiles, updated_local_embs = self.profile_updater(
                     global_profiles=streaming_state.global_spk_embs,
-                    local_embs=spk_embs_chunk,
-                    sinkhorn_scores=profile_sinkhorn_scores,
+                    local_embs=updater_spk_embs,
+                    sinkhorn_scores=updater_sinkhorn,
                 )
-                streaming_state.global_spk_embs = updated_profiles
+                # Clone to avoid in-place autograd issues when initializing new speakers below
+                streaming_state.global_spk_embs = updated_profiles.clone()
 
                 # Handle new speakers: find local speakers assigned to previously-inactive global slots
                 _local_num_spks = spk_embs_chunk.shape[1]
                 assigned_globals = centroid_spk_assignments_chunk.argmax(dim=2)  # (B, local_num_spks)
-                logging.info(f"assigned_globals: {assigned_globals[0,0:17]}")
                 has_assignment = centroid_spk_assignments_chunk.max(dim=2).values > 0.01
+
                 _batch_idx = torch.arange(batch_size, device=spk_embs_chunk.device).unsqueeze(1).expand(-1, _local_num_spks)
-                is_new_speaker = has_assignment & ~was_active[_batch_idx, assigned_globals]
-                logging.info(f"is_new_speaker: {is_new_speaker[0,0:17]}")
+                # Only allocate new slots for reliable speakers
+                is_new_speaker = has_assignment & reliable_spk & ~was_active[_batch_idx, assigned_globals]
 
                 if is_new_speaker.any():
                     new_b, new_s = torch.where(is_new_speaker)
@@ -1016,7 +1029,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                     streaming_state.global_spk_total_confidence[new_b, new_g] = 1.0
 
                 # Mark existing assigned speakers as active (increment confidence counter)
-                is_existing = has_assignment & was_active[_batch_idx, assigned_globals]
+                is_existing = has_assignment & reliable_spk & was_active[_batch_idx, assigned_globals]
                 if is_existing.any():
                     ex_b, ex_s = torch.where(is_existing)
                     ex_g = assigned_globals[ex_b, ex_s]
