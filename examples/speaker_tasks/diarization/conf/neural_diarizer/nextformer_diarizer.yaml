@@ -16,6 +16,7 @@ model:
   oracle_assignment: False
   oracle_centroids_train: False
   oracle_centroids_test: False
+  oracle_centroids_weight: 1.0  # Float in [0,1]. When oracle_centroids is enabled: 1.0 = pure oracle, 0.0 = pure Sinkhorn, values in between = interpolation.
 
   profile_updater_detach_inputs: false  # If true, detach all inputs to the profile updater (breaks gradient chain to encoder, isolates updater training)
 

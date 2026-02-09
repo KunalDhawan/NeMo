@@ -147,6 +147,8 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.oracle_assignment = self._cfg.get("oracle_assignment", False)
         self.oracle_centroids_train = self._cfg.get("oracle_centroids_train", False)
         self.oracle_centroids_test = self._cfg.get("oracle_centroids_test", False)
+        # Interpolation weight for oracle centroids: 0.0 = pure Sinkhorn, 1.0 = pure oracle.
+        self.oracle_centroids_weight = self._cfg.get("oracle_centroids_weight", 1.0)
         self.streaming_mode = self.cfg.get("streaming_mode", False)
 
         # Cross-chunk speaker embedding swap augmentation
@@ -967,20 +969,32 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                     spk_embs=spk_embs_chunk,
                     streaming_state=streaming_state,
                 )
-                if (self.oracle_centroids_train and self.training) or (self.oracle_centroids_test and not self.training):
-                    centroid_spk_assignments_chunk = oracle_spk_assignments_chunk
-                    profile_sinkhorn_scores = oracle_spk_assignments_chunk
-                    # On the first chunk the streaming state is empty, so the
-                    # centroid has no history — it just allocates speakers to
-                    # the first available global slots (sequential).  These
-                    # sequential columns can differ from the target-column
-                    # indices the oracle uses, causing a column mismatch: the
-                    # streaming state is built at oracle columns while the logit
-                    # assembly uses centroid columns.  Subsequent chunks' centroid
-                    # matching then follows the oracle-built profiles, swapping
-                    # speakers relative to the first chunk.
-                    # Fix: also use oracle for the first chunk's logit assembly
-                    # so the column convention is consistent from the start.
+
+                # oracle_centroids flags gate whether oracle is used at all.
+                # oracle_centroids_weight (if set) controls the softness: 1.0 = pure oracle, <1 = interpolation.
+                use_oracle = (self.oracle_centroids_train and self.training) or (
+                    self.oracle_centroids_test and not self.training
+                )
+                if use_oracle:
+                    ocw = self.oracle_centroids_weight
+                else:
+                    ocw = 0.0
+
+                if ocw > 0:
+                    # Interpolate between oracle (one-hot) and Sinkhorn (soft).
+                    # ocw=1 → pure oracle, ocw=0 → pure Sinkhorn.
+                    # Both are in the same coordinate system because oracle_centroids
+                    # maintains slot j = target speaker j alignment.
+                    centroid_spk_assignments_chunk = (
+                        ocw * oracle_spk_assignments_chunk
+                        + (1 - ocw) * spk_assignments_chunk
+                    )
+                    profile_sinkhorn_scores = (
+                        ocw * oracle_spk_assignments_chunk
+                        + (1 - ocw) * sinkhorn_scores_chunk
+                    )
+                    # On the first chunk, use oracle for logit assembly to establish
+                    # the slot→target column alignment that oracle_centroids depends on.
                     if chunk_idx == 0:
                         spk_assignments_chunk = oracle_spk_assignments_chunk
                 else:
@@ -1022,10 +1036,18 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 # Clone to avoid in-place autograd issues when initializing new speakers below
                 streaming_state.global_spk_embs = updated_profiles.clone()
 
-                # Handle new speakers: find local speakers assigned to previously-inactive global slots
+                # Handle new speakers: find local speakers assigned to previously-inactive global slots.
+                # When oracle_centroids is active (ocw > 0), use oracle assignments for new speaker
+                # slot allocation to maintain the slot→target column alignment. The interpolated
+                # centroid_spk_assignments_chunk could route new speakers to wrong slots when
+                # Sinkhorn's dustbin allocation disagrees with the oracle's target column.
                 _local_num_spks = spk_embs_chunk.shape[1]
-                assigned_globals = centroid_spk_assignments_chunk.argmax(dim=2)  # (B, local_num_spks)
-                has_assignment = centroid_spk_assignments_chunk.max(dim=2).values > 0.01
+                if ocw > 0:
+                    assigned_globals = oracle_spk_assignments_chunk.argmax(dim=2)
+                    has_assignment = oracle_spk_assignments_chunk.max(dim=2).values > 0.01
+                else:
+                    assigned_globals = centroid_spk_assignments_chunk.argmax(dim=2)
+                    has_assignment = centroid_spk_assignments_chunk.max(dim=2).values > 0.01
 
                 _batch_idx = torch.arange(batch_size, device=spk_embs_chunk.device).unsqueeze(1).expand(-1, _local_num_spks)
                 # Only allocate new slots for reliable speakers
