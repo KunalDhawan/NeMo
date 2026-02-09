@@ -963,7 +963,9 @@ class NextformerModules(NeuralModule, Exportable):
         local_logits_slice = local_logits[:, offset : offset + dur, :]
         local_preds = torch.sigmoid(local_logits_slice)
         global_preds = torch.bmm(local_preds, spk_assignments)
-        global_logits = torch.logit(global_preds, eps=1e-6)
+        # eps=0.01: bounds logit gradient to 1/(0.01*0.99)≈101x (vs 1e6x with eps=1e-6),
+        # and is bf16-safe (1-1e-6 rounds to 1.0 in bf16 → logit=inf)
+        global_logits = torch.logit(global_preds, eps=0.01)
         return global_logits
 
     def partial_sinkhorn(self, scores):
