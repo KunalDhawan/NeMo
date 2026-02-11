@@ -1079,6 +1079,7 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         subsegment_min_len_sec: float = 15.0,
         subsegment_two_chunks_rate: float = 0.0,
         subsegment_min_chunk_len_sec: float = 10.0,
+        subsegment_margin_frames: int = 0,
     ):
         super().__init__()
         self.collection = EndtoEndDiarizationSpeechLabel(
@@ -1111,6 +1112,7 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         self.subsegment_min_len_sec = subsegment_min_len_sec
         self.subsegment_two_chunks_rate = subsegment_two_chunks_rate
         self.subsegment_min_chunk_len_sec = subsegment_min_chunk_len_sec
+        self.subsegment_margin_frames = subsegment_margin_frames
         if self.session_len_sec > 0:
             assert self.subsegment_min_len_sec <= self.session_len_sec, (
                 f"subsegment_min_len_sec ({self.subsegment_min_len_sec}) cannot be greater than "
@@ -1301,14 +1303,45 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         #logging.info(f"uniq_id: {sample.uniq_id}, frame_level_target: {frame_level_target.shape}")
 
         if spks_todrop:
+            samples_per_frame = int(self.featurizer.sample_rate / self.feat_per_sec)
             activity_todrop = frame_level_target[:, spks_todrop].sum(dim=1) > 0
-            frames_to_keep_mask = torch.logical_not(activity_todrop)
 
-            # Filter frame-level targets based on the mask
+            # Option B boundary margin: replace frames adjacent to excision boundaries
+            # with silence (audio) and zeros (targets) to remove residual energy from
+            # dropped speakers and provide an acoustic buffer at concatenation points.
+            if self.subsegment_margin_frames > 0:
+                margin = self.subsegment_margin_frames
+                # Dilate the excision mask to find boundary margin frames
+                activity_float = activity_todrop.float().unsqueeze(0).unsqueeze(0)
+                dilated = (
+                    torch.nn.functional.max_pool1d(
+                        activity_float,
+                        kernel_size=2 * margin + 1,
+                        stride=1,
+                        padding=margin,
+                    ).squeeze(0).squeeze(0)
+                    > 0
+                )
+                # Margin = frames in the dilated region but NOT in the original excision region
+                margin_mask = dilated & ~activity_todrop
+
+                # Zero out frame-level targets at margin frames
+                frame_level_target[margin_mask] = 0
+
+                # Replace audio at margin frames with low-level noise (avoids
+                # log(0) artifacts in log-mel feature extraction that pure zeros would cause)
+                audio_margin_mask = margin_mask.repeat_interleave(samples_per_frame)
+                margin_len = min(audio_signal.shape[0], audio_margin_mask.shape[0])
+                full_audio_margin = torch.zeros(audio_signal.shape[0], dtype=torch.bool)
+                full_audio_margin[:margin_len] = audio_margin_mask[:margin_len]
+                n_margin_samples = full_audio_margin.sum().item()
+                audio_signal[full_audio_margin] = torch.randn(n_margin_samples) * 1e-3
+
+            # Excise frames where dropped speakers are active
+            frames_to_keep_mask = ~activity_todrop
             frame_level_target = frame_level_target[frames_to_keep_mask]
 
             # Create a corresponding mask for the audio signal by expanding the frame mask
-            samples_per_frame = int(self.featurizer.sample_rate / self.feat_per_sec)
             audio_mask = frames_to_keep_mask.repeat_interleave(samples_per_frame)
 
             # Ensure audio_signal and audio_mask have the same length before applying mask
@@ -1450,9 +1483,11 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         target_len = torch.clamp(target_len, max=self.get_frame_count_from_time_series_length(audio_signal.shape[0]))
         targets = self.get_soft_targets_seg(feat_level_target=frame_level_target, target_len=target_len)
         targets = targets[:target_len, :]
-        actual_n_spk = (targets >= self.soft_label_thres).any(dim=0).sum().item()
+        # TODO: support self.soft_targets parameter - now targets are always soft
+
+        #actual_n_spk = (targets >= self.soft_label_thres).any(dim=0).sum().item()
         #logging.info(
-        #    f"uniq_id: {sample.uniq_id}, targets: {targets.shape}, target_len: {target_len}, actual n_spk: {actual_n_spk}"
+        #    f"uniq_id: {sample.uniq_id}, targets shape: {targets.shape}, target_len: {target_len}, actual n_spk: {actual_n_spk}"
         #)
         return audio_signal, audio_signal_length, targets, target_len
 
@@ -1612,6 +1647,7 @@ class AudioToSpeechE2ESpkDiarDataset(_AudioToSpeechE2ESpkDiarDataset):
         subsegment_min_len_sec: float = 15.0,
         subsegment_two_chunks_rate: float = 0.0,
         subsegment_min_chunk_len_sec: float = 10.0,
+        subsegment_margin_frames: int = 0,
     ):
         super().__init__(
             manifest_filepath=manifest_filepath,
@@ -1628,6 +1664,7 @@ class AudioToSpeechE2ESpkDiarDataset(_AudioToSpeechE2ESpkDiarDataset):
             subsegment_min_len_sec=subsegment_min_len_sec,
             subsegment_two_chunks_rate=subsegment_two_chunks_rate,
             subsegment_min_chunk_len_sec=subsegment_min_chunk_len_sec,
+            subsegment_margin_frames=subsegment_margin_frames,
         )
 
     def eesd_train_collate_fn(self, batch):

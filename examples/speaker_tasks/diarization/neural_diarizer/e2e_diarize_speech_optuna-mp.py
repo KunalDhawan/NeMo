@@ -52,7 +52,9 @@ from typing import Dict, List, Optional, Union
 
 import lightning.pytorch as pl
 import optuna
+import optuna.storages
 import torch
+import torch.multiprocessing as mp
 from omegaconf import OmegaConf
 from pytorch_lightning import seed_everything
 
@@ -169,9 +171,9 @@ class DiarizationConfig:
     launch_pp_optim: bool = False  # If True, launch optimization process for postprocessing parameters
     optuna_study_name: str = "optim_postprocessing"
     optuna_temp_dir: str = "/tmp/optuna"
-    optuna_storage: str = f"sqlite:///{optuna_study_name}.db"
     optuna_log_file: str = f"{optuna_study_name}.log"
     optuna_n_trials: int = 100000
+    optuna_n_jobs: int = 1  # Number of parallel worker processes for Optuna optimization
 
     # Optuna search ranges for postprocessing parameters
     optuna_onset_min: float = 0.4
@@ -291,24 +293,55 @@ def diarization_objective(
     return der
 
 
-def run_optuna_hyperparam_search(
-    cfg: DiarizationConfig,  # type: DiarizationConfig
-    postprocessing_cfg: PostProcessingParams,
+def _create_optuna_storage(cfg: DiarizationConfig) -> optuna.storages.JournalStorage:
+    """
+    Create an Optuna JournalStorage backed by a file.
+    JournalStorage uses append-only file I/O, which handles high concurrency
+    (tens of parallel workers) far better than SQLite.
+
+    Args:
+        cfg (DiarizationConfig): The configuration object containing Optuna temp dir and study name.
+
+    Returns:
+        optuna.storages.JournalStorage: The Optuna storage backend.
+    """
+    journal_path = os.path.join(cfg.optuna_temp_dir, f"{cfg.optuna_study_name}.journal")
+    return optuna.storages.JournalStorage(
+        optuna.storages.journal.JournalFileBackend(journal_path),
+    )
+
+
+def _optuna_worker(
+    cfg_dict: dict,
+    postprocessing_dict: dict,
     infer_audio_rttm_dict: Dict[str, Dict[str, str]],
     preds_list: List[torch.Tensor],
     temp_out_dir: str,
+    n_trials: int,
+    worker_id: int,
 ):
     """
-    Run Optuna hyperparameter optimization for speaker diarization.
+    Worker process for parallel Optuna optimization.
+    Each worker independently loads the study from JournalStorage
+    and runs its assigned portion of trials.
+
+    Uses 'spawn' start method, so all arguments must be picklable.
+    OmegaConf objects are passed as plain dicts and reconstructed here.
 
     Args:
-        cfg (DiarizationConfig): The configuration object containing model and dataset details.
-        postprocessing_cfg (PostProcessingParams): The current postprocessing configuration.
-        infer_audio_rttm_dict (dict): dictionary of audio file path, offset, duration and RTTM filepath.
-        preds_list (List[torch.Tensor]): list of prediction matrices containing sigmoid values for each speaker.
-            Dimension: [(1, num_frames, num_speakers), ..., (1, num_frames, num_speakers)]
-        temp_out_dir (str): temporary directory for storing intermediate outputs.
+        cfg_dict (dict): The configuration as a plain dict (converted from OmegaConf).
+        postprocessing_dict (dict): The postprocessing config as a plain dict.
+        infer_audio_rttm_dict (Dict[str, Dict[str, str]]): Audio-RTTM mapping dictionary.
+        preds_list (List[torch.Tensor]): Shared-memory prediction tensors.
+        temp_out_dir (str): Temporary directory for intermediate outputs.
+        n_trials (int): Number of trials this worker should run.
+        worker_id (int): Worker index for logging purposes.
     """
+    # Reconstruct OmegaConf objects from plain dicts in the spawned process
+    cfg = OmegaConf.create(cfg_dict)
+    postprocessing_cfg = OmegaConf.structured(PostProcessingParams(**postprocessing_dict))
+
+    logging.info(f"Optuna worker {worker_id} starting with {n_trials} trials...")
     worker_function = lambda trial: diarization_objective(
         trial=trial,
         cfg=cfg,
@@ -318,16 +351,123 @@ def run_optuna_hyperparam_search(
         diar_model_preds_total_list=preds_list,
         collar=cfg.collar,
     )
-    study = optuna.create_study(
-        direction="minimize", study_name=cfg.optuna_study_name, storage=cfg.optuna_storage, load_if_exists=True
-    )
+    storage = _create_optuna_storage(cfg)
+    study = optuna.load_study(study_name=cfg.optuna_study_name, storage=storage)
+    study.optimize(worker_function, n_trials=n_trials)
+    logging.info(f"Optuna worker {worker_id} finished.")
+
+
+def run_optuna_hyperparam_search(
+    cfg: DiarizationConfig,
+    postprocessing_cfg: PostProcessingParams,
+    infer_audio_rttm_dict: Dict[str, Dict[str, str]],
+    preds_list: List[torch.Tensor],
+    temp_out_dir: str,
+):
+    """
+    Run Optuna hyperparameter optimization for speaker diarization.
+    Supports both single-process and multi-process modes via cfg.optuna_n_jobs.
+    Uses JournalStorage (append-only file) for high-concurrency safety.
+
+    Args:
+        cfg (DiarizationConfig): The configuration object containing model and dataset details.
+        postprocessing_cfg (PostProcessingParams): The current postprocessing configuration.
+        infer_audio_rttm_dict (dict): dictionary of audio file path, offset, duration and RTTM filepath.
+        preds_list (List[torch.Tensor]): list of prediction matrices containing sigmoid values for each speaker.
+            Dimension: [(1, num_frames, num_speakers), ..., (1, num_frames, num_speakers)]
+        temp_out_dir (str): temporary directory for storing intermediate outputs.
+    """
+    # Setup logging
     logger = logging.getLogger()
-    logger.setLevel(logging.INFO)  # Setup the root logger.
+    logger.setLevel(logging.INFO)
     if cfg.optuna_log_file is not None:
         logger.addHandler(logging.FileHandler(cfg.optuna_log_file, mode="a"))
     logger.addHandler(logging.StreamHandler())
-    optuna.logging.enable_propagation()  # Propagate logs to the root logger.
-    study.optimize(worker_function, n_trials=cfg.optuna_n_trials)
+    optuna.logging.enable_propagation()
+
+    # Create the study (ensures it exists before workers try to load it)
+    storage = _create_optuna_storage(cfg)
+    study = optuna.create_study(
+        direction="minimize", study_name=cfg.optuna_study_name, storage=storage, load_if_exists=True
+    )
+
+    n_jobs = cfg.optuna_n_jobs
+
+    if n_jobs <= 1:
+        # Single-process mode (original behavior)
+        logging.info("Running Optuna optimization in single-process mode.")
+        worker_function = lambda trial: diarization_objective(
+            trial=trial,
+            cfg=cfg,
+            postprocessing_cfg=postprocessing_cfg,
+            temp_out_dir=temp_out_dir,
+            infer_audio_rttm_dict=infer_audio_rttm_dict,
+            diar_model_preds_total_list=preds_list,
+            collar=cfg.collar,
+        )
+        study.optimize(worker_function, n_trials=cfg.optuna_n_trials)
+    else:
+        # Multi-process mode using 'spawn' context.
+        # 'spawn' starts fresh child processes (no inherited CUDA/PyTorch state),
+        # which avoids deadlocks that 'fork' causes after CUDA initialization.
+        spawn_ctx = mp.get_context('spawn')
+
+        logging.info(
+            f"Running Optuna optimization with {n_jobs} parallel workers "
+            f"({cfg.optuna_n_trials} total trials, start_method='spawn')."
+        )
+
+        # Move prediction tensors to shared memory so spawned processes
+        # can access them without copying (via file-descriptor sharing).
+        for t in preds_list:
+            t.share_memory_()
+
+        # Convert OmegaConf objects to plain dicts for pickling (required by 'spawn')
+        cfg_dict = OmegaConf.to_container(cfg, resolve=True)
+        postprocessing_dict = OmegaConf.to_container(
+            OmegaConf.structured(postprocessing_cfg), resolve=True
+        )
+
+        # Distribute trials evenly across workers
+        trials_per_worker = cfg.optuna_n_trials // n_jobs
+        remainder = cfg.optuna_n_trials % n_jobs
+
+        processes = []
+        try:
+            for i in range(n_jobs):
+                n_trials = trials_per_worker + (1 if i < remainder else 0)
+                p = spawn_ctx.Process(
+                    target=_optuna_worker,
+                    args=(cfg_dict, postprocessing_dict, infer_audio_rttm_dict,
+                          preds_list, temp_out_dir, n_trials, i),
+                )
+                p.start()
+                processes.append(p)
+                logging.info(f"Started worker {i} (pid={p.pid}, n_trials={n_trials})")
+
+            # Wait for all workers to finish
+            for i, p in enumerate(processes):
+                p.join()
+                if p.exitcode != 0:
+                    logging.warning(f"Worker {i} (pid={p.pid}) exited with code {p.exitcode}")
+        except (KeyboardInterrupt, Exception) as e:
+            logging.error(f"Interrupted or error: {e}. Terminating all workers...")
+            for p in processes:
+                if p.is_alive():
+                    p.terminate()
+            # Give workers a moment to terminate gracefully, then force-kill
+            for p in processes:
+                p.join(timeout=10)
+                if p.is_alive():
+                    p.kill()
+            raise
+
+        # Reload the study to report best results
+        storage = _create_optuna_storage(cfg)
+        study = optuna.load_study(study_name=cfg.optuna_study_name, storage=storage)
+
+    logging.info(f"Optuna optimization complete. Best DER: {study.best_value:.4f}")
+    logging.info(f"Best params: {study.best_params}")
 
 
 def convert_pred_mat_to_segments(
@@ -497,8 +637,10 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     postprocessing_cfg = load_postprocessing_from_yaml(cfg.postprocessing_yaml)
     tensor_path, model_id, tensor_filename = get_tensor_path(cfg)
     cfg.optuna_study_name = f"__{model_id}_{tensor_filename}"
-    cfg.optuna_storage: str = f"sqlite:///{cfg.optuna_temp_dir}/{cfg.optuna_study_name}.db"
     cfg.optuna_log_file: str = f"{cfg.optuna_temp_dir}/{cfg.optuna_study_name}.log"
+
+    # Ensure optuna temp directory exists (for journal storage and log files)
+    os.makedirs(cfg.optuna_temp_dir, exist_ok=True)
 
     if os.path.exists(tensor_path) and cfg.save_preds_tensors:
         logging.info(
