@@ -148,6 +148,10 @@ class DiarizationConfig:
     use_lhotse: bool = True
     batch_duration: int = 100000
 
+    # Output resolution
+    output_subsampling_factor: int = 0  # Output subsampling factor. 0 = use model's default. Set to 1 for 10ms output.
+    upsample_smooth_kernel: int = 0  # Smoothing kernel for upsampling. 0 = use model's default.
+
     # Eval Settings: (0.25, False) should be default setting for sortformer eval.
     collar: float = 0.25  # Collar in seconds for DER calculation
     ignore_overlap: bool = False  # If True, DER will be calculated only for non-overlapping segments
@@ -276,7 +280,7 @@ def diarization_objective(
             audio_rttm_map_dict=infer_audio_rttm_dict,
             postprocessing_cfg=postprocessing_cfg,
             batch_preds_list=diar_model_preds_total_list,
-            unit_10ms_frame_count=8,
+            unit_10ms_frame_count=cfg.output_subsampling_factor if cfg.output_subsampling_factor > 0 else 8,
             bypass_postprocessing=False,
         )
         metric, _, _ = score_labels(
@@ -476,6 +480,28 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     diar_model._cfg.test_ds.batch_duration = cfg.batch_duration
     OmegaConf.set_struct(diar_model._cfg, True)
 
+    # Override output resolution if specified in the inference config.
+    # Must happen BEFORE setup_test_data so the dataloader generates targets at the right resolution.
+    if cfg.output_subsampling_factor > 0:
+        encoder_subsample = diar_model._cfg.encoder.get("subsampling_factor", 8)
+        valid_factors = [d for d in range(1, encoder_subsample + 1) if encoder_subsample % d == 0]
+        if cfg.output_subsampling_factor not in valid_factors:
+            raise ValueError(
+                f"output_subsampling_factor ({cfg.output_subsampling_factor}) is invalid. "
+                f"Must be a positive divisor of encoder.subsampling_factor ({encoder_subsample}). "
+                f"Valid values: {valid_factors}"
+            )
+        diar_model.output_subsampling_factor = cfg.output_subsampling_factor
+        diar_model.upsample_factor = encoder_subsample // cfg.output_subsampling_factor
+        logging.info(
+            f"Overriding output_subsampling_factor={cfg.output_subsampling_factor} "
+            f"(upsample_factor={diar_model.upsample_factor})"
+        )
+        if cfg.upsample_smooth_kernel > 0:
+            diar_model.upsample_smooth_kernel = cfg.upsample_smooth_kernel
+        else:
+            diar_model.upsample_smooth_kernel = diar_model.upsample_factor + 1
+
     # Model setup for inference
     diar_model._cfg.test_ds.num_workers = cfg.num_workers
     diar_model.setup_test_data(test_data_config=diar_model._cfg.test_ds)
@@ -530,11 +556,12 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
             os.mkdir(cfg.out_rttm_dir)
 
         logging.info("Running offline diarization evaluation...")
+        unit_10ms = diar_model.output_subsampling_factor if hasattr(diar_model, 'output_subsampling_factor') else 8
         all_hyps, all_refs, all_uems = convert_pred_mat_to_segments(
             infer_audio_rttm_dict,
             postprocessing_cfg=postprocessing_cfg,
             batch_preds_list=diar_model_preds_total_list,
-            unit_10ms_frame_count=8,
+            unit_10ms_frame_count=unit_10ms,
             bypass_postprocessing=cfg.bypass_postprocessing,
             out_rttm_dir=cfg.out_rttm_dir,
         )

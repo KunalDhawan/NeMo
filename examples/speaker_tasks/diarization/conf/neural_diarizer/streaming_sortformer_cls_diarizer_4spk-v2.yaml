@@ -13,6 +13,7 @@ model:
   pil_weight: 0.5 # Weight for Permutation Invariant Loss (PIL) used in training the Sortformer diarizer model
   ats_weight: 0.5 # Weight for Arrival Time Sort (ATS) loss in training the Sortformer diarizer model
   max_num_of_spks: 4 # Maximum number of speakers per model; currently set to 4
+  output_subsampling_factor: 8 # Output resolution factor. Set to 1 for 10ms output (upsampled from encoder's 80ms).
   streaming_mode: True
 
   model_defaults:

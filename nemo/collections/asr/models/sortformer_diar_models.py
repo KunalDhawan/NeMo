@@ -133,6 +133,20 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.max_batch_dur = self._cfg.get("max_batch_dur", 20000)
         self.concat_and_pad_script = torch.jit.script(self.sortformer_modules.concat_and_pad)
 
+        # Output upsampling: when output_subsampling_factor < encoder.subsampling_factor,
+        # sigmoid predictions are upsampled to produce finer-resolution output (e.g. 10ms).
+        encoder_subsample = self._cfg.encoder.get("subsampling_factor", 8)
+        self.output_subsampling_factor = self._cfg.get("output_subsampling_factor", encoder_subsample)
+        valid_factors = [d for d in range(1, encoder_subsample + 1) if encoder_subsample % d == 0]
+        if self.output_subsampling_factor not in valid_factors:
+            raise ValueError(
+                f"output_subsampling_factor ({self.output_subsampling_factor}) is invalid. "
+                f"Must be a positive divisor of encoder.subsampling_factor ({encoder_subsample}). "
+                f"Valid values: {valid_factors}"
+            )
+        self.upsample_factor = encoder_subsample // self.output_subsampling_factor
+        self.upsample_smooth_kernel = self._cfg.get("upsample_smooth_kernel", self.upsample_factor + 1)
+
     def _init_loss_weights(self):
         pil_weight = self._cfg.get("pil_weight", 0.0)
         ats_weight = self._cfg.get("ats_weight", 1.0)
@@ -205,6 +219,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             featurizer=featurizer,
             fb_featurizer=fb_featurizer,
             window_stride=self._cfg.preprocessor.window_stride,
+            subsampling_factor=self.output_subsampling_factor,
             global_rank=global_rank,
             soft_targets=config.soft_targets if 'soft_targets' in config else False,
             device=self.device,
@@ -374,7 +389,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 ts_mat = ts_vad_post_processing(
                     speaker_assign_mat[:, spk_id],
                     cfg_vad_params=diarcfg.postprocessing_params,
-                    unit_10ms_frame_count=int(self._cfg.encoder.subsampling_factor),
+                    unit_10ms_frame_count=int(self.output_subsampling_factor),
                     bypass_postprocessing=False,
                 )
                 ts_mat = ts_mat + offset
@@ -545,6 +560,10 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 processed_signal=processed_signal, processed_signal_length=processed_signal_length
             )
             preds = self.forward_infer(emb_seq, emb_seq_length)
+        if self.upsample_factor > 1:
+            preds = self.sortformer_modules.upsample_preds(
+                preds, upsample_factor=self.upsample_factor, smooth_kernel=self.upsample_smooth_kernel
+            )
         return preds
 
     @property
@@ -844,6 +863,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             )
             targets = targets[:, : preds.shape[1], :]
             target_lens = target_lens.clamp(max=preds.shape[1])
+        elif preds.shape[1] > targets.shape[1]:
+            preds = preds[:, : targets.shape[1], :]
         targets_ats = get_ats_targets(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
         targets_pil = get_pil_targets(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
         ats_loss = self.loss(probs=preds, labels=targets_ats, target_lens=target_lens)
@@ -917,6 +938,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             )
             targets = targets[:, : preds.shape[1], :]
             target_lens = target_lens.clamp(max=preds.shape[1])
+        elif preds.shape[1] > targets.shape[1]:
+            preds = preds[:, : targets.shape[1], :]
         targets_ats = get_ats_targets(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
         targets_pil = get_pil_targets(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
 
@@ -1049,6 +1072,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             )
             targets = targets[:, : preds.shape[1], :]
             target_lens = target_lens.clamp(max=preds.shape[1])
+        elif preds.shape[1] > targets.shape[1]:
+            preds = preds[:, : targets.shape[1], :]
         targets_ats = get_ats_targets(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
         targets_pil = get_pil_targets(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
         self._accuracy_test(preds, targets_pil, target_lens)

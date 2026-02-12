@@ -1258,6 +1258,18 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
                 Number of segments for each scale. This information is used for reshaping embedding batch
                 during forward propagation.
         """
+        stride = int(self.feat_per_sec * self.diar_frame_length)
+
+        # When stride<=1 (no subsampling), there is a 1:1 mapping between feature
+        # frames and diarization steps. Compute target_len directly from the audio
+        # duration rather than going through get_subsegments, which would fail because
+        # the subsegment window is shorter than min_subsegment_duration.
+        if stride <= 1:
+            num_frames = int(
+                np.ceil((1 + duration * sample_rate) / int(sample_rate / self.feat_per_sec))
+            )
+            return torch.tensor([num_frames])
+
         subsegments = get_subsegments(
             offset=offset,
             window=round(self.diar_frame_length * 2, self.round_digits),
@@ -1651,6 +1663,7 @@ class AudioToSpeechE2ESpkDiarDataset(_AudioToSpeechE2ESpkDiarDataset):
         global_rank: int,
         soft_targets: bool,
         device: str,
+        subsampling_factor: int = 8,
         subsegment_mode: bool = False,
         subsegment_min_len_sec: float = 15.0,
         subsegment_two_chunks_rate: float = 0.0,
@@ -1665,6 +1678,7 @@ class AudioToSpeechE2ESpkDiarDataset(_AudioToSpeechE2ESpkDiarDataset):
             featurizer=featurizer,
             fb_featurizer=fb_featurizer,
             window_stride=window_stride,
+            subsampling_factor=subsampling_factor,
             global_rank=global_rank,
             soft_targets=soft_targets,
             device=device,

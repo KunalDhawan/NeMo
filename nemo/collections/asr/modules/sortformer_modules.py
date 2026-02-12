@@ -256,6 +256,40 @@ class SortformerModules(NeuralModule, Exportable):
         return preds
 
     @staticmethod
+    def upsample_preds(preds, upsample_factor, smooth_kernel=9):
+        """
+        Upsample speaker probability predictions by repeating each frame and smoothing
+        with average pooling. This converts coarse-resolution (e.g. 80ms) predictions to
+        fine-resolution (e.g. 10ms) by interpolating in probability space.
+
+        Args:
+            preds (torch.Tensor): Speaker probabilities at encoder resolution.
+                Shape: (batch_size, n_frames, n_spk)
+            upsample_factor (int): Factor by which to upsample (e.g. 8 for 80ms -> 10ms).
+            smooth_kernel (int): Kernel size for average pooling to smooth step artifacts
+                from the repeat operation. Must be odd. Use 1 to skip smoothing.
+
+        Returns:
+            upsampled (torch.Tensor): Upsampled speaker probabilities.
+                Shape: (batch_size, n_frames * upsample_factor, n_spk)
+        """
+        if upsample_factor <= 1:
+            return preds
+
+        # Repeat each frame upsample_factor times: (B, T, S) -> (B, T*factor, S)
+        upsampled = preds.repeat_interleave(upsample_factor, dim=1)
+
+        if smooth_kernel > 1:
+            # avg_pool1d expects (B, C, T), so transpose speaker and time dims
+            # Process each speaker channel through avg-pool to smooth transitions
+            x = upsampled.transpose(1, 2)  # (B, S, T*factor)
+            padding = smooth_kernel // 2
+            x = F.avg_pool1d(x, kernel_size=smooth_kernel, stride=1, padding=padding)
+            upsampled = x.transpose(1, 2)  # (B, T*factor, S)
+
+        return upsampled
+
+    @staticmethod
     def concat_embs(
         list_of_tensors=List[torch.Tensor],
         return_lengths: bool = False,
