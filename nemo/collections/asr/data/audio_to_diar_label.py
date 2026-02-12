@@ -1217,8 +1217,16 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
                 Tensor variable containing soft-labels of speaker activity in each step-level segment.
         """
         num_seg = torch.max(target_len)
-        targets = torch.zeros(num_seg, self.max_spks)
         stride = int(self.feat_per_sec * self.diar_frame_length)
+
+        # When stride=1 (no subsampling), there is a 1:1 mapping between feature
+        # frames and diarization steps. Skip the averaging loop entirely to avoid
+        # an indexing bug (empty slice at index=0) and the performance cost of a
+        # Python loop over potentially thousands of frames.
+        if stride <= 1:
+            return feat_level_target[:num_seg, :].clone()
+
+        targets = torch.zeros(num_seg, self.max_spks)
         for index in range(num_seg):
             if index == 0:
                 seg_stt_feat = 0

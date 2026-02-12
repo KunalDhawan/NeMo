@@ -97,7 +97,11 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         super().__init__(cfg=self._cfg, trainer=trainer)
         self.preprocessor = NextformerEncLabelModel.from_config_dict(self._cfg.preprocessor)
 
-        if hasattr(self._cfg, 'spec_augment') and self._cfg.spec_augment is not None:
+        if (
+            hasattr(self._cfg, 'spec_augment')
+            and self._cfg.spec_augment is not None
+            and self._cfg.spec_augment.get('freq_masks', 0) + self._cfg.spec_augment.get('time_masks', 0) > 0
+        ):
             self.spec_augmentation = NextformerEncLabelModel.from_config_dict(self._cfg.spec_augment)
         else:
             self.spec_augmentation = None

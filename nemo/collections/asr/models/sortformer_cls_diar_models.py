@@ -101,7 +101,11 @@ class SortformerCLSEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationM
         super().__init__(cfg=self._cfg, trainer=trainer)
         self.preprocessor = SortformerCLSEncLabelModel.from_config_dict(self._cfg.preprocessor)
 
-        if hasattr(self._cfg, 'spec_augment') and self._cfg.spec_augment is not None:
+        if (
+            hasattr(self._cfg, 'spec_augment')
+            and self._cfg.spec_augment is not None
+            and self._cfg.spec_augment.get('freq_masks', 0) + self._cfg.spec_augment.get('time_masks', 0) > 0
+        ):
             self.spec_augmentation = SortformerCLSEncLabelModel.from_config_dict(self._cfg.spec_augment)
         else:
             self.spec_augmentation = None
@@ -709,7 +713,9 @@ class SortformerCLSEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationM
         )
         processed_signal = processed_signal[:, :, : processed_signal_length.max()]
 
-        if self.spec_augmentation is not None and self.training:
+        # Spec augment is not applied during evaluation/testing.
+        # In streaming mode, spec augment is applied per-chunk in forward_streaming_step, so skip it here.
+        if self.spec_augmentation is not None and self.training and not self.streaming_mode:
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
 
         if self.streaming_mode:
@@ -943,6 +949,11 @@ class SortformerCLSEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationM
                 Tensor containing the updated total predicted speaker activity probabilities.
                 Shape: (batch_size, cumulative pred length, num_speakers)
         """
+        # Per-chunk spec augment: each chunk gets independently sampled masks,
+        # simulating acoustic condition mismatch between cached and current embeddings.
+        if self.spec_augmentation is not None and self.training:
+            processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
+
         chunk_pre_encode_embs, chunk_pre_encode_lengths = self.encoder.pre_encode(
             x=processed_signal, lengths=processed_signal_length
         )

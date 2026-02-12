@@ -117,6 +117,13 @@ model:
     frame_splicing: 1
     dither: 0.00001
 
+  spec_augment:
+    _target_: nemo.collections.asr.modules.SpectrogramAugmentation
+    freq_masks: 0
+    time_masks: 0
+    freq_width: 1
+    time_width: 0.02
+
   nextformer_modules:
     _target_: nemo.collections.asr.modules.nextformer_modules.NextformerModules
     ff_dropout_rate: 0.5 # Dropout rate

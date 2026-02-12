@@ -94,7 +94,11 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         super().__init__(cfg=self._cfg, trainer=trainer)
         self.preprocessor = SortformerEncLabelModel.from_config_dict(self._cfg.preprocessor)
 
-        if hasattr(self._cfg, 'spec_augment') and self._cfg.spec_augment is not None:
+        if (
+            hasattr(self._cfg, 'spec_augment')
+            and self._cfg.spec_augment is not None
+            and self._cfg.spec_augment.get('freq_masks', 0) + self._cfg.spec_augment.get('time_masks', 0) > 0
+        ):
             self.spec_augmentation = SortformerEncLabelModel.from_config_dict(self._cfg.spec_augment)
         else:
             self.spec_augmentation = None
@@ -280,8 +284,10 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             emb_seq_length (torch.Tensor):
                 tensor containing lengths of encoder outputs.
         """
-        # Spec augment is not applied during evaluation/testing
-        if self.spec_augmentation is not None and self.training:
+        # Spec augment is not applied during evaluation/testing.
+        # In streaming mode (bypass_pre_encode=True), spec augment is applied per-chunk
+        # in forward_streaming_step before pre_encode, so skip it here.
+        if self.spec_augmentation is not None and self.training and not bypass_pre_encode:
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
         emb_seq, emb_seq_length = self.encoder(
             audio_signal=processed_signal,
@@ -751,6 +757,11 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 Tensor containing the updated total predicted speaker activity probabilities.
                 Shape: (batch_size, cumulative pred length, num_speakers)
         """
+        # Per-chunk spec augment: each chunk gets independently sampled masks,
+        # simulating acoustic condition mismatch between cached and current embeddings.
+        if self.spec_augmentation is not None and self.training:
+            processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
+
         chunk_pre_encode_embs, chunk_pre_encode_lengths = self.encoder.pre_encode(
             x=processed_signal, lengths=processed_signal_length
         )
