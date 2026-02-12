@@ -759,8 +759,12 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         """
         # Per-chunk spec augment: each chunk gets independently sampled masks,
         # simulating acoustic condition mismatch between cached and current embeddings.
+        # Note: processed_signal arrives as (B, T, D) from streaming_feat_loader (transposed),
+        # but SpecAugment expects (B, D, T), so we transpose before and after.
         if self.spec_augmentation is not None and self.training:
-            processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
+            processed_signal = self.spec_augmentation(
+                input_spec=processed_signal.transpose(1, 2), length=processed_signal_length
+            ).transpose(1, 2)
 
         chunk_pre_encode_embs, chunk_pre_encode_lengths = self.encoder.pre_encode(
             x=processed_signal, lengths=processed_signal_length
