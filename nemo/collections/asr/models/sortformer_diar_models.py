@@ -36,7 +36,12 @@ from nemo.collections.asr.models.asr_model import ExportableEncDecModel
 from nemo.collections.asr.parts.mixins.diarization import DiarizeConfig, SpkDiarizationMixin
 from nemo.collections.asr.parts.preprocessing.features import FilterbankFeatures, WaveformFeaturizer
 from nemo.collections.asr.parts.preprocessing.perturb import process_augmentations
-from nemo.collections.asr.parts.utils.asr_multispeaker_utils import get_ats_targets, get_pil_targets
+from nemo.collections.asr.modules.sortformer_modules import StreamingChunkTargetInfo
+from nemo.collections.asr.parts.utils.asr_multispeaker_utils import (
+    get_ats_targets,
+    get_ats_targets_streaming,
+    get_pil_targets,
+)
 from nemo.collections.asr.parts.utils.speaker_utils import generate_diarization_output_lines
 from nemo.collections.asr.parts.utils.vad_utils import ts_vad_post_processing
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
@@ -153,10 +158,18 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
     def _init_loss_weights(self):
         pil_weight = self._cfg.get("pil_weight", 0.0)
         ats_weight = self._cfg.get("ats_weight", 1.0)
-        if pil_weight + ats_weight == 0:
-            raise ValueError(f"weights for PIL {pil_weight} and ATS {ats_weight} cannot sum to 0")
-        self.pil_weight = pil_weight / (pil_weight + ats_weight)
-        self.ats_weight = ats_weight / (pil_weight + ats_weight)
+        local_pil_weight = self._cfg.get("local_pil_weight", 0.0)
+        local_ats_weight = self._cfg.get("local_ats_weight", 0.0)
+        total = pil_weight + ats_weight + local_pil_weight + local_ats_weight
+        if total == 0:
+            raise ValueError(
+                f"Loss weights cannot all be zero: pil={pil_weight}, ats={ats_weight}, "
+                f"local_pil={local_pil_weight}, local_ats={local_ats_weight}"
+            )
+        self.pil_weight = pil_weight / total
+        self.ats_weight = ats_weight / total
+        self.local_pil_weight = local_pil_weight / total
+        self.local_ats_weight = local_ats_weight / total
 
     def _init_eval_metrics(self):
         """
@@ -557,12 +570,14 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         )
         processed_signal = processed_signal[:, :, : processed_signal_length.max()]
         if self.streaming_mode:
-            preds = self.forward_streaming(processed_signal, processed_signal_length)
+            preds, chunk_info_list = self.forward_streaming(processed_signal, processed_signal_length)
+            self._streaming_chunk_info = chunk_info_list
         else:
             emb_seq, emb_seq_length = self.frontend_encoder(
                 processed_signal=processed_signal, processed_signal_length=processed_signal_length
             )
             preds = self.forward_infer(emb_seq, emb_seq_length)
+            self._streaming_chunk_info = None
         if self.upsample_factor > 1:
             preds = self.sortformer_modules.upsample_preds(
                 preds, upsample_factor=self.upsample_factor, smooth_kernel=self.upsample_smooth_kernel
@@ -663,6 +678,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             total_preds (torch.Tensor): Tensor containing predicted speaker labels for the current chunk
                 and all previous chunks
                 Shape: (batch_size, pred_len, num_speakers)
+            chunk_info_list (list[StreamingChunkTargetInfo] or None): Per-chunk supplementary info
+                for per-chunk target alignment during training. None when not training.
         """
         streaming_state = self.sortformer_modules.init_streaming_state(
             batch_size=processed_signal.shape[0], async_streaming=self.async_streaming, device=self.device
@@ -710,20 +727,32 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             feat_seq_length=processed_signal_length,
             feat_seq_offset=processed_signal_offset,
         )
-        for _, chunk_feat_seq_t, feat_lengths, left_offset, right_offset in tqdm(
+
+        chunk_info_list = []
+        frame_offset = 0
+
+        for i, chunk_feat_seq_t, feat_lengths, left_offset, right_offset in tqdm(
             streaming_loader,
             total=num_chunks,
             desc="Streaming Steps",
             disable=self.training,
         ):
-            streaming_state, total_preds = self.forward_streaming_step(
+            streaming_state, total_preds, chunk_target_info = self.forward_streaming_step(
                 processed_signal=chunk_feat_seq_t,
                 processed_signal_length=feat_lengths,
                 streaming_state=streaming_state,
                 total_preds=total_preds,
                 left_offset=left_offset,
                 right_offset=right_offset,
+                frame_offset=frame_offset,
+                collect_chunk_info=True,
             )
+            #if chunk_target_info is not None:
+            #    logging.info(f"i={i}: chunk_target_info: {chunk_target_info.frame_indices.shape}, {chunk_target_info.preds.shape}, {chunk_target_info.chunk_start}, {chunk_target_info.chunk_end}")
+            #    logging.info(f"i={i}: chunk_target_info.frame_indices: {chunk_target_info.frame_indices[0, :500]}")
+            chunk_len = chunk_target_info.chunk_end - chunk_target_info.chunk_start
+            chunk_info_list.append(chunk_target_info)
+            frame_offset += chunk_len
 
         if att_mod:
             self.encoder.att_context_size = [-1, -1]
@@ -734,7 +763,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         if sig_length < max_n_frames:  # Discard preds corresponding to padding
             n_frames = math.ceil(sig_length / self.encoder.subsampling_factor)
             total_preds = total_preds[:, :n_frames, :]
-        return total_preds
+        return total_preds, chunk_info_list
 
     def forward_streaming_step(
         self,
@@ -744,6 +773,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         total_preds,
         left_offset=0,
         right_offset=0,
+        frame_offset=0,
+        collect_chunk_info=False,
     ):
         """
         One-step forward pass for diarization inference in streaming mode.
@@ -770,6 +801,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 Shape: (batch_size, cumulative pred length, num_speakers)
             left_offset (int): left offset for the current chunk
             right_offset (int): right offset for the current chunk
+            frame_offset (int): cumulative target frame offset for the current chunk core
+            collect_chunk_info (bool): If True, build and return StreamingChunkTargetInfo
 
         Returns:
             streaming_state (SortformerStreamingState):
@@ -778,6 +811,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             total_preds (torch.Tensor):
                 Tensor containing the updated total predicted speaker activity probabilities.
                 Shape: (batch_size, cumulative pred length, num_speakers)
+            chunk_target_info (StreamingChunkTargetInfo or None):
+                Per-chunk supplementary info for target alignment. None if collect_chunk_info is False.
         """
         # Per-chunk spec augment: each chunk gets independently sampled masks,
         # simulating acoustic condition mismatch between cached and current embeddings.
@@ -818,26 +853,150 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         spkcache_fifo_chunk_preds = self.sortformer_modules.apply_mask_to_preds(
             spkcache_fifo_chunk_preds, spkcache_fifo_chunk_fc_encoder_lengths
         )
+
+        # Compute chunk geometry in pre-encode units
+        lc = round(left_offset / self.encoder.subsampling_factor)
+        rc = math.ceil(right_offset / self.encoder.subsampling_factor)
+        spkcache_len = streaming_state.spkcache.shape[1]
+        fifo_len = streaming_state.fifo.shape[1]
+        chunk_len = chunk_pre_encode_embs.shape[1] - lc - rc
+        batch_size = processed_signal.shape[0]
+
+        # Build per-chunk target info BEFORE streaming_update.
+        # Store canonical preds (after inv_spk_perm) and spkcache_len.
+        # ATS uses spkcache-based content matching (invariant to cache block ordering).
+        chunk_target_info = None
+        chunk_frame_indices = None
+        if collect_chunk_info:
+            # Build context_frame_indices: [spkcache_indices, fifo_indices, lc_indices, chunk_indices, rc_indices]
+            lc_start = max(frame_offset - lc, 0)
+            lc_actual = frame_offset - lc_start
+            lc_indices = torch.arange(lc_start, frame_offset, device=self.device).unsqueeze(0).expand(batch_size, -1)
+            chunk_indices = torch.arange(frame_offset, frame_offset + chunk_len, device=self.device).unsqueeze(0).expand(batch_size, -1)
+            rc_indices = torch.arange(frame_offset + chunk_len, frame_offset + chunk_len + rc, device=self.device).unsqueeze(0).expand(batch_size, -1)
+
+            context_frame_indices = torch.cat([
+                streaming_state.spkcache_frame_indices,
+                streaming_state.fifo_frame_indices,
+                lc_indices,
+                chunk_indices,
+                rc_indices,
+            ], dim=1)
+
+            chunk_start = spkcache_len + fifo_len + lc_actual
+            chunk_end = chunk_start + chunk_len
+
+            # Canonical preds: apply inv_spk_perm (same as streaming_update) so preds
+            # match total_preds ordering.
+            preds_for_info = spkcache_fifo_chunk_preds.detach()
+            if streaming_state.spk_perm is not None:
+                inv_spk_perm = torch.stack(
+                    [torch.argsort(streaming_state.spk_perm[b]) for b in range(batch_size)]
+                )
+                preds_for_info = torch.stack(
+                    [preds_for_info[b, :, inv_spk_perm[b]] for b in range(batch_size)]
+                )
+
+            chunk_target_info = StreamingChunkTargetInfo(
+                preds=preds_for_info,
+                frame_indices=context_frame_indices,
+                spkcache_len=spkcache_len,
+                chunk_start=chunk_start,
+                chunk_end=chunk_end,
+            )
+
+            # Core chunk frame indices for streaming_update frame tracking
+            chunk_frame_indices = chunk_indices
+
         if self.async_streaming:
             streaming_state, chunk_preds = self.sortformer_modules.streaming_update_async(
                 streaming_state=streaming_state,
                 chunk=chunk_pre_encode_embs,
                 chunk_lengths=chunk_pre_encode_lengths,
                 preds=spkcache_fifo_chunk_preds,
-                lc=round(left_offset / self.encoder.subsampling_factor),
-                rc=math.ceil(right_offset / self.encoder.subsampling_factor),
+                lc=lc,
+                rc=rc,
             )
         else:
             streaming_state, chunk_preds = self.sortformer_modules.streaming_update(
                 streaming_state=streaming_state,
                 chunk=chunk_pre_encode_embs,
                 preds=spkcache_fifo_chunk_preds,
-                lc=round(left_offset / self.encoder.subsampling_factor),
-                rc=math.ceil(right_offset / self.encoder.subsampling_factor),
+                lc=lc,
+                rc=rc,
+                chunk_frame_indices=chunk_frame_indices,
             )
         total_preds = torch.cat([total_preds, chunk_preds], dim=1)
 
-        return streaming_state, total_preds
+        return streaming_state, total_preds, chunk_target_info
+
+    def _get_per_chunk_aligned_targets(self, targets, chunk_info_list):
+        """
+        Compute ATS and PIL targets using per-chunk permutation alignment.
+
+        For each chunk, reconstructs the full-context targets from original target frames,
+        computes the optimal ATS/PIL permutation for that chunk's context, and extracts
+        only the chunk core portion. The chunk-level targets are then concatenated.
+
+        ATS uses spkcache-based content matching (get_ats_targets_streaming):
+        binarized preds and targets on the spkcache portion identify which pred column
+        corresponds to which speaker, invariant to cache block ordering. When not all
+        speakers are in the spkcache, full-context match score breaks ties.
+
+        PIL uses standard permutation-invariant matching on canonical preds.
+
+        Args:
+            targets (torch.Tensor): Full-sequence ground truth speaker labels.
+                Shape: (batch_size, total_frames, num_speakers)
+            chunk_info_list (list[StreamingChunkTargetInfo]): Per-chunk supplementary info.
+
+        Returns:
+            total_targets_ats (torch.Tensor): Per-chunk aligned ATS targets in canonical order.
+                Shape: (batch_size, total_pred_frames, num_speakers)
+            total_targets_pil (torch.Tensor): Per-chunk aligned PIL targets in canonical order.
+                Shape: (batch_size, total_pred_frames, num_speakers)
+        """
+        chunk_targets_ats_list = []
+        chunk_targets_pil_list = []
+        max_target_idx = targets.shape[1] - 1
+
+        for chunk_info in chunk_info_list:
+            frame_indices = chunk_info.frame_indices  # (B, context_len), long, -1 for invalid
+
+            # Build targets_i by gathering from original targets; clamp invalid indices for safe gather
+            invalid_mask = frame_indices < 0
+            safe_indices = frame_indices.clone()
+            safe_indices[invalid_mask] = 0
+            safe_indices = safe_indices.clamp(0, max_target_idx)
+
+            # Gather: (B, context_len, n_spk)
+            indices_expanded = safe_indices.unsqueeze(-1).expand(-1, -1, targets.shape[2])
+            targets_i = torch.gather(targets, 1, indices_expanded)
+            # Zero out invalid positions (silence frames in spkcache)
+            targets_i[invalid_mask.unsqueeze(-1).expand_as(targets_i)] = 0.0
+
+            preds_i = chunk_info.preds  # canonical ordering (after inv_spk_perm)
+
+            # ATS: spkcache-based content matching (invariant to cache block ordering)
+            targets_ats_i = get_ats_targets_streaming(
+                targets_i.clone(), preds_i,
+                speaker_permutations=self.speaker_permutations,
+                spkcache_len=chunk_info.spkcache_len,
+            )
+
+            # PIL: standard permutation-invariant matching on canonical preds
+            targets_pil_i = get_pil_targets(
+                targets_i.clone(), preds_i, speaker_permutations=self.speaker_permutations
+            )
+
+            # Extract chunk core portion
+            cs, ce = chunk_info.chunk_start, chunk_info.chunk_end
+            chunk_targets_ats_list.append(targets_ats_i[:, cs:ce, :])
+            chunk_targets_pil_list.append(targets_pil_i[:, cs:ce, :])
+
+        total_targets_ats = torch.cat(chunk_targets_ats_list, dim=1)
+        total_targets_pil = torch.cat(chunk_targets_pil_list, dim=1)
+        return total_targets_ats, total_targets_pil
 
     def _get_aux_train_evaluations(self, preds, targets, target_lens) -> dict:
         """
@@ -846,6 +1005,10 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         This function calculates various losses and metrics for the training process,
         including Arrival Time Sort (ATS) Loss and Permutation Invariant Loss (PIL)
         based evaluations.
+
+        When streaming chunk info is available (self._streaming_chunk_info), uses per-chunk
+        permutation alignment for correct gradient signals. Otherwise falls back to the
+        global permutation approach.
 
         Args:
             preds (torch.Tensor): Predicted speaker labels.
@@ -868,11 +1031,34 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             target_lens = target_lens.clamp(max=preds.shape[1])
         elif preds.shape[1] > targets.shape[1]:
             preds = preds[:, : targets.shape[1], :]
+
+        # Global targets (standard ATS/PIL on full concatenated predictions)
         targets_ats = get_ats_targets(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
         targets_pil = get_pil_targets(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
         ats_loss = self.loss(probs=preds, labels=targets_ats, target_lens=target_lens)
         pil_loss = self.loss(probs=preds, labels=targets_pil, target_lens=target_lens)
-        loss = self.ats_weight * ats_loss + self.pil_weight * pil_loss
+
+        # Local targets (per-chunk aligned, streaming only)
+        chunk_info_list = getattr(self, '_streaming_chunk_info', None)
+        if chunk_info_list:
+            local_targets_ats, local_targets_pil = self._get_per_chunk_aligned_targets(targets.clone(), chunk_info_list)
+            min_len = min(preds.shape[1], local_targets_ats.shape[1])
+            local_targets_ats = local_targets_ats[:, :min_len, :]
+            local_targets_pil = local_targets_pil[:, :min_len, :]
+            preds_local = preds[:, :min_len, :]
+            target_lens_local = target_lens.clamp(max=min_len)
+            local_ats_loss = self.loss(probs=preds_local, labels=local_targets_ats, target_lens=target_lens_local)
+            local_pil_loss = self.loss(probs=preds_local, labels=local_targets_pil, target_lens=target_lens_local)
+        else:
+            local_ats_loss = torch.tensor(0.0, device=preds.device)
+            local_pil_loss = torch.tensor(0.0, device=preds.device)
+
+        loss = (
+            self.ats_weight * ats_loss
+            + self.pil_weight * pil_loss
+            + self.local_ats_weight * local_ats_loss
+            + self.local_pil_weight * local_pil_loss
+        )
 
         self._accuracy_train(preds, targets_pil, target_lens)
         train_f1_acc, train_precision, train_recall = self._accuracy_train.compute()
@@ -884,6 +1070,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'loss': loss,
             'ats_loss': ats_loss,
             'pil_loss': pil_loss,
+            'local_ats_loss': local_ats_loss,
+            'local_pil_loss': local_pil_loss,
             'learning_rate': self._optimizer.param_groups[0]['lr'],
             'train_f1_acc': train_f1_acc,
             'train_precision': train_precision,
@@ -922,6 +1110,10 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         including Arrival Time Sort (ATS) Loss and Permutation Invariant Loss (PIL)
         based evaluations.
 
+        When streaming chunk info is available (self._streaming_chunk_info), uses per-chunk
+        permutation alignment for correct evaluation. Otherwise falls back to the
+        global permutation approach.
+
         Args:
             preds (torch.Tensor): Predicted speaker labels.
                 Shape: (batch_size, diar_frame_count, num_speakers)
@@ -943,12 +1135,34 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             target_lens = target_lens.clamp(max=preds.shape[1])
         elif preds.shape[1] > targets.shape[1]:
             preds = preds[:, : targets.shape[1], :]
+
+        # Global targets
         targets_ats = get_ats_targets(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
         targets_pil = get_pil_targets(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
-
         val_ats_loss = self.loss(probs=preds, labels=targets_ats, target_lens=target_lens)
         val_pil_loss = self.loss(probs=preds, labels=targets_pil, target_lens=target_lens)
-        val_loss = self.ats_weight * val_ats_loss + self.pil_weight * val_pil_loss
+
+        # Local targets (per-chunk aligned, streaming only)
+        chunk_info_list = getattr(self, '_streaming_chunk_info', None)
+        if chunk_info_list:
+            local_targets_ats, local_targets_pil = self._get_per_chunk_aligned_targets(targets.clone(), chunk_info_list)
+            min_len = min(preds.shape[1], local_targets_ats.shape[1])
+            local_targets_ats = local_targets_ats[:, :min_len, :]
+            local_targets_pil = local_targets_pil[:, :min_len, :]
+            preds_local = preds[:, :min_len, :]
+            target_lens_local = target_lens.clamp(max=min_len)
+            val_local_ats_loss = self.loss(probs=preds_local, labels=local_targets_ats, target_lens=target_lens_local)
+            val_local_pil_loss = self.loss(probs=preds_local, labels=local_targets_pil, target_lens=target_lens_local)
+        else:
+            val_local_ats_loss = torch.tensor(0.0, device=preds.device)
+            val_local_pil_loss = torch.tensor(0.0, device=preds.device)
+
+        val_loss = (
+            self.ats_weight * val_ats_loss
+            + self.pil_weight * val_pil_loss
+            + self.local_ats_weight * val_local_ats_loss
+            + self.local_pil_weight * val_local_pil_loss
+        )
 
         self._accuracy_valid(preds, targets_pil, target_lens)
         val_f1_acc, val_precision, val_recall = self._accuracy_valid.compute()
@@ -963,6 +1177,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'val_loss': val_loss,
             'val_ats_loss': val_ats_loss,
             'val_pil_loss': val_pil_loss,
+            'val_local_ats_loss': val_local_ats_loss,
+            'val_local_pil_loss': val_local_pil_loss,
             'val_f1_acc': val_f1_acc,
             'val_precision': val_precision,
             'val_recall': val_recall,
@@ -1033,6 +1249,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         val_loss_mean = torch.stack([x['val_loss'] for x in outputs]).mean()
         val_ats_loss_mean = torch.stack([x['val_ats_loss'] for x in outputs]).mean()
         val_pil_loss_mean = torch.stack([x['val_pil_loss'] for x in outputs]).mean()
+        val_local_ats_loss_mean = torch.stack([x['val_local_ats_loss'] for x in outputs]).mean()
+        val_local_pil_loss_mean = torch.stack([x['val_local_pil_loss'] for x in outputs]).mean()
         val_f1_acc_mean = torch.stack([x['val_f1_acc'] for x in outputs]).mean()
         val_precision_mean = torch.stack([x['val_precision'] for x in outputs]).mean()
         val_recall_mean = torch.stack([x['val_recall'] for x in outputs]).mean()
@@ -1044,6 +1262,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'val_loss': val_loss_mean,
             'val_ats_loss': val_ats_loss_mean,
             'val_pil_loss': val_pil_loss_mean,
+            'val_local_ats_loss': val_local_ats_loss_mean,
+            'val_local_pil_loss': val_local_pil_loss_mean,
             'val_f1_acc': val_f1_acc_mean,
             'val_precision': val_precision_mean,
             'val_recall': val_recall_mean,
@@ -1053,13 +1273,10 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
     def _get_aux_test_batch_evaluations(self, batch_idx: int, preds, targets, target_lens):
         """
-        Compute auxiliary validation evaluations including losses and metrics.
-
-        This function calculates various losses and metrics for the training process,
-        including Arrival Time Sort (ATS) Loss and Permutation Invariant Loss (PIL)
-        based evaluations.
+        Compute auxiliary test batch evaluations using global (standard) accuracy metrics.
 
         Args:
+            batch_idx (int): The index of the current batch.
             preds (torch.Tensor): Predicted speaker labels.
                 Shape: (batch_size, diar_frame_count, num_speakers)
             targets (torch.Tensor): Ground truth speaker labels.
@@ -1077,8 +1294,11 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             target_lens = target_lens.clamp(max=preds.shape[1])
         elif preds.shape[1] > targets.shape[1]:
             preds = preds[:, : targets.shape[1], :]
+
+        # Global targets
         targets_ats = get_ats_targets(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
         targets_pil = get_pil_targets(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
+
         self._accuracy_test(preds, targets_pil, target_lens)
         f1_acc, precision, recall = self._accuracy_test.compute()
         self.batch_f1_accs_list.append(f1_acc)

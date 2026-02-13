@@ -10,8 +10,10 @@ batch_size: 4
 
 model: 
   sample_rate: 16000
-  pil_weight: 0.5 # Weight for Permutation Invariant Loss (PIL) used in training the Sortformer diarizer model
-  ats_weight: 0.5 # Weight for Arrival Time Sort (ATS) loss in training the Sortformer diarizer model
+  pil_weight: 0.5 # Weight for global Permutation Invariant Loss (PIL)
+  ats_weight: 0.5 # Weight for global Arrival Time Sort (ATS) loss
+  local_pil_weight: 0.0 # Weight for per-chunk (local) PIL loss in streaming mode
+  local_ats_weight: 0.0 # Weight for per-chunk (local) ATS loss in streaming mode (uses spkcache-based speaker ID)
   max_num_of_spks: 4 # Maximum number of speakers per model; currently set to 4
   output_subsampling_factor: 8 # Output resolution factor. Set to 1 for 10ms output (upsampled from encoder's 80ms).
   streaming_mode: True

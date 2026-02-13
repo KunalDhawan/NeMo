@@ -991,7 +991,7 @@ class TestSortformerModules_StreamingScoreComputations:
         mean_sil_emb, _ = sortformer_modules._get_silence_profile(mean_sil_emb, n_sil_frames, emb_seq, preds)
 
         # Call the method
-        emb_seq_gathered, preds_gathered = sortformer_modules._gather_spkcache_and_preds(
+        emb_seq_gathered, preds_gathered, _ = sortformer_modules._gather_spkcache_and_preds(
             emb_seq, preds, topk_indices, is_disabled, mean_sil_emb
         )
 
@@ -1030,7 +1030,7 @@ class TestSortformerModules_StreamingScoreComputations:
 
         # Test edge case: all frames disabled
         all_disabled = torch.ones((batch_size, spkcache_len), dtype=torch.bool)
-        all_disabled_emb, all_disabled_preds = sortformer_modules._gather_spkcache_and_preds(
+        all_disabled_emb, all_disabled_preds, _ = sortformer_modules._gather_spkcache_and_preds(
             emb_seq, preds, topk_indices, all_disabled, mean_sil_emb
         )
 
@@ -1043,7 +1043,7 @@ class TestSortformerModules_StreamingScoreComputations:
 
         # Test edge case: no frames disabled
         no_disabled = torch.zeros((batch_size, spkcache_len), dtype=torch.bool)
-        no_disabled_emb, no_disabled_preds = sortformer_modules._gather_spkcache_and_preds(
+        no_disabled_emb, no_disabled_preds, _ = sortformer_modules._gather_spkcache_and_preds(
             emb_seq, preds, topk_indices, no_disabled, mean_sil_emb
         )
 
@@ -1059,7 +1059,7 @@ class TestSortformerModules_StreamingScoreComputations:
         edge_indices[:, 0] = 0  # First frame
         edge_indices[:, -1] = n_frames - 1  # Last frame
 
-        edge_emb, edge_preds = sortformer_modules._gather_spkcache_and_preds(
+        edge_emb, edge_preds, _ = sortformer_modules._gather_spkcache_and_preds(
             emb_seq, preds, edge_indices, is_disabled, mean_sil_emb
         )
 
@@ -1309,7 +1309,7 @@ class TestSortformerModules_StreamingScoreComputations:
         mean_sil_emb, _ = sortformer_modules._get_silence_profile(mean_sil_emb, n_sil_frames, emb_seq, preds)
 
         # Call the method without permutation
-        spkcache, spkcache_preds, spk_perm = sortformer_modules._compress_spkcache(
+        spkcache, spkcache_preds, spk_perm, _ = sortformer_modules._compress_spkcache(
             emb_seq, preds, mean_sil_emb, permute_spk=False
         )
 
@@ -1327,7 +1327,7 @@ class TestSortformerModules_StreamingScoreComputations:
         assert spkcache_preds.dtype == preds.dtype
 
         # Test with permutation enabled
-        spkcache_perm, spkcache_preds_perm, spk_perm_perm = sortformer_modules._compress_spkcache(
+        spkcache_perm, spkcache_preds_perm, spk_perm_perm, _ = sortformer_modules._compress_spkcache(
             emb_seq, preds, mean_sil_emb, permute_spk=True
         )
 
@@ -1346,7 +1346,7 @@ class TestSortformerModules_StreamingScoreComputations:
             mean_sil_emb_edge, _ = sortformer_modules._get_silence_profile(
                 mean_sil_emb, n_sil_frames, edge_emb_seq, edge_preds
             )
-            edge_spkcache, edge_spkcache_preds, edge_spk_perm = sortformer_modules._compress_spkcache(
+            edge_spkcache, edge_spkcache_preds, edge_spk_perm, _ = sortformer_modules._compress_spkcache(
                 edge_emb_seq, edge_preds, mean_sil_emb_edge, permute_spk=False
             )
 
@@ -1895,3 +1895,164 @@ class TestSortformerModules_StreamingUpdateAsync:
                 streaming_state.spkcache_preds[b, :max_spkcache_len],
                 expected_spkcache_preds,
             )
+
+
+class TestGetAtsTargetsStreaming:
+    """Tests for get_ats_targets_streaming function."""
+
+    @staticmethod
+    def _make_permutations(n_spk):
+        import itertools
+        return torch.tensor(list(itertools.permutations(range(n_spk))))
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("batch_size, num_frames, n_spk", [(10, 20, 4), (20, 30, 3), (30, 15, 2)])
+    def test_identical_to_get_ats_targets_when_spkcache_len_zero(self, batch_size, num_frames, n_spk):
+        """When spkcache_len=0, no speakers are pinned, so get_ats_targets_streaming
+        should produce identical results to get_ats_targets."""
+        from nemo.collections.asr.parts.utils.asr_multispeaker_utils import (
+            get_ats_targets,
+            get_ats_targets_streaming,
+        )
+
+        torch.manual_seed(42)
+        labels = (torch.rand(batch_size, num_frames, n_spk) > 0.5).float()
+        preds = torch.rand(batch_size, num_frames, n_spk)
+        speaker_permutations = self._make_permutations(n_spk)
+
+        result_standard = get_ats_targets(labels.clone(), preds, speaker_permutations)
+        result_streaming = get_ats_targets_streaming(labels.clone(), preds, speaker_permutations, spkcache_len=0)
+
+        assert torch.allclose(result_standard, result_streaming), (
+            f"Results differ when spkcache_len=0.\n"
+            f"Standard:\n{result_standard}\nStreaming:\n{result_streaming}"
+        )
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("batch_size, n_spk", [(1, 4), (2, 3)])
+    def test_pinned_speakers_override_arrival_order(self, batch_size, n_spk):
+        """When spkcache identifies speakers, those speakers should be pinned to the
+        correct columns regardless of their context-position arrival order."""
+        from nemo.collections.asr.parts.utils.asr_multispeaker_utils import get_ats_targets_streaming
+
+        torch.manual_seed(0)
+        speaker_permutations = self._make_permutations(n_spk)
+
+        # Build labels: spkcache portion has speaker columns in REVERSED block order,
+        # followed by a chunk portion in natural temporal order.
+        spkcache_len = n_spk * 5  # 5 frames per speaker block
+        chunk_len = 10
+        num_frames = spkcache_len + chunk_len
+
+        labels = torch.zeros(batch_size, num_frames, n_spk)
+        preds = torch.zeros(batch_size, num_frames, n_spk)
+
+        # Spkcache: blocks in reversed speaker order (speaker n_spk-1 first, speaker 0 last)
+        for s in range(n_spk):
+            block_start = (n_spk - 1 - s) * 5
+            labels[:, block_start:block_start + 5, s] = 1.0
+            preds[:, block_start:block_start + 5, s] = 0.9  # model predicts correctly in canonical order
+
+        # Chunk: all speakers active (for simplicity)
+        labels[:, spkcache_len:, :] = 1.0
+        preds[:, spkcache_len:, :] = 0.8
+
+        result = get_ats_targets_streaming(
+            labels.clone(), preds, speaker_permutations, spkcache_len=spkcache_len
+        )
+
+        # The result should have speakers in canonical column order (matching preds),
+        # NOT in reversed arrival order from context position.
+        # Check on the chunk portion where all speakers are active:
+        # each column should match the same column in labels (identity permutation)
+        chunk_result = result[:, spkcache_len:, :]
+        chunk_labels = labels[:, spkcache_len:, :]
+        assert torch.allclose(chunk_result, chunk_labels), (
+            f"Pinned speakers not correctly assigned.\n"
+            f"Expected:\n{chunk_labels}\nGot:\n{chunk_result}"
+        )
+
+    @pytest.mark.unit
+    def test_unpinned_speakers_get_arrival_order(self):
+        """Speakers absent from spkcache should be assigned to remaining columns
+        by their arrival order in the fifo/chunk portion."""
+        from nemo.collections.asr.parts.utils.asr_multispeaker_utils import get_ats_targets_streaming
+
+        speaker_permutations = self._make_permutations(4)
+        spkcache_len = 10
+        chunk_len = 20
+        num_frames = spkcache_len + chunk_len
+
+        labels = torch.zeros(1, num_frames, 4)
+        preds = torch.zeros(1, num_frames, 4)
+
+        # Spkcache: only speakers 0 and 1 are present
+        labels[0, :5, 0] = 1.0   # speaker 0 in first half of spkcache
+        labels[0, 5:10, 1] = 1.0  # speaker 1 in second half
+        preds[0, :5, 0] = 0.9
+        preds[0, 5:10, 1] = 0.9
+
+        # Chunk: speaker 3 arrives at frame 12, speaker 2 arrives at frame 18
+        # (reversed index order, so arrival order is 3 before 2)
+        labels[0, 12, 3] = 1.0
+        labels[0, 18, 2] = 1.0
+        preds[0, 12, 3] = 0.8
+        preds[0, 18, 2] = 0.8
+
+        result = get_ats_targets_streaming(
+            labels.clone(), preds, speaker_permutations, spkcache_len=spkcache_len
+        )
+
+        # Speakers 0 and 1 are pinned (from spkcache matching):
+        #   pred col 0 → speaker 0, pred col 1 → speaker 1
+        # Speakers 2 and 3 are unpinned. Speaker 3 arrives before speaker 2.
+        # Remaining columns are 2 and 3. In arrival order: speaker 3 (earlier) → col 2, speaker 2 → col 3.
+        # So result should have: col 0=spk0, col 1=spk1, col 2=spk3, col 3=spk2
+
+        # Check at frame 12: speaker 3 should be in column 2
+        assert result[0, 12, 2] == 1.0, f"Speaker 3 (arriving first) should be in column 2, got {result[0, 12, :]}"
+        # Check at frame 18: speaker 2 should be in column 3
+        assert result[0, 18, 3] == 1.0, f"Speaker 2 (arriving second) should be in column 3, got {result[0, 18, :]}"
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("batch_size, num_frames, n_spk", [(2, 30, 4), (1, 20, 3)])
+    def test_invariant_to_spkcache_block_order(self, batch_size, num_frames, n_spk):
+        """Result should be the same regardless of how spkcache blocks are ordered,
+        as long as the same speakers and frames are present."""
+        from nemo.collections.asr.parts.utils.asr_multispeaker_utils import get_ats_targets_streaming
+
+        torch.manual_seed(7)
+        speaker_permutations = self._make_permutations(n_spk)
+        spkcache_len = n_spk * 4
+        chunk_len = num_frames - spkcache_len
+
+        # Build natural-order spkcache labels and preds
+        labels_nat = torch.zeros(batch_size, num_frames, n_spk)
+        preds_nat = torch.zeros(batch_size, num_frames, n_spk)
+        for s in range(n_spk):
+            labels_nat[:, s * 4:(s + 1) * 4, s] = 1.0
+            preds_nat[:, s * 4:(s + 1) * 4, s] = 0.9
+        # Chunk: random
+        labels_nat[:, spkcache_len:, :] = (torch.rand(batch_size, chunk_len, n_spk) > 0.5).float()
+        preds_nat[:, spkcache_len:, :] = torch.rand(batch_size, chunk_len, n_spk)
+
+        # Build reversed-order spkcache: reverse the block order
+        labels_rev = labels_nat.clone()
+        preds_rev = preds_nat.clone()
+        for s in range(n_spk):
+            src_start = s * 4
+            dst_start = (n_spk - 1 - s) * 4
+            labels_rev[:, dst_start:dst_start + 4, s] = labels_nat[:, src_start:src_start + 4, s]
+            preds_rev[:, dst_start:dst_start + 4, s] = preds_nat[:, src_start:src_start + 4, s]
+
+        result_nat = get_ats_targets_streaming(
+            labels_nat.clone(), preds_nat, speaker_permutations, spkcache_len=spkcache_len
+        )
+        result_rev = get_ats_targets_streaming(
+            labels_rev.clone(), preds_rev, speaker_permutations, spkcache_len=spkcache_len
+        )
+
+        # Chunk portion should be identical regardless of spkcache block order
+        assert torch.allclose(result_nat[:, spkcache_len:, :], result_rev[:, spkcache_len:, :]), (
+            "Chunk targets differ with different spkcache block orderings — not invariant!"
+        )

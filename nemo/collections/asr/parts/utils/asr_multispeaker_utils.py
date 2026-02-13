@@ -151,6 +151,107 @@ def get_ats_targets(
     return max_score_permed_labels  # (batch_size, num_frames, num_speakers)
 
 
+def get_ats_targets_streaming(
+    labels: torch.Tensor,
+    preds: torch.Tensor,
+    speaker_permutations: torch.Tensor,
+    spkcache_len: int,
+    thres: float = 0.5,
+    tolerance: float = 0,
+) -> torch.Tensor:
+    """
+    Streaming-aware ATS target computation using spkcache-based speaker identification.
+
+    Standard get_ats_targets derives arrival order from first-nonzero context position, which
+    is corrupted when spkcache frames are reordered by speaker blocks (especially with permute_spk).
+    This function fixes the arrival order for speakers already identified in the spkcache:
+
+      Step 1: Binarize preds and labels on the spkcache portion. For each pred column, find the
+              best-matching target column (speaker). For matched speakers, override their
+              nonzero_ind to -n_spk + assigned_column, pinning them to the front of the
+              arrival-time sorted order in the correct column assignment.
+      Step 2: Run standard ATS logic (arrival-time sorting + best match score) with the
+              overridden nonzero_ind. Speakers not in spkcache keep their natural first-nonzero
+              from the context (fifo/chunk portion, which IS in temporal order) and get assigned
+              to remaining columns in arrival-time order.
+
+    Args:
+        labels (torch.Tensor): Context labels (canonical speaker columns).
+            Shape: (batch_size, context_len, num_speakers)
+        preds (torch.Tensor): Context predictions (canonical ordering, after inv_spk_perm).
+            Shape: (batch_size, context_len, num_speakers)
+        speaker_permutations (torch.Tensor): All possible speaker permutations.
+            Shape: (num_permutations, num_speakers)
+        spkcache_len (int): Number of frames in the spkcache portion of the context.
+        thres (float): Threshold for binarizing preds and labels. Default 0.5.
+        tolerance (float): Tolerance for comparing first speech frame indices. Default 0.
+
+    Returns:
+        torch.Tensor: Reconstructed labels using the best permutation.
+            Shape: (batch_size, context_len, num_speakers)
+    """
+    batch_size, context_len, num_speakers = labels.shape
+
+    # --- Step 1: spkcache-based speaker identification ---
+    # Compute per-column binarized match: for each (pred_col, target_col) pair,
+    # count how many spkcache frames agree (both active).
+    labels_spk = labels[:, :spkcache_len, :]  # (B, spkcache_len, S)
+    preds_spk = preds[:, :spkcache_len, :]    # (B, spkcache_len, S)
+    labels_bin = (labels_spk >= thres).float()
+    preds_bin = (preds_spk >= thres).float()
+
+    # match_matrix[b, i, j] = number of spkcache frames where pred_col i and target_col j are both active
+    match_matrix = torch.bmm(preds_bin.transpose(1, 2), labels_bin)  # (B, S, S)
+
+    # Greedy assignment: for each pred column, find the best-matching target column.
+    # A speaker is "identified" if it has at least 1 matching frame in the spkcache.
+    # Use the match_matrix to assign pred columns to target columns greedily.
+    # We assign in order of highest match score to avoid conflicts.
+    nonzero_ind = find_first_nonzero(
+        mat=labels, max_cap_val=context_len, thres=thres
+    )  # (B, S)
+
+    for b in range(batch_size):
+        assigned_targets = set()
+        assigned_preds = set()
+        mm = match_matrix[b]  # (S, S)
+
+        # Iterate by descending match score
+        flat_order = torch.argsort(mm.flatten(), descending=True)
+        for flat_idx in flat_order:
+            pred_col = (flat_idx // num_speakers).item()
+            target_col = (flat_idx % num_speakers).item()
+            if mm[pred_col, target_col] <= 0:
+                break  # No more positive matches
+            if pred_col in assigned_preds or target_col in assigned_targets:
+                continue
+            # Pin this speaker: set nonzero_ind so that this target speaker
+            # sorts to position = pred_col in the arrival-time ordering.
+            # Using -num_speakers + pred_col ensures pinned speakers sort before
+            # any real frame index (which is >= 0) and in the correct column order.
+            nonzero_ind[b, target_col] = -num_speakers + pred_col
+            assigned_targets.add(target_col)
+            assigned_preds.add(pred_col)
+
+    # --- Step 2: standard ATS logic with overridden nonzero_ind ---
+    sorted_values = torch.sort(nonzero_ind)[0]  # (B, S)
+    perm_size = speaker_permutations.shape[0]
+    permed_labels = labels[:, :, speaker_permutations]  # (B, context_len, P, S)
+    permed_nonzero_ind = nonzero_ind[:, speaker_permutations]  # (B, P, S)
+
+    perm_compare = (
+        torch.abs(sorted_values.unsqueeze(1) - permed_nonzero_ind) <= tolerance
+    )  # (B, P, S)
+    perm_mask = torch.all(perm_compare, dim=2).float()  # (B, P)
+    preds_rep = preds.unsqueeze(2).repeat(1, 1, perm_size, 1)  # (B, context_len, P, S)
+
+    match_score = (
+        torch.sum(permed_labels * preds_rep, axis=1).sum(axis=2) * perm_mask
+    )  # (B, P)
+    batch_perm_inds = find_best_permutation(match_score, speaker_permutations)  # (B, S)
+    return reconstruct_labels(labels, batch_perm_inds)  # (B, context_len, S)
+
+
 def get_pil_targets(labels: torch.Tensor, preds: torch.Tensor, speaker_permutations: torch.Tensor) -> torch.Tensor:
     """
     Sorts labels and predictions to get the optimal permutation based on the match score.
