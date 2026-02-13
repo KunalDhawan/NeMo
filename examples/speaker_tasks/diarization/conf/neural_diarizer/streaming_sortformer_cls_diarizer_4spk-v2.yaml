@@ -117,7 +117,7 @@ model:
     dropout_rate: 0.5 # Dropout rate
     fc_d_model: ${model.model_defaults.fc_d_model} # Hidden dimension size for Fast Conformer encoder
     tf_d_model: ${model.model_defaults.tf_d_model} # Hidden dimension size for Transformer encoder
-    backend: "dotp" # trff, dotp, isd, jsd
+    backend: "jsd" # trff, dotp, isd, jsd
     fusion_type: "hdm" # concat, film, hdm (for isd/jsd backends)
     fusion_lnorm: true
     # Streaming mode parameters

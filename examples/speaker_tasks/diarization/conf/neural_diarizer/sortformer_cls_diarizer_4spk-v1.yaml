@@ -118,7 +118,7 @@ model:
     dropout_rate: 0.5 # Dropout rate
     fc_d_model: ${model.model_defaults.fc_d_model}
     tf_d_model: ${model.model_defaults.tf_d_model} # Hidden layer size for linear layers in Sortformer Diarizer module
-    backend: "dotp" # trff, dotp, isd, jsd
+    backend: "jsd" # trff, dotp, isd, jsd
     fusion_type: "hdm" # concat, film, hdm
     fusion_lnorm: true
 

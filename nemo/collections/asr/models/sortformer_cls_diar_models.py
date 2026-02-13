@@ -98,6 +98,23 @@ class SortformerCLSEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationM
             self.augmentor = process_augmentations(self._cfg.augmentor)
         else:
             self.augmentor = None
+
+        # Output upsampling: when output_subsampling_factor < encoder.subsampling_factor,
+        # sigmoid predictions are upsampled to produce finer-resolution output (e.g. 10ms).
+        # Must be set before super().__init__() because it triggers setup_training_data()
+        # which needs self.output_subsampling_factor.
+        encoder_subsample = self._cfg.encoder.get("subsampling_factor", 8)
+        self.output_subsampling_factor = self._cfg.get("output_subsampling_factor", encoder_subsample)
+        valid_factors = [d for d in range(1, encoder_subsample + 1) if encoder_subsample % d == 0]
+        if self.output_subsampling_factor not in valid_factors:
+            raise ValueError(
+                f"output_subsampling_factor ({self.output_subsampling_factor}) is invalid. "
+                f"Must be a positive divisor of encoder.subsampling_factor ({encoder_subsample}). "
+                f"Valid values: {valid_factors}"
+            )
+        self.upsample_factor = encoder_subsample // self.output_subsampling_factor
+        self.upsample_smooth_kernel = self._cfg.get("upsample_smooth_kernel", self.upsample_factor + 1)
+
         super().__init__(cfg=self._cfg, trainer=trainer)
         self.preprocessor = SortformerCLSEncLabelModel.from_config_dict(self._cfg.preprocessor)
 
@@ -167,20 +184,6 @@ class SortformerCLSEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationM
 
         self.max_batch_dur = self._cfg.get("max_batch_dur", 20000)
         self.concat_and_pad_script = torch.jit.script(self.sortformer_modules.concat_and_pad)
-
-        # Output upsampling: when output_subsampling_factor < encoder.subsampling_factor,
-        # sigmoid predictions are upsampled to produce finer-resolution output (e.g. 10ms).
-        encoder_subsample = self._cfg.encoder.get("subsampling_factor", 8)
-        self.output_subsampling_factor = self._cfg.get("output_subsampling_factor", encoder_subsample)
-        valid_factors = [d for d in range(1, encoder_subsample + 1) if encoder_subsample % d == 0]
-        if self.output_subsampling_factor not in valid_factors:
-            raise ValueError(
-                f"output_subsampling_factor ({self.output_subsampling_factor}) is invalid. "
-                f"Must be a positive divisor of encoder.subsampling_factor ({encoder_subsample}). "
-                f"Valid values: {valid_factors}"
-            )
-        self.upsample_factor = encoder_subsample // self.output_subsampling_factor
-        self.upsample_smooth_kernel = self._cfg.get("upsample_smooth_kernel", self.upsample_factor + 1)
 
     def _init_loss_weights(self):
         pil_weight = self._cfg.get("pil_weight", 0.0)
