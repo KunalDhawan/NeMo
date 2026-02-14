@@ -42,6 +42,9 @@ class StreamingChunkTargetInfo:
             Used by streaming ATS to identify speakers via spkcache content matching.
         chunk_start (int): Index where the chunk core starts within the context.
         chunk_end (int): Index where the chunk core ends within the context.
+        spk_perm (torch.Tensor or None): Speaker permutation from the last spkcache compression.
+            Shape: (batch_size, n_spk). Maps canonical speaker index to permuted block position.
+            None when permute_spk is inactive (eval mode).
     """
 
     preds: torch.Tensor
@@ -49,6 +52,7 @@ class StreamingChunkTargetInfo:
     spkcache_len: int
     chunk_start: int
     chunk_end: int
+    spk_perm: torch.Tensor = None
 
 
 @dataclass

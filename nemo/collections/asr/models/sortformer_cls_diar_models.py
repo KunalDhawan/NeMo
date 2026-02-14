@@ -1091,6 +1091,7 @@ class SortformerCLSEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationM
                 spkcache_len=spkcache_len,
                 chunk_start=chunk_start,
                 chunk_end=chunk_end,
+                spk_perm=streaming_state.spk_perm,
             )
 
             chunk_frame_indices = chunk_indices
@@ -1125,10 +1126,12 @@ class SortformerCLSEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationM
         computes the optimal ATS/PIL permutation for that chunk's context, and extracts
         only the chunk core portion. The chunk-level targets are then concatenated.
 
-        ATS uses spkcache-based content matching (get_ats_targets_streaming):
-        binarized preds and targets on the spkcache portion identify which pred column
-        corresponds to which speaker, invariant to cache block ordering. When not all
-        speakers are in the spkcache, full-context match score breaks ties.
+        ATS uses block-position-based pinning (get_ats_targets_streaming):
+        when the spkcache has been compressed, silence markers (-1) in the spkcache
+        frame indices delineate speaker blocks. For each block, ground-truth labels are
+        averaged and argmax identifies the speaker. That speaker is pinned to the block's
+        positional index (0, 1, 2, ...), creating a genuine spatial ordering constraint.
+        Before first compression, standard ATS arrival-time ordering applies.
 
         PIL uses standard permutation-invariant matching on canonical preds.
 
@@ -1164,11 +1167,29 @@ class SortformerCLSEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationM
 
             preds_i = chunk_info.preds  # canonical ordering (after inv_spk_perm)
 
-            # ATS: spkcache-based content matching (invariant to cache block ordering)
+            # Extract spkcache frame indices for block-based ATS detection.
+            # Only use block-based pinning when spkcache has been compressed
+            # (indicated by presence of -1 silence markers in frame indices).
+            # Before first compression, fall back to pure ATS by passing spkcache_len=0,
+            # so arrival-time ordering uses the natural temporal order of fifo+chunk frames.
+            spkcache_fi = None
+            ats_spkcache_len = 0
+            if chunk_info.spkcache_len > 0:
+                spkcache_fi = frame_indices[:, :chunk_info.spkcache_len]
+                if (spkcache_fi < 0).any():
+                    ats_spkcache_len = chunk_info.spkcache_len  # compressed: use block detection
+                # else: not compressed yet, keep ats_spkcache_len=0 for pure ATS
+
+            # ATS: block-position-based pinning on compressed spkcache,
+            # with arrival-time ordering for remaining speakers.
+            # Before first compression, ats_spkcache_len=0 gives pure ATS.
+            # spk_perm translates block positions to canonical column positions.
             targets_ats_i = get_ats_targets_streaming(
                 targets_i.clone(), preds_i,
                 speaker_permutations=self.speaker_permutations,
-                spkcache_len=chunk_info.spkcache_len,
+                spkcache_len=ats_spkcache_len,
+                spkcache_frame_indices=spkcache_fi,
+                spk_perm=chunk_info.spk_perm,
             )
 
             # PIL: standard permutation-invariant matching on canonical preds

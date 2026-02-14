@@ -903,6 +903,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 spkcache_len=spkcache_len,
                 chunk_start=chunk_start,
                 chunk_end=chunk_end,
+                spk_perm=streaming_state.spk_perm,
             )
 
             # Core chunk frame indices for streaming_update frame tracking
@@ -938,10 +939,12 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         computes the optimal ATS/PIL permutation for that chunk's context, and extracts
         only the chunk core portion. The chunk-level targets are then concatenated.
 
-        ATS uses spkcache-based content matching (get_ats_targets_streaming):
-        binarized preds and targets on the spkcache portion identify which pred column
-        corresponds to which speaker, invariant to cache block ordering. When not all
-        speakers are in the spkcache, full-context match score breaks ties.
+        ATS uses block-position-based pinning (get_ats_targets_streaming):
+        when the spkcache has been compressed, silence markers (-1) in the spkcache
+        frame indices delineate speaker blocks. For each block, ground-truth labels are
+        averaged and argmax identifies the speaker. That speaker is pinned to the block's
+        positional index (0, 1, 2, ...), creating a genuine spatial ordering constraint.
+        Before first compression, standard ATS arrival-time ordering applies.
 
         PIL uses standard permutation-invariant matching on canonical preds.
 
@@ -977,11 +980,29 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
             preds_i = chunk_info.preds  # canonical ordering (after inv_spk_perm)
 
-            # ATS: spkcache-based content matching (invariant to cache block ordering)
+            # Extract spkcache frame indices for block-based ATS detection.
+            # Only use block-based pinning when spkcache has been compressed
+            # (indicated by presence of -1 silence markers in frame indices).
+            # Before first compression, fall back to pure ATS by passing spkcache_len=0,
+            # so arrival-time ordering uses the natural temporal order of fifo+chunk frames.
+            spkcache_fi = None
+            ats_spkcache_len = 0
+            if chunk_info.spkcache_len > 0:
+                spkcache_fi = frame_indices[:, :chunk_info.spkcache_len]
+                if (spkcache_fi < 0).any():
+                    ats_spkcache_len = chunk_info.spkcache_len  # compressed: use block detection
+                # else: not compressed yet, keep ats_spkcache_len=0 for pure ATS
+
+            # ATS: block-position-based pinning on compressed spkcache,
+            # with arrival-time ordering for remaining speakers.
+            # Before first compression, ats_spkcache_len=0 gives pure ATS.
+            # spk_perm translates block positions to canonical column positions.
             targets_ats_i = get_ats_targets_streaming(
                 targets_i.clone(), preds_i,
                 speaker_permutations=self.speaker_permutations,
-                spkcache_len=chunk_info.spkcache_len,
+                spkcache_len=ats_spkcache_len,
+                spkcache_frame_indices=spkcache_fi,
+                spk_perm=chunk_info.spk_perm,
             )
 
             # PIL: standard permutation-invariant matching on canonical preds
@@ -1296,7 +1317,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             preds = preds[:, : targets.shape[1], :]
 
         # Global targets
-        targets_ats = get_ats_targets(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
         targets_pil = get_pil_targets(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
 
         self._accuracy_test(preds, targets_pil, target_lens)
@@ -1306,9 +1326,22 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.batch_recall_list.append(recall)
         logging.info(f"batch {batch_idx}: f1_acc={f1_acc}, precision={precision}, recall={recall}")
 
-        self._accuracy_test_ats(preds, targets_ats, target_lens)
+        # Local ATS targets (per-chunk aligned, streaming only)
+        chunk_info_list = getattr(self, '_streaming_chunk_info', None)
+        if chunk_info_list:
+            local_targets_ats, _ = self._get_per_chunk_aligned_targets(targets.clone(), chunk_info_list)
+            min_len = min(preds.shape[1], local_targets_ats.shape[1])
+            local_targets_ats = local_targets_ats[:, :min_len, :]
+            preds_local = preds[:, :min_len, :]
+            target_lens_local = target_lens.clamp(max=min_len)
+            self._accuracy_test_ats(preds_local, local_targets_ats, target_lens_local)
+        else:
+            targets_ats = get_ats_targets(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
+            self._accuracy_test_ats(preds, targets_ats, target_lens)
+
         f1_acc_ats, precision_ats, recall_ats = self._accuracy_test_ats.compute()
         self.batch_f1_accs_ats_list.append(f1_acc_ats)
+
         logging.info(
             f"batch {batch_idx}: f1_acc_ats={f1_acc_ats}, precision_ats={precision_ats}, recall_ats={recall_ats}"
         )
