@@ -43,6 +43,10 @@ class StreamingSortformerState:
         spk_perm (torch.Tensor): Speaker permutation information for the speaker cache
         mean_sil_emb (torch.Tensor): Mean silence embedding
         n_sil_frames (torch.Tensor): Number of silence frames
+        spkcache_frame_indices (torch.Tensor): Frame indices for speaker cache entries
+            Shape: (B, spkcache_len), long, -1 for silence
+        fifo_frame_indices (torch.Tensor): Frame indices for FIFO queue entries
+            Shape: (B, fifo_len), long
     """
 
     spkcache = None  # Speaker cache to store embeddings from start
@@ -54,6 +58,8 @@ class StreamingSortformerState:
     spk_perm = None
     mean_sil_emb = None
     n_sil_frames = None
+    spkcache_frame_indices = None  # (B, spkcache_len), long, -1 for silence
+    fifo_frame_indices = None  # (B, fifo_len), long
 
 
 class SortformerCLSModules(NeuralModule, Exportable):
@@ -507,6 +513,8 @@ class SortformerCLSModules(NeuralModule, Exportable):
         else:
             streaming_state.spkcache = torch.zeros((batch_size, 0, self.fc_d_model), device=device)
             streaming_state.fifo = torch.zeros((batch_size, 0, self.fc_d_model), device=device)
+        streaming_state.spkcache_frame_indices = torch.zeros((batch_size, 0), dtype=torch.long, device=device)
+        streaming_state.fifo_frame_indices = torch.zeros((batch_size, 0), dtype=torch.long, device=device)
         streaming_state.mean_sil_emb = torch.zeros((batch_size, self.fc_d_model), device=device)
         streaming_state.n_sil_frames = torch.zeros((batch_size,), dtype=torch.long, device=device)
         return streaming_state
@@ -645,7 +653,7 @@ class SortformerCLSModules(NeuralModule, Exportable):
 
         idx = torch.where(need_compress)[0]
         if len(idx) > 0:
-            streaming_state.spkcache[idx], streaming_state.spkcache_preds[idx], _ = self._compress_spkcache(
+            streaming_state.spkcache[idx], streaming_state.spkcache_preds[idx], _, _ = self._compress_spkcache(
                 emb_seq=updated_spkcache[idx],
                 preds=updated_spkcache_preds[idx],
                 mean_sil_emb=streaming_state.mean_sil_emb[idx],
@@ -663,7 +671,7 @@ class SortformerCLSModules(NeuralModule, Exportable):
 
         return streaming_state, chunk_preds
 
-    def streaming_update(self, streaming_state, chunk, preds, lc: int = 0, rc: int = 0):
+    def streaming_update(self, streaming_state, chunk, preds, lc: int = 0, rc: int = 0, chunk_frame_indices=None):
         """
         Update the speaker cache and FIFO queue with the chunk of embeddings and speaker predictions.
         Synchronous version, which means speaker cahce, FIFO queue and chunk have same lengths within a batch.
@@ -706,6 +714,10 @@ class SortformerCLSModules(NeuralModule, Exportable):
         # append chunk to fifo
         streaming_state.fifo = torch.cat([streaming_state.fifo, chunk], dim=1)
         streaming_state.fifo_preds = torch.cat([streaming_state.fifo_preds, chunk_preds], dim=1)
+        if chunk_frame_indices is not None:
+            streaming_state.fifo_frame_indices = torch.cat(
+                [streaming_state.fifo_frame_indices, chunk_frame_indices], dim=1
+            )
 
         if fifo_len + chunk_len > self.fifo_len:
             # extract pop_out_len first frames from FIFO queue
@@ -715,6 +727,9 @@ class SortformerCLSModules(NeuralModule, Exportable):
 
             pop_out_embs = streaming_state.fifo[:, :pop_out_len]
             pop_out_preds = streaming_state.fifo_preds[:, :pop_out_len]
+            if chunk_frame_indices is not None:
+                pop_out_frame_indices = streaming_state.fifo_frame_indices[:, :pop_out_len]
+                streaming_state.fifo_frame_indices = streaming_state.fifo_frame_indices[:, pop_out_len:]
             streaming_state.mean_sil_emb, streaming_state.n_sil_frames = self._get_silence_profile(
                 streaming_state.mean_sil_emb,
                 streaming_state.n_sil_frames,
@@ -728,17 +743,28 @@ class SortformerCLSModules(NeuralModule, Exportable):
             streaming_state.spkcache = torch.cat([streaming_state.spkcache, pop_out_embs], dim=1)
             if streaming_state.spkcache_preds is not None:  # if speaker cache has been already updated at least once
                 streaming_state.spkcache_preds = torch.cat([streaming_state.spkcache_preds, pop_out_preds], dim=1)
+            if chunk_frame_indices is not None:
+                streaming_state.spkcache_frame_indices = torch.cat(
+                    [streaming_state.spkcache_frame_indices, pop_out_frame_indices], dim=1
+                )
             if streaming_state.spkcache.shape[1] > self.spkcache_len:
                 if streaming_state.spkcache_preds is None:  # if this is a first update of speaker cache
                     streaming_state.spkcache_preds = torch.cat([preds[:, :spkcache_len], pop_out_preds], dim=1)
-                streaming_state.spkcache, streaming_state.spkcache_preds, streaming_state.spk_perm = (
-                    self._compress_spkcache(
-                        emb_seq=streaming_state.spkcache,
-                        preds=streaming_state.spkcache_preds,
-                        mean_sil_emb=streaming_state.mean_sil_emb,
-                        permute_spk=self.training,
-                    )
+                compress_frame_indices = streaming_state.spkcache_frame_indices if chunk_frame_indices is not None else None
+                (
+                    streaming_state.spkcache,
+                    streaming_state.spkcache_preds,
+                    streaming_state.spk_perm,
+                    compressed_frame_indices,
+                ) = self._compress_spkcache(
+                    emb_seq=streaming_state.spkcache,
+                    preds=streaming_state.spkcache_preds,
+                    mean_sil_emb=streaming_state.mean_sil_emb,
+                    permute_spk=self.training,
+                    frame_indices=compress_frame_indices,
                 )
+                if compressed_frame_indices is not None:
+                    streaming_state.spkcache_frame_indices = compressed_frame_indices
 
         if self.log:
             logging.info(
@@ -858,7 +884,7 @@ class SortformerCLSModules(NeuralModule, Exportable):
         topk_indices_sorted[is_disabled] = 0  # Set a placeholder index to make gather work
         return topk_indices_sorted, is_disabled
 
-    def _gather_spkcache_and_preds(self, emb_seq, preds, topk_indices, is_disabled, mean_sil_emb):
+    def _gather_spkcache_and_preds(self, emb_seq, preds, topk_indices, is_disabled, mean_sil_emb, frame_indices=None):
         """
         Gather embeddings from emb_seq and speaker activities from preds corresponding to topk_indices.
         For disabled frames, use mean silence embedding and zero probability instead.
@@ -874,12 +900,16 @@ class SortformerCLSModules(NeuralModule, Exportable):
                 Shape: (batch_size, spkcache_len)
             mean_sil_emb (torch.Tensor): Tensor containing mean silence embedding
                 Shape: (batch_size, emb_dim)
+            frame_indices (torch.Tensor, optional): Frame indices for spkcache entries.
+                Shape: (batch_size, n_frames), long. If provided, gathered indices are returned.
 
         Returns:
             emb_seq_gathered (torch.Tensor): Tensor containing gathered embeddings.
                 Shape: (batch_size, spkcache_len, emb_dim)
             preds_gathered (torch.Tensor): Tensor containing gathered speaker activities.
                 Shape: (batch_size, spkcache_len, n_spk)
+            frame_indices_gathered (torch.Tensor or None): Gathered frame indices with -1 for disabled.
+                Shape: (batch_size, spkcache_len), long. None if frame_indices is None.
         """
         # To use `torch.gather`, expand `topk_indices` along the last dimension to match `emb_dim`.
         # Gather the speaker cache embeddings, including the placeholder embeddings for silence frames.
@@ -896,7 +926,12 @@ class SortformerCLSModules(NeuralModule, Exportable):
         indices_expanded_spk = topk_indices.unsqueeze(-1).expand(-1, -1, n_spk)
         preds_gathered = torch.gather(preds, 1, indices_expanded_spk)  # (batch_size, spkcache_len, n_spk)
         preds_gathered = torch.where(is_disabled.unsqueeze(-1), torch.tensor(0.0), preds_gathered)
-        return emb_seq_gathered, preds_gathered
+
+        frame_indices_gathered = None
+        if frame_indices is not None:
+            frame_indices_gathered = torch.gather(frame_indices, 1, topk_indices)
+            frame_indices_gathered[is_disabled] = -1
+        return emb_seq_gathered, preds_gathered, frame_indices_gathered
 
     def _get_max_perm_index(self, scores):
         """
@@ -975,7 +1010,7 @@ class SortformerCLSModules(NeuralModule, Exportable):
         scores = torch.stack(scores_list).to(scores.device)
         return scores, spk_perm
 
-    def _compress_spkcache(self, emb_seq, preds, mean_sil_emb, permute_spk: bool = False):
+    def _compress_spkcache(self, emb_seq, preds, mean_sil_emb, permute_spk: bool = False, frame_indices=None):
         """
         Compress speaker cache for streaming inference.
         Keep spkcache_len most important frames out of input n_frames, based on preds.
@@ -988,6 +1023,8 @@ class SortformerCLSModules(NeuralModule, Exportable):
             mean_sil_emb (torch.Tensor): Tensor containing mean silence embedding
                 Shape: (batch_size, emb_dim)
             permute_spk (bool): If true, will generate a random permutation of existing speakers
+            frame_indices (torch.Tensor, optional): Frame indices for spkcache entries.
+                Shape: (batch_size, n_frames), long. If provided, gathered indices are returned.
 
         Returns:
             spkcache (torch.Tensor): Tensor containing spkcache_len most important embeddings from emb_seq.
@@ -997,6 +1034,8 @@ class SortformerCLSModules(NeuralModule, Exportable):
                 Shape: (batch_size, spkcache_len, n_spk)
             spk_perm (torch.Tensor): random speaker permutation tensor if permute_spk=True, otherwise None
                 Shape: (batch_size, n_spk)
+            spkcache_frame_indices (torch.Tensor or None): Gathered frame indices with -1 for silence.
+                Shape: (batch_size, spkcache_len), long. None if frame_indices is None.
         """
         batch_size, n_frames, n_spk = preds.shape
         spkcache_len_per_spk = self.spkcache_len // n_spk - self.spkcache_sil_frames_per_spk
@@ -1030,7 +1069,7 @@ class SortformerCLSModules(NeuralModule, Exportable):
             scores = torch.cat([scores, pad], dim=1)  # (batch_size, n_frames + spkcache_sil_frames_per_spk, n_spk)
 
         topk_indices, is_disabled = self._get_topk_indices(scores)
-        spkcache, spkcache_preds = self._gather_spkcache_and_preds(
-            emb_seq, preds, topk_indices, is_disabled, mean_sil_emb
+        spkcache, spkcache_preds, spkcache_frame_indices = self._gather_spkcache_and_preds(
+            emb_seq, preds, topk_indices, is_disabled, mean_sil_emb, frame_indices=frame_indices
         )
-        return spkcache, spkcache_preds, spk_perm
+        return spkcache, spkcache_preds, spk_perm, spkcache_frame_indices
