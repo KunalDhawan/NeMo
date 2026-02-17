@@ -1294,8 +1294,17 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         return target_len
 
     def _create_subsegment(self, sample, offset):
-        audio_signal = self.featurizer.process(sample.audio_file, offset=offset, duration=sample.duration)
         duration = sample.duration
+
+        # Pre-crop: for very long files, randomly select a window to avoid
+        # loading the entire file from disk (major I/O bottleneck for 30min+ files).
+        if self.session_len_sec > 0 and duration > self.session_len_sec * 6:
+            preload_dur = self.session_len_sec * 6
+            preload_start = random.uniform(0, duration - preload_dur)
+            offset = offset + preload_start
+            duration = preload_dur
+
+        audio_signal = self.featurizer.process(sample.audio_file, offset=offset, duration=duration)
         
         with open(sample.rttm_file, 'r') as f:
             rttm_lines = f.readlines()

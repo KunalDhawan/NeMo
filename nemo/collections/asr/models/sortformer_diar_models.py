@@ -131,6 +131,13 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             self.sortformer_modules.encoder_proj = self.sortformer_modules.encoder_proj.to(self.device)
         else:
             self.sortformer_modules.encoder_proj = None
+
+        # Set up learnable sub-pixel upsampling for high-resolution output
+        if self.upsample_factor > 1:
+            self.sortformer_modules.upsample_factor = self.upsample_factor
+            self.sortformer_modules._init_subpixel_upsample()
+            self.sortformer_modules.subpixel_upsample = self.sortformer_modules.subpixel_upsample.to(self.device)
+
         self._init_loss_weights()
 
         self.eps = 1e-3
@@ -329,10 +336,12 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         Returns:
             preds (torch.Tensor): Sorted tensor containing Sigmoid values for predicted speaker labels.
-                Shape: (batch_size, diar_frame_count, num_speakers)
+                Shape: (batch_size, diar_frame_count [* upsample_factor], num_speakers)
         """
         encoder_mask = self.sortformer_modules.length_to_mask(emb_seq_length, emb_seq.shape[1])
         trans_emb_seq = self.transformer_encoder(encoder_states=emb_seq, encoder_mask=encoder_mask)
+        if not self.streaming_mode:
+            trans_emb_seq = self.sortformer_modules.upsample_hidden(trans_emb_seq)
         preds = self.sortformer_modules.forward_speaker_sigmoids(trans_emb_seq)
         return preds
 
@@ -558,15 +567,17 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         processed_signal = processed_signal[:, :, : processed_signal_length.max()]
         if self.streaming_mode:
             preds = self.forward_streaming(processed_signal, processed_signal_length)
+            # Streaming operates at encoder resolution; use interpolation-based
+            # upsampling on the final assembled predictions.
+            if self.upsample_factor > 1:
+                preds = self.sortformer_modules.upsample_preds(
+                    preds, upsample_factor=self.upsample_factor, smooth_kernel=self.upsample_smooth_kernel
+                )
         else:
             emb_seq, emb_seq_length = self.frontend_encoder(
                 processed_signal=processed_signal, processed_signal_length=processed_signal_length
             )
             preds = self.forward_infer(emb_seq, emb_seq_length)
-        if self.upsample_factor > 1:
-            preds = self.sortformer_modules.upsample_preds(
-                preds, upsample_factor=self.upsample_factor, smooth_kernel=self.upsample_smooth_kernel
-            )
         return preds
 
     @property
@@ -908,6 +919,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             (dict): A dictionary containing the 'loss' key with the calculated loss value.
         """
         audio_signal, audio_signal_length, targets, target_lens = batch
+        logging.info(f"audio_signal.shape: {audio_signal.shape}, targets.shape: {targets.shape}, target_lens: {target_lens}")
         preds = self.forward(audio_signal=audio_signal, audio_signal_length=audio_signal_length)
         train_metrics = self._get_aux_train_evaluations(preds, targets, target_lens)
         self._reset_train_metrics()

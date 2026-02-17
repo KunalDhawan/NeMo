@@ -109,6 +109,10 @@ class SortformerModules(NeuralModule, Exportable):
         self.encoder_proj = nn.Linear(self.fc_d_model, self.tf_d_model)
         self.log = False
 
+        # Learnable sub-pixel upsampling (initialized by the model when needed)
+        self.upsample_factor = 1
+        self.subpixel_upsample = None
+
         # Streaming-related params
         self.spkcache_len = spkcache_len
         self.fifo_len = fifo_len
@@ -254,6 +258,45 @@ class SortformerModules(NeuralModule, Exportable):
         spk_preds = self.single_hidden_to_spks(hidden_out)
         preds = F.sigmoid(spk_preds)
         return preds
+
+    def _init_subpixel_upsample(self):
+        """
+        Initialize the learnable sub-pixel upsampling layer.
+
+        Creates a linear projection that maps each hidden frame to ``upsample_factor``
+        sub-frames.  The weight is initialised as stacked identity matrices so the
+        initial behaviour is equivalent to ``repeat_interleave`` (all sub-frames
+        start identical).  Training then gradually specialises each sub-frame.
+        """
+        self.subpixel_upsample = nn.Linear(self.tf_d_model, self.tf_d_model * self.upsample_factor)
+        with torch.no_grad():
+            self.subpixel_upsample.weight.copy_(torch.eye(self.tf_d_model).repeat(self.upsample_factor, 1))
+            self.subpixel_upsample.bias.zero_()
+
+    def upsample_hidden(self, hidden_states):
+        """
+        Upsample hidden states using a learnable sub-pixel projection.
+
+        Each encoder frame is projected to ``upsample_factor`` sub-frames of
+        the same hidden dimension, then reshaped to produce a higher-resolution
+        sequence.  The resulting tensor can be fed directly into
+        ``forward_speaker_sigmoids`` so the prediction head operates at the
+        fine-grained (e.g. 10 ms) resolution.
+
+        Args:
+            hidden_states (torch.Tensor): Transformer encoder output.
+                Shape: (batch_size, n_frames, hidden_dim)
+
+        Returns:
+            upsampled (torch.Tensor): Upsampled hidden states.
+                Shape: (batch_size, n_frames * upsample_factor, hidden_dim)
+        """
+        if self.subpixel_upsample is None:
+            return hidden_states
+        B, T, D = hidden_states.shape
+        projected = self.subpixel_upsample(hidden_states)
+        upsampled = projected.view(B, T, self.upsample_factor, D).reshape(B, T * self.upsample_factor, D)
+        return upsampled
 
     @staticmethod
     def upsample_preds(preds, upsample_factor, smooth_kernel=9):
