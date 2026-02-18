@@ -111,6 +111,10 @@ class SortformerModules(NeuralModule, Exportable):
 
         # Learnable sub-pixel upsampling (initialized by the model when needed)
         self.upsample_factor = 1
+        self.upsample_mode = "progressive_residual"
+        self.upsample_kernel_sizes = [3, 5, 7]
+        self.subpixel_convs = None
+        self.subpixel_norms = None
         self.subpixel_upsample = None
 
         # Streaming-related params
@@ -259,44 +263,178 @@ class SortformerModules(NeuralModule, Exportable):
         preds = F.sigmoid(spk_preds)
         return preds
 
+    @staticmethod
+    def _validate_odd_kernel_size(kernel_size: int, kernel_name: str):
+        """Validate that a convolution/pooling kernel is a positive odd integer."""
+        if not isinstance(kernel_size, int):
+            raise TypeError(
+                f"{kernel_name} must be an integer, but got {type(kernel_size).__name__}: {kernel_size}"
+            )
+        if kernel_size < 1:
+            raise ValueError(f"{kernel_name} must be >= 1, but got {kernel_size}")
+        if kernel_size % 2 == 0:
+            raise ValueError(
+                f"{kernel_name} must be odd to preserve sequence length with symmetric padding, got {kernel_size}"
+            )
+
+    def _validated_progressive_kernel_sizes(self, n_stages: int) -> List[int]:
+        """
+        Validate and normalize kernel sizes for progressive upsampling stages.
+
+        Returns a list of length ``n_stages`` by extending the final value when
+        fewer kernel sizes are provided.
+        """
+        ks = self.upsample_kernel_sizes
+        if ks is None:
+            raise ValueError(
+                "upsample_kernel_sizes cannot be None for progressive upsampling modes."
+            )
+        ks = list(ks)
+        if len(ks) == 0:
+            raise ValueError(
+                "upsample_kernel_sizes cannot be empty for progressive upsampling modes."
+            )
+
+        for idx, kernel_size in enumerate(ks):
+            self._validate_odd_kernel_size(kernel_size, f"upsample_kernel_sizes[{idx}]")
+
+        if len(ks) < n_stages:
+            ks += [ks[-1]] * (n_stages - len(ks))
+        return ks[:n_stages]
+
     def _init_subpixel_upsample(self):
         """
-        Initialize the learnable sub-pixel upsampling layer.
+        Initialize learnable sub-pixel upsampling layers.
 
-        Creates a linear projection that maps each hidden frame to ``upsample_factor``
-        sub-frames.  The weight is initialised as stacked identity matrices so the
-        initial behaviour is equivalent to ``repeat_interleave`` (all sub-frames
-        start identical).  Training then gradually specialises each sub-frame.
+        Modes:
+            ``"single"``:  One Conv1d mapping ``D → D * factor``, then reshape.
+                Identity-initialised centre tap; initial behaviour equals
+                ``repeat_interleave``.
+
+            ``"progressive"``:  ``log2(factor)`` cascaded 2× Conv1d stages,
+                each identity-initialised.  No residual, normalisation, or
+                activation.
+
+            ``"progressive_residual"``:  Same cascaded stages with a residual
+                path (``repeat_interleave`` main + zero-init conv delta),
+                LayerNorm after every stage, and GELU between stages.
+
+        Kernel sizes for progressive modes are taken from
+        ``self.upsample_kernel_sizes`` (default ``[3, 5, 7]``), using larger
+        kernels at higher-resolution stages to maintain comparable physical
+        receptive fields.
         """
-        self.subpixel_upsample = nn.Linear(self.tf_d_model, self.tf_d_model * self.upsample_factor)
-        with torch.no_grad():
-            self.subpixel_upsample.weight.copy_(torch.eye(self.tf_d_model).repeat(self.upsample_factor, 1))
-            self.subpixel_upsample.bias.zero_()
+        if self.upsample_mode == "single":
+            self.subpixel_upsample = nn.Conv1d(
+                self.tf_d_model,
+                self.tf_d_model * self.upsample_factor,
+                kernel_size=3,
+                padding=1,
+            )
+            with torch.no_grad():
+                self.subpixel_upsample.weight.zero_()
+                self.subpixel_upsample.weight[:, :, 1].copy_(
+                    torch.eye(self.tf_d_model).repeat(self.upsample_factor, 1)
+                )
+                self.subpixel_upsample.bias.zero_()
+
+        elif self.upsample_mode in ("progressive", "progressive_residual"):
+            n_stages = int(math.log2(self.upsample_factor))
+            if 2 ** n_stages != self.upsample_factor:
+                raise ValueError(
+                    f"Progressive sub-pixel upsampling requires upsample_factor to be "
+                    f"a power of 2, got {self.upsample_factor}"
+                )
+            ks = self._validated_progressive_kernel_sizes(n_stages=n_stages)
+
+            residual = self.upsample_mode == "progressive_residual"
+            self.subpixel_convs = nn.ModuleList()
+            if residual:
+                self.subpixel_norms = nn.ModuleList()
+
+            for i in range(n_stages):
+                k = ks[i]
+                conv = nn.Conv1d(
+                    self.tf_d_model, self.tf_d_model * 2,
+                    kernel_size=k, padding=k // 2,
+                )
+                with torch.no_grad():
+                    conv.weight.zero_()
+                    if not residual:
+                        conv.weight[:, :, k // 2].copy_(
+                            torch.eye(self.tf_d_model).repeat(2, 1)
+                        )
+                    conv.bias.zero_()
+                self.subpixel_convs.append(conv)
+                if residual:
+                    self.subpixel_norms.append(nn.LayerNorm(self.tf_d_model))
+
+        else:
+            raise ValueError(
+                f"Unknown upsample_mode '{self.upsample_mode}'. "
+                f"Must be 'single', 'progressive', or 'progressive_residual'."
+            )
 
     def upsample_hidden(self, hidden_states):
         """
-        Upsample hidden states using a learnable sub-pixel projection.
-
-        Each encoder frame is projected to ``upsample_factor`` sub-frames of
-        the same hidden dimension, then reshaped to produce a higher-resolution
-        sequence.  The resulting tensor can be fed directly into
-        ``forward_speaker_sigmoids`` so the prediction head operates at the
-        fine-grained (e.g. 10 ms) resolution.
+        Upsample hidden states using the configured sub-pixel upsampling mode.
 
         Args:
             hidden_states (torch.Tensor): Transformer encoder output.
                 Shape: (batch_size, n_frames, hidden_dim)
 
         Returns:
-            upsampled (torch.Tensor): Upsampled hidden states.
+            torch.Tensor: Upsampled hidden states.
                 Shape: (batch_size, n_frames * upsample_factor, hidden_dim)
         """
+        if self.upsample_factor <= 1:
+            return hidden_states
+        if self.upsample_mode == "single":
+            return self._upsample_single(hidden_states)
+        elif self.upsample_mode == "progressive":
+            return self._upsample_progressive(hidden_states)
+        elif self.upsample_mode == "progressive_residual":
+            return self._upsample_progressive_residual(hidden_states)
+        return hidden_states
+
+    def _upsample_single(self, hidden_states):
+        """Single-shot sub-pixel convolution: Conv1d(D -> D*factor) + reshape."""
         if self.subpixel_upsample is None:
             return hidden_states
         B, T, D = hidden_states.shape
-        projected = self.subpixel_upsample(hidden_states)
-        upsampled = projected.view(B, T, self.upsample_factor, D).reshape(B, T * self.upsample_factor, D)
-        return upsampled
+        projected = self.subpixel_upsample(hidden_states.transpose(1, 2))
+        projected = projected.transpose(1, 2)
+        return projected.view(B, T, self.upsample_factor, D).reshape(
+            B, T * self.upsample_factor, D
+        )
+
+    def _upsample_progressive(self, hidden_states):
+        """Cascaded 2x sub-pixel stages without residual or normalisation."""
+        if self.subpixel_convs is None:
+            return hidden_states
+        D = hidden_states.shape[2]
+        x = hidden_states
+        for conv in self.subpixel_convs:
+            x = conv(x.transpose(1, 2)).transpose(1, 2)
+            B_i, T_i, _ = x.shape
+            x = x.view(B_i, T_i, 2, D).reshape(B_i, T_i * 2, D)
+        return x
+
+    def _upsample_progressive_residual(self, hidden_states):
+        """Cascaded 2x stages with repeat_interleave residual, LayerNorm, and GELU."""
+        if self.subpixel_convs is None:
+            return hidden_states
+        D = hidden_states.shape[2]
+        x = hidden_states
+        for i, (conv, norm) in enumerate(zip(self.subpixel_convs, self.subpixel_norms)):
+            x_up = x.repeat_interleave(2, dim=1)
+            delta = conv(x.transpose(1, 2)).transpose(1, 2)
+            B_i, T_i, _ = delta.shape
+            delta = delta.view(B_i, T_i, 2, D).reshape(B_i, T_i * 2, D)
+            x = norm(x_up + delta)
+            if i < len(self.subpixel_convs) - 1:
+                x = F.gelu(x)
+        return x
 
     @staticmethod
     def upsample_preds(preds, upsample_factor, smooth_kernel=9):
@@ -318,6 +456,8 @@ class SortformerModules(NeuralModule, Exportable):
         """
         if upsample_factor <= 1:
             return preds
+
+        SortformerModules._validate_odd_kernel_size(smooth_kernel, "smooth_kernel")
 
         # Repeat each frame upsample_factor times: (B, T, S) -> (B, T*factor, S)
         upsampled = preds.repeat_interleave(upsample_factor, dim=1)

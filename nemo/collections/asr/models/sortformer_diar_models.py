@@ -107,6 +107,46 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             )
         self.upsample_factor = encoder_subsample // self.output_subsampling_factor
         self.upsample_smooth_kernel = self._cfg.get("upsample_smooth_kernel", self.upsample_factor + 1)
+        self.upsample_mode = self._cfg.get("upsample_mode", "progressive_residual")
+        upsample_kernel_sizes_cfg = self._cfg.get("upsample_kernel_sizes", [3, 5, 7])
+        try:
+            self.upsample_kernel_sizes = list(upsample_kernel_sizes_cfg)
+        except TypeError as e:
+            raise TypeError(
+                "upsample_kernel_sizes must be an iterable of positive odd integers, "
+                f"but got {type(upsample_kernel_sizes_cfg).__name__}: {upsample_kernel_sizes_cfg}"
+            ) from e
+
+        if self.upsample_factor > 1:
+            if not isinstance(self.upsample_smooth_kernel, int):
+                raise TypeError(
+                    "upsample_smooth_kernel must be an integer when upsampling is enabled, "
+                    f"but got {type(self.upsample_smooth_kernel).__name__}: {self.upsample_smooth_kernel}"
+                )
+            if self.upsample_smooth_kernel < 1:
+                raise ValueError(
+                    f"upsample_smooth_kernel must be >= 1 when upsampling is enabled, got {self.upsample_smooth_kernel}"
+                )
+            if self.upsample_smooth_kernel % 2 == 0:
+                raise ValueError(
+                    "upsample_smooth_kernel must be odd when upsampling is enabled to preserve output length, "
+                    f"got {self.upsample_smooth_kernel}"
+                )
+
+        # When val_upsample_preds is True, training runs at coarse encoder resolution
+        # (output_subsampling_factor) while validation targets are prepared at 10 ms
+        # resolution and predictions are upsampled with upsample_preds.
+        self.val_upsample_preds = self._cfg.get("val_upsample_preds", False)
+        if self.val_upsample_preds and self.upsample_factor > 1:
+            raise ValueError(
+                "val_upsample_preds cannot be combined with learnable upsampling "
+                "(output_subsampling_factor < encoder.subsampling_factor). "
+                "Set output_subsampling_factor equal to encoder.subsampling_factor "
+                "when using val_upsample_preds."
+            )
+        self.val_upsample_smooth_kernel = self._cfg.get(
+            "val_upsample_smooth_kernel", self.output_subsampling_factor + 1
+        )
 
         super().__init__(cfg=self._cfg, trainer=trainer)
         self.preprocessor = SortformerEncLabelModel.from_config_dict(self._cfg.preprocessor)
@@ -135,8 +175,15 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         # Set up learnable sub-pixel upsampling for high-resolution output
         if self.upsample_factor > 1:
             self.sortformer_modules.upsample_factor = self.upsample_factor
+            self.sortformer_modules.upsample_mode = self.upsample_mode
+            self.sortformer_modules.upsample_kernel_sizes = self.upsample_kernel_sizes
             self.sortformer_modules._init_subpixel_upsample()
-            self.sortformer_modules.subpixel_upsample = self.sortformer_modules.subpixel_upsample.to(self.device)
+            if self.sortformer_modules.subpixel_convs is not None:
+                self.sortformer_modules.subpixel_convs = self.sortformer_modules.subpixel_convs.to(self.device)
+            if self.sortformer_modules.subpixel_norms is not None:
+                self.sortformer_modules.subpixel_norms = self.sortformer_modules.subpixel_norms.to(self.device)
+            if self.sortformer_modules.subpixel_upsample is not None:
+                self.sortformer_modules.subpixel_upsample = self.sortformer_modules.subpixel_upsample.to(self.device)
 
         self._init_loss_weights()
 
@@ -185,9 +232,16 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self._accuracy_valid.reset()
         self._accuracy_valid_ats.reset()
 
-    def __setup_dataloader_from_config(self, config):
+    def __setup_dataloader_from_config(self, config, subsampling_factor=None):
+        sf = subsampling_factor if subsampling_factor is not None else self.output_subsampling_factor
+
         # Switch to lhotse dataloader if specified in the config
         if config.get("use_lhotse"):
+            if subsampling_factor is not None:
+                from omegaconf import OmegaConf
+
+                config = DictConfig(OmegaConf.to_container(config, resolve=True))
+                config.subsampling_factor = sf
             return get_lhotse_dataloader_from_config(
                 config,
                 global_rank=self.global_rank,
@@ -229,7 +283,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             featurizer=featurizer,
             fb_featurizer=fb_featurizer,
             window_stride=self._cfg.preprocessor.window_stride,
-            subsampling_factor=self.output_subsampling_factor,
+            subsampling_factor=sf,
             global_rank=global_rank,
             soft_targets=config.soft_targets if 'soft_targets' in config else False,
             device=self.device,
@@ -260,8 +314,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         )
 
     def setup_validation_data(self, val_data_layer_config: Optional[Union[DictConfig, Dict]]):
+        sf = 1 if self.val_upsample_preds else None
         self._validation_dl = self.__setup_dataloader_from_config(
-            config=val_data_layer_config,
+            config=val_data_layer_config, subsampling_factor=sf,
         )
 
     def setup_test_data(self, test_data_config: Optional[Union[DictConfig, Dict]]):
@@ -342,7 +397,10 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         trans_emb_seq = self.transformer_encoder(encoder_states=emb_seq, encoder_mask=encoder_mask)
         if not self.streaming_mode:
             trans_emb_seq = self.sortformer_modules.upsample_hidden(trans_emb_seq)
-        preds = self.sortformer_modules.forward_speaker_sigmoids(trans_emb_seq)
+            if self.upsample_factor > 1:
+                encoder_mask = encoder_mask.repeat_interleave(self.upsample_factor, dim=1)
+        _preds = self.sortformer_modules.forward_speaker_sigmoids(trans_emb_seq)
+        preds = _preds * encoder_mask.unsqueeze(-1)
         return preds
 
     def _diarize_forward(self, batch: Any):
@@ -573,11 +631,23 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 preds = self.sortformer_modules.upsample_preds(
                     preds, upsample_factor=self.upsample_factor, smooth_kernel=self.upsample_smooth_kernel
                 )
+            elif self.val_upsample_preds and not self.training:
+                preds = self.sortformer_modules.upsample_preds(
+                    preds,
+                    upsample_factor=self.output_subsampling_factor,
+                    smooth_kernel=self.val_upsample_smooth_kernel,
+                )
         else:
             emb_seq, emb_seq_length = self.frontend_encoder(
                 processed_signal=processed_signal, processed_signal_length=processed_signal_length
             )
             preds = self.forward_infer(emb_seq, emb_seq_length)
+            if self.val_upsample_preds and not self.training:
+                preds = self.sortformer_modules.upsample_preds(
+                    preds,
+                    upsample_factor=self.output_subsampling_factor,
+                    smooth_kernel=self.val_upsample_smooth_kernel,
+                )
         return preds
 
     @property
@@ -1004,6 +1074,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             dict: A dictionary containing various validation metrics for this batch.
         """
         audio_signal, audio_signal_length, targets, target_lens = batch
+        logging.info(f"audio_signal.shape: {audio_signal.shape}, targets.shape: {targets.shape}, target_lens: {target_lens}")
         preds = self.forward(
             audio_signal=audio_signal,
             audio_signal_length=audio_signal_length,

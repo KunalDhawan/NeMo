@@ -14,6 +14,8 @@ model:
   ats_weight: 0.5 # Weight for Arrival Time Sort (ATS) loss in training the Sortformer diarizer model
   max_num_of_spks: 4 # Maximum number of speakers per model; currently set to 4
   output_subsampling_factor: 8 # Output resolution factor. Set to 1 for 10ms output (upsampled from encoder's 80ms).
+  val_upsample_preds: false # If true, train at coarse resolution (output_subsampling_factor) but validate at 10ms by upsampling preds.
+  val_upsample_smooth_kernel: 9 # Smoothing kernel size for val upsample_preds (must be odd, ignored when val_upsample_preds is false).
 
   model_defaults:
     fc_d_model: 512 # Hidden dimension size of the Fast-conformer Encoder
