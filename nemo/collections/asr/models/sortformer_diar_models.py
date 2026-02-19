@@ -395,10 +395,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         """
         encoder_mask = self.sortformer_modules.length_to_mask(emb_seq_length, emb_seq.shape[1])
         trans_emb_seq = self.transformer_encoder(encoder_states=emb_seq, encoder_mask=encoder_mask)
-        if not self.streaming_mode:
-            trans_emb_seq = self.sortformer_modules.upsample_hidden(trans_emb_seq)
-            if self.upsample_factor > 1:
-                encoder_mask = encoder_mask.repeat_interleave(self.upsample_factor, dim=1)
+        trans_emb_seq = self.sortformer_modules.upsample_hidden(trans_emb_seq)
+        if self.upsample_factor > 1:
+            encoder_mask = encoder_mask.repeat_interleave(self.upsample_factor, dim=1)
         _preds = self.sortformer_modules.forward_speaker_sigmoids(trans_emb_seq)
         preds = _preds * encoder_mask.unsqueeze(-1)
         return preds
@@ -625,13 +624,10 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         processed_signal = processed_signal[:, :, : processed_signal_length.max()]
         if self.streaming_mode:
             preds = self.forward_streaming(processed_signal, processed_signal_length)
-            # Streaming operates at encoder resolution; use interpolation-based
-            # upsampling on the final assembled predictions.
-            if self.upsample_factor > 1:
-                preds = self.sortformer_modules.upsample_preds(
-                    preds, upsample_factor=self.upsample_factor, smooth_kernel=self.upsample_smooth_kernel
-                )
-            elif self.val_upsample_preds and not self.training:
+            # When upsample_factor > 1, forward_streaming_step already collects
+            # fine-resolution chunk preds from the learnable upsampler, so
+            # total_preds is already at target resolution — no further upsampling.
+            if self.upsample_factor <= 1 and self.val_upsample_preds and not self.training:
                 preds = self.sortformer_modules.upsample_preds(
                     preds,
                     upsample_factor=self.output_subsampling_factor,
@@ -724,6 +720,10 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         spkcache_fifo_chunk_preds = self.forward_infer(
             spkcache_fifo_chunk_fc_encoder_embs, spkcache_fifo_chunk_fc_encoder_lengths
         )
+        if self.upsample_factor > 1:
+            spkcache_fifo_chunk_preds = self.sortformer_modules.downsample_preds(
+                spkcache_fifo_chunk_preds, downsample_factor=self.upsample_factor
+            )
         return spkcache_fifo_chunk_preds, chunk_pre_encode_embs, chunk_pre_encode_lengths
 
     def forward_streaming(
@@ -814,6 +814,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         if sig_length < max_n_frames:  # Discard preds corresponding to padding
             n_frames = math.ceil(sig_length / self.encoder.subsampling_factor)
+            if self.upsample_factor > 1:
+                n_frames *= self.upsample_factor
             total_preds = total_preds[:, :n_frames, :]
         return total_preds
 
@@ -896,26 +898,67 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             emb_seq=spkcache_fifo_chunk_fc_encoder_embs, emb_seq_length=spkcache_fifo_chunk_fc_encoder_lengths
         )
 
-        spkcache_fifo_chunk_preds = self.sortformer_modules.apply_mask_to_preds(
-            spkcache_fifo_chunk_preds, spkcache_fifo_chunk_fc_encoder_lengths
-        )
+        lc_enc = round(left_offset / self.encoder.subsampling_factor)
+        rc_enc = math.ceil(right_offset / self.encoder.subsampling_factor)
+        uf = self.upsample_factor
+
+        if uf > 1:
+            preds_fine = spkcache_fifo_chunk_preds
+            spkcache_fifo_chunk_preds = self.sortformer_modules.downsample_preds(
+                preds_fine, downsample_factor=uf
+            ).detach()
+            # Apply the same inverse speaker permutation that streaming_update
+            # will apply to the coarse preds (sync mode only, training only).
+            if not self.async_streaming and streaming_state.spk_perm is not None:
+                batch_size_pf = preds_fine.shape[0]
+                inv_spk_perm = torch.stack(
+                    [torch.argsort(streaming_state.spk_perm[bi]) for bi in range(batch_size_pf)]
+                )
+                preds_fine = torch.stack(
+                    [preds_fine[bi, :, inv_spk_perm[bi]] for bi in range(batch_size_pf)]
+                )
+
         if self.async_streaming:
+            if uf > 1:
+                saved_spkcache_lengths = streaming_state.spkcache_lengths.clone()
+                saved_fifo_lengths = streaming_state.fifo_lengths.clone()
             streaming_state, chunk_preds = self.sortformer_modules.streaming_update_async(
                 streaming_state=streaming_state,
                 chunk=chunk_pre_encode_embs,
                 chunk_lengths=chunk_pre_encode_lengths,
                 preds=spkcache_fifo_chunk_preds,
-                lc=round(left_offset / self.encoder.subsampling_factor),
-                rc=math.ceil(right_offset / self.encoder.subsampling_factor),
+                lc=lc_enc,
+                rc=rc_enc,
             )
+            if uf > 1:
+                batch_size_cp = chunk_pre_encode_embs.shape[0]
+                max_chunk_len = chunk_pre_encode_embs.shape[1] - lc_enc - rc_enc
+                cl_enc = (chunk_pre_encode_lengths - lc_enc).clamp(min=0, max=max_chunk_len)
+                chunk_preds = torch.zeros(
+                    (batch_size_cp, max_chunk_len * uf, preds_fine.shape[2]),
+                    device=preds_fine.device, dtype=preds_fine.dtype,
+                )
+                for bi in range(batch_size_cp):
+                    sl = saved_spkcache_lengths[bi].item()
+                    fl = saved_fifo_lengths[bi].item()
+                    cl = cl_enc[bi].item()
+                    start = (sl + fl + lc_enc) * uf
+                    chunk_preds[bi, : cl * uf, :] = preds_fine[bi, start : start + cl * uf, :]
         else:
+            saved_spkcache_len = streaming_state.spkcache.shape[1]
+            saved_fifo_len = streaming_state.fifo.shape[1]
             streaming_state, chunk_preds = self.sortformer_modules.streaming_update(
                 streaming_state=streaming_state,
                 chunk=chunk_pre_encode_embs,
                 preds=spkcache_fifo_chunk_preds,
-                lc=round(left_offset / self.encoder.subsampling_factor),
-                rc=math.ceil(right_offset / self.encoder.subsampling_factor),
+                lc=lc_enc,
+                rc=rc_enc,
             )
+            if uf > 1:
+                chunk_len = chunk_pre_encode_embs.shape[1] - lc_enc - rc_enc
+                start = (saved_spkcache_len + saved_fifo_len + lc_enc) * uf
+                chunk_preds = preds_fine[:, start : start + chunk_len * uf, :]
+
         total_preds = torch.cat([total_preds, chunk_preds], dim=1)
 
         return streaming_state, total_preds

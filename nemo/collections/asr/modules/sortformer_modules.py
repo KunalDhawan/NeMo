@@ -473,6 +473,32 @@ class SortformerModules(NeuralModule, Exportable):
         return upsampled
 
     @staticmethod
+    def downsample_preds(preds, downsample_factor):
+        """
+        Downsample speaker probability predictions by averaging groups of consecutive
+        frames.  This converts fine-resolution (e.g. 10 ms) predictions back to
+        coarse-resolution (e.g. 80 ms) for streaming-state management.
+
+        Args:
+            preds (torch.Tensor): Speaker probabilities at fine resolution.
+                Shape: (batch_size, n_frames_fine, n_spk)
+            downsample_factor (int): Factor by which to downsample
+                (e.g. 8 for 10 ms -> 80 ms).
+
+        Returns:
+            downsampled (torch.Tensor): Downsampled speaker probabilities.
+                Shape: (batch_size, n_frames_fine // downsample_factor, n_spk)
+        """
+        if downsample_factor <= 1:
+            return preds
+        # Non-overlapping block average: kernel == stride, no padding, so
+        # odd/even kernel is irrelevant (each output is the mean of exactly
+        # downsample_factor adjacent input frames).
+        x = preds.transpose(1, 2)  # avg_pool1d expects (B, C, T)
+        x = F.avg_pool1d(x, kernel_size=downsample_factor, stride=downsample_factor)
+        return x.transpose(1, 2)
+
+    @staticmethod
     def concat_embs(
         list_of_tensors=List[torch.Tensor],
         return_lengths: bool = False,
