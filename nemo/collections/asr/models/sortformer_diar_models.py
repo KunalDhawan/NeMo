@@ -320,8 +320,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         )
 
     def setup_test_data(self, test_data_config: Optional[Union[DictConfig, Dict]]):
+        sf = 1 if self.val_upsample_preds else None
         self._test_dl = self.__setup_dataloader_from_config(
-            config=test_data_config,
+            config=test_data_config, subsampling_factor=sf,
         )
 
     def test_dataloader(self):
