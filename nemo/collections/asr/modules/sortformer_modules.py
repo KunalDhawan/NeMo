@@ -116,6 +116,10 @@ class SortformerModules(NeuralModule, Exportable):
         self.subpixel_convs = None
         self.subpixel_norms = None
         self.subpixel_upsample = None
+        self.preenc_proj_dim = 0
+        self.preenc_proj = None
+        self.preenc_norm = None
+        self.fusion_block = None
 
         # Streaming-related params
         self.spkcache_len = spkcache_len
@@ -338,6 +342,42 @@ class SortformerModules(NeuralModule, Exportable):
                 )
                 self.subpixel_upsample.bias.zero_()
 
+        elif self.upsample_mode == "single_preenc_mlp":
+            proj_dim = self.preenc_proj_dim if self.preenc_proj_dim > 0 else self.tf_d_model
+            self.preenc_proj = nn.Linear(self.fc_d_model, proj_dim)
+            self.preenc_norm = nn.LayerNorm(proj_dim)
+            self.fusion_block = nn.Sequential(
+                nn.Linear(self.tf_d_model + proj_dim, self.tf_d_model),
+                nn.GELU(),
+                nn.LayerNorm(self.tf_d_model)
+            )
+            self.subpixel_upsample = nn.Conv1d(
+                self.tf_d_model,
+                self.tf_d_model * self.upsample_factor,
+                kernel_size=3,
+                padding=1,
+            )
+
+        elif self.upsample_mode in ("single_preenc", "single_preenc_full"):
+            proj_dim = self.preenc_proj_dim if self.preenc_proj_dim > 0 else self.tf_d_model
+            self.preenc_proj = nn.Linear(self.fc_d_model, proj_dim)
+            self.preenc_norm = nn.LayerNorm(proj_dim)
+            self.subpixel_upsample = nn.Conv1d(
+                self.tf_d_model + proj_dim,
+                self.tf_d_model * self.upsample_factor,
+                kernel_size=3,
+                padding=1,
+            )
+            if self.upsample_mode == "single_preenc":
+                with torch.no_grad():
+                    self.preenc_proj.weight.zero_()
+                    self.preenc_proj.bias.zero_()
+                    self.subpixel_upsample.weight[:, :self.tf_d_model, :].zero_()
+                    self.subpixel_upsample.weight[:, :self.tf_d_model, 1].copy_(
+                        torch.eye(self.tf_d_model).repeat(self.upsample_factor, 1)
+                    )
+                    self.subpixel_upsample.bias.zero_()
+
         elif self.upsample_mode in ("progressive", "progressive_residual"):
             n_stages = int(math.log2(self.upsample_factor))
             if 2 ** n_stages != self.upsample_factor:
@@ -372,16 +412,20 @@ class SortformerModules(NeuralModule, Exportable):
         else:
             raise ValueError(
                 f"Unknown upsample_mode '{self.upsample_mode}'. "
-                f"Must be 'single', 'progressive', or 'progressive_residual'."
+                f"Must be 'single', 'single_preenc', 'single_preenc_full', 'single_preenc_mlp', "
+                f"'progressive', or 'progressive_residual'."
             )
 
-    def upsample_hidden(self, hidden_states):
+    def upsample_hidden(self, hidden_states, pre_encode_feats=None):
         """
         Upsample hidden states using the configured sub-pixel upsampling mode.
 
         Args:
             hidden_states (torch.Tensor): Transformer encoder output.
                 Shape: (batch_size, n_frames, hidden_dim)
+            pre_encode_feats (torch.Tensor, optional): Pre-encoder embeddings
+                from ConvSubsampling, used by ``single_preenc*`` modes.
+                Shape: (batch_size, n_frames, fc_d_model)
 
         Returns:
             torch.Tensor: Upsampled hidden states.
@@ -391,6 +435,8 @@ class SortformerModules(NeuralModule, Exportable):
             return hidden_states
         if self.upsample_mode == "single":
             return self._upsample_single(hidden_states)
+        elif self.upsample_mode in ("single_preenc", "single_preenc_full", "single_preenc_mlp"):
+            return self._upsample_single_preenc(hidden_states, pre_encode_feats)
         elif self.upsample_mode == "progressive":
             return self._upsample_progressive(hidden_states)
         elif self.upsample_mode == "progressive_residual":
@@ -403,6 +449,41 @@ class SortformerModules(NeuralModule, Exportable):
             return hidden_states
         B, T, D = hidden_states.shape
         projected = self.subpixel_upsample(hidden_states.transpose(1, 2))
+        projected = projected.transpose(1, 2)
+        return projected.view(B, T, self.upsample_factor, D).reshape(
+            B, T * self.upsample_factor, D
+        )
+
+    def _upsample_single_preenc(self, hidden_states, pre_encode_feats):
+        """Single-shot sub-pixel convolution with pre-encode feature injection.
+
+        ``single_preenc`` zero-inits the projection (conv pre-encode half keeps
+        Kaiming init) so the model starts identical to vanilla ``single``.
+        ``single_preenc_full`` uses default init for all layers.
+        ``single_preenc_mlp`` fuses pre-encode and transformer features through
+        a Linear+GELU+LayerNorm block before the sub-pixel conv.
+        """
+        if self.subpixel_upsample is None or self.preenc_proj is None:
+            return hidden_states
+        if pre_encode_feats is None:
+            raise ValueError(
+                f"upsample_mode '{self.upsample_mode}' requires pre_encode_feats "
+                f"but received None"
+            )
+        B, T, D = hidden_states.shape
+        proj_feats = self.preenc_proj(pre_encode_feats[:, :T, :])
+        
+        if self.upsample_mode in ("single_preenc_mlp", "single_preenc", "single_preenc_full"):
+            proj_feats = self.preenc_norm(proj_feats)
+            
+        combined = torch.cat([hidden_states, proj_feats], dim=-1)
+        
+        if self.upsample_mode == "single_preenc_mlp":
+            fused = self.fusion_block(combined)
+            projected = self.subpixel_upsample(fused.transpose(1, 2))
+        else:
+            projected = self.subpixel_upsample(combined.transpose(1, 2))
+            
         projected = projected.transpose(1, 2)
         return projected.view(B, T, self.upsample_factor, D).reshape(
             B, T * self.upsample_factor, D

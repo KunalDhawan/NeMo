@@ -177,6 +177,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             self.sortformer_modules.upsample_factor = self.upsample_factor
             self.sortformer_modules.upsample_mode = self.upsample_mode
             self.sortformer_modules.upsample_kernel_sizes = self.upsample_kernel_sizes
+            self.sortformer_modules.preenc_proj_dim = self._cfg.get("preenc_proj_dim", 0)
             self.sortformer_modules._init_subpixel_upsample()
             if self.sortformer_modules.subpixel_convs is not None:
                 self.sortformer_modules.subpixel_convs = self.sortformer_modules.subpixel_convs.to(self.device)
@@ -184,6 +185,12 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 self.sortformer_modules.subpixel_norms = self.sortformer_modules.subpixel_norms.to(self.device)
             if self.sortformer_modules.subpixel_upsample is not None:
                 self.sortformer_modules.subpixel_upsample = self.sortformer_modules.subpixel_upsample.to(self.device)
+            if self.sortformer_modules.preenc_proj is not None:
+                self.sortformer_modules.preenc_proj = self.sortformer_modules.preenc_proj.to(self.device)
+            if self.sortformer_modules.preenc_norm is not None:
+                self.sortformer_modules.preenc_norm = self.sortformer_modules.preenc_norm.to(self.device)
+            if self.sortformer_modules.fusion_block is not None:
+                self.sortformer_modules.fusion_block = self.sortformer_modules.fusion_block.to(self.device)
 
         self._init_loss_weights()
 
@@ -349,38 +356,75 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             }
         )
 
+    _PREENC_UPSAMPLE_MODES = ("single_preenc", "single_preenc_full", "single_preenc_mlp")
+
     def frontend_encoder(self, processed_signal, processed_signal_length, bypass_pre_encode: bool = False):
         """
         Generate encoder outputs from frontend encoder.
+
+        When the upsample mode requires pre-encoder features and
+        ``bypass_pre_encode`` is False, the encoder call is split so that
+        the ConvSubsampling output is captured before the conformer layers.
 
         Args:
             processed_signal (torch.Tensor):
                 tensor containing audio-feature (mel spectrogram, mfcc, etc.).
             processed_signal_length (torch.Tensor):
                 tensor containing lengths of audio signal in integers.
+            bypass_pre_encode (bool):
+                if True, ``processed_signal`` already contains pre-encoded
+                embeddings and the subsampling step is skipped.
 
         Returns:
             emb_seq (torch.Tensor):
                 tensor containing encoder outputs.
             emb_seq_length (torch.Tensor):
                 tensor containing lengths of encoder outputs.
+            pre_encode_feats (torch.Tensor or None):
+                ConvSubsampling output at ``fc_d_model`` dimensionality,
+                or None when not needed / not available.
         """
         # Spec augment is not applied during evaluation/testing.
         # In streaming mode (bypass_pre_encode=True), spec augment is applied per-chunk
         # in forward_streaming_step before pre_encode, so skip it here.
         if self.spec_augmentation is not None and self.training and not bypass_pre_encode:
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
-        emb_seq, emb_seq_length = self.encoder(
-            audio_signal=processed_signal,
-            length=processed_signal_length,
-            bypass_pre_encode=bypass_pre_encode,
+
+        need_preenc = (
+            self.upsample_factor > 1
+            and self.upsample_mode in self._PREENC_UPSAMPLE_MODES
+            and not bypass_pre_encode
         )
+        pre_encode_feats = None
+
+        if need_preenc:
+            processed_signal_t = processed_signal.transpose(1, 2)
+            if isinstance(self.encoder.pre_encode, torch.nn.Linear):
+                pre_encode_feats = self.encoder.pre_encode(processed_signal_t)
+                pre_encode_lengths = processed_signal_length
+            else:
+                pre_encode_feats, pre_encode_lengths = self.encoder.pre_encode(
+                    x=processed_signal_t, lengths=processed_signal_length
+                )
+                pre_encode_lengths = pre_encode_lengths.to(torch.int64)
+            emb_seq, emb_seq_length = self.encoder(
+                audio_signal=pre_encode_feats,
+                length=pre_encode_lengths,
+                bypass_pre_encode=True,
+            )
+        else:
+            emb_seq, emb_seq_length = self.encoder(
+                audio_signal=processed_signal,
+                length=processed_signal_length,
+                bypass_pre_encode=bypass_pre_encode,
+            )
+
         emb_seq = emb_seq.transpose(1, 2)
         if self.sortformer_modules.encoder_proj is not None:
             emb_seq = self.sortformer_modules.encoder_proj(emb_seq)
-        return emb_seq, emb_seq_length
+        return emb_seq, emb_seq_length, pre_encode_feats
 
-    def forward_infer(self, emb_seq, emb_seq_length):
+    def forward_infer(self, emb_seq, emb_seq_length, pre_encode_feats=None):
         """
         The main forward pass for diarization for offline diarization inference.
 
@@ -389,6 +433,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 Shape: (batch_size, diar_frame_count, emb_dim)
             emb_seq_length (torch.Tensor): Tensor containing lengths of FastConformer encoder states.
                 Shape: (batch_size,)
+            pre_encode_feats (torch.Tensor, optional): Pre-encoder embeddings from
+                ConvSubsampling, passed through to the upsampler for ``single_preenc*`` modes.
+                Shape: (batch_size, diar_frame_count, fc_d_model)
 
         Returns:
             preds (torch.Tensor): Sorted tensor containing Sigmoid values for predicted speaker labels.
@@ -396,7 +443,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         """
         encoder_mask = self.sortformer_modules.length_to_mask(emb_seq_length, emb_seq.shape[1])
         trans_emb_seq = self.transformer_encoder(encoder_states=emb_seq, encoder_mask=encoder_mask)
-        trans_emb_seq = self.sortformer_modules.upsample_hidden(trans_emb_seq)
+        trans_emb_seq = self.sortformer_modules.upsample_hidden(trans_emb_seq, pre_encode_feats=pre_encode_feats)
         if self.upsample_factor > 1:
             encoder_mask = encoder_mask.repeat_interleave(self.upsample_factor, dim=1)
         _preds = self.sortformer_modules.forward_speaker_sigmoids(trans_emb_seq)
@@ -635,10 +682,10 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                     smooth_kernel=self.val_upsample_smooth_kernel,
                 )
         else:
-            emb_seq, emb_seq_length = self.frontend_encoder(
+            emb_seq, emb_seq_length, pre_encode_feats = self.frontend_encoder(
                 processed_signal=processed_signal, processed_signal_length=processed_signal_length
             )
-            preds = self.forward_infer(emb_seq, emb_seq_length)
+            preds = self.forward_infer(emb_seq, emb_seq_length, pre_encode_feats=pre_encode_feats)
             if self.val_upsample_preds and not self.training:
                 preds = self.sortformer_modules.upsample_preds(
                     preds,
@@ -711,7 +758,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         )
 
         # encode the concatenated embeddings
-        spkcache_fifo_chunk_fc_encoder_embs, spkcache_fifo_chunk_fc_encoder_lengths = self.frontend_encoder(
+        spkcache_fifo_chunk_fc_encoder_embs, spkcache_fifo_chunk_fc_encoder_lengths, _ = self.frontend_encoder(
             processed_signal=spkcache_fifo_chunk_pre_encode_embs,
             processed_signal_length=spkcache_fifo_chunk_pre_encode_lengths,
             bypass_pre_encode=True,
@@ -719,7 +766,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         # forward pass for inference
         spkcache_fifo_chunk_preds = self.forward_infer(
-            spkcache_fifo_chunk_fc_encoder_embs, spkcache_fifo_chunk_fc_encoder_lengths
+            spkcache_fifo_chunk_fc_encoder_embs,
+            spkcache_fifo_chunk_fc_encoder_lengths,
+            pre_encode_feats=spkcache_fifo_chunk_pre_encode_embs,
         )
         if self.upsample_factor > 1:
             spkcache_fifo_chunk_preds = self.sortformer_modules.downsample_preds(
@@ -890,13 +939,15 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             spkcache_fifo_chunk_pre_encode_lengths = (
                 streaming_state.spkcache.shape[1] + streaming_state.fifo.shape[1] + chunk_pre_encode_lengths
             )
-        spkcache_fifo_chunk_fc_encoder_embs, spkcache_fifo_chunk_fc_encoder_lengths = self.frontend_encoder(
+        spkcache_fifo_chunk_fc_encoder_embs, spkcache_fifo_chunk_fc_encoder_lengths, _ = self.frontend_encoder(
             processed_signal=spkcache_fifo_chunk_pre_encode_embs,
             processed_signal_length=spkcache_fifo_chunk_pre_encode_lengths,
             bypass_pre_encode=True,
         )
         spkcache_fifo_chunk_preds = self.forward_infer(
-            emb_seq=spkcache_fifo_chunk_fc_encoder_embs, emb_seq_length=spkcache_fifo_chunk_fc_encoder_lengths
+            emb_seq=spkcache_fifo_chunk_fc_encoder_embs,
+            emb_seq_length=spkcache_fifo_chunk_fc_encoder_lengths,
+            pre_encode_feats=spkcache_fifo_chunk_pre_encode_embs,
         )
 
         lc_enc = round(left_offset / self.encoder.subsampling_factor)
