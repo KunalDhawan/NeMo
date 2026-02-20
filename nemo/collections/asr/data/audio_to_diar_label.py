@@ -1331,9 +1331,9 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
                 weights = torch.ones(num_speakers)
             spk_indices = torch.multinomial(weights, self.max_spks, replacement=False)
             spks_tokeep = sorted(spk_indices.tolist())
-            logging.info(
-                f"uniq_id: {sample.uniq_id}, active_frames_per_spk: {active_frames_per_spk.tolist()}, spks_tokeep: {spks_tokeep}"
-            )
+            #logging.info(
+            #    f"uniq_id: {sample.uniq_id}, active_frames_per_spk: {active_frames_per_spk.tolist()}, spks_tokeep: {spks_tokeep}"
+            #)
         else:
             spks_tokeep = all_spks
 
@@ -1506,10 +1506,10 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         min_viable_samples = int(self.min_subsegment_duration * self.featurizer.sample_rate)
         if audio_signal.shape[0] < min_viable_samples:
             return (
-                torch.tensor([]),
+                torch.tensor([], dtype=audio_signal.dtype),
                 torch.tensor(0).long(),
-                torch.tensor([[]]),
-                torch.tensor(0),
+                torch.zeros((0, self.max_spks), dtype=frame_level_target.dtype),
+                torch.tensor([0]).long(),
             )
 
         audio_signal_length = torch.tensor(audio_signal.shape[0]).long()
@@ -1584,6 +1584,15 @@ def _eesd_train_collate_fn(self, batch):
             A tensor containing the number of segments for each sample in the batch, necessary for
             reshaping inputs to the EESD model.
     """
+    batch = [item for item in batch if item[0].numel() > 0]
+    if len(batch) == 0:
+        return (
+            torch.zeros(0),
+            torch.zeros(0, dtype=torch.long),
+            torch.zeros(0),
+            torch.zeros(0, dtype=torch.long),
+        )
+
     packed_batch = list(zip(*batch))
     audio_signal, feature_length, targets, target_len = packed_batch
     audio_signal_list, feature_length_list = [], []
