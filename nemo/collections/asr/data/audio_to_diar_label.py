@@ -185,6 +185,8 @@ def get_subsegments_to_timestamps(
         ts (torch.tensor):
             A tensor containing the scaled and rounded timestamps for each subsegment.
     """
+    if len(subsegments) == 0:
+        return torch.zeros((0, 2), dtype=torch.long)
     seg_ts = (torch.tensor(subsegments) * feat_per_sec).float()
     ts_round = torch.round(seg_ts, decimals=decimals)
     ts = ts_round.long()
@@ -1313,14 +1315,6 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         num_speakers = len(sess_to_global_spkids)
         all_spks = list(sess_to_global_spkids.keys())
 
-        if num_speakers > self.max_spks:
-            spks_tokeep = sorted(random.sample(all_spks, self.max_spks))
-        else:
-            spks_tokeep = all_spks
-
-        spks_todrop = [spk for spk in all_spks if spk not in spks_tokeep]
-        #logging.info(f"uniq_id: {sample.uniq_id}, num_speakers: {num_speakers}, spks_tokeep: {spks_tokeep}, spks_todrop: {spks_todrop}")
-
         frame_level_target = get_frame_targets_from_rttm(
             rttm_timestamps=rttm_timestamps,
             offset=offset,
@@ -1329,7 +1323,21 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
             feat_per_sec=self.feat_per_sec,
             max_spks=num_speakers,
         )
-        #logging.info(f"uniq_id: {sample.uniq_id}, frame_level_target: {frame_level_target.shape}")
+
+        if num_speakers > self.max_spks:
+            active_frames_per_spk = frame_level_target.sum(dim=0)
+            weights = active_frames_per_spk.float()
+            if weights.sum() == 0:
+                weights = torch.ones(num_speakers)
+            spk_indices = torch.multinomial(weights, self.max_spks, replacement=False)
+            spks_tokeep = sorted(spk_indices.tolist())
+            logging.info(
+                f"uniq_id: {sample.uniq_id}, active_frames_per_spk: {active_frames_per_spk.tolist()}, spks_tokeep: {spks_tokeep}"
+            )
+        else:
+            spks_tokeep = all_spks
+
+        spks_todrop = [spk for spk in all_spks if spk not in spks_tokeep]
 
         if spks_todrop:
             samples_per_frame = int(self.featurizer.sample_rate / self.feat_per_sec)
@@ -1495,8 +1503,8 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
                 #logging.info(f"uniq_id: {sample.uniq_id}, audio_signal after trimming: {audio_signal.shape}")
                 #logging.info(f"uniq_id: {sample.uniq_id}, frame_level_target after trimming: {frame_level_target.shape}")
 
-        if audio_signal.shape[0] == 0:
-            # If all audio was dropped, return empty tensors to be skipped by collate_fn or handled downstream
+        min_viable_samples = int(self.min_subsegment_duration * self.featurizer.sample_rate)
+        if audio_signal.shape[0] < min_viable_samples:
             return (
                 torch.tensor([]),
                 torch.tensor(0).long(),
