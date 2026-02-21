@@ -150,6 +150,9 @@ class DiarizationConfig:
     use_lhotse: bool = True
     batch_duration: int = 100000
 
+    # Upsample coarse predictions to 10 ms resolution via repeat + smooth
+    upsample_preds: bool = False
+
     # Eval Settings: (0.25, False) should be default setting for sortformer eval.
     collar: float = 0.25  # Collar in seconds for DER calculation
     ignore_overlap: bool = False  # If True, DER will be calculated only for non-overlapping segments
@@ -244,6 +247,7 @@ def diarization_objective(
     temp_out_dir: str,
     infer_audio_rttm_dict: Dict[str, Dict[str, str]],
     diar_model_preds_total_list: List[torch.Tensor],
+    unit_10ms_frame_count: int = 8,
     collar: float = 0.25,
     ignore_overlap: bool = False,
 ) -> float:
@@ -264,6 +268,8 @@ def diarization_objective(
         diar_model_preds_total_list (List[torch.Tensor]): List of prediction matrices containing
             sigmoid values for each speaker.
             Dimension: [(1, num_frames, num_speakers), ..., (1, num_frames, num_speakers)]
+        unit_10ms_frame_count (int, optional): Number of 10ms units represented by one model frame.
+            Defaults to 8.
         collar (float, optional): Collar in seconds for DER calculation. Defaults to 0.25.
         ignore_overlap (bool, optional): If True, DER will be calculated only for non-overlapping segments.
             Defaults to False.
@@ -278,7 +284,7 @@ def diarization_objective(
             audio_rttm_map_dict=infer_audio_rttm_dict,
             postprocessing_cfg=postprocessing_cfg,
             batch_preds_list=diar_model_preds_total_list,
-            unit_10ms_frame_count=8,
+            unit_10ms_frame_count=unit_10ms_frame_count,
             bypass_postprocessing=False,
         )
         metric, _, _ = score_labels(
@@ -317,6 +323,7 @@ def _optuna_worker(
     infer_audio_rttm_dict: Dict[str, Dict[str, str]],
     preds_list: List[torch.Tensor],
     temp_out_dir: str,
+    unit_10ms_frame_count: int,
     n_trials: int,
     worker_id: int,
 ):
@@ -334,6 +341,7 @@ def _optuna_worker(
         infer_audio_rttm_dict (Dict[str, Dict[str, str]]): Audio-RTTM mapping dictionary.
         preds_list (List[torch.Tensor]): Shared-memory prediction tensors.
         temp_out_dir (str): Temporary directory for intermediate outputs.
+        unit_10ms_frame_count (int): Number of 10ms units represented by one model frame.
         n_trials (int): Number of trials this worker should run.
         worker_id (int): Worker index for logging purposes.
     """
@@ -349,6 +357,7 @@ def _optuna_worker(
         temp_out_dir=temp_out_dir,
         infer_audio_rttm_dict=infer_audio_rttm_dict,
         diar_model_preds_total_list=preds_list,
+        unit_10ms_frame_count=unit_10ms_frame_count,
         collar=cfg.collar,
     )
     storage = _create_optuna_storage(cfg)
@@ -363,6 +372,7 @@ def run_optuna_hyperparam_search(
     infer_audio_rttm_dict: Dict[str, Dict[str, str]],
     preds_list: List[torch.Tensor],
     temp_out_dir: str,
+    unit_10ms_frame_count: int = 8,
 ):
     """
     Run Optuna hyperparameter optimization for speaker diarization.
@@ -376,6 +386,8 @@ def run_optuna_hyperparam_search(
         preds_list (List[torch.Tensor]): list of prediction matrices containing sigmoid values for each speaker.
             Dimension: [(1, num_frames, num_speakers), ..., (1, num_frames, num_speakers)]
         temp_out_dir (str): temporary directory for storing intermediate outputs.
+        unit_10ms_frame_count (int, optional): Number of 10ms units represented by one model frame.
+            Defaults to 8.
     """
     # Setup logging
     logger = logging.getLogger()
@@ -403,6 +415,7 @@ def run_optuna_hyperparam_search(
             temp_out_dir=temp_out_dir,
             infer_audio_rttm_dict=infer_audio_rttm_dict,
             diar_model_preds_total_list=preds_list,
+            unit_10ms_frame_count=unit_10ms_frame_count,
             collar=cfg.collar,
         )
         study.optimize(worker_function, n_trials=cfg.optuna_n_trials)
@@ -439,7 +452,7 @@ def run_optuna_hyperparam_search(
                 p = spawn_ctx.Process(
                     target=_optuna_worker,
                     args=(cfg_dict, postprocessing_dict, infer_audio_rttm_dict,
-                          preds_list, temp_out_dir, n_trials, i),
+                          preds_list, temp_out_dir, unit_10ms_frame_count, n_trials, i),
                 )
                 p.start()
                 processes.append(p)
@@ -616,6 +629,15 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     diar_model._cfg.test_ds.batch_duration = cfg.batch_duration
     OmegaConf.set_struct(diar_model._cfg, True)
 
+    if cfg.upsample_preds:
+        if getattr(diar_model, 'upsample_factor', 1) > 1:
+            raise ValueError(
+                "upsample_preds cannot be used with a model that already has "
+                "learnable upsampling (upsample_factor > 1)."
+            )
+        diar_model.val_upsample_preds = True
+        logging.info("Enabling upsample_preds")
+
     # Model setup for inference
     diar_model._cfg.test_ds.num_workers = cfg.num_workers
     diar_model.setup_test_data(test_data_config=diar_model._cfg.test_ds)
@@ -656,6 +678,8 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         if cfg.save_preds_tensors:
             torch.save(diar_model.preds_total_list, tensor_path)
 
+    unit_10ms = 1 if cfg.upsample_preds else getattr(diar_model, 'output_subsampling_factor', 8)
+
     if cfg.launch_pp_optim:
         # Launch a hyperparameter optimization process if launch_pp_optim is True
         run_optuna_hyperparam_search(
@@ -664,6 +688,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
             infer_audio_rttm_dict=infer_audio_rttm_dict,
             preds_list=diar_model_preds_total_list,
             temp_out_dir=cfg.optuna_temp_dir,
+            unit_10ms_frame_count=unit_10ms,
         )
 
     # Evaluation
@@ -676,7 +701,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
             infer_audio_rttm_dict,
             postprocessing_cfg=postprocessing_cfg,
             batch_preds_list=diar_model_preds_total_list,
-            unit_10ms_frame_count=8,
+            unit_10ms_frame_count=unit_10ms,
             bypass_postprocessing=cfg.bypass_postprocessing,
             out_rttm_dir=cfg.out_rttm_dir,
         )

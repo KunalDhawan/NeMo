@@ -245,6 +245,7 @@ def diarization_objective(
     temp_out_dir: str,
     infer_audio_rttm_dict: Dict[str, Dict[str, str]],
     diar_model_preds_total_list: List[torch.Tensor],
+    unit_10ms_frame_count: int = 8,
     collar: float = 0.25,
     ignore_overlap: bool = False,
 ) -> float:
@@ -265,6 +266,8 @@ def diarization_objective(
         diar_model_preds_total_list (List[torch.Tensor]): List of prediction matrices containing
             sigmoid values for each speaker.
             Dimension: [(1, num_frames, num_speakers), ..., (1, num_frames, num_speakers)]
+        unit_10ms_frame_count (int, optional): Number of 10ms units represented by one model frame.
+            Defaults to 8.
         collar (float, optional): Collar in seconds for DER calculation. Defaults to 0.25.
         ignore_overlap (bool, optional): If True, DER will be calculated only for non-overlapping segments.
             Defaults to False.
@@ -279,7 +282,7 @@ def diarization_objective(
             audio_rttm_map_dict=infer_audio_rttm_dict,
             postprocessing_cfg=postprocessing_cfg,
             batch_preds_list=diar_model_preds_total_list,
-            unit_10ms_frame_count=1 if cfg.upsample_preds else 8,
+            unit_10ms_frame_count=unit_10ms_frame_count,
             bypass_postprocessing=False,
         )
         metric, _, _ = score_labels(
@@ -300,6 +303,7 @@ def run_optuna_hyperparam_search(
     infer_audio_rttm_dict: Dict[str, Dict[str, str]],
     preds_list: List[torch.Tensor],
     temp_out_dir: str,
+    unit_10ms_frame_count: int = 8,
 ):
     """
     Run Optuna hyperparameter optimization for speaker diarization.
@@ -311,6 +315,8 @@ def run_optuna_hyperparam_search(
         preds_list (List[torch.Tensor]): list of prediction matrices containing sigmoid values for each speaker.
             Dimension: [(1, num_frames, num_speakers), ..., (1, num_frames, num_speakers)]
         temp_out_dir (str): temporary directory for storing intermediate outputs.
+        unit_10ms_frame_count (int, optional): Number of 10ms units represented by one model frame.
+            Defaults to 8.
     """
     worker_function = lambda trial: diarization_objective(
         trial=trial,
@@ -319,6 +325,7 @@ def run_optuna_hyperparam_search(
         temp_out_dir=temp_out_dir,
         infer_audio_rttm_dict=infer_audio_rttm_dict,
         diar_model_preds_total_list=preds_list,
+        unit_10ms_frame_count=unit_10ms_frame_count,
         collar=cfg.collar,
     )
     study = optuna.create_study(
@@ -526,6 +533,8 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         if cfg.save_preds_tensors:
             torch.save(diar_model.preds_total_list, tensor_path)
 
+    unit_10ms = 1 if cfg.upsample_preds else getattr(diar_model, 'output_subsampling_factor', 8)
+
     if cfg.launch_pp_optim:
         # Launch a hyperparameter optimization process if launch_pp_optim is True
         run_optuna_hyperparam_search(
@@ -534,6 +543,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
             infer_audio_rttm_dict=infer_audio_rttm_dict,
             preds_list=diar_model_preds_total_list,
             temp_out_dir=cfg.optuna_temp_dir,
+            unit_10ms_frame_count=unit_10ms,
         )
 
     # Evaluation
@@ -542,7 +552,6 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
             os.mkdir(cfg.out_rttm_dir)
 
         logging.info("Running offline diarization evaluation...")
-        unit_10ms = 1 if cfg.upsample_preds else getattr(diar_model, 'output_subsampling_factor', 8)
         all_hyps, all_refs, all_uems = convert_pred_mat_to_segments(
             infer_audio_rttm_dict,
             postprocessing_cfg=postprocessing_cfg,
