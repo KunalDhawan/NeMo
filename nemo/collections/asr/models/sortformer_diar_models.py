@@ -107,7 +107,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             )
         self.upsample_factor = encoder_subsample // self.output_subsampling_factor
         self.upsample_smooth_kernel = self._cfg.get("upsample_smooth_kernel", self.upsample_factor + 1)
-        self.upsample_mode = self._cfg.get("upsample_mode", "progressive_residual")
+        self.upsample_mode = self._cfg.get("upsample_mode", "single")
         upsample_kernel_sizes_cfg = self._cfg.get("upsample_kernel_sizes", [3, 5, 7])
         try:
             self.upsample_kernel_sizes = list(upsample_kernel_sizes_cfg)

@@ -111,7 +111,7 @@ class SortformerModules(NeuralModule, Exportable):
 
         # Learnable sub-pixel upsampling (initialized by the model when needed)
         self.upsample_factor = 1
-        self.upsample_mode = "progressive_residual"
+        self.upsample_mode = "single"
         self.upsample_kernel_sizes = [3, 5, 7]
         self.subpixel_convs = None
         self.subpixel_norms = None
