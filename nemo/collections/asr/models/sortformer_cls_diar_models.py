@@ -449,10 +449,14 @@ class SortformerCLSEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationM
         emb_seq = emb_seq.transpose(1, 2)  # (B, D, T) -> (B, T, D)
         return emb_seq, emb_seq_length, cls_embs, pre_encode_feats
 
-    def forward_backend(self, emb_seq, emb_seq_length, spk_embs=None):
+    def forward_backend(self, emb_seq, emb_seq_length, spk_embs=None, pre_encode_feats=None):
         """
         The main forward pass for diarization for offline diarization inference.
         Dispatches to the appropriate backend based on sortformer_modules.backend.
+
+        Each backend runs its expensive encoder at coarse resolution, then
+        calls ``upsample_hidden`` internally before the final projection so
+        that only the cheap output layer operates at fine resolution.
 
         Args:
             emb_seq (torch.Tensor): Tensor containing FastConformer encoder states (embedding vectors).
@@ -461,55 +465,67 @@ class SortformerCLSEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationM
                 Shape: (batch_size,)
             spk_embs (torch.Tensor, optional): Speaker embeddings from CLS tokens.
                 Shape: (batch_size, local_num_spks, emb_dim). Required for "dotp" backend.
+            pre_encode_feats (torch.Tensor, optional): Pre-encoder embeddings from
+                ConvSubsampling, passed through to the upsampler for ``single_preenc*`` modes.
+                Shape: (batch_size, diar_frame_count, fc_d_model)
 
         Returns:
             logits (torch.Tensor): Tensor containing local speaker logits.
-                Shape: (batch_size, diar_frame_count, num_speakers)
+                Shape: (batch_size, diar_frame_count [* upsample_factor], num_speakers)
         """
         encoder_mask = self.sortformer_modules.length_to_mask(emb_seq_length, emb_seq.shape[1])
 
         if self.sortformer_modules.backend == "trff":
-            logits = self.backend_trff(emb_seq, encoder_mask)
+            logits = self.backend_trff(emb_seq, encoder_mask, pre_encode_feats=pre_encode_feats)
         elif self.sortformer_modules.backend == "dotp":
             if spk_embs is None:
                 raise ValueError("spk_embs is required for 'dotp' backend")
-            logits = self.backend_dotp(emb_seq, spk_embs)
+            logits = self.backend_dotp(emb_seq, spk_embs, pre_encode_feats=pre_encode_feats)
         elif self.sortformer_modules.backend == "isd":
             if spk_embs is None:
                 raise ValueError("spk_embs is required for 'isd' backend")
-            logits = self.backend_isd(emb_seq, emb_seq_length, spk_embs)
+            logits = self.backend_isd(emb_seq, emb_seq_length, spk_embs, pre_encode_feats=pre_encode_feats)
         elif self.sortformer_modules.backend == "jsd":
             if spk_embs is None:
                 raise ValueError("spk_embs is required for 'jsd' backend")
-            logits = self.backend_jsd(emb_seq, emb_seq_length, spk_embs)
+            logits = self.backend_jsd(emb_seq, emb_seq_length, spk_embs, pre_encode_feats=pre_encode_feats)
         else:
             raise ValueError(f"Unknown backend: {self.sortformer_modules.backend}")
-        
-        # Apply length mask (common to all backends)
+
+        # Recompute mask at (possibly upsampled) output resolution
+        if self.upsample_factor > 1:
+            encoder_mask = self.sortformer_modules.length_to_mask(
+                emb_seq_length * self.upsample_factor, logits.shape[1]
+            )
         mask = encoder_mask.unsqueeze(-1)
         logits = logits.masked_fill(~mask, -1e9)
         return logits
 
-    def backend_trff(self, emb_seq, encoder_mask):
+    def backend_trff(self, emb_seq, encoder_mask, pre_encode_feats=None):
         """
         Transformer + feedforward backend for computing local speaker logits.
+        The transformer runs at coarse resolution; upsampling is applied
+        before the cheap feedforward projection.
 
         Args:
             emb_seq (torch.Tensor): Tensor containing encoder states.
                 Shape: (batch_size, diar_frame_count, emb_dim)
             encoder_mask (torch.Tensor): Boolean mask for encoder states.
                 Shape: (batch_size, diar_frame_count)
+            pre_encode_feats (torch.Tensor, optional): Pre-encoder embeddings
+                for ``single_preenc*`` upsample modes.
 
         Returns:
             logits (torch.Tensor): Tensor containing local speaker logits (unmasked).
-                Shape: (batch_size, diar_frame_count, local_num_spks)
+                Shape: (batch_size, diar_frame_count [* upsample_factor], local_num_spks)
         """
         if self.transformer_encoder is not None:
             emb_seq = self.transformer_encoder(encoder_states=emb_seq, encoder_mask=encoder_mask)
+        emb_seq = self.sortformer_modules.upsample_hidden(emb_seq, pre_encode_feats=pre_encode_feats)
         logits = self.sortformer_modules.forward_spk_logits(emb_seq)
         return logits
 
-    def backend_dotp(self, emb_seq, spk_embs):
+    def backend_dotp(self, emb_seq, spk_embs, pre_encode_feats=None):
         """
         Dot product backend for computing local speaker logits.
         Computes logits as dot product between frame embeddings and speaker embeddings.
@@ -519,20 +535,24 @@ class SortformerCLSEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationM
                 Shape: (batch_size, diar_frame_count, emb_dim)
             spk_embs (torch.Tensor): Speaker embeddings from CLS tokens (projected).
                 Shape: (batch_size, local_num_spks, emb_dim)
+            pre_encode_feats (torch.Tensor, optional): Pre-encoder embeddings
+                for ``single_preenc*`` upsample modes.
 
         Returns:
             logits (torch.Tensor): Tensor containing local speaker logits (unmasked).
-                Shape: (batch_size, diar_frame_count, local_num_spks)
+                Shape: (batch_size, diar_frame_count [* upsample_factor], local_num_spks)
         """
         # Compute dot product: (B, T, D) @ (B, D, local_num_spks) -> (B, T, local_num_spks)
+        emb_seq = self.sortformer_modules.upsample_hidden(emb_seq, pre_encode_feats=pre_encode_feats)
         logits = torch.bmm(emb_seq, spk_embs.transpose(1, 2))
         return logits
 
-    def backend_isd(self, emb_seq, emb_seq_length, spk_embs):
+    def backend_isd(self, emb_seq, emb_seq_length, spk_embs, pre_encode_feats=None):
         """
         Individual Speaker Detection (ISD) backend for computing local speaker logits.
         Fuses per-speaker embeddings with frame embeddings using configurable fusion
-        and runs a dedicated encoder.
+        and runs a dedicated encoder.  The ISD encoder runs at coarse resolution;
+        upsampling is applied before the cheap output projection.
 
         Args:
             emb_seq (torch.Tensor): Tensor containing encoder states (projected).
@@ -541,10 +561,13 @@ class SortformerCLSEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationM
                 Shape: (batch_size,)
             spk_embs (torch.Tensor): Speaker embeddings from CLS tokens (projected).
                 Shape: (batch_size, local_num_spks, se_d_model)
+            pre_encode_feats (torch.Tensor, optional): Unused; accepted for
+                interface consistency.  ISD operates on fused per-speaker
+                sequences, so ``single_preenc*`` modes are not applicable.
 
         Returns:
             logits (torch.Tensor): Tensor containing local speaker logits (unmasked).
-                Shape: (batch_size, diar_frame_count, local_num_spks)
+                Shape: (batch_size, diar_frame_count [* upsample_factor], local_num_spks)
         """
         if self.isd_encoder is None or self.sortformer_modules.backend_output_proj is None:
             raise RuntimeError("ISD backend modules are not initialized")
@@ -565,19 +588,23 @@ class SortformerCLSEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationM
         isd_lengths = emb_seq_length.unsqueeze(1).expand(-1, local_num_spks).reshape(-1)
         encoder_mask = self.sortformer_modules.length_to_mask(isd_lengths, seq_len)
 
-        # Run ISD encoder and output projection
+        # Run ISD encoder at coarse resolution, then upsample + project
         encoded = self.isd_encoder(encoder_states=combined, encoder_mask=encoder_mask)
-        logits = self.sortformer_modules.backend_output_proj(encoded)  # (B * local_num_spks, T, 1)
+        encoded = self.sortformer_modules.upsample_hidden(encoded)
+        out_seq_len = encoded.shape[1]
+        logits = self.sortformer_modules.backend_output_proj(encoded)  # (B * local_num_spks, T_out, 1)
 
-        # Reshape back to (B, T, local_num_spks)
-        logits = logits.reshape(batch_size, local_num_spks, seq_len, 1).squeeze(-1).transpose(1, 2)
+        # Reshape back to (B, T_out, local_num_spks)
+        logits = logits.reshape(batch_size, local_num_spks, out_seq_len, 1).squeeze(-1).transpose(1, 2)
         return logits
 
-    def backend_jsd(self, emb_seq, emb_seq_length, spk_embs):
+    def backend_jsd(self, emb_seq, emb_seq_length, spk_embs, pre_encode_feats=None):
         """
         Joint Speaker Detection (JSD) backend for computing local speaker logits.
         Alternates time-wise and speaker-wise self-attention to model both
-        temporal patterns and speaker interactions jointly.
+        temporal patterns and speaker interactions jointly.  The JSD encoder
+        runs at coarse resolution; upsampling is applied before the cheap
+        output projection.
 
         Args:
             emb_seq (torch.Tensor): Tensor containing encoder states (projected).
@@ -586,10 +613,13 @@ class SortformerCLSEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationM
                 Shape: (batch_size,)
             spk_embs (torch.Tensor): Speaker embeddings from CLS tokens (projected).
                 Shape: (batch_size, local_num_spks, se_d_model)
+            pre_encode_feats (torch.Tensor, optional): Unused; accepted for
+                interface consistency.  JSD operates on fused per-speaker
+                sequences, so ``single_preenc*`` modes are not applicable.
 
         Returns:
             logits (torch.Tensor): Tensor containing local speaker logits (unmasked).
-                Shape: (batch_size, diar_frame_count, local_num_spks)
+                Shape: (batch_size, diar_frame_count [* upsample_factor], local_num_spks)
         """
         if self.jsd_encoder is None or self.sortformer_modules.backend_output_proj is None:
             raise RuntimeError("JSD backend modules are not initialized")
@@ -602,12 +632,19 @@ class SortformerCLSEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationM
         # Apply configurable fusion
         combined = self.sortformer_modules.apply_fusion(emb_seq_expanded, spk_embs)  # (B, S, T, tf_d_model)
 
-        # Run JSD encoder - input/output is (B, S, T, D)
+        # Run JSD encoder at coarse resolution - input/output is (B, S, T, D)
         encoded = self.jsd_encoder(combined, time_lengths=emb_seq_length)  # (B, S, T, D)
 
+        # Upsample along time: flatten to (B*S, T, D), upsample, reshape back
+        batch_size, n_spk, seq_len, d = encoded.shape
+        encoded_flat = encoded.reshape(batch_size * n_spk, seq_len, d)
+        encoded_flat = self.sortformer_modules.upsample_hidden(encoded_flat)
+        out_seq_len = encoded_flat.shape[1]
+        encoded = encoded_flat.reshape(batch_size, n_spk, out_seq_len, d)
+
         # Project to logits
-        logits = self.sortformer_modules.backend_output_proj(encoded)  # (B, S, T, 1)
-        logits = logits.squeeze(-1).transpose(1, 2)  # (B, T, S)
+        logits = self.sortformer_modules.backend_output_proj(encoded)  # (B, S, T_out, 1)
+        logits = logits.squeeze(-1).transpose(1, 2)  # (B, T_out, S)
         return logits
 
     def _diarize_forward(self, batch: Any):
@@ -850,11 +887,11 @@ class SortformerCLSEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationM
             )
             n_spk = self.sortformer_modules.n_spk
             emb_seq_proj_tf = self.sortformer_modules.encoder_proj_tf(emb_seq)
-            emb_seq_proj_tf = self.sortformer_modules.upsample_hidden(emb_seq_proj_tf, pre_encode_feats=pre_encode_feats)
-            if self.upsample_factor > 1:
-                emb_seq_length = emb_seq_length * self.upsample_factor
             spk_embs_proj_tf = self.sortformer_modules.spk_emb_proj_tf(cls_embs[:, :n_spk, :])
-            logits = self.forward_backend(emb_seq_proj_tf, emb_seq_length, spk_embs=spk_embs_proj_tf)
+            logits = self.forward_backend(
+                emb_seq_proj_tf, emb_seq_length,
+                spk_embs=spk_embs_proj_tf, pre_encode_feats=pre_encode_feats,
+            )
             preds = F.sigmoid(logits)
             if self.val_upsample_preds and not self.training:
                 preds = self.sortformer_modules.upsample_preds(
@@ -937,17 +974,12 @@ class SortformerCLSEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationM
         # forward pass for inference
         n_spk = self.sortformer_modules.n_spk
         emb_seq_proj_tf = self.sortformer_modules.encoder_proj_tf(spkcache_fifo_chunk_fc_encoder_embs)
-        emb_seq_proj_tf = self.sortformer_modules.upsample_hidden(
-            emb_seq_proj_tf, pre_encode_feats=spkcache_fifo_chunk_pre_encode_embs
-        )
-        backend_lengths = spkcache_fifo_chunk_fc_encoder_lengths
-        if self.upsample_factor > 1:
-            backend_lengths = spkcache_fifo_chunk_fc_encoder_lengths * self.upsample_factor
         spk_embs_proj_tf = self.sortformer_modules.spk_emb_proj_tf(cls_embs[:, :n_spk, :])
         logits = self.forward_backend(
             emb_seq=emb_seq_proj_tf,
-            emb_seq_length=backend_lengths,
+            emb_seq_length=spkcache_fifo_chunk_fc_encoder_lengths,
             spk_embs=spk_embs_proj_tf,
+            pre_encode_feats=spkcache_fifo_chunk_pre_encode_embs,
         )
         spkcache_fifo_chunk_preds = F.sigmoid(logits)
         if self.upsample_factor > 1:
@@ -1128,22 +1160,20 @@ class SortformerCLSEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationM
         )
         n_spk = self.sortformer_modules.n_spk
         emb_seq_proj_tf = self.sortformer_modules.encoder_proj_tf(spkcache_fifo_chunk_fc_encoder_embs)
-        emb_seq_proj_tf = self.sortformer_modules.upsample_hidden(
-            emb_seq_proj_tf, pre_encode_feats=spkcache_fifo_chunk_pre_encode_embs
-        )
-        backend_lengths = spkcache_fifo_chunk_fc_encoder_lengths
-        if self.upsample_factor > 1:
-            backend_lengths = spkcache_fifo_chunk_fc_encoder_lengths * self.upsample_factor
         spk_embs_proj_tf = self.sortformer_modules.spk_emb_proj_tf(cls_embs[:, :n_spk, :])
         logits = self.forward_backend(
             emb_seq=emb_seq_proj_tf,
-            emb_seq_length=backend_lengths,
+            emb_seq_length=spkcache_fifo_chunk_fc_encoder_lengths,
             spk_embs=spk_embs_proj_tf,
+            pre_encode_feats=spkcache_fifo_chunk_pre_encode_embs,
         )
         spkcache_fifo_chunk_preds = F.sigmoid(logits)
 
+        preds_lengths = spkcache_fifo_chunk_fc_encoder_lengths
+        if self.upsample_factor > 1:
+            preds_lengths = spkcache_fifo_chunk_fc_encoder_lengths * self.upsample_factor
         spkcache_fifo_chunk_preds = self.sortformer_modules.apply_mask_to_preds(
-            spkcache_fifo_chunk_preds, backend_lengths
+            spkcache_fifo_chunk_preds, preds_lengths
         )
 
         lc_enc = round(left_offset / self.encoder.subsampling_factor)
