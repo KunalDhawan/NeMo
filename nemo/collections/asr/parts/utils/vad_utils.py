@@ -1944,6 +1944,168 @@ def binarize_vector_fast(sequence: torch.Tensor, threshold: float = 0.5,
     return speech_segments
 
 
+def binarization_vectorized(sequence: torch.Tensor, per_args: Dict[str, float]) -> torch.Tensor:
+    """
+    Fully vectorized binarization with hysteresis support (onset != offset).
+
+    Equivalent to binarization() but without any Python-level frame loops.
+    Uses a cummax forward-fill trick to resolve ambiguous frames in the
+    hysteresis dead-zone between offset and onset thresholds.
+
+    Args:
+        sequence (torch.Tensor): Frame-level predictions (num_frames,).
+        per_args: Dict with keys onset, offset, pad_onset, pad_offset,
+                  frame_length_in_sec.
+
+    Returns:
+        speech_segments (torch.Tensor): (num_segments, 2) with [start, end] in seconds.
+    """
+    frame_length_in_sec = per_args.get('frame_length_in_sec', 0.01)
+    onset = per_args.get('onset', 0.5)
+    offset = per_args.get('offset', 0.5)
+    pad_onset = per_args.get('pad_onset', 0.0)
+    pad_offset = per_args.get('pad_offset', 0.0)
+
+    if len(sequence) == 0:
+        return torch.empty(0)
+
+    device = sequence.device
+
+    if onset == offset:
+        above = sequence > onset
+    else:
+        above_onset = sequence > onset
+        below_offset = sequence < offset
+        state = torch.where(
+            above_onset,
+            torch.ones(1, dtype=torch.long, device=device),
+            torch.where(below_offset,
+                        torch.zeros(1, dtype=torch.long, device=device),
+                        torch.full((1,), -1, dtype=torch.long, device=device)),
+        )
+        non_ambig_mask = state != -1
+        indices = torch.arange(len(state), device=device)
+        last_non_ambig_idx = torch.where(non_ambig_mask, indices, torch.zeros_like(indices))
+        last_non_ambig_idx = torch.cummax(last_non_ambig_idx, dim=0)[0]
+        resolved = state[last_non_ambig_idx]
+        above = torch.where(
+            resolved == -1,
+            torch.zeros(1, dtype=torch.long, device=device),
+            resolved,
+        ).bool()
+
+    padded = torch.nn.functional.pad(above.unsqueeze(0).float(), (1, 1), value=0.0).squeeze(0)
+    diff = padded[1:] - padded[:-1]
+    starts = torch.where(diff > 0.5)[0]
+    ends = torch.where(diff < -0.5)[0]
+
+    if len(starts) == 0:
+        return torch.empty(0)
+
+    if len(starts) > len(ends):
+        ends = torch.cat([ends, torch.tensor([len(sequence)], device=device, dtype=ends.dtype)])
+    min_len = min(len(starts), len(ends))
+    starts = starts[:min_len]
+    ends = ends[:min_len]
+
+    start_times = starts.float() * frame_length_in_sec - pad_onset
+    start_times = torch.clamp(start_times, min=0.0)
+    end_times = ends.float() * frame_length_in_sec + pad_offset
+
+    valid = end_times > start_times
+    if not valid.any():
+        return torch.empty(0)
+    speech_segments = torch.stack([start_times[valid], end_times[valid]], dim=1)
+
+    if pad_onset > 0 or pad_offset > 0:
+        speech_segments = merge_overlap_segment(speech_segments)
+
+    return speech_segments
+
+
+def predlist_to_timestamps_fast_pp(
+    batch_preds_list: List[torch.Tensor],
+    audio_rttm_map_dict: Dict[str, Dict[str, Union[float, int]]],
+    cfg_vad_params,
+    unit_10ms_frame_count: int,
+    bypass_postprocessing: bool = False,
+    precision: int = 2,
+) -> List[List[float]]:
+    """
+    Fast version of predlist_to_timestamps that supports full postprocessing.
+
+    Uses binarization_vectorized instead of the Python-loop binarization,
+    and operates at native frame resolution (no repeat_interleave).
+
+    Args:
+        batch_preds_list (List[Tensor]):
+            Tensor diarization results for each sample.
+            Dimension: [(num_frames, num_speakers), ...]
+        audio_rttm_map_dict (Dict[str, Dict[str, Union[float, int]]]):
+            Dictionary mapping unique audio file names to their rttm file entries.
+        cfg_vad_params:
+            Configuration of VAD parameters (OmegaConf or dict).
+        unit_10ms_frame_count (int):
+            Number of 10ms frames in a unit (e.g. 8 for 80ms frames).
+        bypass_postprocessing (bool, optional):
+            If True, only binarization is applied. Defaults to False.
+        precision (int, optional):
+            Decimal places for rounding timestamps. Defaults to 2.
+
+    Returns:
+        total_speaker_timestamps: nested list [session][speaker][[start, end], ...]
+    """
+    total_speaker_timestamps = []
+    pp_message = "Binarization" if bypass_postprocessing else "Post-processing"
+    actual_frame_length = 0.01 * unit_10ms_frame_count
+
+    for sample_idx, (uniq_id, audio_rttm_values) in tqdm(
+        enumerate(audio_rttm_map_dict.items()), total=len(audio_rttm_map_dict), desc=pp_message
+    ):
+        offset = audio_rttm_values['offset']
+        speaker_assign_mat = batch_preds_list[sample_idx].squeeze(dim=0)
+        speaker_timestamps = [[] for _ in range(speaker_assign_mat.shape[-1])]
+
+        if bypass_postprocessing:
+            pp_params: Dict[str, float] = {
+                'onset': 0.5, 'offset': 0.5,
+                'pad_onset': 0.0, 'pad_offset': 0.0,
+                'frame_length_in_sec': actual_frame_length,
+            }
+        else:
+            pp_params = {
+                'onset': float(cfg_vad_params.get('onset', 0.5)),
+                'offset': float(cfg_vad_params.get('offset', 0.5)),
+                'pad_onset': float(cfg_vad_params.get('pad_onset', 0.0)),
+                'pad_offset': float(cfg_vad_params.get('pad_offset', 0.0)),
+                'frame_length_in_sec': actual_frame_length,
+                'min_duration_on': float(cfg_vad_params.get('min_duration_on', 0.0)),
+                'min_duration_off': float(cfg_vad_params.get('min_duration_off', 0.0)),
+                'filter_speech_first': float(cfg_vad_params.get('filter_speech_first', 1.0)),
+            }
+
+        for spk_id in range(speaker_assign_mat.shape[-1]):
+            speech_segments = binarization_vectorized(speaker_assign_mat[:, spk_id], pp_params)
+
+            if not bypass_postprocessing and speech_segments.numel() > 0:
+                speech_segments = filtering(speech_segments, pp_params)
+
+            if speech_segments.numel() > 0:
+                ts_mat = speech_segments + offset
+                ts_seg_raw_list = ts_mat.tolist()
+                ts_seg_list = [
+                    [round(stt, precision), round(end, precision)]
+                    for (stt, end) in ts_seg_raw_list
+                ]
+            else:
+                ts_seg_list = []
+
+            speaker_timestamps[spk_id].extend(ts_seg_list)
+
+        total_speaker_timestamps.append(speaker_timestamps)
+    return total_speaker_timestamps
+
+
 def predlist_to_timestamps_fast(
     batch_preds_list: List[torch.Tensor],
     audio_rttm_map_dict: Dict[str, Dict[str, Union[float, int]]],

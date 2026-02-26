@@ -134,6 +134,7 @@ class DiarizationConfig:
     postprocessing_yaml: Optional[str] = None  # Path to a yaml file for postprocessing configurations
     no_der: bool = False
     out_rttm_dir: Optional[str] = None
+    out_preds_tensors: Optional[str] = None  # Explicit path for saving/loading pred tensors (.pt)
     save_preds_tensors: bool = False
     precision: str = "32"  # 32, bf16, bf16-mixed
 
@@ -514,12 +515,19 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         modules._check_streaming_parameters()
 
     postprocessing_cfg = load_postprocessing_from_yaml(cfg.postprocessing_yaml)
-    tensor_path, model_id, tensor_filename = get_tensor_path(cfg)
+    auto_tensor_path, model_id, tensor_filename = get_tensor_path(cfg)
     cfg.optuna_study_name = f"__{model_id}_{tensor_filename}"
     cfg.optuna_storage: str = f"sqlite:///{cfg.optuna_temp_dir}/{cfg.optuna_study_name}.db"
     cfg.optuna_log_file: str = f"{cfg.optuna_temp_dir}/{cfg.optuna_study_name}.log"
 
-    if os.path.exists(tensor_path) and cfg.save_preds_tensors:
+    if cfg.out_preds_tensors:
+        tensor_path = cfg.out_preds_tensors
+        os.makedirs(os.path.dirname(os.path.abspath(tensor_path)), exist_ok=True)
+    else:
+        tensor_path = auto_tensor_path
+    want_save = cfg.out_preds_tensors or cfg.save_preds_tensors
+
+    if os.path.exists(tensor_path) and want_save:
         logging.info(
             f"A saved prediction tensor has been found. Loading the saved prediction tensors from {tensor_path}..."
         )
@@ -530,8 +538,9 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
             diar_model.test_batch()
 
         diar_model_preds_total_list = diar_model.preds_total_list
-        if cfg.save_preds_tensors:
+        if want_save:
             torch.save(diar_model.preds_total_list, tensor_path)
+            logging.info(f"Prediction tensors saved to {tensor_path}")
 
     unit_10ms = 1 if cfg.upsample_preds else getattr(diar_model, 'output_subsampling_factor', 8)
 
