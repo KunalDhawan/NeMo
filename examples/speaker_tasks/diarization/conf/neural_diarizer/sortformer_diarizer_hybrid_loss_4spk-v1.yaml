@@ -7,6 +7,9 @@
 name: "SortFormerDiarizer"
 num_workers: 18
 batch_size: 8
+init_seed: 42 # Seed used before model construction (controls parameter initialization).
+train_seed: null # Optional seed applied right before trainer.fit() to vary sampling/dropout noise.
+seed_workers: true # If true, dataloader workers are seeded deterministically by Lightning.
 
 model: 
   sample_rate: 16000

@@ -117,7 +117,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         Initialize an Sortformer Diarizer model and a pretrained NEST encoder.
         In this init function, training and validation datasets are prepared.
         """
-        random.seed(42)
         self._trainer = trainer if trainer else None
         self._cfg = cfg
 
