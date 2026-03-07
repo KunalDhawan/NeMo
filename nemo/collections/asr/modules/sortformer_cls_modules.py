@@ -171,7 +171,7 @@ class SortformerCLSModules(NeuralModule, Exportable):
         self.preenc_proj_dim = 0
         self.preenc_proj = None
         self.preenc_norm = None
-        self.upsample_fusion_block = None
+        self.fusion_block = None
 
 
     def _init_fusion_layers(self):
@@ -508,7 +508,7 @@ class SortformerCLSModules(NeuralModule, Exportable):
             proj_dim = self.preenc_proj_dim if self.preenc_proj_dim > 0 else self.tf_d_model
             self.preenc_proj = nn.Linear(self.fc_d_model, proj_dim)
             self.preenc_norm = nn.LayerNorm(proj_dim)
-            self.upsample_fusion_block = nn.Sequential(
+            self.fusion_block = nn.Sequential(
                 nn.Linear(self.tf_d_model + proj_dim, self.tf_d_model),
                 nn.GELU(),
                 nn.LayerNorm(self.tf_d_model)
@@ -634,7 +634,7 @@ class SortformerCLSModules(NeuralModule, Exportable):
         combined = torch.cat([hidden_states, proj_feats], dim=-1)
 
         if self.upsample_mode == "single_preenc_mlp":
-            fused = self.upsample_fusion_block(combined)
+            fused = self.fusion_block(combined)
             projected = self.subpixel_upsample(fused.transpose(1, 2))
         else:
             projected = self.subpixel_upsample(combined.transpose(1, 2))

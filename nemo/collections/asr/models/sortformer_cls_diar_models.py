@@ -50,6 +50,45 @@ from nemo.utils import logging
 __all__ = ['SortformerCLSEncLabelModel']
 
 
+class _OversamplingDistributedSampler(torch.utils.data.DistributedSampler):
+    """DistributedSampler that cycles through the dataset to guarantee a
+    minimum number of samples per GPU per epoch.  Because it inherits from
+    DistributedSampler, PyTorch Lightning will *not* replace it with its own
+    sampler in DDP mode.
+
+    Args:
+        num_samples_per_epoch: desired total samples across ALL GPUs.
+            Each GPU will yield ``num_samples_per_epoch // num_replicas``
+            samples, cycling through the dataset as many times as needed.
+    """
+
+    def __init__(self, dataset, *, num_samples_per_epoch: int, **kwargs):
+        super().__init__(dataset, **kwargs)
+        self._target = max(math.ceil(num_samples_per_epoch / self.num_replicas), 1)
+
+    def __iter__(self):
+        base = list(super().__iter__())
+        if len(base) == 0:
+            raise ValueError(
+                "OversamplingDistributedSampler received no indices from DistributedSampler. "
+                "This usually means the training dataset is empty."
+            )
+        if len(base) >= self._target:
+            return iter(base[: self._target])
+        result = []
+        cycle = 0
+        while len(result) < self._target:
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch * 100_000 + cycle)
+            perm = torch.randperm(len(base), generator=g).tolist()
+            result.extend(base[i] for i in perm)
+            cycle += 1
+        return iter(result[: self._target])
+
+    def __len__(self):
+        return self._target
+
+
 class SortformerCLSEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixin):
     """
     CLS-based Sortformer diarization model with multiple backend support.
@@ -85,7 +124,6 @@ class SortformerCLSEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationM
         Initialize an Sortformer Diarizer model and a pretrained NEST encoder.
         In this init function, training and validation datasets are prepared.
         """
-        random.seed(42)
         self._trainer = trainer if trainer else None
         self._cfg = cfg
 
@@ -219,8 +257,8 @@ class SortformerCLSEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationM
                 self.sortformer_modules.preenc_proj = self.sortformer_modules.preenc_proj.to(self.device)
             if self.sortformer_modules.preenc_norm is not None:
                 self.sortformer_modules.preenc_norm = self.sortformer_modules.preenc_norm.to(self.device)
-            if self.sortformer_modules.upsample_fusion_block is not None:
-                self.sortformer_modules.upsample_fusion_block = self.sortformer_modules.upsample_fusion_block.to(self.device)
+            if self.sortformer_modules.fusion_block is not None:
+                self.sortformer_modules.fusion_block = self.sortformer_modules.fusion_block.to(self.device)
 
         self._init_loss_weights()
 
@@ -334,12 +372,26 @@ class SortformerCLSEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationM
         self.data_collection = dataset.collection
         self.collate_ds = dataset
 
+        sampler = None
+        shuffle = config.get('shuffle', False)
+        num_samples = config.get('num_samples_per_epoch', 0)
+        if num_samples > 0:
+            sampler = _OversamplingDistributedSampler(
+                dataset,
+                num_samples_per_epoch=num_samples,
+                num_replicas=self.world_size,
+                rank=global_rank,
+                shuffle=shuffle,
+            )
+            shuffle = False
+
         dataloader_instance = torch.utils.data.DataLoader(
             dataset=dataset,
             batch_size=config.batch_size,
             collate_fn=self.collate_ds.eesd_train_collate_fn,
             drop_last=config.get('drop_last', False),
-            shuffle=False,
+            shuffle=shuffle,
+            sampler=sampler,
             num_workers=config.get('num_workers', 1),
             pin_memory=config.get('pin_memory', False),
         )
@@ -1308,6 +1360,7 @@ class SortformerCLSEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationM
             (dict): A dictionary containing the 'loss' key with the calculated loss value.
         """
         audio_signal, audio_signal_length, targets, target_lens = batch
+        logging.info(f"audio_signal.shape: {audio_signal.shape}, targets.shape: {targets.shape}, target_lens: {target_lens}")
         preds = self.forward(audio_signal=audio_signal, audio_signal_length=audio_signal_length)
         train_metrics = self._get_aux_train_evaluations(preds, targets, target_lens)
         self._reset_train_metrics()
@@ -1392,6 +1445,7 @@ class SortformerCLSEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationM
             dict: A dictionary containing various validation metrics for this batch.
         """
         audio_signal, audio_signal_length, targets, target_lens = batch
+        logging.info(f"audio_signal.shape: {audio_signal.shape}, targets.shape: {targets.shape}, target_lens: {target_lens}")
         preds = self.forward(
             audio_signal=audio_signal,
             audio_signal_length=audio_signal_length,

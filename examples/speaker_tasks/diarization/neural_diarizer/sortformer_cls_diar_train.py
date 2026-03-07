@@ -36,7 +36,14 @@ python ./sortformer_cls_diar_train.py --config-path='../conf/neural_diarizer' \
     model.validation_ds.manifest_filepath="<dev_manifest_path>" \
     exp_manager.name='sample_train' \
     exp_manager.exp_dir='./sortformer_cls_diar_train'
+
+Same initialization seed but different training noise (sampling/dropout):
+python ./sortformer_cls_diar_train.py --config-path='../conf/neural_diarizer' \
+    --config-name='sortformer_cls_diarizer_4spk-v1.yaml' \
+    init_seed=42 \
+    train_seed=101
 """
+
 
 @hydra_runner(config_path="../conf/neural_diarizer", config_name="sortformer_cls_diarizer_4spk-v1.yaml")
 def main(cfg):
@@ -47,6 +54,7 @@ def main(cfg):
     train_seed = init_seed if train_seed_cfg is None else int(train_seed_cfg)
     seed_workers = bool(cfg.get("seed_workers", True))
 
+    # Seed before model construction so parameter initialization is reproducible.
     seed_everything(init_seed, workers=seed_workers)
     logging.info(f"Seeding: init_seed={init_seed}, train_seed={train_seed}, seed_workers={seed_workers}")
 
@@ -55,6 +63,7 @@ def main(cfg):
     sortformer_model = SortformerCLSEncLabelModel(cfg=cfg.model, trainer=trainer)
     sortformer_model.maybe_init_from_pretrained_checkpoint(cfg)
 
+    # Optional re-seed before fit() to vary training noise while keeping init fixed.
     if train_seed != init_seed:
         seed_everything(train_seed, workers=seed_workers)
         logging.info("RNGs reseeded before trainer.fit() to vary training/sampling noise.")
