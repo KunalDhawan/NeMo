@@ -271,7 +271,7 @@ model:
 
   profile_updater:
     _target_: nemo.collections.asr.modules.nextformer_modules.SinkhornMaskedProfileUpdater
-    num_layers: 2  # Number of self-attention + FFN blocks
+    num_layers: 0  # Number of self-attention + FFN blocks
     hidden_size: ${model.model_defaults.se_d_model}  # Must match se_d_model (global profile / local embedding dimension)
     inner_size: 384
     num_attention_heads: 4
