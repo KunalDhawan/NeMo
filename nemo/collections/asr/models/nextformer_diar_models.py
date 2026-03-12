@@ -200,6 +200,16 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.cross_chunk_swap_detach = self._cfg.get("cross_chunk_swap_detach", True)
         self.cross_chunk_swap_min_frames = self._cfg.get("cross_chunk_swap_min_frames", 0)
 
+        # SupCon auxiliary loss on speaker embeddings
+        self.supcon_weight = self._cfg.get("supcon_weight", 0.0)
+        self.supcon_min_active_frames = self._cfg.get("supcon_min_active_frames", 5)
+        self.supcon_cross_batch = self._cfg.get("supcon_cross_batch", True)
+        self.supcon_aam = self._cfg.get("supcon_aam", 0.0)
+        self.supcon_temperature = self._cfg.get("supcon_temperature", 0.1)
+
+        # Profile update mode: "frame" (legacy frame-embedding average) or "cls" (CLS-embedding average)
+        self.profile_update_mode = self._cfg.get("profile_update_mode", "cls")
+
         # Backend and fusion settings come from NextformerModules config
         logging.info(f"Using backend: {self.nextformer_modules.backend}")
 
@@ -318,6 +328,10 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         else:
             global_rank = 0
 
+        # Reuse the training speaker vocabulary for validation/test datasets
+        # so that global_speaker_ids are consistent across splits.
+        existing_speaker_to_id = getattr(self, 'speaker_to_id', None)
+
         dataset = AudioToSpeechE2ESpkDiarDataset(
             manifest_filepath=config.manifest_filepath,
             soft_label_thres=config.soft_label_thres,
@@ -334,10 +348,15 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             subsegment_two_chunks_rate=config.get('subsegment_two_chunks_rate', 0.0),
             subsegment_min_chunk_len_sec=config.get('subsegment_min_chunk_len_sec', 10.0),
             subsegment_margin_frames=config.get('subsegment_margin_frames', 0),
+            speaker_to_id=existing_speaker_to_id,
         )
 
         self.data_collection = dataset.collection
         self.collate_ds = dataset
+
+        if not hasattr(self, 'speaker_to_id'):
+            self.speaker_to_id = dataset.speaker_to_id
+            self.num_speaker_classes = dataset.num_speaker_classes
 
         sampler = None
         shuffle = config.get('shuffle', False)
@@ -368,6 +387,28 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self._train_dl = self.__setup_dataloader_from_config(
             config=train_data_config,
         )
+
+    def _save_speaker_vocab(self):
+        """Save speaker_to_id mapping as JSON to the trainer's log directory."""
+        if not hasattr(self, 'speaker_to_id') or self.speaker_to_id is None:
+            return
+        log_dir = getattr(self.trainer, 'log_dir', None)
+        if log_dir is None:
+            return
+        if not (hasattr(self, 'global_rank') and self.global_rank == 0):
+            if not (hasattr(self, '_trainer') and hasattr(self._trainer, 'global_rank') and self._trainer.global_rank == 0):
+                return
+        import json
+        save_path = os.path.join(log_dir, 'speaker_to_id.json')
+        with open(save_path, 'w') as f:
+            json.dump(self.speaker_to_id, f, indent=2)
+        logging.info(
+            f"Saved speaker_to_id mapping ({len(self.speaker_to_id)} speakers) to {save_path}"
+        )
+
+    def on_train_start(self):
+        super().on_train_start()
+        self._save_speaker_vocab()
 
     def setup_validation_data(self, val_data_layer_config: Optional[Union[DictConfig, Dict]]):
         self._validation_dl = self.__setup_dataloader_from_config(
@@ -1133,18 +1174,24 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                     f"{streaming_state.global_spk_total_confidence[0, 0:17]}"
                 )
             else:
-                # --- Legacy: confidence-weighted average profile update ---
-                # Use full chunk for logits and projected embeddings
-                local_logits_pred_window = local_logits_chunk
-                emb_seq_proj_se_pred_window = emb_seq_proj_se_chunk
-
-                self.nextformer_modules.update_streaming_state(
-                    streaming_state=streaming_state,
-                    emb_seq_proj=emb_seq_proj_se_pred_window,
-                    local_logits=local_logits_pred_window,
-                    spk_assignments=centroid_spk_assignments_chunk,
-                    active_frames_per_spk=active_frames_chunk,
-                )
+                if self.profile_update_mode == "cls":
+                    self.nextformer_modules.update_streaming_state_cls(
+                        streaming_state=streaming_state,
+                        spk_embs=spk_embs_chunk,
+                        local_logits=local_logits_chunk,
+                        spk_assignments=centroid_spk_assignments_chunk,
+                        active_frames_per_spk=active_frames_chunk,
+                    )
+                elif self.profile_update_mode == "frame":
+                    self.nextformer_modules.update_streaming_state_frame(
+                        streaming_state=streaming_state,
+                        emb_seq_proj=emb_seq_proj_se_chunk,
+                        local_logits=local_logits_chunk,
+                        spk_assignments=centroid_spk_assignments_chunk,
+                        active_frames_per_spk=active_frames_chunk,
+                    )
+                else:
+                    raise ValueError(f"Invalid profile update mode: {self.profile_update_mode}")
             logits_chunk = self.nextformer_modules.get_global_logits(
                 local_logits=local_logits_chunk,
                 spk_assignments=spk_assignments_chunk,
@@ -1687,8 +1734,165 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         
         return local_pil_targets, local_ats_targets, local_target_lens, local_target_indices, total_logits_op
 
+    def compute_supcon_loss(
+        self,
+        spk_embs,
+        local_target_indices,
+        global_speaker_ids,
+        active_frames_per_spk,
+        batch_size,
+        num_chunks,
+        force_within_session=False,
+    ):
+        """
+        Supervised Contrastive (SupCon) loss on speaker embeddings.
+
+        When cross-batch mode is active (and not overridden), uses globally
+        unique speaker IDs so that same-speaker embeddings across different
+        sessions are treated as positives.  When within-session mode is active,
+        each session is processed independently -- no cross-session interactions.
+
+        Args:
+            spk_embs: SE-projected speaker embeddings.
+                Shape: (num_chunks * B, local_num_spks, emb_dim)
+            local_target_indices: Oracle mapping from local speaker slots to
+                target matrix columns.
+                Shape: (num_chunks * B, local_num_spks)
+            global_speaker_ids: Global integer speaker ID per target column.
+                Shape: (B, max_num_spks)
+            active_frames_per_spk: Number of active frames per speaker.
+                Shape: (num_chunks * B, local_num_spks)
+            batch_size: Batch size.
+            num_chunks: Number of chunks per batch item.
+            force_within_session: If True, always use within-session mode
+                regardless of self.supcon_cross_batch. Used for validation
+                where cross-batch matching is not meaningful.
+
+        Returns:
+            loss (torch.Tensor): Scalar SupCon loss.
+        """
+        local_num_spks = spk_embs.shape[1]
+        emb_dim = spk_embs.shape[2]
+        max_num_spks = global_speaker_ids.shape[1]
+
+        # Reshape for indexing: (num_chunks, B, local_num_spks, ...)
+        target_cols = local_target_indices.view(num_chunks, batch_size, local_num_spks)
+        af = active_frames_per_spk.view(num_chunks, batch_size, local_num_spks)
+
+        # Track which batch item (session) each embedding belongs to
+        batch_idx = torch.arange(batch_size, device=spk_embs.device)
+        batch_idx = batch_idx.unsqueeze(0).unsqueeze(-1).expand(num_chunks, batch_size, local_num_spks)
+
+        use_cross_batch = self.supcon_cross_batch and not force_within_session
+
+        # Resolve each CLS embedding's speaker ID
+        emb_speaker_ids = torch.full(
+            (num_chunks, batch_size, local_num_spks), -1,
+            dtype=torch.long, device=spk_embs.device,
+        )
+        valid_col = target_cols >= 0
+        safe_cols = target_cols.clamp(min=0)
+
+        if use_cross_batch:
+            # Use globally unique speaker IDs from RTTM vocabulary
+            emb_speaker_ids[valid_col] = global_speaker_ids[
+                batch_idx[valid_col], safe_cols[valid_col]
+            ]
+        else:
+            # Use session-local IDs: offset column by batch item so that
+            # same column in different sessions maps to different IDs.
+            # This avoids needing the shared vocabulary for within-session mode.
+            emb_speaker_ids[valid_col] = (
+                batch_idx[valid_col] * max_num_spks + safe_cols[valid_col]
+            )
+
+        # Flatten and filter by validity and minimum active frames
+        all_embs = spk_embs.view(num_chunks, batch_size, local_num_spks, emb_dim)
+        all_embs_flat = all_embs.reshape(-1, emb_dim)
+        all_ids_flat = emb_speaker_ids.reshape(-1)
+        all_af_flat = af.reshape(-1)
+        all_batch_flat = batch_idx.reshape(-1)
+
+        valid_mask = (all_ids_flat >= 0) & (all_af_flat >= self.supcon_min_active_frames)
+        valid_embs = all_embs_flat[valid_mask]
+        valid_ids = all_ids_flat[valid_mask]
+        valid_batch = all_batch_flat[valid_mask]
+        N = valid_embs.shape[0]
+
+        if N < 2:
+            return torch.tensor(0.0, device=spk_embs.device, requires_grad=True)
+
+        # L2-normalize for cosine similarity
+        z = F.normalize(valid_embs, dim=-1)
+
+        # Raw pairwise cosine similarity in [-1, 1]
+        sim_raw = z @ z.T  # (N, N)
+
+        # Masks
+        self_mask = torch.eye(N, dtype=torch.bool, device=sim_raw.device)
+        same_speaker = (valid_ids.unsqueeze(0) == valid_ids.unsqueeze(1))  # (N, N)
+        same_session = (valid_batch.unsqueeze(0) == valid_batch.unsqueeze(1))  # (N, N)
+
+        if use_cross_batch:
+            pos_mask = same_speaker & ~self_mask
+            denom_mask = ~self_mask
+        else:
+            pos_mask = same_speaker & same_session & ~self_mask
+            denom_mask = same_session & ~self_mask
+
+        # Apply additive angular margin (ArcFace) to positive pairs before temperature scaling
+        if self.supcon_aam > 0:
+            cos_m = math.cos(self.supcon_aam)
+            sin_m = math.sin(self.supcon_aam)
+            cos_theta = torch.clamp(sim_raw, -1.0, 1.0)
+            sin_theta = torch.sqrt(torch.clamp(1.0 - cos_theta ** 2, min=1e-8))
+            cos_theta_plus_m = cos_theta * cos_m - sin_theta * sin_m
+            cos_theta_plus_m = torch.where(cos_theta < -cos_m, -torch.ones_like(cos_theta_plus_m), cos_theta_plus_m)
+            sim_raw = torch.where(pos_mask, cos_theta_plus_m, sim_raw)
+
+        # Scale by SupCon temperature (separate from Sinkhorn's cosine_temperature
+        # to allow balanced gradients across positives and negatives)
+        sim = sim_raw / self.supcon_temperature  # (N, N)
+
+        # Only anchors with both positives and denominator entries can contribute
+        has_positive = pos_mask.any(dim=1)
+        has_denom = denom_mask.any(dim=1)
+        active_anchors = has_positive & has_denom
+        if not active_anchors.any():
+            return torch.tensor(0.0, device=spk_embs.device, requires_grad=True)
+
+        # Numerical stability: subtract row-wise max over denom entries.
+        # For rows without denom entries, set sim_max to 0 to avoid -inf → overflow.
+        NEG_INF = float('-inf')
+        sim_for_max = sim.detach().masked_fill(~denom_mask, NEG_INF)
+        sim_max = sim_for_max.max(dim=1, keepdim=True).values
+        sim_max = sim_max.masked_fill(~has_denom.unsqueeze(1), 0.0)
+        sim_shifted = sim - sim_max
+
+        # Mask non-denom entries to -inf BEFORE exp so that exp(-inf) = 0 exactly,
+        # avoiding the inf * 0 = NaN hazard from post-multiply masking.
+        sim_shifted = sim_shifted.masked_fill(~denom_mask, NEG_INF)
+        exp_sim = torch.exp(sim_shifted)
+
+        # Add dustbin class to denominator: creates a reference point that
+        # negatives above dustbin_val get stronger gradient to push down
+        dustbin_score = self.nextformer_modules.sinkhorn_dustbin_val.detach() / self.supcon_temperature
+        exp_dustbin = torch.exp(dustbin_score - sim_max.squeeze(1))  # (N,) shifted for stability
+        log_denom = torch.log(exp_sim.sum(dim=1) + exp_dustbin + 1e-12)  # (N,)
+
+        # Numerator: for each anchor, average (sim_pos - log_denom) over positives.
+        # Positive entries are always a subset of denom entries, so sim_shifted
+        # is valid (not -inf) for them.
+        pos_sim_sum = torch.where(pos_mask, sim_shifted, torch.zeros_like(sim_shifted)).sum(dim=1)  # (N,)
+        num_positives = pos_mask.float().sum(dim=1).clamp(min=1)  # (N,)
+
+        loss_per_anchor = -(pos_sim_sum / num_positives - log_denom)
+        loss = loss_per_anchor[active_anchors].mean()
+        return loss
+
     def _get_aux_train_evaluations(
-        self, logits, local_logits, spk_embs, active_frames_per_spk, targets, target_lens
+        self, logits, local_logits, spk_embs, active_frames_per_spk, targets, target_lens,
+        global_speaker_ids=None,
     ) -> dict:
         """
         Compute auxiliary training evaluations including losses and metrics.
@@ -1713,6 +1917,8 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 Shape: (batch_size, total_n_frames, max_num_spks)
             target_lens (torch.Tensor): Lengths of target sequences.
                 Shape: (batch_size,)
+            global_speaker_ids (torch.Tensor, optional): Global speaker integer IDs per target column.
+                Shape: (batch_size, max_num_spks). Used for cross-batch contrastive losses.
 
         Returns:
             (dict): A dictionary containing the following training metrics.
@@ -1752,6 +1958,22 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             + self.global_pil_weight * global_pil_loss
         )
 
+        # SupCon auxiliary loss on speaker embeddings
+        batch_size = targets.shape[0]
+        num_chunks = local_logits.shape[0] // batch_size
+        supcon_loss = torch.tensor(0.0, device=logits.device)
+        if self.supcon_weight >= 0 and global_speaker_ids is not None:
+            supcon_loss = self.compute_supcon_loss(
+                spk_embs=spk_embs,
+                local_target_indices=local_target_indices,
+                global_speaker_ids=global_speaker_ids,
+                active_frames_per_spk=active_frames_per_spk,
+                batch_size=batch_size,
+                num_chunks=num_chunks,
+            )
+            if self.supcon_weight > 0:
+                loss = loss + self.supcon_weight * supcon_loss
+
         local_preds = torch.sigmoid(local_logits)
         self._accuracy_train(local_preds, local_pil_targets, local_target_lens)
         train_f1_acc, train_precision, train_recall = self._accuracy_train.compute()
@@ -1764,6 +1986,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'ats_loss': ats_loss,
             'pil_loss': pil_loss,
             'global_pil_loss': global_pil_loss,
+            'supcon_loss': supcon_loss,
             'learning_rate': self._optimizer.param_groups[0]['lr'],
             'train_f1_acc': train_f1_acc,
             'train_f1_acc_global': train_f1_acc_global,
@@ -1784,17 +2007,19 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 - audio_signal_length (torch.Tensor): The length of each audio signal in the batch.
                 - targets (torch.Tensor): The target labels for the batch.
                 - target_lens (torch.Tensor): The length of each target sequence in the batch.
+                - global_speaker_ids (torch.Tensor): Global speaker integer IDs per target column.
             batch_idx (int): The index of the current batch.
 
         Returns:
             (dict): A dictionary containing the 'loss' key with the calculated loss value.
         """
-        audio_signal, audio_signal_length, targets, target_lens = batch
+        audio_signal, audio_signal_length, targets, target_lens, global_speaker_ids = batch
         logits, local_logits, spk_embs, active_frames_per_spk = self.forward(
             audio_signal=audio_signal, audio_signal_length=audio_signal_length, targets=targets
         )
         train_metrics = self._get_aux_train_evaluations(
-            logits, local_logits, spk_embs, active_frames_per_spk, targets, target_lens
+            logits, local_logits, spk_embs, active_frames_per_spk, targets, target_lens,
+            global_speaker_ids=global_speaker_ids,
         )
         logging.info(f"dustbin parameter value: {self.nextformer_modules.sinkhorn_dustbin_val.item()}")
         self._reset_train_metrics()
@@ -1802,7 +2027,8 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         return {'loss': train_metrics['loss']}
 
     def _get_aux_validation_evaluations(
-        self, logits, local_logits, spk_embs, active_frames_per_spk, targets, target_lens
+        self, logits, local_logits, spk_embs, active_frames_per_spk, targets, target_lens,
+        global_speaker_ids=None,
     ) -> dict:
         """
         Compute auxiliary validation evaluations including losses and metrics.
@@ -1824,6 +2050,8 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 Shape: (batch_size, total_n_frames, max_num_spks)
             target_lens (torch.Tensor): Lengths of target sequences.
                 Shape: (batch_size,)
+            global_speaker_ids (torch.Tensor, optional): Global speaker integer IDs per target column.
+                Shape: (batch_size, max_num_spks). Used for cross-batch contrastive losses.
 
         Returns:
             val_metrics (dict): A dictionary containing the following validation metrics
@@ -1863,6 +2091,23 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             + self.global_pil_weight * val_global_pil_loss
         )
 
+        # SupCon for monitoring (within-session only, regardless of cross_batch setting)
+        batch_size = targets.shape[0]
+        num_chunks = local_logits.shape[0] // batch_size
+        val_supcon_loss = torch.tensor(0.0, device=logits.device)
+        if self.supcon_weight >= 0 and global_speaker_ids is not None:
+            val_supcon_loss = self.compute_supcon_loss(
+                spk_embs=spk_embs,
+                local_target_indices=local_target_indices,
+                global_speaker_ids=global_speaker_ids,
+                active_frames_per_spk=active_frames_per_spk,
+                batch_size=batch_size,
+                num_chunks=num_chunks,
+                force_within_session=True,
+            )
+            if self.supcon_weight > 0:
+                val_loss = val_loss + self.supcon_weight * val_supcon_loss
+
         local_preds = torch.sigmoid(local_logits)
         self._accuracy_valid(local_preds, local_pil_targets, local_target_lens)
         val_f1_acc, val_precision, val_recall = self._accuracy_valid.compute()
@@ -1880,6 +2125,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'val_ats_loss': val_ats_loss,
             'val_pil_loss': val_pil_loss,
             'val_global_pil_loss': val_global_pil_loss,
+            'val_supcon_loss': val_supcon_loss,
             'val_f1_acc': val_f1_acc,
             'val_f1_acc_global': val_f1_acc_global,
             'val_f1_acc_global_op': val_f1_acc_global_op,
@@ -1903,6 +2149,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 - audio_signal_length (torch.Tensor): The length of each audio signal in the batch.
                 - targets (torch.Tensor): The target labels for the batch.
                 - target_lens (torch.Tensor): The length of each target sequence in the batch.
+                - global_speaker_ids (torch.Tensor): Global speaker integer IDs per target column.
             batch_idx (int): The index of the current batch.
             dataloader_idx (int, optional): The index of the dataloader in case of multiple
                                             validation dataloaders. Defaults to 0.
@@ -1910,12 +2157,13 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         Returns:
             dict: A dictionary containing various validation metrics for this batch.
         """
-        audio_signal, audio_signal_length, targets, target_lens = batch
+        audio_signal, audio_signal_length, targets, target_lens, global_speaker_ids = batch
         logits, local_logits, spk_embs, active_frames_per_spk = self.forward(
             audio_signal=audio_signal, audio_signal_length=audio_signal_length, targets=targets
         )
         val_metrics = self._get_aux_validation_evaluations(
-            logits, local_logits, spk_embs, active_frames_per_spk, targets, target_lens
+            logits, local_logits, spk_embs, active_frames_per_spk, targets, target_lens,
+            global_speaker_ids=global_speaker_ids,
         )
         if isinstance(self.trainer.val_dataloaders, list) and len(self.trainer.val_dataloaders) > 1:
             self.validation_step_outputs[dataloader_idx].append(val_metrics)
@@ -1925,11 +2173,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
     def test_step(self, batch: list, batch_idx: int, dataloader_idx: int = 0):
         """
-        Performs a single validation step.
-
-        This method processes a batch of data during the validation phase. It forward passes
-        the audio signal through the model, computes various validation metrics, and stores
-        these metrics for later aggregation.
+        Performs a single test step (delegates to validation_step).
 
         Args:
             batch (list): A list containing the following elements:
@@ -1937,6 +2181,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 - audio_signal_length (torch.Tensor): The length of each audio signal in the batch.
                 - targets (torch.Tensor): The target labels for the batch.
                 - target_lens (torch.Tensor): The length of each target sequence in the batch.
+                - global_speaker_ids (torch.Tensor): Global speaker integer IDs per target column.
             batch_idx (int): The index of the current batch.
             dataloader_idx (int, optional): The index of the dataloader in case of multiple
                                             validation dataloaders. Defaults to 0.
@@ -1954,6 +2199,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         val_ats_loss_mean = torch.stack([x['val_ats_loss'] for x in outputs]).mean()
         val_pil_loss_mean = torch.stack([x['val_pil_loss'] for x in outputs]).mean()
         val_global_pil_loss_mean = torch.stack([x['val_global_pil_loss'] for x in outputs]).mean()
+        val_supcon_loss_mean = torch.stack([x['val_supcon_loss'] for x in outputs]).mean()
         val_f1_acc_mean = torch.stack([x['val_f1_acc'] for x in outputs]).mean()
         val_f1_acc_global_mean = torch.stack([x['val_f1_acc_global'] for x in outputs]).mean()
         val_f1_acc_global_op_mean = torch.stack([x['val_f1_acc_global_op'] for x in outputs]).mean()
@@ -1968,6 +2214,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'val_ats_loss': val_ats_loss_mean,
             'val_pil_loss': val_pil_loss_mean,
             'val_global_pil_loss': val_global_pil_loss_mean,
+            'val_supcon_loss': val_supcon_loss_mean,
             'val_f1_acc': val_f1_acc_mean,
             'val_f1_acc_global': val_f1_acc_global_mean,
             'val_f1_acc_global_op': val_f1_acc_global_op_mean,
@@ -2044,7 +2291,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         with torch.no_grad():
             for batch_idx, batch in enumerate(tqdm(self._test_dl)):
-                audio_signal, audio_signal_length, targets, target_lens = batch
+                audio_signal, audio_signal_length, targets, target_lens, _global_speaker_ids = batch
                 audio_signal = audio_signal.to(self.device)
                 audio_signal_length = audio_signal_length.to(self.device)
                 targets = targets.to(self.device)

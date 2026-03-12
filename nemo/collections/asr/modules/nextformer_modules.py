@@ -458,6 +458,7 @@ class NextformerModules(NeuralModule, Exportable):
         self.sinkhorn_dustbin_val = nn.Parameter(
             torch.tensor(float(sinkhorn_dustbin_init), dtype=torch.float32)
         )
+
         #self.sinkhorn_dustbin_val = 100 / math.sqrt(self.se_d_model)
         #self.sinkhorn_dustbin_val=0.5
 
@@ -755,7 +756,7 @@ class NextformerModules(NeuralModule, Exportable):
         streaming_state.global_spk_total_confidence = torch.zeros((batch_size, self.max_num_spks), device=device)
         return streaming_state
 
-    def update_streaming_state(
+    def update_streaming_state_frame(
         self,
         streaming_state,
         emb_seq_proj,
@@ -835,6 +836,97 @@ class NextformerModules(NeuralModule, Exportable):
         # Update total confidence
         streaming_state.global_spk_total_confidence = total_conf
 
+        logging.info(f"streaming_state.global_spk_total_confidence: {streaming_state.global_spk_total_confidence[0,0:17]}")
+
+        return streaming_state
+
+    def update_streaming_state_cls(
+        self,
+        streaming_state,
+        spk_embs,
+        local_logits,
+        spk_assignments,
+        active_frames_per_spk=None,
+    ):
+        """
+        Update the streaming state using L2-normalized CLS embeddings weighted by
+        chunk-level confidence (sum of per-frame confidence over the chunk).
+
+        Unlike ``update_streaming_state`` which accumulates frame-level embeddings,
+        this method accumulates speaker-level CLS embeddings.  This makes the
+        profiles directly comparable to the CLS embeddings used in Sinkhorn
+        matching, and makes SupCon loss directly relevant to profile quality.
+
+        The confidence weight per CLS embedding is the sum of per-frame confidence
+        ``C[i,t] = P[i,t] * Prod(1 - P[j,t])`` over active frames.  This captures
+        both speaking duration and overlap suppression (frames where multiple
+        speakers are active contribute less).
+
+        Args:
+            streaming_state (StreamingNextformerState): The current streaming state.
+            spk_embs (torch.Tensor): CLS-derived speaker embeddings (SE-projected).
+                Shape: (B, local_num_spks, emb_dim)
+            local_logits (torch.Tensor): Per-frame per-local-speaker logits.
+                Shape: (B, T, local_num_spks)
+            spk_assignments (torch.Tensor): Soft assignments from local to global speakers.
+                Shape: (B, local_num_spks, max_num_spks)
+            active_frames_per_spk (torch.Tensor, optional): Number of active frames per local speaker.
+                Shape: (B, local_num_spks). Used to filter out short, unreliable speakers.
+        """
+        # Compute chunk-level confidence from per-frame confidence
+        preds = torch.sigmoid(local_logits)  # (B, T, local_num_spks)
+        local_confidence = self._get_confidence(preds)  # (B, T, local_num_spks)
+        local_confidence = local_confidence.masked_fill(preds <= 0.5, 0)
+
+        if active_frames_per_spk is not None and self.spk_emb_update_min_frames > 0:
+            insufficient_frames = active_frames_per_spk < self.spk_emb_update_min_frames
+            local_confidence = local_confidence.masked_fill(insufficient_frames.unsqueeze(1), 0)
+
+        # Sum per-frame confidence to get a chunk-level quality weight per speaker
+        chunk_confidence = local_confidence.sum(dim=1)  # (B, local_num_spks)
+
+        # Convert soft assignments to hard one-hot during inference or when configured
+        if self.hard_history_assignments or not self.training:
+            spk_assignments_hard = F.one_hot(
+                spk_assignments.argmax(dim=-1),
+                num_classes=self.max_num_spks
+            ).to(spk_assignments.dtype).detach()
+            spk_assignments = spk_assignments_hard
+
+        # L2-normalize CLS embeddings before accumulation so that
+        # each chunk contributes only direction, weighted by confidence
+        spk_embs_normed = F.normalize(spk_embs, dim=-1, eps=1e-8)
+
+        # Map chunk confidence to global space via assignments:
+        # (B, local_num_spks) -> weighted by (B, local_num_spks, max_num_spks) -> (B, max_num_spks)
+        # Also map CLS embeddings to global space:
+        # (B, max_num_spks, local_num_spks) @ (B, local_num_spks, D) -> (B, max_num_spks, D)
+        global_confidence = torch.bmm(
+            chunk_confidence.unsqueeze(1),  # (B, 1, local_num_spks)
+            spk_assignments,  # (B, local_num_spks, max_num_spks)
+        ).squeeze(1)  # (B, max_num_spks)
+
+        weighted_emb_sum = torch.bmm(
+            (chunk_confidence.unsqueeze(-1) * spk_assignments).transpose(1, 2),  # (B, max_num_spks, local_num_spks)
+            spk_embs_normed,  # (B, local_num_spks, D)
+        )  # (B, max_num_spks, D)
+
+        old_conf = streaming_state.global_spk_total_confidence
+        total_conf = old_conf + global_confidence
+        safe_total_conf = total_conf.clamp(min=1e-3)
+
+        updated_profiles = (
+            streaming_state.global_spk_embs * old_conf.unsqueeze(-1) + weighted_emb_sum
+        ) / safe_total_conf.unsqueeze(-1)
+
+        # Re-normalize profiles to the unit sphere (only active speakers)
+        active = total_conf > 0
+        updated_profiles[active] = F.normalize(updated_profiles[active], dim=-1, eps=1e-8)
+        streaming_state.global_spk_embs = updated_profiles
+
+        streaming_state.global_spk_total_confidence = total_conf
+
+        logging.info(f"global_spk_embs norms: {streaming_state.global_spk_embs[0,0:17,:].norm(dim=-1)}")
         logging.info(f"streaming_state.global_spk_total_confidence: {streaming_state.global_spk_total_confidence[0,0:17]}")
 
         return streaming_state

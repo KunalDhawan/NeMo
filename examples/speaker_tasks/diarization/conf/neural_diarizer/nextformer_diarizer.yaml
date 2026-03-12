@@ -25,6 +25,16 @@ model:
   cross_chunk_swap_detach: false  # Whether to detach swapped embeddings from computation graph
   cross_chunk_swap_min_frames: 25  # Minimum active frames a source speaker must have to be eligible as a swap source (0 = no filtering)
 
+  # SupCon auxiliary loss on speaker embeddings
+  supcon_weight: 0.0  # Weight for SupCon loss (0 = disabled). Recommended starting value: 0.5-1.0
+  supcon_min_active_frames: 5  # Minimum active frames for a speaker embedding to participate in SupCon
+  supcon_cross_batch: true  # If true, use global speaker IDs for cross-batch positives/negatives; if false, positives are within-session only
+  supcon_aam: 0.0  # Additive angular margin (ArcFace) for SupCon positive pairs in radians (0 = disabled). Recommended: 0.1-0.2
+  supcon_temperature: 0.1  # Temperature for SupCon loss (separate from Sinkhorn's cosine_temperature for balanced gradients)
+
+  # Profile update mode: "frame" (legacy frame-embedding average) or "cls" (CLS-embedding average with confidence weighting)
+  profile_update_mode: "cls"
+
   model_defaults:
     fc_d_model: 512 # Hidden dimension size of the Fast-conformer Encoder
     tf_d_model: 192 # Hidden dimension size of the Transformer Encoder

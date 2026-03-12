@@ -1046,6 +1046,11 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
             Featurizer instance for generating audio_signal from the raw waveform.
         window_stride (float):
             Window stride for acoustic feature. This value is used for calculating the numbers of feature-level frames.
+        speaker_to_id (dict, optional):
+            Pre-built mapping from RTTM speaker name strings to global integer IDs.
+            If None, the mapping is built automatically by scanning all RTTM files
+            in the collection. Required for cross-batch contrastive losses (SupCon)
+            and future AAM-Softmax support.
     """
 
     @property
@@ -1059,6 +1064,78 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         }
 
         return output_types
+
+    @staticmethod
+    def extract_global_speaker_ids(
+        collection,
+        min_speaker_duration_sec: float = 0.0,
+    ) -> dict:
+        """
+        Scan all RTTM files in the collection to build a mapping from
+        speaker name strings (RTTM column 8) to globally unique integer IDs.
+
+        The collection is first deduplicated by ``(rttm_file, offset, duration)``
+        so that multi-microphone recordings sharing the same RTTM and duplicate
+        manifest lines do not inflate per-speaker duration counts.
+
+        Args:
+            collection: An EndtoEndDiarizationSpeechLabel collection whose
+                items have ``rttm_file``, ``offset`` and ``duration`` attributes.
+            min_speaker_duration_sec: If > 0, only speakers whose total speech
+                duration (summed across all unique segments) meets this threshold
+                are included. Set to 0 to include all speakers (default).
+
+        Returns:
+            speaker_to_id (dict): Sorted mapping ``{speaker_name: int_id}``.
+        """
+        from collections import defaultdict
+
+        seen_segments = set()
+        speaker_duration = defaultdict(float)
+
+        for sample in collection:
+            if sample.rttm_file in (None, ''):
+                continue
+            offset = sample.offset if sample.offset is not None else 0
+            seg_key = (sample.rttm_file, offset, sample.duration)
+            if seg_key in seen_segments:
+                continue
+            seen_segments.add(seg_key)
+
+            with open(sample.rttm_file, 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) < 8:
+                        continue
+                    speaker = parts[7]
+                    seg_start = float(parts[3])
+                    seg_dur = float(parts[4])
+                    seg_end = seg_start + seg_dur
+
+                    clipped_start = max(seg_start, offset)
+                    clipped_end = min(seg_end, offset + sample.duration)
+                    if clipped_end > clipped_start:
+                        speaker_duration[speaker] += clipped_end - clipped_start
+
+        if min_speaker_duration_sec > 0:
+            all_speakers = sorted(speaker_duration.keys())
+            speakers = [
+                s for s in all_speakers
+                if speaker_duration[s] >= min_speaker_duration_sec
+            ]
+            n_filtered = len(all_speakers) - len(speakers)
+            logging.info(
+                f"Built global speaker vocabulary: {len(speakers)} speakers "
+                f"({n_filtered} filtered out with < {min_speaker_duration_sec}s speech)"
+            )
+        else:
+            speakers = sorted(speaker_duration.keys())
+            logging.info(
+                f"Built global speaker vocabulary: {len(speakers)} unique speakers"
+            )
+
+        speaker_to_id = {s: i for i, s in enumerate(speakers)}
+        return speaker_to_id
 
     def __init__(
         self,
@@ -1082,12 +1159,23 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         subsegment_two_chunks_rate: float = 0.0,
         subsegment_min_chunk_len_sec: float = 10.0,
         subsegment_margin_frames: int = 0,
+        speaker_to_id: dict = None,
+        min_speaker_duration_sec: float = 0.0,
     ):
         super().__init__()
         self.collection = EndtoEndDiarizationSpeechLabel(
             manifests_files=manifest_filepath.split(','),
             round_digits=round_digits,
         )
+
+        if speaker_to_id is not None:
+            self.speaker_to_id = speaker_to_id
+        else:
+            self.speaker_to_id = self.extract_global_speaker_ids(
+                self.collection,
+                min_speaker_duration_sec=min_speaker_duration_sec,
+            )
+        self.num_speaker_classes = len(self.speaker_to_id)
         self.featurizer = featurizer
         self.fb_featurizer = fb_featurizer
         # STFT and subsampling factor parameters
@@ -1167,6 +1255,35 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         uniq_id = f"{bare_uniq_id}_{offset}_{endtime}"
         return uniq_id
 
+    def _build_global_speaker_ids(self, sess_to_global_spkids, columns=None):
+        """
+        Build a tensor mapping target-matrix columns to global speaker integer IDs.
+
+        Args:
+            sess_to_global_spkids (dict): ``{column_index: speaker_name}`` from
+                ``extract_frame_info_from_rttm``.
+            columns (list, optional): Subset of column indices that were kept
+                (after speaker dropping in subsegment mode).  If *None*, all
+                columns ``0 .. max_spks-1`` are used in order.
+
+        Returns:
+            global_speaker_ids (torch.Tensor): Shape ``(max_spks,)``, dtype long.
+                Each entry is the global integer ID for the speaker in that
+                column, or -1 if the column is unused or the speaker is not in
+                the vocabulary.
+        """
+        global_speaker_ids = torch.full((self.max_spks,), -1, dtype=torch.long)
+        if columns is None:
+            for col_idx, spk_name in sess_to_global_spkids.items():
+                if col_idx < self.max_spks:
+                    global_speaker_ids[col_idx] = self.speaker_to_id.get(spk_name, -1)
+        else:
+            for new_col, old_col in enumerate(columns):
+                spk_name = sess_to_global_spkids.get(old_col)
+                if spk_name is not None and new_col < self.max_spks:
+                    global_speaker_ids[new_col] = self.speaker_to_id.get(spk_name, -1)
+        return global_speaker_ids
+
     def parse_rttm_for_targets_and_lens(self, rttm_file, offset, duration, target_len):
         """
         Generate target tensor variable by extracting groundtruth diarization labels from an RTTM file.
@@ -1179,7 +1296,8 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         if rttm_file in [None, '']:
             num_seg = torch.max(target_len)
             targets = torch.zeros(num_seg, self.max_spks)
-            return targets
+            global_speaker_ids = torch.full((self.max_spks,), -1, dtype=torch.long)
+            return targets, global_speaker_ids
 
         with open(rttm_file, 'r') as f:
             rttm_lines = f.readlines()
@@ -1200,7 +1318,9 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
             step_target = soft_target_seg
         else:
             step_target = (soft_target_seg >= self.soft_label_thres).float()
-        return step_target
+
+        global_speaker_ids = self._build_global_speaker_ids(sess_to_global_spkids)
+        return step_target, global_speaker_ids
 
     def get_soft_targets_seg(self, feat_level_target, target_len):
         """
@@ -1390,6 +1510,7 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
             audio_signal = audio_signal[audio_mask]
 
         frame_level_target = frame_level_target[:, spks_tokeep]
+        global_speaker_ids = self._build_global_speaker_ids(sess_to_global_spkids, columns=spks_tokeep)
 
         if frame_level_target.shape[1] < self.max_spks:
             pad_width = self.max_spks - frame_level_target.shape[1]
@@ -1510,6 +1631,7 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
                 torch.tensor(0).long(),
                 torch.zeros((0, self.max_spks), dtype=frame_level_target.dtype),
                 torch.tensor([0]).long(),
+                torch.full((self.max_spks,), -1, dtype=torch.long),
             )
 
         audio_signal_length = torch.tensor(audio_signal.shape[0]).long()
@@ -1522,11 +1644,11 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         targets = targets[:target_len, :]
         # TODO: support self.soft_targets parameter - now targets are always soft
 
-        #actual_n_spk = (targets >= self.soft_label_thres).any(dim=0).sum().item()
-        #logging.info(
-        #    f"uniq_id: {sample.uniq_id}, targets shape: {targets.shape}, target_len: {target_len}, actual n_spk: {actual_n_spk}"
-        #)
-        return audio_signal, audio_signal_length, targets, target_len
+        actual_n_spk = (targets >= self.soft_label_thres).any(dim=0).sum().item()
+        logging.info(
+            f"uniq_id: {sample.uniq_id}, targets shape: {targets.shape}, target_len: {target_len}, actual n_spk: {actual_n_spk}, global_speaker_ids: {global_speaker_ids}"
+        )
+        return audio_signal, audio_signal_length, targets, target_len, global_speaker_ids
 
     def __getitem__(self, index):
         sample = self.collection[index]
@@ -1556,11 +1678,11 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         target_len = self.get_segment_timestamps(duration=session_len_sec, sample_rate=self.featurizer.sample_rate)
         target_len = torch.clamp(target_len, max=self.get_frame_count_from_time_series_length(audio_signal.shape[0]))
 
-        targets = self.parse_rttm_for_targets_and_lens(
+        targets, global_speaker_ids = self.parse_rttm_for_targets_and_lens(
             rttm_file=sample.rttm_file, offset=offset, duration=session_len_sec, target_len=target_len
         )
         targets = targets[:target_len, :]
-        return audio_signal, audio_signal_length, targets, target_len
+        return audio_signal, audio_signal_length, targets, target_len, global_speaker_ids
 
 
 def _eesd_train_collate_fn(self, batch):
@@ -1591,12 +1713,14 @@ def _eesd_train_collate_fn(self, batch):
             torch.zeros(0, dtype=torch.long),
             torch.zeros(0),
             torch.zeros(0, dtype=torch.long),
+            torch.zeros(0, dtype=torch.long),
         )
 
     packed_batch = list(zip(*batch))
-    audio_signal, feature_length, targets, target_len = packed_batch
+    audio_signal, feature_length, targets, target_len, global_speaker_ids = packed_batch
     audio_signal_list, feature_length_list = [], []
     target_len_list, targets_list = [], []
+    global_speaker_ids_list = []
 
     max_raw_feat_len = max([x.shape[0] for x in audio_signal])
     max_target_len = max([x.shape[0] for x in targets])
@@ -1604,7 +1728,7 @@ def _eesd_train_collate_fn(self, batch):
         max_ch = max([feat.shape[1] for feat in audio_signal])
     else:
         max_ch = 1
-    for feat, feat_len, tgt, segment_ct in batch:
+    for feat, feat_len, tgt, segment_ct, gsi in batch:
         seq_len = tgt.shape[0]
         if len(feat.shape) > 1:
             pad_feat = (0, 0, 0, max_raw_feat_len - feat.shape[0])
@@ -1623,11 +1747,13 @@ def _eesd_train_collate_fn(self, batch):
         feature_length_list.append(feat_len.clone().detach())
         target_len_list.append(segment_ct.clone().detach())
         targets_list.append(padded_tgt)
+        global_speaker_ids_list.append(gsi)
         audio_signal = torch.stack(audio_signal_list)
     feature_length = torch.stack(feature_length_list)
     target_lens = torch.stack(target_len_list).squeeze(1)
     targets = torch.stack(targets_list)
-    return audio_signal, feature_length, targets, target_lens
+    global_speaker_ids = torch.stack(global_speaker_ids_list)
+    return audio_signal, feature_length, targets, target_lens, global_speaker_ids
 
 
 class AudioToSpeechE2ESpkDiarDataset(_AudioToSpeechE2ESpkDiarDataset):
@@ -1695,6 +1821,8 @@ class AudioToSpeechE2ESpkDiarDataset(_AudioToSpeechE2ESpkDiarDataset):
         subsegment_two_chunks_rate: float = 0.0,
         subsegment_min_chunk_len_sec: float = 10.0,
         subsegment_margin_frames: int = 0,
+        speaker_to_id: dict = None,
+        min_speaker_duration_sec: float = 0.0,
     ):
         super().__init__(
             manifest_filepath=manifest_filepath,
@@ -1713,6 +1841,8 @@ class AudioToSpeechE2ESpkDiarDataset(_AudioToSpeechE2ESpkDiarDataset):
             subsegment_two_chunks_rate=subsegment_two_chunks_rate,
             subsegment_min_chunk_len_sec=subsegment_min_chunk_len_sec,
             subsegment_margin_frames=subsegment_margin_frames,
+            speaker_to_id=speaker_to_id,
+            min_speaker_duration_sec=min_speaker_duration_sec,
         )
 
     def eesd_train_collate_fn(self, batch):
