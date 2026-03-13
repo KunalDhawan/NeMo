@@ -504,6 +504,24 @@ class NextformerModules(NeuralModule, Exportable):
         self.extra_right_context = extra_right_context
         self.extra_silence_frames = extra_silence_frames
 
+        # AAM-Softmax classification head (lazily initialized after speaker vocabulary is built)
+        self.aam_head = None
+
+    def init_aam_head(self, num_speaker_classes: int):
+        """
+        Initialize the AAM-Softmax classification head.
+
+        Called after the speaker vocabulary is built (from dataset or loaded from file),
+        since ``num_speaker_classes`` is not known at YAML parse time.
+
+        Args:
+            num_speaker_classes: Number of unique speakers in the vocabulary.
+        """
+        self.aam_head = nn.Linear(self.se_d_model, num_speaker_classes, bias=False)
+        logging.info(
+            f"Initialized AAM-Softmax head: {self.se_d_model} -> {num_speaker_classes}"
+        )
+
     def _init_fusion_layers(self):
         """
         Initialize fusion layers for combining frame embeddings and speaker embeddings.

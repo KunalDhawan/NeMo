@@ -27,10 +27,18 @@ model:
 
   # SupCon auxiliary loss on speaker embeddings
   supcon_weight: 0.0  # Weight for SupCon loss (0 = disabled). Recommended starting value: 0.5-1.0
-  supcon_min_active_frames: 5  # Minimum active frames for a speaker embedding to participate in SupCon
+  supcon_min_active_frames: 15  # Minimum active frames for a speaker embedding to participate in SupCon
   supcon_cross_batch: true  # If true, use global speaker IDs for cross-batch positives/negatives; if false, positives are within-session only
   supcon_aam: 0.0  # Additive angular margin (ArcFace) for SupCon positive pairs in radians (0 = disabled). Recommended: 0.1-0.2
   supcon_temperature: 0.1  # Temperature for SupCon loss (separate from Sinkhorn's cosine_temperature for balanced gradients)
+
+  # AAM-Softmax auxiliary loss on speaker embeddings
+  min_speaker_duration_sec: 0.0  # Minimum speech duration per speaker for vocabulary filtering (0 = include all). Recommended: 60+ for AAM-Softmax
+  aam_weight: 0.0  # Weight for AAM-Softmax loss (0 = disabled). Recommended: 0.1-1.0
+  aam_scale: 30.0  # Scale parameter for AAM-Softmax (equivalent to 1/temperature)
+  aam_margin: 0.2  # Angular margin in radians for AAM-Softmax
+  aam_min_active_frames: 15  # Minimum active frames for a speaker embedding to participate in AAM-Softmax
+  aam_min_confidence: 0.0  # Minimum accumulated confidence for AAM. Adaptive: strict early in training, relaxes as model improves. 0 = disabled.
 
   # Profile update mode: "frame" (legacy frame-embedding average) or "cls" (CLS-embedding average with confidence weighting)
   profile_update_mode: "cls"

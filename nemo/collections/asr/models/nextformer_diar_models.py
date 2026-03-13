@@ -134,6 +134,10 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             self.augmentor = process_augmentations(self._cfg.augmentor)
         else:
             self.augmentor = None
+
+        # Set before super().__init__() because setup_training_data() is called during super init
+        self.min_speaker_duration_sec = self._cfg.get("min_speaker_duration_sec", 0.0)
+
         super().__init__(cfg=self._cfg, trainer=trainer)
         self.preprocessor = NextformerEncLabelModel.from_config_dict(self._cfg.preprocessor)
 
@@ -207,6 +211,13 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.supcon_aam = self._cfg.get("supcon_aam", 0.0)
         self.supcon_temperature = self._cfg.get("supcon_temperature", 0.1)
 
+        # AAM-Softmax loss on speaker embeddings
+        self.aam_weight = self._cfg.get("aam_weight", 0.0)
+        self.aam_scale = self._cfg.get("aam_scale", 30.0)
+        self.aam_margin = self._cfg.get("aam_margin", 0.2)
+        self.aam_min_active_frames = self._cfg.get("aam_min_active_frames", 10)
+        self.aam_min_confidence = self._cfg.get("aam_min_confidence", 0.0)
+
         # Profile update mode: "frame" (legacy frame-embedding average) or "cls" (CLS-embedding average)
         self.profile_update_mode = self._cfg.get("profile_update_mode", "cls")
 
@@ -243,6 +254,16 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 f"{self.nextformer_modules.backend.upper()} backend initialized with fusion_type: "
                 f"{self.nextformer_modules.fusion_type}"
             )
+        # Initialize AAM-Softmax head if speaker vocabulary is available
+        if hasattr(self, 'num_speaker_classes') and self.num_speaker_classes > 0:
+            self.nextformer_modules.init_aam_head(self.num_speaker_classes)
+        elif self.aam_weight > 0:
+            logging.warning(
+                "aam_weight > 0 but speaker vocabulary is not available at init time. "
+                "AAM-Softmax head was NOT initialized and the loss will be disabled. "
+                "This can happen with Lhotse dataloaders or deferred data setup."
+            )
+
         self.save_hyperparameters("cfg")
         self._init_eval_metrics()
         speaker_inds = list(range(self._cfg.local_num_spks))
@@ -349,6 +370,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             subsegment_min_chunk_len_sec=config.get('subsegment_min_chunk_len_sec', 10.0),
             subsegment_margin_frames=config.get('subsegment_margin_frames', 0),
             speaker_to_id=existing_speaker_to_id,
+            min_speaker_duration_sec=self.min_speaker_duration_sec,
         )
 
         self.data_collection = dataset.collection
@@ -1844,10 +1866,12 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         if self.supcon_aam > 0:
             cos_m = math.cos(self.supcon_aam)
             sin_m = math.sin(self.supcon_aam)
+            threshold = -cos_m
+            mm = sin_m * self.supcon_aam
             cos_theta = torch.clamp(sim_raw, -1.0, 1.0)
             sin_theta = torch.sqrt(torch.clamp(1.0 - cos_theta ** 2, min=1e-8))
             cos_theta_plus_m = cos_theta * cos_m - sin_theta * sin_m
-            cos_theta_plus_m = torch.where(cos_theta < -cos_m, -torch.ones_like(cos_theta_plus_m), cos_theta_plus_m)
+            cos_theta_plus_m = torch.where(cos_theta < threshold, cos_theta - mm, cos_theta_plus_m)
             sim_raw = torch.where(pos_mask, cos_theta_plus_m, sim_raw)
 
         # Scale by SupCon temperature (separate from Sinkhorn's cosine_temperature
@@ -1888,6 +1912,131 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         loss_per_anchor = -(pos_sim_sum / num_positives - log_denom)
         loss = loss_per_anchor[active_anchors].mean()
+        return loss
+
+    def compute_aam_softmax_loss(
+        self,
+        spk_embs,
+        local_target_indices,
+        global_speaker_ids,
+        active_frames_per_spk,
+        batch_size,
+        num_chunks,
+        total_confidence_per_spk=None,
+    ):
+        """
+        AAM-Softmax (ArcFace) loss on speaker embeddings.
+
+        Each valid CLS embedding is classified to its global speaker class using
+        cosine similarity against learnable class weight vectors with additive
+        angular margin on the correct class.
+
+        Args:
+            spk_embs: SE-projected speaker embeddings.
+                Shape: (num_chunks * B, local_num_spks, emb_dim)
+            local_target_indices: Oracle mapping from local speaker slots to
+                target matrix columns.
+                Shape: (num_chunks * B, local_num_spks)
+            global_speaker_ids: Global integer speaker ID per target column.
+                Shape: (B, max_num_spks)
+            active_frames_per_spk: Number of active frames per speaker.
+                Shape: (num_chunks * B, local_num_spks)
+            batch_size: Batch size.
+            num_chunks: Number of chunks per batch item.
+            total_confidence_per_spk: Accumulated per-frame confidence per speaker.
+                Shape: (num_chunks * B, local_num_spks). If provided and
+                aam_min_confidence > 0, used as additional quality filter.
+
+        Returns:
+            loss (torch.Tensor): Scalar AAM-Softmax loss.
+        """
+        if self.nextformer_modules.aam_head is None:
+            logging.warning("AAM-Softmax head is not initialized, returning zero loss.")
+            return torch.tensor(0.0, device=spk_embs.device)
+
+        local_num_spks = spk_embs.shape[1]
+        emb_dim = spk_embs.shape[2]
+        max_num_spks = global_speaker_ids.shape[1]
+        num_classes = self.nextformer_modules.aam_head.weight.shape[0]
+
+        # Resolve per-embedding global speaker IDs (same chain as SupCon)
+        target_cols = local_target_indices.view(num_chunks, batch_size, local_num_spks)
+        af = active_frames_per_spk.view(num_chunks, batch_size, local_num_spks)
+        batch_idx = torch.arange(batch_size, device=spk_embs.device)
+        batch_idx = batch_idx.unsqueeze(0).unsqueeze(-1).expand(num_chunks, batch_size, local_num_spks)
+
+        emb_speaker_ids = torch.full(
+            (num_chunks, batch_size, local_num_spks), -1,
+            dtype=torch.long, device=spk_embs.device,
+        )
+        valid_col = target_cols >= 0
+        safe_cols = target_cols.clamp(min=0)
+        emb_speaker_ids[valid_col] = global_speaker_ids[
+            batch_idx[valid_col], safe_cols[valid_col]
+        ]
+
+        # Flatten and filter
+        all_embs = spk_embs.view(num_chunks, batch_size, local_num_spks, emb_dim).reshape(-1, emb_dim)
+        all_ids = emb_speaker_ids.reshape(-1)
+        all_af = af.reshape(-1)
+        emb_norms = all_embs.norm(dim=-1)
+
+        valid_mask = (
+            (all_ids >= 0)
+            & (all_ids < num_classes)
+            & (all_af >= self.aam_min_active_frames)
+            & (emb_norms > 1e-6)
+            & torch.isfinite(emb_norms)
+        )
+
+        # Confidence-based filtering: adaptive threshold that is strict when
+        # predictions are uncertain (early training) and permissive when confident.
+        if total_confidence_per_spk is not None and self.aam_min_confidence > 0:
+            all_conf = total_confidence_per_spk.view(num_chunks, batch_size, local_num_spks).reshape(-1)
+            valid_mask = valid_mask & (all_conf >= self.aam_min_confidence)
+        valid_embs = all_embs[valid_mask]
+        valid_labels = all_ids[valid_mask]
+        N = valid_embs.shape[0]
+
+        if N < 1:
+            return torch.tensor(0.0, device=spk_embs.device, requires_grad=True)
+
+        # L2-normalize embeddings and weight matrix
+        embs_norm = F.normalize(valid_embs, dim=1)
+        W_norm = F.normalize(self.nextformer_modules.aam_head.weight, dim=1)  # (C, D)
+
+        # Cosine similarities to all class centers
+        cos_theta = F.linear(embs_norm, W_norm)  # (N, C)
+
+        # Apply angular margin to the correct class
+        if self.aam_margin > 0:
+            cos_m = math.cos(self.aam_margin)
+            sin_m = math.sin(self.aam_margin)
+            threshold = -cos_m
+            mm = sin_m * self.aam_margin
+
+            cos_theta_clamped = torch.clamp(cos_theta, -1.0, 1.0)
+            sin_theta = torch.sqrt(torch.clamp(1.0 - cos_theta_clamped ** 2, min=1e-8))
+            cos_theta_plus_m = cos_theta_clamped * cos_m - sin_theta * sin_m
+
+            # Canonical ArcFace fallback: linear approximation when theta + m > pi
+            cos_theta_plus_m = torch.where(
+                cos_theta_clamped < threshold,
+                cos_theta_clamped - mm,
+                cos_theta_plus_m,
+            )
+
+            one_hot = F.one_hot(valid_labels, num_classes=num_classes).bool()
+            cos_theta = torch.where(one_hot, cos_theta_plus_m, cos_theta)
+
+        # Scale and cross-entropy
+        logits = cos_theta * self.aam_scale
+        loss = F.cross_entropy(logits, valid_labels)
+
+        if not torch.isfinite(loss):
+            logging.warning("AAM-Softmax loss is NaN/inf, returning zero.")
+            return torch.tensor(0.0, device=spk_embs.device, requires_grad=True)
+
         return loss
 
     def _get_aux_train_evaluations(
@@ -1958,9 +2107,17 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             + self.global_pil_weight * global_pil_loss
         )
 
-        # SupCon auxiliary loss on speaker embeddings
+        # Compute chunk-level confidence for embedding quality filtering.
+        # confidence = sum of per-frame C[i] = P[i] * Prod(1-P[j]) over active frames.
+        # Used by SupCon and AAM to filter unreliable embeddings.
         batch_size = targets.shape[0]
         num_chunks = local_logits.shape[0] // batch_size
+        local_preds_for_conf = torch.sigmoid(local_logits)
+        per_frame_confidence = self.nextformer_modules._get_confidence(local_preds_for_conf)
+        per_frame_confidence = per_frame_confidence.masked_fill(local_preds_for_conf <= self.local_mask_threshold, 0)
+        total_confidence_per_spk = per_frame_confidence.sum(dim=1)  # (num_chunks * B, local_num_spks)
+
+        # SupCon auxiliary loss on speaker embeddings
         supcon_loss = torch.tensor(0.0, device=logits.device)
         if self.supcon_weight >= 0 and global_speaker_ids is not None:
             supcon_loss = self.compute_supcon_loss(
@@ -1973,6 +2130,20 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             )
             if self.supcon_weight > 0:
                 loss = loss + self.supcon_weight * supcon_loss
+
+        # AAM-Softmax auxiliary loss on speaker embeddings
+        aam_loss = torch.tensor(0.0, device=logits.device)
+        if self.aam_weight > 0 and global_speaker_ids is not None:
+            aam_loss = self.compute_aam_softmax_loss(
+                spk_embs=spk_embs,
+                local_target_indices=local_target_indices,
+                global_speaker_ids=global_speaker_ids,
+                active_frames_per_spk=active_frames_per_spk,
+                total_confidence_per_spk=total_confidence_per_spk,
+                batch_size=batch_size,
+                num_chunks=num_chunks,
+            )
+            loss = loss + self.aam_weight * aam_loss
 
         local_preds = torch.sigmoid(local_logits)
         self._accuracy_train(local_preds, local_pil_targets, local_target_lens)
@@ -1987,6 +2158,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'pil_loss': pil_loss,
             'global_pil_loss': global_pil_loss,
             'supcon_loss': supcon_loss,
+            'aam_loss': aam_loss,
             'learning_rate': self._optimizer.param_groups[0]['lr'],
             'train_f1_acc': train_f1_acc,
             'train_f1_acc_global': train_f1_acc_global,
