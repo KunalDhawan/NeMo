@@ -1645,9 +1645,9 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         # TODO: support self.soft_targets parameter - now targets are always soft
 
         actual_n_spk = (targets >= self.soft_label_thres).any(dim=0).sum().item()
-        logging.info(
-            f"uniq_id: {sample.uniq_id}, targets shape: {targets.shape}, target_len: {target_len}, actual n_spk: {actual_n_spk}, global_speaker_ids: {global_speaker_ids}"
-        )
+        #logging.info(
+        #    f"uniq_id: {sample.uniq_id}, targets shape: {targets.shape}, target_len: {target_len}, actual n_spk: {actual_n_spk}, global_speaker_ids: {global_speaker_ids}"
+        #)
         return audio_signal, audio_signal_length, targets, target_len, global_speaker_ids
 
     def __getitem__(self, index):

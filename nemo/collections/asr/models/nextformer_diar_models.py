@@ -2133,7 +2133,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         # AAM-Softmax auxiliary loss on speaker embeddings
         aam_loss = torch.tensor(0.0, device=logits.device)
-        if self.aam_weight > 0 and global_speaker_ids is not None:
+        if self.aam_weight >= 0 and global_speaker_ids is not None:
             aam_loss = self.compute_aam_softmax_loss(
                 spk_embs=spk_embs,
                 local_target_indices=local_target_indices,
