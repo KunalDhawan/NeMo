@@ -47,6 +47,7 @@ from nemo.core.classes import ModelPT
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.core.neural_types import AudioSignal, LengthsType, NeuralType, LogitsType
 from nemo.core.neural_types.elements import ProbsType
+from nemo.collections.asr.parts.utils.offline_clustering import SpeakerClustering
 from nemo.utils import logging
 
 __all__ = ['NextformerEncLabelModel']
@@ -198,6 +199,15 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         # Interpolation weight for oracle centroids: 0.0 = pure Sinkhorn, 1.0 = pure oracle.
         self.oracle_centroids_weight = self._cfg.get("oracle_centroids_weight", 1.0)
         self.streaming_mode = self.cfg.get("streaming_mode", False)
+
+        self.clustering_assignment = self._cfg.get("clustering_assignment", False)
+        self.clustering_method = self._cfg.get("clustering_method", "nmesc")  # "nmesc" or "ahc"
+        self.clustering_threshold = self._cfg.get("clustering_threshold", -1.0)
+        if self.clustering_assignment:
+            use_cuda = torch.cuda.is_available()
+            self.speaker_clustering = SpeakerClustering(cuda=use_cuda)
+        else:
+            self.speaker_clustering = None
 
         # Cross-chunk speaker embedding swap augmentation
         self.cross_chunk_swap_p = self._cfg.get("cross_chunk_swap_p", 0.0)
@@ -858,6 +868,241 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         return swapped_embs
 
+    @staticmethod
+    def _constrained_ahc(
+        cos_sim: torch.Tensor,
+        cannot_link: set,
+        threshold: float,
+    ) -> torch.LongTensor:
+        """Constrained Agglomerative Hierarchical Clustering (average linkage).
+
+        Merges the closest pair of clusters whose merge does not violate any
+        cannot-link constraint, stopping when the minimum valid distance
+        exceeds *threshold*.
+
+        Args:
+            cos_sim: (N, N) cosine similarity matrix.
+            cannot_link: set of frozenset({i, j}) pairs that must stay apart.
+            threshold: maximum cosine *distance* (1 - similarity) for merging.
+
+        Returns:
+            labels: (N,) contiguous integer cluster labels on the same device
+                as *cos_sim*.
+        """
+        device = cos_sim.device
+        distance = (1.0 - cos_sim).float().cpu().numpy()
+        N = distance.shape[0]
+
+        clusters: dict = {i: [i] for i in range(N)}
+        point_to_cluster = list(range(N))
+        active = set(range(N))
+
+        while len(active) > 1:
+            best_dist = float("inf")
+            best_pair = None
+
+            active_list = sorted(active)
+            for ii in range(len(active_list)):
+                ci = active_list[ii]
+                for jj in range(ii + 1, len(active_list)):
+                    cj = active_list[jj]
+                    # Check cannot-link
+                    violates = False
+                    for pi in clusters[ci]:
+                        for pj in clusters[cj]:
+                            if frozenset({pi, pj}) in cannot_link:
+                                violates = True
+                                break
+                        if violates:
+                            break
+                    if violates:
+                        continue
+                    # Average linkage distance
+                    total = sum(
+                        distance[pi, pj]
+                        for pi in clusters[ci]
+                        for pj in clusters[cj]
+                    )
+                    d = total / (len(clusters[ci]) * len(clusters[cj]))
+                    if d < best_dist:
+                        best_dist = d
+                        best_pair = (ci, cj)
+
+            if best_pair is None or best_dist > threshold:
+                break
+
+            ci, cj = best_pair
+            clusters[ci] = clusters[ci] + clusters[cj]
+            for p in clusters[cj]:
+                point_to_cluster[p] = ci
+            del clusters[cj]
+            active.discard(cj)
+
+        label_map = {cid: label for label, cid in enumerate(sorted(active))}
+        labels = [label_map[point_to_cluster[i]] for i in range(N)]
+        return torch.tensor(labels, device=device, dtype=torch.long)
+
+    def _compute_clustering_assignments(
+        self,
+        spk_embs: torch.Tensor,
+        spk_detected: torch.Tensor,
+        batch_size: int,
+        num_chunks: int,
+        local_num_spks: int,
+    ) -> torch.Tensor:
+        """Cluster all local speaker embeddings across chunks to produce
+        global assignment matrices.
+
+        Args:
+            spk_embs: (num_chunks * batch_size, local_num_spks, emb_dim)
+            spk_detected: (num_chunks * batch_size, local_num_spks) bool
+            batch_size: batch size
+            num_chunks: number of chunks
+            local_num_spks: number of local speakers per chunk
+
+        Returns:
+            assignments: (num_chunks * batch_size, local_num_spks, max_num_spks)
+                one-hot assignment matrices.
+        """
+        emb_dim = spk_embs.shape[-1]
+        max_num_spks = self.nextformer_modules.max_num_spks
+        N = num_chunks * local_num_spks
+
+        # Reshape to (B, num_chunks * local_num_spks, emb_dim)
+        spk_embs_flat = (
+            spk_embs.view(num_chunks, batch_size, local_num_spks, emb_dim)
+            .transpose(0, 1)
+            .reshape(batch_size, N, emb_dim)
+        )
+        valid_mask = (
+            spk_detected.view(num_chunks, batch_size, local_num_spks)
+            .transpose(0, 1)
+            .reshape(batch_size, N)
+        )
+
+        # Build cannot-link pairs: speakers from the same chunk must not merge
+        cannot_link: set = set()
+        for c in range(num_chunks):
+            base = c * local_num_spks
+            for i in range(local_num_spks):
+                for j in range(i + 1, local_num_spks):
+                    cannot_link.add(frozenset({base + i, base + j}))
+
+        all_assignments = torch.zeros(
+            batch_size, N, max_num_spks,
+            device=spk_embs.device, dtype=spk_embs.dtype,
+        )
+
+        for b in range(batch_size):
+            valid_b = valid_mask[b]
+            num_valid = valid_b.sum().item()
+            if num_valid == 0:
+                continue
+
+            valid_indices = torch.where(valid_b)[0]
+            valid_embs = F.normalize(spk_embs_flat[b, valid_b, :], p=2, dim=1)
+            cos_sim = torch.mm(valid_embs, valid_embs.T)
+
+            if self.clustering_method == "nmesc":
+                cluster_labels = self.speaker_clustering.forward_unit_infer(
+                    cos_sim,
+                    max_num_speakers=max_num_spks,
+                    fixed_thres=self.clustering_threshold,
+                )
+                cluster_labels = cluster_labels.to(self.device)
+
+                # Post-check: warn if same-chunk speakers share a cluster
+                for c in range(num_chunks):
+                    base = c * local_num_spks
+                    chunk_valid_local = []
+                    for vi, idx in enumerate(valid_indices.tolist()):
+                        if base <= idx < base + local_num_spks:
+                            chunk_valid_local.append(vi)
+                    chunk_labels = [cluster_labels[vi].item() for vi in chunk_valid_local]
+                    if len(chunk_labels) != len(set(chunk_labels)):
+                        logging.warning(
+                            f"NMESC: same-chunk speakers share a cluster in chunk {c} "
+                            f"(labels={chunk_labels}). Consider using clustering_method='ahc'."
+                        )
+
+            elif self.clustering_method == "ahc":
+                # Remap cannot-link to valid-only indices
+                idx_map = {orig.item(): vi for vi, orig in enumerate(valid_indices)}
+                valid_cl: set = set()
+                for pair in cannot_link:
+                    mapped = [idx_map[p] for p in pair if p in idx_map]
+                    if len(mapped) == 2:
+                        valid_cl.add(frozenset(mapped))
+
+                threshold = self.clustering_threshold if self.clustering_threshold > 0 else 0.3
+                cluster_labels = self._constrained_ahc(cos_sim, valid_cl, threshold)
+            else:
+                raise ValueError(
+                    f"Unknown clustering_method='{self.clustering_method}'. "
+                    f"Expected 'nmesc' or 'ahc'."
+                )
+
+            cluster_labels = cluster_labels.clamp(0, max_num_spks - 1)
+            one_hot = F.one_hot(cluster_labels, num_classes=max_num_spks).to(all_assignments.dtype)
+            all_assignments[b, valid_indices, :] = one_hot
+
+        # Reshape back to (num_chunks * batch_size, local_num_spks, max_num_spks)
+        all_assignments = (
+            all_assignments.view(batch_size, num_chunks, local_num_spks, max_num_spks)
+            .transpose(0, 1)
+            .reshape(num_chunks * batch_size, local_num_spks, max_num_spks)
+        )
+        return all_assignments
+
+    def _forward_offline_clustering(
+        self,
+        local_logits: torch.Tensor,
+        spk_embs: torch.Tensor,
+        spk_detected: torch.Tensor,
+        batch_size: int,
+        num_chunks: int,
+        local_num_spks: int,
+        chunk_len: int,
+        lc: int,
+        total_n_frames: int,
+    ) -> torch.Tensor:
+        """Build global logits using clustering-based assignment.
+
+        Replaces the Sinkhorn / streaming-state chunk loop when
+        ``clustering_assignment`` is enabled at inference time.
+        """
+        clustering_assignments = self._compute_clustering_assignments(
+            spk_embs=spk_embs,
+            spk_detected=spk_detected,
+            batch_size=batch_size,
+            num_chunks=num_chunks,
+            local_num_spks=local_num_spks,
+        )
+
+        logits_list = []
+        for chunk_idx in range(num_chunks):
+            start = chunk_idx * chunk_len
+            end = min(start + chunk_len, total_n_frames)
+            dur = end - start
+            offset = min(lc, start)
+
+            local_logits_chunk = local_logits[
+                chunk_idx * batch_size : (chunk_idx + 1) * batch_size, :, :
+            ]
+            spk_assignments_chunk = clustering_assignments[
+                chunk_idx * batch_size : (chunk_idx + 1) * batch_size, :, :
+            ]
+
+            logits_chunk = self.nextformer_modules.get_global_logits(
+                local_logits=local_logits_chunk,
+                spk_assignments=spk_assignments_chunk,
+                offset=offset,
+                dur=dur,
+            )
+            logits_list.append(logits_chunk)
+
+        return torch.cat(logits_list, dim=1)
+
     def forward_offline(
         self,
         processed_signal,
@@ -1050,6 +1295,23 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             spk_embs_enhanced = spk_embs_enhanced.masked_fill(~valid_spk_mask.unsqueeze(-1), 0)
             spk_embs = spk_embs_enhanced.view(batch_size, num_chunks, local_num_spks, emb_dim).transpose(0, 1)
             spk_embs = spk_embs.reshape(num_chunks * batch_size, local_num_spks, emb_dim)
+
+        if self.clustering_assignment and not self.training:
+            logits = self._forward_offline_clustering(
+                local_logits=local_logits,
+                spk_embs=spk_embs,
+                spk_detected=spk_detected,
+                batch_size=batch_size,
+                num_chunks=num_chunks,
+                local_num_spks=local_num_spks,
+                chunk_len=chunk_len,
+                lc=lc,
+                total_n_frames=total_n_frames,
+            )
+            if sig_length < max_n_frames:
+                n_frames = math.ceil(sig_length / self.encoder.subsampling_factor)
+                logits = logits[:, :n_frames, :]
+            return logits, local_logits, spk_embs, active_frames_per_spk
 
         # Collect per-chunk logits and concatenate for differentiable assembly
         logits_list = []
