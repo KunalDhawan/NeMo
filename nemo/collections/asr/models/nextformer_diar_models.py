@@ -220,6 +220,8 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.supcon_cross_batch = self._cfg.get("supcon_cross_batch", True)
         self.supcon_aam = self._cfg.get("supcon_aam", 0.0)
         self.supcon_temperature = self._cfg.get("supcon_temperature", 0.1)
+        self.supcon_decoupled = self._cfg.get("supcon_decoupled", False)
+        self.supcon_dustbin_margin = self._cfg.get("supcon_dustbin_margin", 0.0)
 
         # AAM-Softmax loss on speaker embeddings
         self.aam_weight = self._cfg.get("aam_weight", 0.0)
@@ -2119,10 +2121,16 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         if use_cross_batch:
             pos_mask = same_speaker & ~self_mask
-            denom_mask = ~self_mask
+            if self.supcon_decoupled:
+                denom_mask = ~same_speaker & ~self_mask
+            else:
+                denom_mask = ~self_mask
         else:
             pos_mask = same_speaker & same_session & ~self_mask
-            denom_mask = same_session & ~self_mask
+            if self.supcon_decoupled:
+                denom_mask = ~same_speaker & same_session & ~self_mask
+            else:
+                denom_mask = same_session & ~self_mask
 
         # Apply additive angular margin (ArcFace) to positive pairs before temperature scaling
         if self.supcon_aam > 0:
@@ -2162,7 +2170,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         # Add dustbin class to denominator: creates a reference point that
         # negatives above dustbin_val get stronger gradient to push down
-        dustbin_score = self.nextformer_modules.sinkhorn_dustbin_val.detach() / self.supcon_temperature
+        dustbin_score = (self.nextformer_modules.sinkhorn_dustbin_val.detach() - self.supcon_dustbin_margin) / self.supcon_temperature
         exp_dustbin = torch.exp(dustbin_score - sim_max.squeeze(1))  # (N,) shifted for stability
         log_denom = torch.log(exp_sim.sum(dim=1) + exp_dustbin + 1e-12)  # (N,)
 

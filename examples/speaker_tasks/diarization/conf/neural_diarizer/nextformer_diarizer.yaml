@@ -31,6 +31,8 @@ model:
   supcon_cross_batch: true  # If true, use global speaker IDs for cross-batch positives/negatives; if false, positives are within-session only
   supcon_aam: 0.0  # Additive angular margin (ArcFace) for SupCon positive pairs in radians (0 = disabled). Recommended: 0.1-0.2
   supcon_temperature: 0.1  # Temperature for SupCon loss (separate from Sinkhorn's cosine_temperature for balanced gradients)
+  supcon_decoupled: false  # If true, exclude positives from denominator (DCL variant) for independent negative gradients
+  supcon_dustbin_margin: 0.0  # Subtracted from dustbin score in denominator to lower the gradient pivot (e.g., 0.25 shifts pivot from 0.5 to 0.25)
 
   # AAM-Softmax auxiliary loss on speaker embeddings
   min_speaker_duration_sec: 0.0  # Minimum speech duration per speaker for vocabulary filtering (0 = include all). Recommended: 60+ for AAM-Softmax
