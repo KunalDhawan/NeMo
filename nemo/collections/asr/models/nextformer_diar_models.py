@@ -2165,8 +2165,8 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         # Mask non-denom entries to -inf BEFORE exp so that exp(-inf) = 0 exactly,
         # avoiding the inf * 0 = NaN hazard from post-multiply masking.
-        sim_shifted = sim_shifted.masked_fill(~denom_mask, NEG_INF)
-        exp_sim = torch.exp(sim_shifted)
+        sim_shifted_denom = sim_shifted.masked_fill(~denom_mask, NEG_INF)
+        exp_sim = torch.exp(sim_shifted_denom)
 
         # Add dustbin class to denominator: creates a reference point that
         # negatives above dustbin_val get stronger gradient to push down
@@ -2174,9 +2174,9 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         exp_dustbin = torch.exp(dustbin_score - sim_max.squeeze(1))  # (N,) shifted for stability
         log_denom = torch.log(exp_sim.sum(dim=1) + exp_dustbin + 1e-12)  # (N,)
 
-        # Numerator: for each anchor, average (sim_pos - log_denom) over positives.
-        # Positive entries are always a subset of denom entries, so sim_shifted
-        # is valid (not -inf) for them.
+        # Numerator: use sim_shifted (not sim_shifted_denom) so that positive
+        # entries retain valid values in decoupled mode where pos_mask and
+        # denom_mask are disjoint.
         pos_sim_sum = torch.where(pos_mask, sim_shifted, torch.zeros_like(sim_shifted)).sum(dim=1)  # (N,)
         num_positives = pos_mask.float().sum(dim=1).clamp(min=1)  # (N,)
 
