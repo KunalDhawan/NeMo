@@ -185,6 +185,8 @@ def get_pil_targets_hungarian(
     cls_preds: Optional[torch.Tensor] = None,
     cls_preds_weight: float = 1.0,
     metric: str = 'dot_product',
+    assignment_mask: Optional[torch.Tensor] = None,
+    apply_sigmoid: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Calculates permutation-invariant training (PIT) targets using the Hungarian algorithm.
@@ -194,14 +196,22 @@ def get_pil_targets_hungarian(
     Args:
         labels (torch.Tensor): Ground truth labels of shape (B, T, S), where B is the batch size,
             T is the number of frames, and S is the number of speakers in labels.
-        logits (torch.Tensor): Predicted speaker logits of shape (B, T, N), where N is the
-            number of speakers in predictions.
+        logits (torch.Tensor): Predicted speaker values of shape (B, T, N), where N is the
+            number of speakers in predictions. When apply_sigmoid=True (default), these are
+            raw logits and sigmoid is applied internally. When apply_sigmoid=False, these are
+            already probabilities in [0, 1] and are used directly.
         cls_preds (torch.Tensor, optional): Predicted speaker existence probabilities of shape (B, N).
             If provided, these probabilities are added to the match score to bias the assignment.
             Defaults to None.
         cls_preds_weight (float): Weight for the `cls_preds` contribution. Defaults to 1.0.
         metric (str): Metric to use for the match score. Can be 'accuracy', 'dot_product' or 'bce'.
-            If 'accuracy' or 'dot_product' is used, sigmoid is applied to logits. Defaults to 'dot_product'.
+            'bce' requires apply_sigmoid=True for numerical stability. Defaults to 'dot_product'.
+        assignment_mask (torch.Tensor, optional): Boolean mask of shape (B, S, N) indicating
+            which (label speaker, output position) assignments are feasible. Infeasible entries
+            are set to a large negative value so Hungarian will not select them. Used by
+            get_ats_targets_hungarian to enforce arrival-time ordering. Defaults to None.
+        apply_sigmoid (bool): If True (default), sigmoid is applied to `logits` to obtain
+            probabilities. If False, `logits` is treated as probabilities directly.
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: 
             - reconstructed_labels: The permuted labels that best match the predictions, of shape (B, T, N).
@@ -211,17 +221,17 @@ def get_pil_targets_hungarian(
     batch_size, _num_frames, num_speakers_labels = labels.shape
     _batch_size, _num_frames, num_speakers_preds = logits.shape
 
-    # Check for NaN/Inf in input logits (can happen early in training)
-    # Clip logits to [-20, 20] to prevent numerical overflow in sigmoid/BCE computation
-    # sigmoid(20) ≈ 1.0 and sigmoid(-20) ≈ 0.0 within floating point precision
-    if torch.isnan(logits).any() or torch.isinf(logits).any():
-        nan_count = torch.isnan(logits).sum().item()
-        inf_count = torch.isinf(logits).sum().item()
-        logging.warning(f"Invalid values detected in logits: {nan_count} NaNs, {inf_count} Infs. Clipping to [-20, 20].")
-        logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0)
-    else:
-        # Even if no NaN/Inf, clamp extreme values for numerical stability
-        logits = torch.clamp(logits, min=-20.0, max=20.0)
+    if apply_sigmoid:
+        # Check for NaN/Inf in input logits (can happen early in training)
+        # Clip logits to [-20, 20] to prevent numerical overflow in sigmoid/BCE computation
+        # sigmoid(20) ≈ 1.0 and sigmoid(-20) ≈ 0.0 within floating point precision
+        if torch.isnan(logits).any() or torch.isinf(logits).any():
+            nan_count = torch.isnan(logits).sum().item()
+            inf_count = torch.isinf(logits).sum().item()
+            logging.warning(f"Invalid values detected in logits: {nan_count} NaNs, {inf_count} Infs. Clipping to [-20, 20].")
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0)
+        else:
+            logits = torch.clamp(logits, min=-20.0, max=20.0)
 
     # Allow rectangular assignment when num_speakers_labels > num_speakers_preds (N < S)
 
@@ -234,17 +244,21 @@ def get_pil_targets_hungarian(
     # Calculate match score by averaging the element-wise product over the time dimension.
     # The result is a match score matrix of shape (B, S, N).
     if metric == 'accuracy':
-        preds_expanded = torch.sigmoid(logits_expanded)
+        preds_expanded = torch.sigmoid(logits_expanded) if apply_sigmoid else logits_expanded
         match_score_matrix = (preds_expanded * labels_expanded + (1 - preds_expanded) * (1 - labels_expanded)).mean(
             dim=1
         )
     elif metric == 'bce':
-        # Negative BCE with logits, since we want to maximize the score
-        match_score_matrix = -F.binary_cross_entropy_with_logits(
-            logits_expanded, labels_expanded.to(logits_expanded.dtype), reduction='none'
-        ).mean(dim=1)
+        if apply_sigmoid:
+            match_score_matrix = -F.binary_cross_entropy_with_logits(
+                logits_expanded, labels_expanded.to(logits_expanded.dtype), reduction='none'
+            ).mean(dim=1)
+        else:
+            match_score_matrix = -F.binary_cross_entropy(
+                logits_expanded, labels_expanded.to(logits_expanded.dtype), reduction='none'
+            ).mean(dim=1)
     elif metric == 'dot_product':
-        preds_expanded = torch.sigmoid(logits_expanded)
+        preds_expanded = torch.sigmoid(logits_expanded) if apply_sigmoid else logits_expanded
         match_score_matrix = (preds_expanded * labels_expanded).mean(dim=1)
     else:
         raise ValueError(f"Unsupported metric for Hungarian assignment: {metric}")
@@ -267,7 +281,13 @@ def get_pil_targets_hungarian(
         torch.full_like(match_score_matrix, large_negative_value),
         match_score_matrix
     )
-    #logging.info(f"match_score_matrix after active speaker mask: {match_score_matrix}")
+
+    if assignment_mask is not None:
+        match_score_matrix = torch.where(
+            assignment_mask,
+            match_score_matrix,
+            torch.full_like(match_score_matrix, large_negative_value),
+        )
 
     # linear_sum_assignment minimizes the cost, so we use the negative of the score for maximization.
     # We also convert to float32, as numpy doesn't support bfloat16.
@@ -323,6 +343,67 @@ def get_pil_targets_hungarian(
     )
     
     return reconstructed_labels, spk_indices
+
+
+def get_ats_targets_hungarian(
+    labels: torch.Tensor,
+    logits: torch.Tensor,
+    thres: float = 0.5,
+    tolerance: float = 0,
+    **kwargs,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Calculates ATS (Arrival Time Sort) targets using the Hungarian algorithm.
+
+    Speakers are ordered by their first activity frame (arrival time). When multiple
+    speakers share the same arrival time (within tolerance), the Hungarian algorithm
+    resolves the tie by maximizing the match score with predictions.
+
+    This replaces the brute-force get_ats_targets which enumerates all S! permutations
+    (O(B*T*S!) memory) with an O(S^3) per-sample Hungarian assignment that masks out
+    assignments violating the arrival-time order.
+
+    Args:
+        labels (torch.Tensor): Ground truth labels of shape (B, T, S).
+        logits (torch.Tensor): Predicted speaker logits (or probabilities when
+            apply_sigmoid=False is passed via kwargs) of shape (B, T, N).
+        thres (float): Threshold for detecting speaker activity. Default is 0.5.
+        tolerance (float): Tolerance in frames for arrival time comparison. Speakers whose
+            arrival times differ by at most this value are considered tied and may be
+            assigned to each other's positions. Default is 0.
+        **kwargs: Additional keyword arguments forwarded to get_pil_targets_hungarian
+            (e.g., cls_preds, cls_preds_weight, metric, apply_sigmoid).
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]:
+            - reconstructed_labels: Permuted labels in arrival-time order, shape (B, T, N).
+            - spk_indices: Speaker index mapping of shape (B, N).
+    """
+    num_speakers_labels = labels.shape[2]
+    num_speakers_preds = logits.shape[2]
+
+    arrival = find_first_nonzero(labels, max_cap_val=labels.shape[1], thres=thres)  # (B, S)
+    sorted_arrival = torch.sort(arrival, dim=1).values  # (B, S)
+
+    # Build target arrival time for each output position.
+    # Square case (S == N): use sorted_arrival directly.
+    # S < N: pad with max_cap_val so extra positions only match inactive speakers.
+    # S > N: use the first N sorted arrivals (earliest speakers get priority).
+    if num_speakers_labels <= num_speakers_preds:
+        target_arrival = torch.full(
+            (labels.shape[0], num_speakers_preds), labels.shape[1],
+            device=labels.device, dtype=sorted_arrival.dtype,
+        )
+        target_arrival[:, :num_speakers_labels] = sorted_arrival
+    else:
+        target_arrival = sorted_arrival[:, :num_speakers_preds]
+
+    # ATS feasibility mask: label speaker i can go to output position j iff their
+    # arrival time matches the target arrival at position j within tolerance.
+    # arrival: (B, S, 1), target_arrival: (B, 1, N) -> ats_mask: (B, S, N)
+    ats_mask = torch.abs(arrival.unsqueeze(2) - target_arrival.unsqueeze(1)) <= tolerance
+
+    return get_pil_targets_hungarian(labels, logits, assignment_mask=ats_mask, **kwargs)
 
 
 def find_segments_from_rttm(

@@ -36,7 +36,12 @@ from nemo.collections.asr.models.asr_model import ExportableEncDecModel
 from nemo.collections.asr.parts.mixins.diarization import DiarizeConfig, SpkDiarizationMixin
 from nemo.collections.asr.parts.preprocessing.features import FilterbankFeatures, WaveformFeaturizer
 from nemo.collections.asr.parts.preprocessing.perturb import process_augmentations
-from nemo.collections.asr.parts.utils.asr_multispeaker_utils import get_ats_targets, get_pil_targets
+from nemo.collections.asr.parts.utils.asr_multispeaker_utils import (
+    get_ats_targets,
+    get_ats_targets_hungarian,
+    get_pil_targets,
+    get_pil_targets_hungarian,
+)
 from nemo.collections.asr.parts.utils.speaker_utils import generate_diarization_output_lines
 from nemo.collections.asr.parts.utils.vad_utils import ts_vad_post_processing
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
@@ -1096,8 +1101,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             target_lens = target_lens.clamp(max=preds.shape[1])
         elif preds.shape[1] > targets.shape[1]:
             preds = preds[:, : targets.shape[1], :]
-        targets_ats = get_ats_targets(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
-        targets_pil = get_pil_targets(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
+        targets_ats, _ = get_ats_targets_hungarian(targets.clone(), preds, apply_sigmoid=False)
+        targets_pil, _ = get_pil_targets_hungarian(targets.clone(), preds, apply_sigmoid=False)
         ats_loss = self.loss(probs=preds, labels=targets_ats, target_lens=target_lens)
         pil_loss = self.loss(probs=preds, labels=targets_pil, target_lens=target_lens)
         loss = self.ats_weight * ats_loss + self.pil_weight * pil_loss
@@ -1172,8 +1177,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             target_lens = target_lens.clamp(max=preds.shape[1])
         elif preds.shape[1] > targets.shape[1]:
             preds = preds[:, : targets.shape[1], :]
-        targets_ats = get_ats_targets(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
-        targets_pil = get_pil_targets(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
+        targets_ats, _ = get_ats_targets_hungarian(targets.clone(), preds, apply_sigmoid=False)
+        targets_pil, _ = get_pil_targets_hungarian(targets.clone(), preds, apply_sigmoid=False)
 
         val_ats_loss = self.loss(probs=preds, labels=targets_ats, target_lens=target_lens)
         val_pil_loss = self.loss(probs=preds, labels=targets_pil, target_lens=target_lens)
@@ -1307,8 +1312,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             target_lens = target_lens.clamp(max=preds.shape[1])
         elif preds.shape[1] > targets.shape[1]:
             preds = preds[:, : targets.shape[1], :]
-        targets_ats = get_ats_targets(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
-        targets_pil = get_pil_targets(targets.clone(), preds, speaker_permutations=self.speaker_permutations)
+        targets_ats, _ = get_ats_targets_hungarian(targets.clone(), preds, apply_sigmoid=False)
+        targets_pil, _ = get_pil_targets_hungarian(targets.clone(), preds, apply_sigmoid=False)
         self._accuracy_test(preds, targets_pil, target_lens)
         f1_acc, precision, recall = self._accuracy_test.compute()
         self.batch_f1_accs_list.append(f1_acc)

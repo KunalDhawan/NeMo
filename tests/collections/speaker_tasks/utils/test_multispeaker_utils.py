@@ -20,6 +20,7 @@ from nemo.collections.asr.parts.utils.asr_multispeaker_utils import (
     find_best_permutation,
     find_first_nonzero,
     get_ats_targets,
+    get_ats_targets_hungarian,
     get_hidden_length_from_sample_length,
     get_pil_targets,
     get_pil_targets_hungarian,
@@ -446,3 +447,144 @@ class TestGetPILTargetsHungarian:
         assert out.shape == (1, 3, 3)
         assert spk_indices.shape == (1, 3)
         assert torch.equal(spk_indices, expected_spk_indices), f"Expected {expected_spk_indices} but got {spk_indices}"
+
+
+class TestGetATSTargetsHungarian:
+    """Verify get_ats_targets_hungarian produces identical results to brute-force get_ats_targets."""
+
+    @staticmethod
+    def _preds_to_logits(preds: torch.Tensor) -> torch.Tensor:
+        return torch.logit(preds.clamp(1e-6, 1 - 1e-6))
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "labels, preds, num_speakers, expected_output",
+        [
+            # Existing test 1: distinct arrivals (Batch 2) + tied arrivals (Batch 1)
+            (
+                torch.tensor(
+                    [
+                        [[0.9, 0.1, 0.0], [0.1, 0.8, 0.0], [0.0, 0.1, 0.9]],
+                        [[0.0, 0.0, 0.9], [0.0, 0.9, 0.1], [0.9, 0.1, 0.0]],
+                    ]
+                ),
+                torch.tensor(
+                    [
+                        [[0.8, 0.2, 0.0], [0.2, 0.7, 0.0], [0.0, 0.1, 0.9]],
+                        [[0.0, 0.0, 0.8], [0.0, 0.8, 0.2], [0.9, 0.1, 0.0]],
+                    ]
+                ),
+                3,
+                torch.tensor(
+                    [
+                        [[0.9, 0.1, 0.0], [0.1, 0.8, 0.0], [0.0, 0.1, 0.9]],
+                        [[0.9, 0.0, 0.0], [0.1, 0.9, 0.0], [0.0, 0.1, 0.9]],
+                    ]
+                ),
+            ),
+            # Existing test 2: all three speakers tied at frame 0
+            (
+                torch.tensor([[[0.9, 0.8, 0.7], [0.2, 0.8, 0.7], [0.2, 0.3, 0.9]]]),
+                torch.tensor([[[0.6, 0.7, 0.2], [0.9, 0.4, 0.0], [0.1, 0.7, 0.1]]]),
+                3,
+                torch.tensor([[[0.8, 0.7, 0.9], [0.8, 0.7, 0.2], [0.3, 0.9, 0.2]]]),
+            ),
+            # Existing test 3: 4 speakers, 2 active (tied) + 2 inactive
+            (
+                torch.tensor([[[0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 0, 1], [0, 0, 0, 0]]]),
+                torch.tensor(
+                    [[[0.6, 0.6, 0.1, 0.9], [0.7, 0.7, 0.2, 0.8], [0.4, 0.6, 0.2, 0.7], [0.1, 0.1, 0.1, 0.7]]]
+                ),
+                4,
+                torch.tensor([[[1, 1, 0, 0], [1, 1, 0, 0], [0, 1, 0, 0], [0, 0, 0, 0]]]),
+            ),
+        ],
+    )
+    def test_reproduces_existing_cases(self, labels, preds, num_speakers, expected_output):
+        """Hungarian ATS must match the known-good outputs from brute-force test cases."""
+        logits = self._preds_to_logits(preds)
+        result, _ = get_ats_targets_hungarian(labels.clone(), logits, metric='dot_product')
+        assert torch.allclose(result, expected_output, atol=1e-4), (
+            f"Expected:\n{expected_output}\n\nGot:\n{result}"
+        )
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("seed", list(range(10)))
+    @pytest.mark.parametrize("num_speakers", [2, 3, 4, 5, 6])
+    def test_matches_bruteforce_random(self, num_speakers, seed):
+        """Exhaustive random comparison against brute-force across speaker counts and seeds."""
+        torch.manual_seed(seed)
+        batch_size = 32
+        num_frames = 30
+
+        labels = (torch.rand(batch_size, num_frames, num_speakers) > 0.5).float()
+        logits = torch.randn(batch_size, num_frames, num_speakers) * 3
+        preds = torch.sigmoid(logits)
+
+        speaker_perms = torch.tensor(list(itertools.permutations(range(num_speakers))))
+
+        expected = get_ats_targets(labels.clone(), preds, speaker_perms)
+        result, _ = get_ats_targets_hungarian(labels.clone(), logits, metric='dot_product')
+
+        assert torch.allclose(result, expected, atol=1e-5), (
+            f"Mismatch for {num_speakers} speakers, seed={seed}.\n"
+            f"Expected:\n{expected}\n\nGot:\n{result}"
+        )
+
+    @pytest.mark.unit
+    def test_all_distinct_arrivals(self):
+        """With distinct arrival times, there is exactly one valid ATS permutation.
+        The result must not depend on predictions at all."""
+        labels = torch.tensor([[[0.0, 0.0, 1.0],
+                                [0.0, 1.0, 1.0],
+                                [1.0, 1.0, 1.0]]])  # arrivals: spk0=2, spk1=1, spk2=0
+        logits_a = torch.randn(1, 3, 3) * 5
+        logits_b = torch.randn(1, 3, 3) * 5
+
+        result_a, _ = get_ats_targets_hungarian(labels.clone(), logits_a, metric='dot_product')
+        result_b, _ = get_ats_targets_hungarian(labels.clone(), logits_b, metric='dot_product')
+
+        # ATS order: spk2 (arrival 0), spk1 (arrival 1), spk0 (arrival 2)
+        expected = labels[:, :, [2, 1, 0]]
+        assert torch.allclose(result_a, expected)
+        assert torch.allclose(result_b, expected)
+
+    @pytest.mark.unit
+    def test_all_inactive_speakers(self):
+        """All-zero labels must produce all-zero output regardless of predictions."""
+        labels = torch.zeros(2, 10, 4)
+        logits = torch.randn(2, 10, 4) * 3
+
+        result, spk_indices = get_ats_targets_hungarian(labels, logits, metric='dot_product')
+        assert torch.allclose(result, torch.zeros_like(result))
+        assert (spk_indices == -1).all()
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("seed", list(range(10)))
+    @pytest.mark.parametrize("num_speakers", [2, 3, 4, 5, 6])
+    def test_apply_sigmoid_false_matches_bruteforce(self, num_speakers, seed):
+        """Verify apply_sigmoid=False with preds matches brute-force (sortformer integration path)."""
+        torch.manual_seed(seed)
+        batch_size = 32
+        num_frames = 30
+
+        labels = (torch.rand(batch_size, num_frames, num_speakers) > 0.5).float()
+        preds = torch.rand(batch_size, num_frames, num_speakers)
+
+        speaker_perms = torch.tensor(list(itertools.permutations(range(num_speakers))))
+
+        expected_ats = get_ats_targets(labels.clone(), preds, speaker_perms)
+        result_ats, _ = get_ats_targets_hungarian(
+            labels.clone(), preds, metric='dot_product', apply_sigmoid=False,
+        )
+        assert torch.allclose(result_ats, expected_ats, atol=1e-5), (
+            f"ATS mismatch for {num_speakers} speakers, seed={seed}"
+        )
+
+        expected_pil = get_pil_targets(labels.clone(), preds, speaker_perms)
+        result_pil, _ = get_pil_targets_hungarian(
+            labels.clone(), preds, metric='dot_product', apply_sigmoid=False,
+        )
+        assert torch.allclose(result_pil, expected_pil, atol=1e-5), (
+            f"PIL mismatch for {num_speakers} speakers, seed={seed}"
+        )
