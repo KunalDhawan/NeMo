@@ -321,7 +321,7 @@ def get_pil_targets_hungarian(
     P[b_idx, batch_row_ind, batch_col_ind] = 1.0
 
     # Reconstruct labels with the best permutation; output shape is always (B, T, N)
-    reconstructed_labels = torch.matmul(labels, P)
+    reconstructed_labels = torch.matmul(labels, P).to(labels.dtype)
     
     # Create speaker indices mapping: (B, N) where spk_indices[b, n] is the original speaker index
     # that prediction column n corresponds to, or -1 if unmatched or if the speaker has no activity
