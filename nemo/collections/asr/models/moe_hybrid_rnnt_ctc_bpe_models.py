@@ -1,34 +1,48 @@
 """
-Hybrid RNNT-CTC BPE model with Mixture-of-Experts (MoE) encoder auxiliary loss support.
+Hybrid RNNT-CTC BPE model with Mixture-of-Experts (MoE) encoder auxiliary loss
+and optional Expert Parallelism wiring.
 
-Extends EncDecHybridRNNTCTCBPEModel to collect and add the MoE load-balancing
-auxiliary loss from MoETransformerEncoder during training.
+Same pattern as :class:`EncDecMoERNNTBPEModel` -- collects MoE aux loss,
+populates ``_ddp_params_and_buffers_to_ignore`` for EP-local expert params at
+``__init__``, and registers DP-group grad hooks at :meth:`on_train_start`.
+
+No Megatron dependency; uses only ``torch.distributed``.
 """
+
+from __future__ import annotations
 
 import torch
 
 from nemo.collections.asr.models.hybrid_rnnt_ctc_bpe_models import EncDecHybridRNNTCTCBPEModel
+from nemo.collections.asr.models.moe_rnnt_bpe_models import (
+    _apply_moe_ep_ddp_ignore,
+    _register_moe_ep_grad_hooks,
+)
 
 __all__ = ['EncDecMoEHybridRNNTCTCBPEModel']
 
 
 class EncDecMoEHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCBPEModel):
-    """Hybrid RNNT-CTC BPE model with MoE encoder auxiliary loss support.
+    """Hybrid RNNT-CTC BPE model with MoE encoder auxiliary loss + optional
+    Expert Parallelism wiring.
 
-    Inherits all functionality from :class:`EncDecHybridRNNTCTCBPEModel` and
-    overrides :meth:`add_auxiliary_losses` to collect the MoE load-balancing loss
-    from the encoder during training.
-
-    Use this model class with :class:`MoETransformerEncoder` to train Hybrid
-    RNNT-CTC models with MoE feed-forward layers and the auxiliary load-balancing loss.
+    Inherits all functionality from :class:`EncDecHybridRNNTCTCBPEModel`.
     """
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        _apply_moe_ep_ddp_ignore(self)
+
+    def on_train_start(self) -> None:
+        super().on_train_start()
+        _register_moe_ep_grad_hooks(self)
+
     def add_auxiliary_losses(self, loss: torch.Tensor, reset_registry: bool = False) -> torch.Tensor:
-        """Add auxiliary losses including MoE load-balancing loss.
+        """Add auxiliary losses, including the MoE load-balancing loss.
 
         Args:
             loss: The primary loss value.
-            reset_registry: Whether to reset the AccessMixin registry.
+            reset_registry: Whether to reset the :class:`AccessMixin` registry.
 
         Returns:
             Loss tensor with auxiliary losses added.
