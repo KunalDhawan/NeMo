@@ -16,7 +16,10 @@ import torch
 from nemo.collections.asr.models.hybrid_rnnt_ctc_bpe_models import EncDecHybridRNNTCTCBPEModel
 from nemo.collections.asr.models.moe_rnnt_bpe_models import (
     _apply_moe_ep_ddp_ignore,
+    _consolidate_moe_ep_checkpoint,
     _register_moe_ep_grad_hooks,
+    _save_to_with_moe_ep_consolidation,
+    _shard_moe_ep_checkpoint,
 )
 
 __all__ = ['EncDecMoEHybridRNNTCTCBPEModel']
@@ -36,6 +39,21 @@ class EncDecMoEHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCBPEModel):
     def on_train_start(self) -> None:
         super().on_train_start()
         _register_moe_ep_grad_hooks(self)
+
+    def on_save_checkpoint(self, checkpoint) -> None:
+        super().on_save_checkpoint(checkpoint)
+        _consolidate_moe_ep_checkpoint(self, checkpoint)
+
+    def on_load_checkpoint(self, checkpoint) -> None:
+        _shard_moe_ep_checkpoint(self, checkpoint)
+        super().on_load_checkpoint(checkpoint)
+
+    def save_to(self, save_path: str):
+        """Save a ``.nemo`` archive with consolidated MoE expert weights.
+
+        See :class:`EncDecMoERNNTBPEModel.save_to` for details.
+        """
+        return _save_to_with_moe_ep_consolidation(self, save_path)
 
     def add_auxiliary_losses(self, loss: torch.Tensor, reset_registry: bool = False) -> torch.Tensor:
         """Add auxiliary losses, including the MoE load-balancing loss.
