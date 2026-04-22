@@ -503,6 +503,10 @@ class MoETransformerEncoder(TransformerEncoder):
         # this is effectively a no-op wrapper that reports enabled=False.
         self.moe_topology = build_topology(num_experts=moe_num_experts, ep_size=moe_ep_size)
         self.moe_parallel_ctx = MoEParallelContext(self.moe_topology)
+        # Consolidation cache for save_to paths. Populated temporarily by
+        # begin_consolidated_state_dict() and read by state_dict(). None means
+        # "no consolidation in progress", i.e. normal local-shard behavior.
+        self._moe_ep_full_expert_cache: Optional[dict] = None
 
         # Shared router for omni mode.
         if moe_router_type == 'omni':
@@ -592,6 +596,223 @@ class MoETransformerEncoder(TransformerEncoder):
         return names
 
     # ------------------------------------------------------------------
+    # Checkpoint consolidation across the EP group
+    # ------------------------------------------------------------------
+
+    _EXPERT_PARAM_NAMES = ('w1', 'w2', 'b1', 'b2')
+
+    def _moe_expert_state_dict_keys(self, root_prefix: str = '') -> List[str]:
+        """Return fully-qualified state_dict keys (with ``root_prefix``) for
+        all EP-local expert parameters across all MoE layers.
+
+        When EP is disabled this returns ``[]`` (no consolidation needed).
+        """
+        if not self.moe_topology.enabled:
+            return []
+        keys = []
+        for layer_idx in self.moe_layer_indices:
+            ff = self.layers[layer_idx].ffn
+            if not isinstance(ff, MoEFeedForward) or ff.local_experts is None:
+                continue
+            for name in self._EXPERT_PARAM_NAMES:
+                param = getattr(ff.local_experts, name, None)
+                if param is None:
+                    continue
+                keys.append(f"{root_prefix}layers.{layer_idx}.ffn.local_experts.{name}")
+        return keys
+
+    def consolidate_ep_state_dict_(
+        self,
+        state_dict: dict,
+        root_prefix: str = '',
+    ) -> None:
+        """All-gather each EP-local expert tensor in ``state_dict`` across the
+        EP group into a full ``(num_experts, ...)`` tensor.
+
+        This MUST be called on *every* rank (it issues collective ops). On
+        rank 0 the full tensor is written back into ``state_dict`` in place of
+        the local shard. On non-zero ranks the key is deleted to save memory
+        (Lightning only writes from rank 0 anyway).
+
+        Safe to call when EP is disabled (``moe_ep_size == 1``) -- becomes a
+        no-op.
+
+        Args:
+            state_dict: The checkpoint state_dict to mutate in place.
+            root_prefix: Prefix under which the encoder lives in the state_dict,
+                e.g. ``'encoder.'`` when called from a LightningModule that has
+                ``self.encoder = <this>``.
+        """
+        if not self.moe_topology.enabled:
+            return
+        self.moe_parallel_ctx.ensure_initialized()
+        ep_group = self.moe_parallel_ctx.ep_group
+        ep_size = self.moe_topology.ep_size
+        is_rank0 = self.moe_topology.rank == 0
+
+        for key in self._moe_expert_state_dict_keys(root_prefix=root_prefix):
+            if key not in state_dict:
+                # The caller's state_dict may not contain encoder weights at all
+                # (some Lightning hooks pass partial dicts); silently skip.
+                continue
+            local = state_dict[key]
+            if not isinstance(local, torch.Tensor):
+                continue
+            # NCCL wants CUDA + contiguous; Lightning sometimes moves state to
+            # CPU before save. Bounce through the param's actual device.
+            orig_device = local.device
+            orig_dtype = local.dtype
+            work = local.detach()
+            if work.device.type != 'cuda' and torch.cuda.is_available():
+                work = work.to(f'cuda:{self.moe_topology.local_rank}')
+            work = work.contiguous()
+
+            full_shape = (ep_size * work.shape[0],) + tuple(work.shape[1:])
+            gathered = torch.empty(full_shape, dtype=work.dtype, device=work.device)
+            dist.all_gather_into_tensor(gathered, work, group=ep_group)
+
+            if is_rank0:
+                state_dict[key] = gathered.to(device=orig_device, dtype=orig_dtype)
+            else:
+                # Non-rank-0 ranks don't write, so drop the entry.
+                del state_dict[key]
+
+    def shard_ep_state_dict_(
+        self,
+        state_dict: dict,
+        root_prefix: str = '',
+    ) -> None:
+        """Slice each full ``(num_experts, ...)`` expert tensor in
+        ``state_dict`` to this rank's local ``(experts_per_rank, ...)`` shard.
+
+        Call this on every rank at load time *before* the state_dict is
+        applied, so each rank only sees its own experts.
+
+        Safe to call when EP is disabled -- the only possible transform is
+        "num_experts == experts_per_rank", which is a no-op slice.
+
+        Args:
+            state_dict: The checkpoint state_dict to mutate in place.
+            root_prefix: Same as in :meth:`consolidate_ep_state_dict_`.
+        """
+        L = (
+            self.moe_topology.experts_per_rank
+            if self.moe_topology.enabled
+            else self.moe_num_experts
+        )
+        ep_rank = self.moe_topology.ep_rank if self.moe_topology.enabled else 0
+        E = self.moe_num_experts
+
+        for key in self._moe_expert_state_dict_keys(root_prefix=root_prefix):
+            if key not in state_dict:
+                continue
+            t = state_dict[key]
+            if not isinstance(t, torch.Tensor) or t.ndim < 1:
+                continue
+            n = t.shape[0]
+            if n == L:
+                # Already sharded.
+                continue
+            if n == E:
+                state_dict[key] = t[ep_rank * L : (ep_rank + 1) * L].contiguous()
+            else:
+                raise RuntimeError(
+                    f"Unexpected first-dim size for MoE expert key '{key}': "
+                    f"got {n}, expected either {L} (local shard) or {E} "
+                    f"(consolidated). Check that this checkpoint matches the "
+                    f"current moe_num_experts/moe_ep_size config."
+                )
+
+    # ------------------------------------------------------------------
+    # .nemo save support: gather expert shards, emit full tensors via
+    # state_dict(). Complements the .ckpt path's on_save_checkpoint hook.
+    # NeMo's ModelPT.save_to -> SaveRestoreConnector.save_to is rank-0-only
+    # and does NOT fire Lightning's on_save_checkpoint, so the Lightning-only
+    # consolidation from `consolidate_ep_state_dict_` is insufficient for the
+    # .nemo path. Instead we:
+    #   1. Have all ranks participate in a collective all-gather before the
+    #      rank-0 save (so the collective can complete).
+    #   2. Cache the gathered full tensors on the encoder.
+    #   3. Override `state_dict()` to swap the local shards for full tensors
+    #      when the cache is active, so rank 0's write picks them up.
+    # ------------------------------------------------------------------
+
+    def gather_full_expert_state(self) -> dict:
+        """Collective: all-gather every EP-local expert parameter into full
+        ``(num_experts, ...)`` tensors.
+
+        Must be called on *every* rank (it issues collective ops). Returns a
+        dict keyed by the encoder-relative state_dict name (e.g.
+        ``'layers.3.ffn.local_experts.w1'``) with full tensors as values.
+
+        Returns ``{}`` when EP is disabled (no gather needed).
+        """
+        if not self.moe_topology.enabled:
+            return {}
+        self.moe_parallel_ctx.ensure_initialized()
+        ep_group = self.moe_parallel_ctx.ep_group
+        ep_size = self.moe_topology.ep_size
+
+        full: dict = {}
+        for layer_idx in self.moe_layer_indices:
+            ff = self.layers[layer_idx].ffn
+            if not isinstance(ff, MoEFeedForward) or ff.local_experts is None:
+                continue
+            for name in self._EXPERT_PARAM_NAMES:
+                param = getattr(ff.local_experts, name, None)
+                if param is None:
+                    continue
+                local = param.data.contiguous()
+                full_shape = (ep_size * local.shape[0],) + tuple(local.shape[1:])
+                gathered = torch.empty(full_shape, dtype=local.dtype, device=local.device)
+                dist.all_gather_into_tensor(gathered, local, group=ep_group)
+                full[f"layers.{layer_idx}.ffn.local_experts.{name}"] = gathered
+        return full
+
+    def begin_consolidated_state_dict(self, full_expert_state: Optional[dict] = None) -> None:
+        """Activate state_dict consolidation.
+
+        Until :meth:`end_consolidated_state_dict` is called, :meth:`state_dict`
+        will substitute cached full expert tensors in place of the local
+        shards. ``full_expert_state`` is typically the result of
+        :meth:`gather_full_expert_state`. If ``None``, the gather is run here.
+
+        Must be preceded by a collective (gather) executed on *every* rank;
+        otherwise ranks will go out of sync.
+        """
+        if not self.moe_topology.enabled:
+            self._moe_ep_full_expert_cache = None
+            return
+        if full_expert_state is None:
+            full_expert_state = self.gather_full_expert_state()
+        self._moe_ep_full_expert_cache = full_expert_state
+
+    def end_consolidated_state_dict(self) -> None:
+        """Deactivate state_dict consolidation. Clears the gathered cache."""
+        self._moe_ep_full_expert_cache = None
+
+    def state_dict(self, *args, destination=None, prefix: str = '', keep_vars: bool = False):
+        """Standard :meth:`nn.Module.state_dict` with an optional consolidation
+        override for EP saves.
+
+        When :meth:`begin_consolidated_state_dict` has populated
+        ``_moe_ep_full_expert_cache``, the returned mapping has EP-local
+        expert entries replaced with their full ``(num_experts, ...)`` tensors.
+        This is how :meth:`save_to` (via :class:`SaveRestoreConnector`) writes
+        complete weights into the ``.nemo`` archive on rank 0.
+        """
+        sd = super().state_dict(
+            *args, destination=destination, prefix=prefix, keep_vars=keep_vars
+        )
+        cache = getattr(self, '_moe_ep_full_expert_cache', None)
+        if cache:
+            for rel_key, full_tensor in cache.items():
+                full_key = f"{prefix}{rel_key}"
+                if full_key in sd:
+                    sd[full_key] = full_tensor
+        return sd
+
+    # ------------------------------------------------------------------
     # Auxiliary loss
     # ------------------------------------------------------------------
 
@@ -664,22 +885,42 @@ class MoETransformerEncoder(TransformerEncoder):
         unexpected_keys,
         error_msgs,
     ):
-        """Remap legacy FFN / per-expert checkpoint keys into the current
-        module layout.
+        """Remap checkpoint keys into the current module layout.
 
-        Two input layouts are supported:
+        Three input cases are handled, in order:
 
-        - **Base-encoder checkpoint** (``layers.{i}.ffn.ffn.0.weight``) --
-          broadcast into all expert slots if ``moe_init_from_ffn`` is True.
-        - **Legacy MoE checkpoint** (``layers.{i}.ffn.experts.{j}.ffn.0.weight``)
-          -- loaded directly into :class:`FeedForward` slots when the current
-          module uses the legacy path, or transposed + gathered into
-          :class:`LocalExperts` when using the grouped path.
+        1. **Consolidated EP save** (``layers.{i}.ffn.local_experts.w1`` with
+           first-dim == ``num_experts``): slice to this rank's local shard
+           ``(experts_per_rank, ...)``. This covers ``.nemo`` loads via
+           :meth:`ModelPT.restore_from`, which does NOT fire Lightning's
+           ``on_load_checkpoint`` hook and therefore does not go through
+           :meth:`shard_ep_state_dict_`. When ``ep_size=1`` this is a no-op.
+        2. **Base-encoder checkpoint** (``layers.{i}.ffn.ffn.0.weight``):
+           broadcast into all expert slots if ``moe_init_from_ffn`` is True.
+        3. Anything else -- fall through to :meth:`nn.Module._load_from_state_dict`.
 
-        When EP is active, only the local-rank's expert slots are populated
-        from the checkpoint.
+        Legacy per-expert-ModuleList checkpoints
+        (``layers.{i}.ffn.experts.{j}.ffn.0.weight``) are accepted directly
+        when the current module uses the legacy path (``ep_size=1`` +
+        ``backend='loop'``); translation into the grouped layout is NOT
+        implemented in this release (no user of the EP branch currently needs
+        it -- fresh training is the only supported entry point). Attempting
+        such a cross-layout load will raise ``missing_keys`` / ``unexpected_keys``
+        when ``strict=True``.
         """
         moe_layer_set = set(self.moe_layer_indices)
+
+        # (0) Slice consolidated EP tensors down to the local shard.
+        # Safe to always run: when EP is disabled (ep_size=1) then
+        # num_experts == experts_per_rank and shard_ep_state_dict_ is a
+        # no-op; when a checkpoint was saved with the legacy layout there
+        # are no `local_experts.*` keys to process.
+        try:
+            self.shard_ep_state_dict_(state_dict, root_prefix=prefix)
+        except RuntimeError as e:
+            # Surface a clear error rather than letting load_state_dict fail
+            # with an opaque shape mismatch later.
+            error_msgs.append(f"MoETransformerEncoder state_dict shard failed: {e}")
 
         # (A) Broadcast base FFN weights into experts (legacy behavior).
         if self.moe_init_from_ffn:
