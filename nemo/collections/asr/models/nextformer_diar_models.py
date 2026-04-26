@@ -31,7 +31,10 @@ from pytorch_lightning import Trainer
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from nemo.collections.asr.data.audio_to_diar_label import AudioToSpeechE2ESpkDiarDataset
+from nemo.collections.asr.data.audio_to_diar_label import (
+    AudioToSpeechE2ESpkDiarDataset,
+    extract_global_speaker_ids,
+)
 from nemo.collections.asr.data.audio_to_diar_label_lhotse import LhotseAudioToSpeechE2ESpkDiarDataset
 from nemo.collections.asr.metrics.multi_binary_acc import MultiBinaryAccuracy
 from nemo.collections.asr.models.asr_model import ExportableEncDecModel
@@ -361,10 +364,6 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         else:
             global_rank = 0
 
-        # Reuse the training speaker vocabulary for validation/test datasets
-        # so that global_speaker_ids are consistent across splits.
-        existing_speaker_to_id = getattr(self, 'speaker_to_id', None)
-
         dataset = AudioToSpeechE2ESpkDiarDataset(
             manifest_filepath=config.manifest_filepath,
             soft_label_thres=config.soft_label_thres,
@@ -381,16 +380,17 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             subsegment_two_chunks_rate=config.get('subsegment_two_chunks_rate', 0.0),
             subsegment_min_chunk_len_sec=config.get('subsegment_min_chunk_len_sec', 10.0),
             subsegment_margin_frames=config.get('subsegment_margin_frames', 0),
-            speaker_to_id=existing_speaker_to_id,
-            min_speaker_duration_sec=self.min_speaker_duration_sec,
         )
 
         self.data_collection = dataset.collection
         self.collate_ds = dataset
 
         if not hasattr(self, 'speaker_to_id'):
-            self.speaker_to_id = dataset.speaker_to_id
-            self.num_speaker_classes = dataset.num_speaker_classes
+            self.speaker_to_id = extract_global_speaker_ids(
+                dataset.collection,
+                min_speaker_duration_sec=self.min_speaker_duration_sec,
+            )
+            self.num_speaker_classes = len(self.speaker_to_id)
 
         sampler = None
         shuffle = config.get('shuffle', False)
@@ -439,6 +439,33 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         logging.info(
             f"Saved speaker_to_id mapping ({len(self.speaker_to_id)} speakers) to {save_path}"
         )
+
+    def _speaker_names_to_ids(self, speaker_names_batch):
+        """
+        Convert a batch of speaker name lists to a global-speaker-ID tensor.
+
+        Args:
+            speaker_names_batch (list[list[str|None]]): Length B, each inner
+                list has length max_spks.  Entries are RTTM speaker name
+                strings or None for unused slots.
+
+        Returns:
+            global_speaker_ids (torch.Tensor): Shape (B, max_spks), dtype long,
+                on the current model device.  Each entry is the global integer
+                ID for that speaker, or -1 if the slot is unused or the speaker
+                is not in the vocabulary.
+        """
+        speaker_to_id = getattr(self, 'speaker_to_id', None)
+        B = len(speaker_names_batch)
+        max_spks = len(speaker_names_batch[0]) if B > 0 else 0
+        ids = torch.full((B, max_spks), -1, dtype=torch.long, device=self.device)
+        if speaker_to_id is None:
+            return ids
+        for b, names in enumerate(speaker_names_batch):
+            for s, name in enumerate(names):
+                if name is not None:
+                    ids[b, s] = speaker_to_id.get(name, -1)
+        return ids
 
     def on_train_start(self):
         super().on_train_start()
@@ -2449,13 +2476,14 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 - audio_signal_length (torch.Tensor): The length of each audio signal in the batch.
                 - targets (torch.Tensor): The target labels for the batch.
                 - target_lens (torch.Tensor): The length of each target sequence in the batch.
-                - global_speaker_ids (torch.Tensor): Global speaker integer IDs per target column.
+                - speaker_names (list[list[str|None]]): RTTM speaker names per target column.
             batch_idx (int): The index of the current batch.
 
         Returns:
             (dict): A dictionary containing the 'loss' key with the calculated loss value.
         """
-        audio_signal, audio_signal_length, targets, target_lens, global_speaker_ids = batch
+        audio_signal, audio_signal_length, targets, target_lens, speaker_names = batch
+        global_speaker_ids = self._speaker_names_to_ids(speaker_names)
         logits, local_logits, spk_embs, active_frames_per_spk = self.forward(
             audio_signal=audio_signal, audio_signal_length=audio_signal_length, targets=targets
         )
@@ -2591,7 +2619,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 - audio_signal_length (torch.Tensor): The length of each audio signal in the batch.
                 - targets (torch.Tensor): The target labels for the batch.
                 - target_lens (torch.Tensor): The length of each target sequence in the batch.
-                - global_speaker_ids (torch.Tensor): Global speaker integer IDs per target column.
+                - speaker_names (list[list[str|None]]): RTTM speaker names per target column.
             batch_idx (int): The index of the current batch.
             dataloader_idx (int, optional): The index of the dataloader in case of multiple
                                             validation dataloaders. Defaults to 0.
@@ -2599,7 +2627,8 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         Returns:
             dict: A dictionary containing various validation metrics for this batch.
         """
-        audio_signal, audio_signal_length, targets, target_lens, global_speaker_ids = batch
+        audio_signal, audio_signal_length, targets, target_lens, speaker_names = batch
+        global_speaker_ids = self._speaker_names_to_ids(speaker_names)
         logits, local_logits, spk_embs, active_frames_per_spk = self.forward(
             audio_signal=audio_signal, audio_signal_length=audio_signal_length, targets=targets
         )
@@ -2623,7 +2652,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 - audio_signal_length (torch.Tensor): The length of each audio signal in the batch.
                 - targets (torch.Tensor): The target labels for the batch.
                 - target_lens (torch.Tensor): The length of each target sequence in the batch.
-                - global_speaker_ids (torch.Tensor): Global speaker integer IDs per target column.
+                - speaker_names (list[list[str|None]]): RTTM speaker names per target column.
             batch_idx (int): The index of the current batch.
             dataloader_idx (int, optional): The index of the dataloader in case of multiple
                                             validation dataloaders. Defaults to 0.
@@ -2733,7 +2762,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         with torch.no_grad():
             for batch_idx, batch in enumerate(tqdm(self._test_dl)):
-                audio_signal, audio_signal_length, targets, target_lens, _global_speaker_ids = batch
+                audio_signal, audio_signal_length, targets, target_lens, _speaker_names = batch
                 audio_signal = audio_signal.to(self.device)
                 audio_signal_length = audio_signal_length.to(self.device)
                 targets = targets.to(self.device)
