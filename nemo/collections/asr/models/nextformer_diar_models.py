@@ -2336,6 +2336,92 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         return loss
 
+    def compute_cosine_margin_metric(
+        self,
+        spk_embs,
+        local_target_indices,
+        active_frames_per_spk,
+        batch_size,
+        num_chunks,
+        max_num_spks,
+    ):
+        """
+        Within-session cosine margin metric on speaker embeddings.
+
+        For each pair of valid embeddings in the same session, computes the
+        mean cosine similarity for same-speaker pairs (positives) and for
+        different-speaker pairs (negatives).  The margin is their difference.
+
+        This metric is vocabulary-independent: it uses session-local speaker
+        identities derived from the Sinkhorn/oracle assignment, so it works
+        for validation speakers that are not in the training vocabulary.
+
+        Args:
+            spk_embs: Speaker embeddings.
+                Shape: (num_chunks * B, local_num_spks, emb_dim)
+            local_target_indices: Oracle mapping from local speaker slots to
+                target matrix columns.
+                Shape: (num_chunks * B, local_num_spks)
+            active_frames_per_spk: Number of active frames per speaker.
+                Shape: (num_chunks * B, local_num_spks)
+            batch_size: Batch size B.
+            num_chunks: Number of chunks per batch item.
+            max_num_spks: Number of columns in the target matrix.
+
+        Returns:
+            (cos_pos, cos_neg, margin): Three scalar tensors.
+        """
+        local_num_spks = spk_embs.shape[1]
+        emb_dim = spk_embs.shape[2]
+
+        target_cols = local_target_indices.view(num_chunks, batch_size, local_num_spks)
+        af = active_frames_per_spk.view(num_chunks, batch_size, local_num_spks)
+
+        batch_idx = torch.arange(batch_size, device=spk_embs.device)
+        batch_idx = batch_idx.unsqueeze(0).unsqueeze(-1).expand(num_chunks, batch_size, local_num_spks)
+
+        emb_speaker_ids = torch.full(
+            (num_chunks, batch_size, local_num_spks), -1,
+            dtype=torch.long, device=spk_embs.device,
+        )
+        valid_col = target_cols >= 0
+        safe_cols = target_cols.clamp(min=0)
+        emb_speaker_ids[valid_col] = (
+            batch_idx[valid_col] * max_num_spks + safe_cols[valid_col]
+        )
+
+        all_embs = spk_embs.view(num_chunks, batch_size, local_num_spks, emb_dim).reshape(-1, emb_dim)
+        all_ids = emb_speaker_ids.reshape(-1)
+        all_af = af.reshape(-1)
+        all_batch = batch_idx.reshape(-1)
+
+        min_active = self.aam_min_active_frames
+        valid_mask = (all_ids >= 0) & (all_af >= min_active)
+        valid_embs = all_embs[valid_mask]
+        valid_ids = all_ids[valid_mask]
+        valid_batch = all_batch[valid_mask]
+        N = valid_embs.shape[0]
+
+        zero = torch.tensor(0.0, device=spk_embs.device)
+        if N < 2:
+            return zero, zero, zero
+
+        z = F.normalize(valid_embs, dim=-1)
+        sim = z @ z.T
+
+        self_mask = torch.eye(N, dtype=torch.bool, device=sim.device)
+        same_speaker = valid_ids.unsqueeze(0) == valid_ids.unsqueeze(1)
+        same_session = valid_batch.unsqueeze(0) == valid_batch.unsqueeze(1)
+
+        pos_mask = same_speaker & same_session & ~self_mask
+        neg_mask = ~same_speaker & same_session & ~self_mask
+
+        cos_pos = sim[pos_mask].mean() if pos_mask.any() else zero
+        cos_neg = sim[neg_mask].mean() if neg_mask.any() else zero
+        margin = cos_pos - cos_neg
+
+        return cos_pos, cos_neg, margin
+
     def _get_aux_train_evaluations(
         self, logits, local_logits, spk_embs, active_frames_per_spk, targets, target_lens,
         global_speaker_ids=None,
@@ -2442,6 +2528,15 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             )
             loss = loss + self.aam_weight * aam_loss
 
+        train_cos_pos, train_cos_neg, train_cos_margin = self.compute_cosine_margin_metric(
+            spk_embs=spk_embs,
+            local_target_indices=local_target_indices,
+            active_frames_per_spk=active_frames_per_spk,
+            batch_size=batch_size,
+            num_chunks=num_chunks,
+            max_num_spks=targets.shape[2],
+        )
+
         local_preds = torch.sigmoid(local_logits)
         self._accuracy_train(local_preds, local_pil_targets, local_target_lens)
         train_f1_acc, train_precision, train_recall = self._accuracy_train.compute()
@@ -2456,6 +2551,9 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'global_pil_loss': global_pil_loss,
             'supcon_loss': supcon_loss,
             'aam_loss': aam_loss,
+            'cos_pos': train_cos_pos,
+            'cos_neg': train_cos_neg,
+            'cos_margin': train_cos_margin,
             'learning_rate': self._optimizer.param_groups[0]['lr'],
             'train_f1_acc': train_f1_acc,
             'train_f1_acc_global': train_f1_acc_global,
@@ -2578,6 +2676,15 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             if self.supcon_weight > 0:
                 val_loss = val_loss + self.supcon_weight * val_supcon_loss
 
+        val_cos_pos, val_cos_neg, val_cos_margin = self.compute_cosine_margin_metric(
+            spk_embs=spk_embs,
+            local_target_indices=local_target_indices,
+            active_frames_per_spk=active_frames_per_spk,
+            batch_size=batch_size,
+            num_chunks=num_chunks,
+            max_num_spks=targets.shape[2],
+        )
+
         local_preds = torch.sigmoid(local_logits)
         self._accuracy_valid(local_preds, local_pil_targets, local_target_lens)
         val_f1_acc, val_precision, val_recall = self._accuracy_valid.compute()
@@ -2596,6 +2703,9 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'val_pil_loss': val_pil_loss,
             'val_global_pil_loss': val_global_pil_loss,
             'val_supcon_loss': val_supcon_loss,
+            'val_cos_pos': val_cos_pos,
+            'val_cos_neg': val_cos_neg,
+            'val_cos_margin': val_cos_margin,
             'val_f1_acc': val_f1_acc,
             'val_f1_acc_global': val_f1_acc_global,
             'val_f1_acc_global_op': val_f1_acc_global_op,
@@ -2671,6 +2781,9 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         val_pil_loss_mean = torch.stack([x['val_pil_loss'] for x in outputs]).mean()
         val_global_pil_loss_mean = torch.stack([x['val_global_pil_loss'] for x in outputs]).mean()
         val_supcon_loss_mean = torch.stack([x['val_supcon_loss'] for x in outputs]).mean()
+        val_cos_pos_mean = torch.stack([x['val_cos_pos'] for x in outputs]).mean()
+        val_cos_neg_mean = torch.stack([x['val_cos_neg'] for x in outputs]).mean()
+        val_cos_margin_mean = torch.stack([x['val_cos_margin'] for x in outputs]).mean()
         val_f1_acc_mean = torch.stack([x['val_f1_acc'] for x in outputs]).mean()
         val_f1_acc_global_mean = torch.stack([x['val_f1_acc_global'] for x in outputs]).mean()
         val_f1_acc_global_op_mean = torch.stack([x['val_f1_acc_global_op'] for x in outputs]).mean()
@@ -2686,6 +2799,9 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'val_pil_loss': val_pil_loss_mean,
             'val_global_pil_loss': val_global_pil_loss_mean,
             'val_supcon_loss': val_supcon_loss_mean,
+            'val_cos_pos': val_cos_pos_mean,
+            'val_cos_neg': val_cos_neg_mean,
+            'val_cos_margin': val_cos_margin_mean,
             'val_f1_acc': val_f1_acc_mean,
             'val_f1_acc_global': val_f1_acc_global_mean,
             'val_f1_acc_global_op': val_f1_acc_global_op_mean,
