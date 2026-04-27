@@ -146,17 +146,42 @@ def build_topology(num_experts: int, ep_size: int) -> EPTopology:
     Returns:
         The topology describing this rank's role.
 
+    Behavior when ``ep_size > world_size`` (typical for inference / restoring
+    an EP-trained model on a smaller world): we transparently fall back to
+    ``ep_size=1`` and emit a ``UserWarning``. This is safe because:
+
+    - Checkpoints written with EP active (``moe_ep_size>1``) are consolidated
+      into full ``(num_experts, ...)`` tensors at save time, so the smaller
+      world can load them without sharding.
+    - With ``ep_size=1`` the encoder runs the single-rank grouped path (or
+      the legacy loop, depending on ``moe_expert_backend``); no all-to-all
+      occurs and no EP process group is required.
+
     Raises:
-        ValueError: If ``ep_size`` is invalid given ``world_size`` / ``num_experts``.
+        ValueError: If ``ep_size < 1``, or if other divisibility constraints
+            fail (these are configuration bugs that cannot be auto-fixed).
     """
     world_size, rank, local_rank = infer_world_from_env()
 
     if ep_size < 1:
         raise ValueError(f"ep_size must be >= 1, got {ep_size}.")
+
     if ep_size > world_size:
-        raise ValueError(
-            f"ep_size ({ep_size}) cannot exceed world_size ({world_size})."
+        # Common case: a model trained with moe_ep_size=8 is now being
+        # restored on a single-GPU box (world_size=1) for eval. The .nemo
+        # contains full expert tensors thanks to checkpoint consolidation,
+        # so the only thing we need to do is stop trying to shard them.
+        import warnings
+        warnings.warn(
+            f"moe_ep_size={ep_size} requested but world_size={world_size}; "
+            f"falling back to ep_size=1 (no expert sharding). This is the "
+            f"expected behavior when restoring an EP-trained .nemo onto a "
+            f"smaller world (e.g. single-GPU eval). To suppress, override "
+            f"`model.encoder.moe_ep_size=1` at restore time.",
+            UserWarning,
+            stacklevel=2,
         )
+        ep_size = 1
     if world_size % ep_size != 0:
         raise ValueError(
             f"world_size ({world_size}) must be divisible by ep_size ({ep_size})."

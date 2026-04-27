@@ -208,6 +208,26 @@ def test_ep_topology_validation_errors(monkeypatch):
 
 
 @pytest.mark.unit
+def test_ep_topology_falls_back_to_single_rank_on_small_world(monkeypatch):
+    """When ``ep_size`` exceeds ``world_size`` we should auto-disable EP and
+    warn rather than raise. This is the standard inference-on-smaller-world
+    scenario (e.g., loading a 64-rank EP-trained .nemo on a single GPU)."""
+    from nemo.collections.asr.parts.submodules.moe_parallel import build_topology
+
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+
+    with pytest.warns(UserWarning, match="falling back to ep_size=1"):
+        topo = build_topology(num_experts=8, ep_size=8)
+
+    assert topo.enabled is False
+    assert topo.ep_size == 1
+    assert topo.experts_per_rank == 8  # all experts replicated on this rank
+    assert topo.dp_size == 1
+
+
+@pytest.mark.unit
 def test_ep_ignored_names_populated(monkeypatch):
     """With EP enabled, ``collect_ep_ignored_param_names`` must return the
     flat names of LocalExperts parameters (w1, w2, b1, b2 per MoE layer)."""
