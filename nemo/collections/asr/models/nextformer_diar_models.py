@@ -380,6 +380,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             subsegment_two_chunks_rate=config.get('subsegment_two_chunks_rate', 0.0),
             subsegment_min_chunk_len_sec=config.get('subsegment_min_chunk_len_sec', 10.0),
             subsegment_margin_frames=config.get('subsegment_margin_frames', 0),
+            subsegment_nspk_bias=config.get('subsegment_nspk_bias', 1.0),
         )
 
         self.data_collection = dataset.collection
@@ -1817,6 +1818,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'subsegment_two_chunks_rate': config.get('subsegment_two_chunks_rate', 0.0),
             'subsegment_min_chunk_len_sec': config.get('subsegment_min_chunk_len_sec', 10.0),
             'subsegment_margin_frames': config.get('subsegment_margin_frames', 0),
+            'subsegment_nspk_bias': config.get('subsegment_nspk_bias', 1.0),
         }
         temporary_datalayer = self.__setup_dataloader_from_config(config=DictConfig(dl_config))
         return temporary_datalayer

@@ -1154,6 +1154,7 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         subsegment_two_chunks_rate: float = 0.0,
         subsegment_min_chunk_len_sec: float = 10.0,
         subsegment_margin_frames: int = 0,
+        subsegment_nspk_bias: float = 1.0,
     ):
         super().__init__()
         self.collection = EndtoEndDiarizationSpeechLabel(
@@ -1188,6 +1189,7 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         self.subsegment_two_chunks_rate = subsegment_two_chunks_rate
         self.subsegment_min_chunk_len_sec = subsegment_min_chunk_len_sec
         self.subsegment_margin_frames = subsegment_margin_frames
+        self.subsegment_nspk_bias = subsegment_nspk_bias
         if self.session_len_sec > 0:
             assert self.subsegment_min_len_sec <= self.session_len_sec, (
                 f"subsegment_min_len_sec ({self.subsegment_min_len_sec}) cannot be greater than "
@@ -1402,6 +1404,32 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         target_len = torch.tensor([ts_tensor.shape[0]])
         return target_len
 
+    def _compute_spk_bias_weights(self, frame_level_target, candidate_indices, window_len):
+        """Compute sampling weights for candidate start positions biased toward higher unique speaker counts.
+
+        For each candidate window, counts how many distinct speakers have at least one
+        active frame in that window, then returns weight = 1 + alpha * n_unique_speakers.
+
+        Uses per-speaker prefix sums so cost is O(T*S + N*S) where S is small (max_spks).
+
+        Args:
+            frame_level_target: (T, S) binary/soft target tensor.
+            candidate_indices: 1-D tensor of eligible start-frame indices.
+            window_len: number of frames in the evaluation window.
+
+        Returns:
+            1-D float tensor of sampling weights aligned with candidate_indices.
+        """
+        active = (frame_level_target > self.soft_label_thres).float()  # (T, S)
+        T, S = active.shape
+        cumsum = torch.zeros(T + 1, S)
+        cumsum[1:] = torch.cumsum(active, dim=0)
+        ends = torch.clamp(candidate_indices + window_len, max=T)
+        window_activity = cumsum[ends] - cumsum[candidate_indices]  # (N, S)
+        unique_spk_counts = (window_activity > 0).float().sum(dim=1)  # (N,)
+        weights = self.subsegment_nspk_bias ** unique_spk_counts
+        return weights
+
     def _create_subsegment(self, sample, offset):
         duration = sample.duration
 
@@ -1532,9 +1560,13 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
                 ]
 
                 if len(potential_start1_indices) > 0:
-                    start1 = potential_start1_indices[
-                        random.randint(0, len(potential_start1_indices) - 1)
-                    ].item()
+                    if self.subsegment_nspk_bias > 1.0:
+                        w1 = self._compute_spk_bias_weights(frame_level_target, potential_start1_indices, len1)
+                        start1 = potential_start1_indices[torch.multinomial(w1, 1).item()].item()
+                    else:
+                        start1 = potential_start1_indices[
+                            random.randint(0, len(potential_start1_indices) - 1)
+                        ].item()
                     #logging.info(f"uniq_id: {sample.uniq_id}, successfully sampled start1: {start1}, len1: {len1}")
                     s2_min = start1 + len1
                     s2_max = current_duration_frames - len2
@@ -1554,7 +1586,11 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
                             #logging.info(f"uniq_id: {sample.uniq_id}, can't sample start2 of len2: {len2}, trying to reduce len2")
 
                     if len(valid_start2_indices) > 0:
-                        start2 = valid_start2_indices[random.randint(0, len(valid_start2_indices) - 1)].item()
+                        if self.subsegment_nspk_bias > 1.0:
+                            w2 = self._compute_spk_bias_weights(frame_level_target, valid_start2_indices, len2)
+                            start2 = valid_start2_indices[torch.multinomial(w2, 1).item()].item()
+                        else:
+                            start2 = valid_start2_indices[random.randint(0, len(valid_start2_indices) - 1)].item()
 
                         if not len2_is_fixed:
                             len2 = min(max_len_frames - len1, current_duration_frames - start2)
@@ -1596,7 +1632,12 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
             if not two_chunks_sampled:
                 # Get a single chunk
                 max_start_frame = current_duration_frames - min_len_frames
-                start_frame = random.randint(0, max_start_frame)
+                if self.subsegment_nspk_bias > 1.0:
+                    candidates = torch.arange(0, max_start_frame + 1)
+                    weights = self._compute_spk_bias_weights(frame_level_target, candidates, min_len_frames)
+                    start_frame = candidates[torch.multinomial(weights, 1).item()].item()
+                else:
+                    start_frame = random.randint(0, max_start_frame)
                 subsegment_len_frames = min(current_duration_frames - start_frame, max_len_frames)
                 end_frame = start_frame + subsegment_len_frames
                 #logging.info(
@@ -1803,6 +1844,7 @@ class AudioToSpeechE2ESpkDiarDataset(_AudioToSpeechE2ESpkDiarDataset):
         subsegment_two_chunks_rate: float = 0.0,
         subsegment_min_chunk_len_sec: float = 10.0,
         subsegment_margin_frames: int = 0,
+        subsegment_nspk_bias: float = 1.0,
     ):
         super().__init__(
             manifest_filepath=manifest_filepath,
@@ -1821,6 +1863,7 @@ class AudioToSpeechE2ESpkDiarDataset(_AudioToSpeechE2ESpkDiarDataset):
             subsegment_two_chunks_rate=subsegment_two_chunks_rate,
             subsegment_min_chunk_len_sec=subsegment_min_chunk_len_sec,
             subsegment_margin_frames=subsegment_margin_frames,
+            subsegment_nspk_bias=subsegment_nspk_bias,
         )
 
     def eesd_train_collate_fn(self, batch):
