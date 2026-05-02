@@ -206,6 +206,7 @@ class SortformerCLSEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationM
             self.spec_augmentation = SortformerCLSEncLabelModel.from_config_dict(self._cfg.spec_augment)
         else:
             self.spec_augmentation = None
+        self.spec_augment_per_chunk = self._cfg.get("spec_augment_per_chunk", True)
 
         self.encoder = SortformerCLSEncLabelModel.from_config_dict(self._cfg.encoder).to(self.device)
         self.sortformer_modules = SortformerCLSEncLabelModel.from_config_dict(self._cfg.sortformer_cls_modules).to(
@@ -928,7 +929,7 @@ class SortformerCLSEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationM
         processed_signal = processed_signal[:, :, : processed_signal_length.max()]
 
         # Spec augment is not applied during evaluation/testing.
-        # In streaming mode, spec augment is applied per-chunk in forward_streaming_step, so skip it here.
+        # In streaming mode, spec augment is applied inside forward_streaming (globally or per-chunk).
         if self.spec_augmentation is not None and self.training and not self.streaming_mode:
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
 
@@ -1093,6 +1094,11 @@ class SortformerCLSEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationM
             )
             processed_signal = torch.cat([processed_signal, pad_tensor], dim=2)
 
+        if self.spec_augmentation is not None and self.training and not self.spec_augment_per_chunk:
+            processed_signal = self.spec_augmentation(
+                input_spec=processed_signal, length=processed_signal_length
+            )
+
         att_mod = False
         if self.training:
             rand_num = random.random()
@@ -1185,11 +1191,12 @@ class SortformerCLSEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationM
                 Tensor containing the updated total predicted speaker activity probabilities.
                 Shape: (batch_size, cumulative pred length, num_speakers)
         """
-        # Per-chunk spec augment: each chunk gets independently sampled masks,
+        # When spec_augment_per_chunk=True, each chunk gets independently sampled masks,
         # simulating acoustic condition mismatch between cached and current embeddings.
+        # When False, a single global mask was already applied in forward_streaming.
         # Note: processed_signal arrives as (B, T, D) from streaming_feat_loader (transposed),
         # but SpecAugment expects (B, D, T), so we transpose before and after.
-        if self.spec_augmentation is not None and self.training:
+        if self.spec_augmentation is not None and self.training and self.spec_augment_per_chunk:
             processed_signal = self.spec_augmentation(
                 input_spec=processed_signal.transpose(1, 2), length=processed_signal_length
             ).transpose(1, 2)

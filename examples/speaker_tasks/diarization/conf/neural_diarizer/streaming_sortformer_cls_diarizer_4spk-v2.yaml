@@ -119,6 +119,7 @@ model:
     time_masks: 0
     freq_width: 1
     time_width: 0.02
+  spec_augment_per_chunk: true  # If true, apply independent masks per chunk in streaming; if false, one global mask
 
   sortformer_cls_modules:
     _target_: nemo.collections.asr.modules.sortformer_cls_modules.SortformerCLSModules

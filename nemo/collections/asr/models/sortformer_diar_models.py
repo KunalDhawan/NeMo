@@ -202,6 +202,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             self.spec_augmentation = SortformerEncLabelModel.from_config_dict(self._cfg.spec_augment)
         else:
             self.spec_augmentation = None
+        self.spec_augment_per_chunk = self._cfg.get("spec_augment_per_chunk", True)
 
         self.encoder = SortformerEncLabelModel.from_config_dict(self._cfg.encoder).to(self.device)
         self.sortformer_modules = SortformerEncLabelModel.from_config_dict(self._cfg.sortformer_modules).to(
@@ -881,6 +882,11 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             )
             processed_signal = torch.cat([processed_signal, pad_tensor], dim=2)
 
+        if self.spec_augmentation is not None and self.training and not self.spec_augment_per_chunk:
+            processed_signal = self.spec_augmentation(
+                input_spec=processed_signal, length=processed_signal_length
+            )
+
         att_mod = False
         if self.training:
             rand_num = random.random()
@@ -971,11 +977,12 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 Tensor containing the updated total predicted speaker activity probabilities.
                 Shape: (batch_size, cumulative pred length, num_speakers)
         """
-        # Per-chunk spec augment: each chunk gets independently sampled masks,
+        # When spec_augment_per_chunk=True, each chunk gets independently sampled masks,
         # simulating acoustic condition mismatch between cached and current embeddings.
+        # When False, a single global mask was already applied in forward_streaming.
         # Note: processed_signal arrives as (B, T, D) from streaming_feat_loader (transposed),
         # but SpecAugment expects (B, D, T), so we transpose before and after.
-        if self.spec_augmentation is not None and self.training:
+        if self.spec_augmentation is not None and self.training and self.spec_augment_per_chunk:
             processed_signal = self.spec_augmentation(
                 input_spec=processed_signal.transpose(1, 2), length=processed_signal_length
             ).transpose(1, 2)
