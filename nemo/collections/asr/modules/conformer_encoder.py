@@ -758,6 +758,128 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         else:
             return audio_signal, length
 
+    def forward_kv_cache(self, audio_signal, length, kv_cache):
+        """
+        Streaming forward pass with a read-only per-layer KV cache.
+
+        Designed for streaming speaker diarization where the speaker cache (spkcache) is
+        stored as per-layer pre-attention hidden states. Each Conformer layer prepends
+        `kv_cache[lth]` to attention's K/V (not Q). Convolutions and feed-forward modules
+        operate only on `audio_signal` (current positions); cached positions only contribute
+        as K/V sources in attention.
+
+        Always operates on pre-encoded inputs (subsampling is skipped). Per-layer
+        pre-attention norm outputs are captured and returned for the caller to optionally
+        promote to the cache after this step's compression decisions.
+
+        Args:
+            audio_signal (torch.Tensor): Pre-encoded current-step embeddings (e.g. fifo+chunk).
+                Shape: (B, T_fc, d_model)
+            length (torch.Tensor): Valid lengths per batch element for `audio_signal`.
+                Shape: (B,)
+            kv_cache (torch.Tensor or None): Per-layer cached pre-attention hidden states
+                for cached positions. Shape: (n_layers, B, T_cache, d_model). May be None or
+                have T_cache=0 (warm-up) — in those cases nothing is prepended but per-layer
+                captures are still produced.
+
+        Returns:
+            emb_seq (torch.Tensor): Encoder output for current positions.
+                Shape: (B, T_fc, _feat_out)
+            emb_seq_length (torch.Tensor): Valid lengths per batch element.
+                Shape: (B,)
+            per_layer_attn_inputs (torch.Tensor): Pre-attention norm outputs captured at
+                each layer for current positions only (excluding the prepended cache). The
+                caller stores these per-layer for frames that get promoted to the cache;
+                future steps then pass them back via `kv_cache`.
+                Shape: (n_layers, B, T_fc, d_model)
+        """
+        if audio_signal.shape[-1] != self.d_model:
+            raise ValueError(
+                f"forward_kv_cache expects pre-encoded input of shape (B, T, {self.d_model}), "
+                f"got last dimension {audio_signal.shape[-1]}."
+            )
+        if kv_cache is not None:
+            if kv_cache.dim() != 4:
+                raise ValueError(
+                    f"kv_cache must be a 4-D tensor of shape (n_layers, B, T_cache, d_model), "
+                    f"got shape {tuple(kv_cache.shape)}."
+                )
+            if kv_cache.size(0) != len(self.layers):
+                raise ValueError(
+                    f"kv_cache first dim must match n_layers={len(self.layers)}, got {kv_cache.size(0)}."
+                )
+            if kv_cache.size(1) != audio_signal.size(0):
+                raise ValueError(
+                    f"kv_cache batch dim ({kv_cache.size(1)}) must match audio_signal batch dim "
+                    f"({audio_signal.size(0)})."
+                )
+            if kv_cache.size(3) != self.d_model:
+                raise ValueError(
+                    f"kv_cache last dim ({kv_cache.size(3)}) must match d_model={self.d_model}."
+                )
+
+        cache_len = kv_cache.size(2) if kv_cache is not None else 0
+        virtual_seq_len = audio_signal.size(1) + cache_len
+        self.update_max_seq_length(seq_length=virtual_seq_len, device=audio_signal.device)
+
+        # Match training-time random att-context selection used in forward_internal.
+        if self.training and len(self.att_context_size_all) > 1:
+            cur_att_context_size = random.choices(self.att_context_size_all, weights=self.att_context_probs)[0]
+        else:
+            cur_att_context_size = self.att_context_size
+
+        audio_signal, pos_emb = self.pos_enc(x=audio_signal, cache_len=cache_len)
+
+        # Build masks for the virtual sequence [cache | current], then keep only current-position
+        # query rows. Sync streaming assumes the cache is fully valid (no front padding) so
+        # offset=None is appropriate.
+        max_audio_length = virtual_seq_len
+        padding_length = length + cache_len
+        pad_mask, att_mask = self._create_masks(
+            att_context_size=cur_att_context_size,
+            padding_length=padding_length,
+            max_audio_length=max_audio_length,
+            offset=None,
+            device=audio_signal.device,
+        )
+        if cache_len > 0:
+            pad_mask = pad_mask[:, cache_len:]
+            if att_mask is not None:
+                att_mask = att_mask[:, cache_len:]
+
+        per_layer_attn_inputs: List[torch.Tensor] = []
+        for lth, (drop_prob, layer) in enumerate(zip(self.layer_drop_probs, self.layers)):
+            original_signal = audio_signal
+            if kv_cache is not None:
+                kv_cache_cur = kv_cache[lth]
+            else:
+                # Pass a non-None zero-length tensor so the layer still produces the capture.
+                kv_cache_cur = audio_signal.new_zeros((audio_signal.size(0), 0, self.d_model))
+
+            audio_signal, captured = layer(
+                x=audio_signal,
+                att_mask=att_mask,
+                pos_emb=pos_emb,
+                pad_mask=pad_mask,
+                kv_cache_readonly=kv_cache_cur,
+            )
+            per_layer_attn_inputs.append(captured)
+
+            # Stochastic depth — same logic as forward_internal.
+            if self.training and drop_prob > 0.0:
+                should_drop = torch.rand(1) < drop_prob
+                if should_drop:
+                    audio_signal = audio_signal * 0.0 + original_signal
+                else:
+                    audio_signal = (audio_signal - original_signal) / (1.0 - drop_prob) + original_signal
+
+        if self.out_proj is not None:
+            audio_signal = self.out_proj(audio_signal)
+
+        length = length.to(dtype=torch.int64)
+        per_layer_attn_inputs_stacked = torch.stack(per_layer_attn_inputs, dim=0)
+        return audio_signal, length, per_layer_attn_inputs_stacked
+
     def update_max_seq_length(self, seq_length: int, device):
         """
         Updates the maximum sequence length for the model.

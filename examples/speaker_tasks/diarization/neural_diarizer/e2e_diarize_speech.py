@@ -164,6 +164,10 @@ class DiarizationConfig:
     chunk_len: int = 6
     chunk_left_context: int = 1
     chunk_right_context: int = 7
+    # KV-cache spkcache mode (sync streaming only). When True, the speaker cache stores
+    # per-layer pre-attention hidden states and the FastConformer runs only on [fifo, chunk]
+    # each step. Only supported by SortformerEncLabelModel (not the CLS variant).
+    use_kv_spkcache: bool = False
 
     # If `cuda` is a negative number, inference will be on CPU only.
     cuda: Optional[int] = None
@@ -503,6 +507,19 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     # Streaming mode setup (only if enabled)
     if diar_model.streaming_mode:
         diar_model.async_streaming = cfg.async_streaming
+        # KV-cache spkcache mode override: only the non-CLS SortformerEncLabelModel
+        # implements this. Validate the combination before flipping the flag.
+        if cfg.use_kv_spkcache:
+            if cfg.async_streaming:
+                raise NotImplementedError(
+                    "use_kv_spkcache=True is not supported with async_streaming=True yet."
+                )
+            if not hasattr(diar_model, 'use_kv_spkcache'):
+                raise ValueError(
+                    f"use_kv_spkcache=True is not supported for {type(diar_model).__name__}."
+                )
+        if hasattr(diar_model, 'use_kv_spkcache'):
+            diar_model.use_kv_spkcache = cfg.use_kv_spkcache
         # Handle both SortformerCLS (sortformer_cls_modules) and Sortformer (sortformer_modules)
         modules = getattr(diar_model, 'sortformer_cls_modules', None) or diar_model.sortformer_modules
         modules.chunk_len = cfg.chunk_len

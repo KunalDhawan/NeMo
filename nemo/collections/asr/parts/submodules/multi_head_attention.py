@@ -270,7 +270,7 @@ class RelPositionMultiHeadAttention(MultiHeadAttention):
         x = x[:, :, 1:].view(b, h, qlen, pos_len)  # (b, h, t1, t2)
         return x
 
-    def forward(self, query, key, value, mask, pos_emb, cache=None):
+    def forward(self, query, key, value, mask, pos_emb, cache=None, kv_cache_readonly=None):
         """Compute 'Scaled Dot Product Attention' with rel. positional encoding.
         Args:
             query (torch.Tensor): (batch, time1, size)
@@ -279,11 +279,27 @@ class RelPositionMultiHeadAttention(MultiHeadAttention):
             mask (torch.Tensor): (batch, time1, time2)
             pos_emb (torch.Tensor) : (batch, time1, size)
             cache (torch.Tensor) : (batch, time_cache, size)
+            kv_cache_readonly (torch.Tensor) : (batch, time_cache, size). Pre-attention hidden states
+                cached from previous calls, prepended to key/value (but not query). Unlike `cache`,
+                this is not auto-updated — the caller manages the cache externally (e.g. for the
+                speaker cache in streaming diarization). Mutually exclusive with `cache`.
 
         Returns:
             output (torch.Tensor): transformed `value` (batch, time1, d_model) weighted by the query dot key attention
             cache (torch.Tensor) : (batch, time_cache_next, size)
         """
+        if cache is not None and kv_cache_readonly is not None:
+            raise ValueError(
+                "`cache` (sliding-window streaming cache) and `kv_cache_readonly` (read-only KV cache) "
+                "are mutually exclusive — pass at most one."
+            )
+
+        # Prepend read-only cached hidden states to K, V (not Q). The auto-update inside
+        # `update_cache` is skipped because the caller manages cache contents externally.
+        if kv_cache_readonly is not None and kv_cache_readonly.size(1) > 0:
+            key = torch.cat([kv_cache_readonly, key], dim=1)
+            value = key
+
         key, value, query, cache = self.update_cache(key=key, value=value, query=query, cache=cache)
 
         if torch.is_autocast_enabled():

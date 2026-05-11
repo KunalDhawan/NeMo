@@ -244,9 +244,23 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         self.async_streaming = self._cfg.get("async_streaming", False)
         self.streaming_mode = self._cfg.get("streaming_mode", False)
+        # KV-cache streaming mode: keep spkcache as per-layer pre-attention hidden states
+        # (read-only KV cache) inside the FastConformer encoder instead of re-encoding
+        # pre-encode embeddings each step. Sync streaming only. Default False preserves
+        # existing behavior for all configs/checkpoints.
+        self.use_kv_spkcache = self._cfg.get("use_kv_spkcache", False)
         if self.streaming_mode:
             # Validate streaming parameters once at initialization for streaming models
             self.sortformer_modules._check_streaming_parameters()
+        if self.use_kv_spkcache:
+            if not self.streaming_mode:
+                raise ValueError(
+                    "use_kv_spkcache=True requires streaming_mode=True."
+                )
+            if self.async_streaming:
+                raise NotImplementedError(
+                    "use_kv_spkcache=True is not supported with async_streaming=True yet."
+                )
         self.save_hyperparameters("cfg")
         self._init_eval_metrics()
         speaker_inds = list(range(self._cfg.max_num_of_spks))
@@ -855,9 +869,18 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 and all previous chunks
                 Shape: (batch_size, pred_len, num_speakers)
         """
-        streaming_state = self.sortformer_modules.init_streaming_state(
-            batch_size=processed_signal.shape[0], async_streaming=self.async_streaming, device=self.device
-        )
+        if self.use_kv_spkcache:
+            streaming_state = self.sortformer_modules.init_streaming_state_kv(
+                n_layers=self.encoder.n_layers,
+                batch_size=processed_signal.shape[0],
+                device=self.device,
+            )
+        else:
+            streaming_state = self.sortformer_modules.init_streaming_state(
+                batch_size=processed_signal.shape[0],
+                async_streaming=self.async_streaming,
+                device=self.device,
+            )
 
         batch_size, ch, sig_length = processed_signal.shape
         processed_signal_offset = torch.zeros((batch_size,), dtype=torch.long, device=self.device)
@@ -906,13 +929,16 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             feat_seq_length=processed_signal_length,
             feat_seq_offset=processed_signal_offset,
         )
+        step_fn = (
+            self.forward_streaming_step_kv if self.use_kv_spkcache else self.forward_streaming_step
+        )
         for _, chunk_feat_seq_t, feat_lengths, left_offset, right_offset in tqdm(
             streaming_loader,
             total=num_chunks,
             desc="Streaming Steps",
             disable=self.training,
         ):
-            streaming_state, total_preds = self.forward_streaming_step(
+            streaming_state, total_preds = step_fn(
                 processed_signal=chunk_feat_seq_t,
                 processed_signal_length=feat_lengths,
                 streaming_state=streaming_state,
@@ -1079,6 +1105,125 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         total_preds = torch.cat([total_preds, chunk_preds], dim=1)
 
+        return streaming_state, total_preds
+
+    def forward_streaming_step_kv(
+        self,
+        processed_signal,
+        processed_signal_length,
+        streaming_state,
+        total_preds,
+        left_offset=0,
+        right_offset=0,
+    ):
+        """
+        KV-cache version of `forward_streaming_step` (sync mode only).
+
+        Differences vs `forward_streaming_step`:
+        - The encoder runs on `[fifo, chunk]` only (no spkcache positions in the input).
+        - The encoder is invoked via the new `ConformerEncoder.forward_kv_cache` entry
+          point, which prepends per-layer cached K/V (the speaker cache) inside each
+          attention sublayer. Conv and feed-forward sublayers operate only on current
+          (fifo+chunk) positions.
+        - Per-layer pre-attention captures from this step feed into the speaker cache
+          when frames are popped from the FIFO.
+        - The Transformer encoder (inside `forward_infer`) sees `[fifo, chunk]` only —
+          spkcache contributes no positions to it.
+        - Cache compression operates on per-layer KV via `streaming_update_kv`.
+
+        Args:
+            processed_signal (torch.Tensor): mel features for the current chunk
+                (with `left_offset`/`right_offset` context already included).
+                Shape: (B, T_chunk_raw, n_mel)
+            processed_signal_length (torch.Tensor): valid lengths per batch element.
+                Shape: (B,)
+            streaming_state (StreamingSortformerState): previous streaming state, initialized
+                via `sortformer_modules.init_streaming_state_kv(n_layers=self.encoder.n_layers)`.
+            total_preds (torch.Tensor): running concatenation of per-chunk predictions.
+                Shape: (B, accumulated_len, n_spk)
+            left_offset (int): left context in feature frames.
+            right_offset (int): right context in feature frames.
+
+        Returns:
+            streaming_state (StreamingSortformerState): updated state.
+            total_preds (torch.Tensor): with the current chunk's preds appended.
+        """
+        # 1. SpecAugment per-chunk (same as forward_streaming_step).
+        if self.spec_augmentation is not None and self.training and self.spec_augment_per_chunk:
+            processed_signal = self.spec_augmentation(
+                input_spec=processed_signal.transpose(1, 2), length=processed_signal_length
+            ).transpose(1, 2)
+
+        # 2. Pre-encode the chunk.
+        chunk_pe, chunk_pe_len = self.encoder.pre_encode(x=processed_signal, lengths=processed_signal_length)
+        chunk_pe_len = chunk_pe_len.to(torch.int64)
+
+        # 3. Concat fifo + chunk only (spkcache stays out of the encoder input).
+        fc_pe = torch.cat([streaming_state.fifo, chunk_pe], dim=1)
+        fc_pe_len = streaming_state.fifo.shape[1] + chunk_pe_len
+
+        # 4. Run encoder with per-layer KV cache for spkcache.
+        # streaming_state.spkcache_kv is (B, n_layers, T_cache, d_model); the encoder expects
+        # (n_layers, B, T_cache, d_model), so transpose at the boundary.
+        kv_cache = streaming_state.spkcache_kv.transpose(0, 1)
+        emb_seq, emb_seq_length, per_layer_x = self.encoder.forward_kv_cache(
+            audio_signal=fc_pe,
+            length=fc_pe_len,
+            kv_cache=kv_cache,
+        )
+        # emb_seq:     (B, T_fc, fc_d_model)
+        # per_layer_x: (n_layers, B, T_fc, fc_d_model)
+
+        # 5. encoder_proj (fc_d_model -> tf_d_model) applied to fifo+chunk only.
+        if self.sortformer_modules.encoder_proj is not None:
+            emb_seq = self.sortformer_modules.encoder_proj(emb_seq)
+
+        # 6. Transformer + upsample + sigmoids on fifo+chunk only.
+        fc_preds = self.forward_infer(
+            emb_seq=emb_seq,
+            emb_seq_length=emb_seq_length,
+            pre_encode_feats=fc_pe,
+        )
+
+        # 7. Encoder-rate left/right offsets and upsample factor.
+        lc_enc = round(left_offset / self.encoder.subsampling_factor)
+        rc_enc = math.ceil(right_offset / self.encoder.subsampling_factor)
+        uf = self.upsample_factor
+
+        if uf > 1:
+            preds_fine = fc_preds
+            fc_preds = self.sortformer_modules.downsample_preds(preds_fine, downsample_factor=uf).detach()
+            # Apply inverse speaker permutation to the fine-grained preds for chunk output.
+            # The coarse preds will be inverse-permuted inside streaming_update_kv.
+            if streaming_state.spk_perm is not None:
+                batch_size_pf = preds_fine.shape[0]
+                inv_spk_perm = torch.stack(
+                    [torch.argsort(streaming_state.spk_perm[bi]) for bi in range(batch_size_pf)]
+                )
+                preds_fine = torch.stack(
+                    [preds_fine[bi, :, inv_spk_perm[bi]] for bi in range(batch_size_pf)]
+                )
+
+        # 8. Cache + FIFO update via per-layer KV update.
+        saved_fifo_len = streaming_state.fifo.shape[1]
+        per_layer_x_bl = per_layer_x.transpose(0, 1)  # (B, n_layers, T_fc, d_model)
+        streaming_state, chunk_preds = self.sortformer_modules.streaming_update_kv(
+            streaming_state=streaming_state,
+            chunk=chunk_pe,
+            fc_per_layer_x=per_layer_x_bl,
+            preds=fc_preds,
+            lc=lc_enc,
+            rc=rc_enc,
+        )
+
+        # When uf > 1, take chunk preds at the fine resolution from preds_fine.
+        # preds_fine layout: [fifo (saved_fifo_len), lc, chunk_core (chunk_len), rc] * uf.
+        if uf > 1:
+            chunk_len = chunk_pe.shape[1] - lc_enc - rc_enc
+            start = (saved_fifo_len + lc_enc) * uf
+            chunk_preds = preds_fine[:, start : start + chunk_len * uf, :]
+
+        total_preds = torch.cat([total_preds, chunk_preds], dim=1)
         return streaming_state, total_preds
 
     def _get_aux_train_evaluations(self, preds, targets, target_lens) -> dict:

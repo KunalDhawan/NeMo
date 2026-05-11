@@ -24,6 +24,7 @@ model:
   val_upsample_preds: false # If true, train at coarse resolution (output_subsampling_factor) but validate at 10ms by upsampling preds.
   val_upsample_smooth_kernel: 9 # Smoothing kernel size for val upsample_preds (must be odd, ignored when val_upsample_preds is false).
   streaming_mode: True
+  use_kv_spkcache: false # If true, store the speaker cache as per-layer pre-attention hidden states (read-only KV cache) and run the FastConformer encoder only on [fifo, chunk] each step. Sync streaming only; not supported with async_streaming. Default false preserves the original re-encode-each-step behavior.
 
   model_defaults:
     fc_d_model: 512 # Hidden dimension size of the Fast-conformer Encoder
@@ -147,6 +148,8 @@ model:
     # Self-attention parameters (training only)
     causal_attn_rate: 0.5 # Proportion of batches that use self-attention with limited right context
     causal_attn_rc: 7 # Right context size for self-attention with limited right context
+    permute_spk: true # If true (default), speakers in the spkcache are randomly permuted during compression at training time (preserves original behavior). Set false to disable this regularization (useful as an ablation, e.g. when isolating KV-cache adaptation issues).
+    detach_spkcache_kv: false # KV-mode only. If true, per-layer K/V values are detached from the autograd graph when promoted into the speaker cache, so gradients do not flow across chunks through the cache. This makes the training forward graph match inference. Set false for the original behavior (full cross-chunk gradient flow through the cache).
 
   encoder:
     _target_: nemo.collections.asr.modules.ConformerEncoder

@@ -43,6 +43,11 @@ class StreamingSortformerState:
         spk_perm (torch.Tensor): Speaker permutation information for the speaker cache
         mean_sil_emb (torch.Tensor): Mean silence embedding
         n_sil_frames (torch.Tensor): Number of silence frames
+        spkcache_kv (torch.Tensor): Speaker cache as per-layer pre-attention hidden states
+            for KV-cache streaming mode. Shape: (batch_size, n_layers, T_cache, fc_d_model).
+            Used only when the model runs with KV-cache mode (see SortformerModules.streaming_update_kv).
+        mean_sil_emb_kv (torch.Tensor): Per-layer mean silence embedding for KV-cache mode.
+            Shape: (batch_size, n_layers, fc_d_model).
     """
 
     spkcache = None  # Speaker cache to store embeddings from start
@@ -54,6 +59,9 @@ class StreamingSortformerState:
     spk_perm = None
     mean_sil_emb = None
     n_sil_frames = None
+    # KV-cache mode fields (None when running the original non-KV streaming path).
+    spkcache_kv = None
+    mean_sil_emb_kv = None
 
 
 class SortformerModules(NeuralModule, Exportable):
@@ -94,6 +102,8 @@ class SortformerModules(NeuralModule, Exportable):
         strong_boost_rate: float = 0.75,
         weak_boost_rate: float = 1.5,
         min_pos_scores_rate: float = 0.5,
+        permute_spk: bool = True,
+        detach_spkcache_kv: bool = True,
     ):
         super().__init__()
         # General params
@@ -139,6 +149,18 @@ class SortformerModules(NeuralModule, Exportable):
         self.strong_boost_rate = strong_boost_rate
         self.weak_boost_rate = weak_boost_rate
         self.min_pos_scores_rate = min_pos_scores_rate
+        # If False, _compress_spkcache(_kv) never permutes speakers, even during training.
+        # Useful as an ablation for disentangling KV-cache adaptation from permutation-based
+        # regularization. Default True preserves the original training behavior.
+        self.permute_spk = permute_spk
+        # If True (default), per-layer K/V values are detached from the autograd graph when
+        # they are promoted into the speaker cache (KV mode only). This stops gradient flow
+        # through the cache across chunks and makes the training forward pass match the
+        # inference forward pass (where no gradients flow through the cache anyway).
+        # Reduces the train-vs-val asymmetry caused by cross-chunk gradient backprop.
+        # Set False to allow cross-chunk gradient flow through the cache (the original
+        # behavior of `streaming_update_kv` before this option existed).
+        self.detach_spkcache_kv = detach_spkcache_kv
 
     def _check_streaming_parameters(self):
         """
@@ -675,6 +697,40 @@ class SortformerModules(NeuralModule, Exportable):
         streaming_state.n_sil_frames = torch.zeros((batch_size,), dtype=torch.long, device=device)
         return streaming_state
 
+    def init_streaming_state_kv(self, n_layers: int, batch_size: int = 1, device: torch.device = None):
+        """
+        Initialize StreamingSortformerState for KV-cache streaming mode (sync only).
+
+        Unlike `init_streaming_state`, the speaker cache stores per-layer pre-attention
+        hidden states (KV cache) instead of pre-encoded embeddings. The FIFO still stores
+        pre-encoded embeddings as in the non-KV mode.
+
+        `spkcache_preds` starts as a zero-length tensor (not None) and is accumulated from
+        the very first pop event onward, since cached spkcache positions never go through
+        `forward_infer` again and we can't re-predict them later.
+
+        Args:
+            n_layers (int): Number of FastConformer layers (matches the n_layers axis of
+                spkcache_kv and mean_sil_emb_kv). The caller (sortformer model) knows this
+                via `self.encoder.n_layers`.
+            batch_size (int): Batch size for tensors in streaming state.
+            device (torch.device): Device for tensors in streaming state.
+
+        Returns:
+            streaming_state (StreamingSortformerState): initialized streaming state.
+        """
+        streaming_state = StreamingSortformerState()
+        streaming_state.spkcache_kv = torch.zeros(
+            (batch_size, n_layers, 0, self.fc_d_model), device=device
+        )
+        streaming_state.spkcache_preds = torch.zeros((batch_size, 0, self.n_spk), device=device)
+        streaming_state.fifo = torch.zeros((batch_size, 0, self.fc_d_model), device=device)
+        streaming_state.mean_sil_emb_kv = torch.zeros(
+            (batch_size, n_layers, self.fc_d_model), device=device
+        )
+        streaming_state.n_sil_frames = torch.zeros((batch_size,), dtype=torch.long, device=device)
+        return streaming_state
+
     @staticmethod
     def apply_mask_to_preds(spkcache_fifo_chunk_preds, spkcache_fifo_chunk_fc_encoder_lengths):
         """
@@ -900,7 +956,7 @@ class SortformerModules(NeuralModule, Exportable):
                         emb_seq=streaming_state.spkcache,
                         preds=streaming_state.spkcache_preds,
                         mean_sil_emb=streaming_state.mean_sil_emb,
-                        permute_spk=self.training,
+                        permute_spk=self.training and self.permute_spk,
                     )
                 )
 
@@ -911,6 +967,139 @@ class SortformerModules(NeuralModule, Exportable):
             )
 
         return streaming_state, chunk_preds
+
+    def streaming_update_kv(
+        self,
+        streaming_state,
+        chunk,
+        fc_per_layer_x,
+        preds,
+        lc: int = 0,
+        rc: int = 0,
+    ):
+        """
+        KV-cache version of `streaming_update` (sync mode).
+
+        Updates the speaker cache (as per-layer KV) and the FIFO queue with the current
+        chunk. The FIFO continues to store pre-encoded embeddings as in non-KV mode, but
+        the spkcache stores per-layer pre-attention hidden states captured by
+        `ConformerEncoder.forward_kv_cache`.
+
+        Differences vs the non-KV `streaming_update`:
+        - Spkcache positions never re-enter the encoder, so we cannot re-predict their
+          activities. We therefore accumulate `spkcache_preds` from the very first pop
+          event (eliminating the lazy initialization in `streaming_update`).
+        - The silence profile is maintained per layer (`mean_sil_emb_kv`).
+        - Compression operates across all n_layers simultaneously via
+          `_compress_spkcache_kv`, using identical scoring logic.
+
+        Args:
+            streaming_state (StreamingSortformerState): previous state (uses spkcache_kv,
+                spkcache_preds, fifo, fifo_preds, mean_sil_emb_kv, n_sil_frames, spk_perm).
+            chunk (torch.Tensor): pre-encoded chunk embeddings (including lc/rc context).
+                Shape: (batch_size, lc + chunk_len + rc, fc_d_model)
+            fc_per_layer_x (torch.Tensor): per-layer pre-attention hidden states for the
+                current step's full encoder input [fifo, chunk_with_lc_rc].
+                Shape: (batch_size, n_layers, fifo_len_old + lc + chunk_len + rc, fc_d_model)
+            preds (torch.Tensor): speaker predictions over the same positions as
+                `fc_per_layer_x` (the spkcache_kv positions are NOT included here).
+                Shape: (batch_size, fifo_len_old + lc + chunk_len + rc, n_spk)
+            lc (int): left context offset within `chunk` (frames).
+            rc (int): right context offset within `chunk` (frames).
+
+        Returns:
+            streaming_state (StreamingSortformerState): updated state.
+            chunk_preds (torch.Tensor): predictions for the chunk core only (lc/rc stripped),
+                inverse-permuted to "real" speaker order.
+                Shape: (batch_size, chunk_len, n_spk)
+        """
+        batch_size = chunk.shape[0]
+        fifo_len_old = streaming_state.fifo.shape[1]
+        chunk_len = chunk.shape[1] - lc - rc
+
+        # Inverse speaker permutation (sync + training only) — same as non-KV path.
+        if streaming_state.spk_perm is not None:
+            inv_spk_perm = torch.stack(
+                [torch.argsort(streaming_state.spk_perm[bi]) for bi in range(batch_size)]
+            )
+            preds = torch.stack(
+                [preds[bi, :, inv_spk_perm[bi]] for bi in range(batch_size)]
+            )
+
+        # Slice preds for the fifo / chunk-core regions.
+        fifo_preds_new = preds[:, :fifo_len_old]
+        chunk_core_preds = preds[:, fifo_len_old + lc : fifo_len_old + lc + chunk_len]
+
+        # Slice per-layer KV for the chunk core and old fifo.
+        # fc_per_layer_x layout along time: [old_fifo | lc | chunk_core | rc].
+        fifo_x_old = fc_per_layer_x[:, :, :fifo_len_old, :]
+        chunk_core_x = fc_per_layer_x[:, :, fifo_len_old + lc : fifo_len_old + lc + chunk_len, :]
+
+        chunk_core = chunk[:, lc : lc + chunk_len]
+
+        # Append chunk core to fifo (pre-encode) and corresponding preds/KV-history.
+        streaming_state.fifo = torch.cat([streaming_state.fifo, chunk_core], dim=1)
+        streaming_state.fifo_preds = torch.cat([fifo_preds_new, chunk_core_preds], dim=1)
+        combined_fifo_x = torch.cat([fifo_x_old, chunk_core_x], dim=2)
+
+        if fifo_len_old + chunk_len > self.fifo_len:
+            # Pop the oldest pop_out_len frames from the combined fifo into spkcache_kv.
+            pop_out_len = self.spkcache_update_period
+            pop_out_len = max(pop_out_len, chunk_len - self.fifo_len + fifo_len_old)
+            pop_out_len = min(pop_out_len, fifo_len_old + chunk_len)
+
+            pop_out_preds = streaming_state.fifo_preds[:, :pop_out_len]
+            pop_out_x = combined_fifo_x[:, :, :pop_out_len, :]
+
+            # Optionally stop the cross-chunk gradient flow through the cache. Detaching
+            # here makes the training forward graph match inference (where the cache is
+            # just data with no gradients flowing through it). This is propagated through
+            # the silence profile and into spkcache_kv at compression time.
+            if self.detach_spkcache_kv:
+                pop_out_x = pop_out_x.detach()
+                pop_out_preds = pop_out_preds.detach()
+
+            # Update per-layer silence profile from popped frames.
+            streaming_state.mean_sil_emb_kv, streaming_state.n_sil_frames = self._get_silence_profile_kv(
+                streaming_state.mean_sil_emb_kv,
+                streaming_state.n_sil_frames,
+                pop_out_x,
+                pop_out_preds,
+            )
+
+            # Drop popped frames from fifo (pre-encode) and fifo_preds.
+            streaming_state.fifo = streaming_state.fifo[:, pop_out_len:]
+            streaming_state.fifo_preds = streaming_state.fifo_preds[:, pop_out_len:]
+
+            # Append popped per-layer KV and preds to the speaker cache.
+            streaming_state.spkcache_kv = torch.cat(
+                [streaming_state.spkcache_kv, pop_out_x], dim=2
+            )
+            streaming_state.spkcache_preds = torch.cat(
+                [streaming_state.spkcache_preds, pop_out_preds], dim=1
+            )
+
+            # Compress when the cache exceeds capacity.
+            if streaming_state.spkcache_kv.shape[2] > self.spkcache_len:
+                (
+                    streaming_state.spkcache_kv,
+                    streaming_state.spkcache_preds,
+                    streaming_state.spk_perm,
+                ) = self._compress_spkcache_kv(
+                    emb_seq_kv=streaming_state.spkcache_kv,
+                    preds=streaming_state.spkcache_preds,
+                    mean_sil_emb_kv=streaming_state.mean_sil_emb_kv,
+                    permute_spk=self.training and self.permute_spk,
+                )
+
+        if self.log:
+            logging.info(
+                f"spkcache_kv: {streaming_state.spkcache_kv.shape}, "
+                f"fifo: {streaming_state.fifo.shape}, chunk: {chunk.shape}, "
+                f"chunk_preds: {chunk_core_preds.shape}"
+            )
+
+        return streaming_state, chunk_core_preds
 
     def _boost_topk_scores(
         self, scores, n_boost_per_spk: int, scale_factor: float = 1.0, offset: float = 0.5
@@ -969,6 +1158,46 @@ class SortformerModules(NeuralModule, Exportable):
         total_sil_sum = old_sil_emb_sum + sil_emb_sum
         upd_mean_sil_emb = total_sil_sum / torch.clamp(upd_n_sil_frames.unsqueeze(1), min=1)
         return upd_mean_sil_emb, upd_n_sil_frames
+
+    def _get_silence_profile_kv(self, mean_sil_emb_kv, n_sil_frames, emb_seq_kv, preds):
+        """
+        Per-layer version of `_get_silence_profile` for KV-cache streaming.
+
+        Silence frames are the same across all layers (selection depends only on preds),
+        so `n_sil_frames` is a single per-batch counter. `mean_sil_emb_kv` is maintained
+        as a running per-layer mean — one mean vector per (batch, layer) pair.
+
+        Args:
+            mean_sil_emb_kv (torch.Tensor): Previous per-layer mean silence embedding.
+                Shape: (batch_size, n_layers, emb_dim)
+            n_sil_frames (torch.Tensor): Previous number of silence frames per batch element.
+                Shape: (batch_size,)
+            emb_seq_kv (torch.Tensor): Per-layer pre-attention hidden states for the input frames.
+                Shape: (batch_size, n_layers, n_frames, emb_dim)
+            preds (torch.Tensor): Speaker activity probabilities for the input frames.
+                Shape: (batch_size, n_frames, n_spk)
+
+        Returns:
+            upd_mean_sil_emb_kv (torch.Tensor): Updated per-layer mean silence embedding.
+                Shape: (batch_size, n_layers, emb_dim)
+            upd_n_sil_frames (torch.Tensor): Updated number of silence frames.
+                Shape: (batch_size,)
+        """
+        is_sil = preds.sum(dim=2) < self.sil_threshold  # (B, n_frames)
+        sil_count = is_sil.sum(dim=1)  # (B,)
+        has_new_sil = sil_count > 0
+        if not has_new_sil.any():
+            return mean_sil_emb_kv, n_sil_frames
+        # Sum silence-frame embeddings per layer: (B, n_layers, emb_dim)
+        sil_emb_sum_kv = torch.sum(emb_seq_kv * is_sil.unsqueeze(1).unsqueeze(-1), dim=2)
+        upd_n_sil_frames = n_sil_frames + sil_count
+        # Broadcast n_sil_frames over (n_layers, emb_dim): (B, 1, 1) * (B, n_layers, emb_dim)
+        old_sil_emb_sum_kv = mean_sil_emb_kv * n_sil_frames.unsqueeze(-1).unsqueeze(-1)
+        total_sil_sum_kv = old_sil_emb_sum_kv + sil_emb_sum_kv
+        upd_mean_sil_emb_kv = total_sil_sum_kv / torch.clamp(
+            upd_n_sil_frames.unsqueeze(-1).unsqueeze(-1), min=1
+        )
+        return upd_mean_sil_emb_kv, upd_n_sil_frames
 
     def _get_log_pred_scores(self, preds):
         """
@@ -1061,6 +1290,49 @@ class SortformerModules(NeuralModule, Exportable):
         preds_gathered = torch.gather(preds, 1, indices_expanded_spk)  # (batch_size, spkcache_len, n_spk)
         preds_gathered = torch.where(is_disabled.unsqueeze(-1), torch.tensor(0.0), preds_gathered)
         return emb_seq_gathered, preds_gathered
+
+    def _gather_spkcache_kv_and_preds(self, emb_seq_kv, preds, topk_indices, is_disabled, mean_sil_emb_kv):
+        """
+        Per-layer version of `_gather_spkcache_and_preds`. The same `topk_indices` are
+        used at every layer, so each selected frame brings its full per-layer KV stack.
+        Disabled (silence-placeholder) positions are filled with the per-layer mean
+        silence embedding.
+
+        Args:
+            emb_seq_kv (torch.Tensor): Per-layer pre-attention hidden states.
+                Shape: (batch_size, n_layers, n_frames, emb_dim)
+            preds (torch.Tensor): Speaker activity probabilities.
+                Shape: (batch_size, n_frames, n_spk)
+            topk_indices (torch.Tensor): Indices of frames to gather.
+                Shape: (batch_size, spkcache_len)
+            is_disabled (torch.Tensor): Boolean mask for disabled (silence-placeholder) frames.
+                Shape: (batch_size, spkcache_len)
+            mean_sil_emb_kv (torch.Tensor): Per-layer mean silence embedding.
+                Shape: (batch_size, n_layers, emb_dim)
+
+        Returns:
+            emb_seq_kv_gathered (torch.Tensor): Gathered per-layer hidden states.
+                Shape: (batch_size, n_layers, spkcache_len, emb_dim)
+            preds_gathered (torch.Tensor): Gathered speaker activities.
+                Shape: (batch_size, spkcache_len, n_spk)
+        """
+        n_layers, emb_dim = emb_seq_kv.shape[1], emb_seq_kv.shape[3]
+        n_spk = preds.shape[2]
+
+        # Same indices used across all layers — broadcast over layer dim.
+        idx_kv = topk_indices.unsqueeze(1).unsqueeze(-1).expand(-1, n_layers, -1, emb_dim)
+        emb_seq_kv_gathered = torch.gather(emb_seq_kv, 2, idx_kv)
+        # Replace disabled positions with per-layer mean silence embedding.
+        sil_expand = mean_sil_emb_kv.unsqueeze(2).expand(-1, -1, self.spkcache_len, -1)
+        emb_seq_kv_gathered = torch.where(
+            is_disabled.unsqueeze(1).unsqueeze(-1), sil_expand, emb_seq_kv_gathered
+        )
+
+        # Preds gathering is identical to the non-KV path.
+        indices_expanded_spk = topk_indices.unsqueeze(-1).expand(-1, -1, n_spk)
+        preds_gathered = torch.gather(preds, 1, indices_expanded_spk)
+        preds_gathered = torch.where(is_disabled.unsqueeze(-1), torch.tensor(0.0), preds_gathered)
+        return emb_seq_kv_gathered, preds_gathered
 
     def _get_max_perm_index(self, scores):
         """
@@ -1198,3 +1470,73 @@ class SortformerModules(NeuralModule, Exportable):
             emb_seq, preds, topk_indices, is_disabled, mean_sil_emb
         )
         return spkcache, spkcache_preds, spk_perm
+
+    def _compress_spkcache_kv(self, emb_seq_kv, preds, mean_sil_emb_kv, permute_spk: bool = False):
+        """
+        Per-layer version of `_compress_spkcache` for KV-cache streaming.
+
+        Scoring and frame-selection logic are identical to the non-KV version (depend only
+        on `preds`). The only difference is that gathering operates on per-layer hidden
+        states: the same set of `spkcache_len` selected frame indices is applied across all
+        n_layers, so a selected frame carries its full per-layer KV stack into the
+        compressed cache.
+
+        Args:
+            emb_seq_kv (torch.Tensor): Per-layer pre-attention hidden states for n_frames
+                candidate frames.
+                Shape: (batch_size, n_layers, n_frames, emb_dim)
+            preds (torch.Tensor): Predictions for the same n_frames candidate frames.
+                Shape: (batch_size, n_frames, n_spk)
+            mean_sil_emb_kv (torch.Tensor): Per-layer mean silence embedding for disabled
+                placeholder positions.
+                Shape: (batch_size, n_layers, emb_dim)
+            permute_spk (bool): If true, generate a random permutation of existing speakers
+                (training-time only).
+
+        Returns:
+            spkcache_kv (torch.Tensor): Compressed per-layer speaker cache.
+                Shape: (batch_size, n_layers, spkcache_len, emb_dim)
+            spkcache_preds (torch.Tensor): Predictions corresponding to compressed cache.
+                Shape: (batch_size, spkcache_len, n_spk)
+            spk_perm (torch.Tensor or None): Speaker permutation applied during compression
+                (None when permute_spk=False).
+                Shape: (batch_size, n_spk)
+        """
+        batch_size, n_frames, n_spk = preds.shape
+        spkcache_len_per_spk = self.spkcache_len // n_spk - self.spkcache_sil_frames_per_spk
+        strong_boost_per_spk = math.floor(spkcache_len_per_spk * self.strong_boost_rate)
+        weak_boost_per_spk = math.floor(spkcache_len_per_spk * self.weak_boost_rate)
+        min_pos_scores_per_spk = math.floor(spkcache_len_per_spk * self.min_pos_scores_rate)
+
+        scores = self._get_log_pred_scores(preds)
+        scores = self._disable_low_scores(preds, scores, min_pos_scores_per_spk)
+
+        if permute_spk:  # Generate a random permutation of speakers (training only)
+            max_perm_index = self._get_max_perm_index(scores)
+            scores, spk_perm = self._permute_speakers(scores, max_perm_index)
+        else:
+            spk_perm = None
+
+        if self.scores_boost_latest > 0:  # Boost newly added frames
+            scores[:, self.spkcache_len :, :] += self.scores_boost_latest
+
+        if self.training:
+            if self.scores_add_rnd > 0:
+                scores += torch.rand(batch_size, n_frames, n_spk, device=scores.device) * self.scores_add_rnd
+
+        # Strong boosting to ensure each speaker has at least K frames in speaker cache
+        scores = self._boost_topk_scores(scores, strong_boost_per_spk, scale_factor=2)
+        # Weak boosting to prevent dominance of one speaker in speaker cache
+        scores = self._boost_topk_scores(scores, weak_boost_per_spk, scale_factor=1)
+
+        if self.spkcache_sil_frames_per_spk > 0:  # Reserved silence positions per speaker
+            pad = torch.full(
+                (batch_size, self.spkcache_sil_frames_per_spk, n_spk), float('inf'), device=scores.device
+            )
+            scores = torch.cat([scores, pad], dim=1)
+
+        topk_indices, is_disabled = self._get_topk_indices(scores)
+        spkcache_kv, spkcache_preds = self._gather_spkcache_kv_and_preds(
+            emb_seq_kv, preds, topk_indices, is_disabled, mean_sil_emb_kv
+        )
+        return spkcache_kv, spkcache_preds, spk_perm

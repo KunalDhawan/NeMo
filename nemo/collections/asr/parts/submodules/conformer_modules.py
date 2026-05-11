@@ -158,7 +158,16 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
         self.dropout = nn.Dropout(dropout)
         self.norm_out = LayerNorm(d_model)
 
-    def forward(self, x, att_mask=None, pos_emb=None, pad_mask=None, cache_last_channel=None, cache_last_time=None):
+    def forward(
+        self,
+        x,
+        att_mask=None,
+        pos_emb=None,
+        pad_mask=None,
+        cache_last_channel=None,
+        cache_last_time=None,
+        kv_cache_readonly=None,
+    ):
         """
         Args:
             x (torch.Tensor): input signals (B, T, d_model)
@@ -167,19 +176,49 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
             pad_mask (torch.tensor): padding mask
             cache_last_channel (torch.tensor) : cache for MHA layers (B, T_cache, d_model)
             cache_last_time (torch.tensor) : cache for convolutional layers (B, d_model, T_cache)
+            kv_cache_readonly (torch.tensor) : read-only KV cache (B, T_cache, d_model) — cached
+                pre-attention hidden states prepended to attention K/V (not Q). The caller manages
+                the cache externally (e.g. for the speaker cache in streaming diarization).
+                Mutually exclusive with `cache_last_channel`/`cache_last_time`. Currently only
+                supported with `self_attention_model='rel_pos'`.
         Returns:
-            x (torch.Tensor): (B, T, d_model)
-            cache_last_channel (torch.tensor) : next cache for MHA layers (B, T_cache, d_model)
-            cache_last_time (torch.tensor) : next cache for convolutional layers (B, d_model, T_cache)
+            One of three return shapes, depending on which streaming mode is active:
+            - default (no caches): x
+            - cache_last_channel set: (x, cache_last_channel, cache_last_time)
+            - kv_cache_readonly set: (x, captured_attn_input) — captured_attn_input is the
+              post-LayerNorm pre-attention input for current positions only, to be stored by
+              the caller for future use as `kv_cache_readonly` input.
         """
+        if kv_cache_readonly is not None:
+            if cache_last_channel is not None or cache_last_time is not None:
+                raise ValueError(
+                    "kv_cache_readonly is mutually exclusive with cache_last_channel/cache_last_time."
+                )
+            if self.self_attention_model != 'rel_pos':
+                raise NotImplementedError(
+                    f"kv_cache_readonly is only supported with self_attention_model='rel_pos', "
+                    f"got '{self.self_attention_model}'."
+                )
+
         residual = x
         x = self.norm_feed_forward1(x)
         x = self.feed_forward1(x)
         residual = residual + self.dropout(x) * self.fc_factor
 
         x = self.norm_self_att(residual)
+        # Capture pre-attention norm output for current positions (before any cache prepending).
+        # This is what the caller stores for future `kv_cache_readonly` inputs.
+        captured_attn_input = x if kv_cache_readonly is not None else None
         if self.self_attention_model == 'rel_pos':
-            x = self.self_attn(query=x, key=x, value=x, mask=att_mask, pos_emb=pos_emb, cache=cache_last_channel)
+            x = self.self_attn(
+                query=x,
+                key=x,
+                value=x,
+                mask=att_mask,
+                pos_emb=pos_emb,
+                cache=cache_last_channel,
+                kv_cache_readonly=kv_cache_readonly,
+            )
         elif self.self_attention_model == 'rel_pos_local_attn':
             x = self.self_attn(query=x, key=x, value=x, pad_mask=pad_mask, pos_emb=pos_emb, cache=cache_last_channel)
         elif self.self_attention_model == 'abs_pos':
@@ -228,10 +267,12 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
             'save_encoder_tensors', False
         ):
             self.register_accessible_tensor(name='encoder', tensor=x)
-        if cache_last_channel is None:
-            return x
-        else:
+        if cache_last_channel is not None:
             return x, cache_last_channel, cache_last_time
+        elif kv_cache_readonly is not None:
+            return x, captured_attn_input
+        else:
+            return x
 
 
 class ConformerLayerWithCLS(ConformerLayer):
