@@ -168,6 +168,10 @@ class DiarizationConfig:
     # per-layer pre-attention hidden states and the FastConformer runs only on [fifo, chunk]
     # each step. Only supported by SortformerEncLabelModel (not the CLS variant).
     use_kv_spkcache: bool = False
+    # When True, the KV speaker cache keeps frames in their original temporal order
+    # (selected by max score across speakers) instead of grouping by speaker with
+    # silence-embedding injection. Only used when use_kv_spkcache=True.
+    temporal_spkcache_kv: bool = False
 
     # If `cuda` is a negative number, inference will be on CPU only.
     cuda: Optional[int] = None
@@ -529,6 +533,8 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         modules.fifo_len = cfg.fifo_len
         modules.log = cfg.log
         modules.spkcache_update_period = cfg.spkcache_update_period
+        if cfg.use_kv_spkcache and cfg.temporal_spkcache_kv:
+            modules.temporal_spkcache_kv = True
         modules._check_streaming_parameters()
 
     postprocessing_cfg = load_postprocessing_from_yaml(cfg.postprocessing_yaml)

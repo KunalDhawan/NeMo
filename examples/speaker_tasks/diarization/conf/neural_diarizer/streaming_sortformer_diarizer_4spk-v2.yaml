@@ -150,6 +150,7 @@ model:
     causal_attn_rc: 7 # Right context size for self-attention with limited right context
     permute_spk: true # If true (default), speakers in the spkcache are randomly permuted during compression at training time (preserves original behavior). Set false to disable this regularization (useful as an ablation, e.g. when isolating KV-cache adaptation issues).
     detach_spkcache_kv: false # KV-mode only. If true, per-layer K/V values are detached from the autograd graph when promoted into the speaker cache, so gradients do not flow across chunks through the cache. This makes the training forward graph match inference. Set false for the original behavior (full cross-chunk gradient flow through the cache).
+    temporal_spkcache_kv: false # KV-mode only. If true, the KV speaker cache keeps frames in their original temporal order (selected by max score across speakers). If false (default), frames are grouped by speaker with silence-embedding injection.
 
   encoder:
     _target_: nemo.collections.asr.modules.ConformerEncoder
