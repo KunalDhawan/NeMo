@@ -417,6 +417,26 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
     _PREENC_UPSAMPLE_MODES = ("single_preenc", "single_preenc_full", "single_preenc_mlp")
 
+    def _call_pre_encode(self, x, lengths):
+        """Call ``self.encoder.pre_encode`` with correct input layout.
+
+        Most pre-encoders (``ConvSubsampling``, ``StackingSubsampling``,
+        ``nn.Linear``) expect *time-major* input ``(B, T, C)``.
+        ``FeatureStacking`` is the exception — it expects ``(B, C, T)``
+        and transposes internally.  This helper hides that difference so
+        every call site can pass ``(B, T, C)`` uniformly.
+
+        Returns:
+            ``(features, lengths)`` with features in ``(B, T', D)`` layout.
+        """
+        from nemo.collections.asr.parts.submodules.subsampling import FeatureStacking
+
+        if isinstance(self.encoder.pre_encode, torch.nn.Linear):
+            return self.encoder.pre_encode(x), lengths
+        if isinstance(self.encoder.pre_encode, FeatureStacking):
+            return self.encoder.pre_encode(x.transpose(1, 2), lengths)
+        return self.encoder.pre_encode(x=x, lengths=lengths)
+
     def frontend_encoder(self, processed_signal, processed_signal_length, bypass_pre_encode: bool = False):
         """
         Generate encoder outputs from frontend encoder.
@@ -458,14 +478,10 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         if need_preenc:
             processed_signal_t = processed_signal.transpose(1, 2)
-            if isinstance(self.encoder.pre_encode, torch.nn.Linear):
-                pre_encode_feats = self.encoder.pre_encode(processed_signal_t)
-                pre_encode_lengths = processed_signal_length
-            else:
-                pre_encode_feats, pre_encode_lengths = self.encoder.pre_encode(
-                    x=processed_signal_t, lengths=processed_signal_length
-                )
-                pre_encode_lengths = pre_encode_lengths.to(torch.int64)
+            pre_encode_feats, pre_encode_lengths = self._call_pre_encode(
+                processed_signal_t, processed_signal_length
+            )
+            pre_encode_lengths = pre_encode_lengths.to(torch.int64)
             emb_seq, emb_seq_length = self.encoder(
                 audio_signal=pre_encode_feats,
                 length=pre_encode_lengths,
@@ -809,7 +825,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 Shape: (batch_size,)
         """
         # pre-encode the chunk
-        chunk_pre_encode_embs, chunk_pre_encode_lengths = self.encoder.pre_encode(x=chunk, lengths=chunk_lengths)
+        chunk_pre_encode_embs, chunk_pre_encode_lengths = self._call_pre_encode(chunk, chunk_lengths)
         chunk_pre_encode_lengths = chunk_pre_encode_lengths.to(torch.int64)
 
         # concat the embeddings from speaker cache, FIFO queue and the chunk
@@ -891,7 +907,10 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         if self.training:
             rand_num = random.random()
             if rand_num < self.sortformer_modules.causal_attn_rate:
-                self.encoder.att_context_size = [-1, self.sortformer_modules.causal_attn_rc]
+                if hasattr(self.encoder, 'att_context_size'):
+                    self.encoder.att_context_size = [-1, self.sortformer_modules.causal_attn_rc]
+                elif hasattr(self.encoder, 'attn_mode'):
+                    self.encoder.attn_mode = "causal"
                 self.transformer_encoder.diag = self.sortformer_modules.causal_attn_rc
                 att_mod = True
 
@@ -922,7 +941,10 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             )
 
         if att_mod:
-            self.encoder.att_context_size = [-1, -1]
+            if hasattr(self.encoder, 'att_context_size'):
+                self.encoder.att_context_size = [-1, -1]
+            elif hasattr(self.encoder, 'attn_mode'):
+                self.encoder.attn_mode = "full"
             self.transformer_encoder.diag = None
 
         del processed_signal, processed_signal_length
@@ -987,8 +1009,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 input_spec=processed_signal.transpose(1, 2), length=processed_signal_length
             ).transpose(1, 2)
 
-        chunk_pre_encode_embs, chunk_pre_encode_lengths = self.encoder.pre_encode(
-            x=processed_signal, lengths=processed_signal_length
+        chunk_pre_encode_embs, chunk_pre_encode_lengths = self._call_pre_encode(
+            processed_signal, processed_signal_length
         )
 
         if self.async_streaming:

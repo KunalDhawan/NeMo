@@ -1,0 +1,254 @@
+# Streaming Sortformer Diarizer with TransformerEncoder (FlexAttention-based) instead of ConformerEncoder.
+# Based on streaming_sortformer_diarizer_4spk-v2.yaml with the encoder replaced by
+# TransformerEncoder from nemo/collections/asr/modules/transformer_encoder.py.
+# Encoder parameters taken from examples/asr/conf/transformer/transformer_ctc_bpe.yaml.
+#
+# Note: TransformerEncoder has no streaming cache support, so streaming relies on
+# the sortformer_modules' chunked processing with bypass_pre_encode. Causal attention
+# during training is toggled via encoder.attn_mode instead of att_context_size.
+#
+# Example manifest line for training:
+# {"audio_filepath": "/path/to/audio01.wav", "offset": 390.83, "duration": 90.00, "text": "-", "num_speakers": 2, "rttm_filepath": "/path/to/audio01.rttm"}
+name: "StreamingSortformerDiarizer_TF"
+num_workers: 18
+batch_size: 4
+init_seed: 42
+train_seed: null
+seed_workers: true
+
+model: 
+  sample_rate: 16000
+  pil_weight: 0.5
+  ats_weight: 0.5
+  max_num_of_spks: 4
+  output_subsampling_factor: 8
+  upsample_smooth_kernel: 9
+  upsample_mode: "single"
+  upsample_kernel_sizes: [3, 5, 7]
+  preenc_proj_dim: 0
+  val_upsample_preds: false
+  val_upsample_smooth_kernel: 9
+  streaming_mode: True
+
+  model_defaults:
+    fc_d_model: 512
+    tf_d_model: 192
+
+  train_ds:
+    manifest_filepath: ???
+    sample_rate: ${model.sample_rate}
+    num_spks: ${model.max_num_of_spks}
+    session_len_sec: 90
+    soft_label_thres: 0.5
+    soft_targets: False
+    labels: null
+    batch_size: ${batch_size}
+    shuffle: True
+    num_workers: ${num_workers}
+    validation_mode: False
+    # lhotse config
+    use_lhotse: False
+    use_bucketing: True
+    num_buckets: 10
+    bucket_duration_bins: [10, 20, 30, 40, 50, 60, 70, 80, 90]
+    pin_memory: True
+    min_duration: 10
+    max_duration: 90
+    batch_duration: 400
+    quadratic_duration: 1200
+    bucket_buffer_size: 20000
+    shuffle_buffer_size: 10000
+    window_stride: ${model.preprocessor.window_stride}
+    subsampling_factor: ${model.encoder.subsampling_factor}
+
+  validation_ds:
+    manifest_filepath: ???
+    is_tarred: False
+    tarred_audio_filepaths: null
+    sample_rate: ${model.sample_rate}
+    num_spks: ${model.max_num_of_spks}
+    session_len_sec: 90
+    soft_label_thres: 0.5
+    soft_targets: False
+    labels: null
+    batch_size: ${batch_size}
+    shuffle: False
+    num_workers: ${num_workers}
+    validation_mode: True
+    # lhotse config
+    use_lhotse: False
+    use_bucketing: False
+    drop_last: False
+    pin_memory: True
+    window_stride: ${model.preprocessor.window_stride}
+    subsampling_factor: ${model.encoder.subsampling_factor}
+  
+  test_ds:
+    manifest_filepath: null
+    is_tarred: False
+    tarred_audio_filepaths: null
+    sample_rate: 16000
+    num_spks: ${model.max_num_of_spks}
+    session_len_sec: 90
+    soft_label_thres: 0.5
+    soft_targets: False
+    labels: null
+    batch_size: ${batch_size}
+    shuffle: False
+    seq_eval_mode: True
+    num_workers: ${num_workers}
+    validation_mode: True
+    # lhotse config
+    use_lhotse: False
+    use_bucketing: False
+    drop_last: False
+    pin_memory: True
+    window_stride: ${model.preprocessor.window_stride}
+    subsampling_factor: ${model.encoder.subsampling_factor}
+
+  preprocessor:
+    _target_: nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor
+    normalize: "NA"
+    window_size: 0.025
+    sample_rate: ${model.sample_rate}
+    window_stride: 0.01
+    window: "hann"
+    features: 128
+    n_fft: 512
+    frame_splicing: 1
+    dither: 0.00001
+
+  spec_augment:
+    _target_: nemo.collections.asr.modules.SpectrogramAugmentation
+    freq_masks: 0
+    time_masks: 0
+    freq_width: 1
+    time_width: 0.02
+  spec_augment_per_chunk: true
+
+  sortformer_modules:
+    _target_: nemo.collections.asr.modules.sortformer_modules.SortformerModules
+    num_spks: ${model.max_num_of_spks}
+    dropout_rate: 0.5
+    fc_d_model: ${model.model_defaults.fc_d_model}
+    tf_d_model: ${model.model_defaults.tf_d_model}
+    # Streaming mode parameters
+    spkcache_len: 188
+    fifo_len: 0
+    chunk_len: 188
+    spkcache_update_period: 188
+    chunk_left_context: 1
+    chunk_right_context: 1
+    # Speaker cache update parameters
+    spkcache_sil_frames_per_spk: 3
+    scores_add_rnd: 0
+    pred_score_threshold: 0.25
+    max_index: 99999
+    scores_boost_latest: 0.05
+    sil_threshold: 0.2
+    strong_boost_rate: 0.75
+    weak_boost_rate: 1.5
+    min_pos_scores_rate: 0.5
+    # Self-attention parameters (training only)
+    causal_attn_rate: 0.5
+    causal_attn_rc: 7
+
+  encoder:
+    _target_: nemo.collections.asr.modules.TransformerEncoder
+    feat_in: ${model.preprocessor.features}
+    feat_out: -1
+    n_layers: 31
+    d_model: ${model.model_defaults.fc_d_model}
+    n_heads: 8
+
+    # Sub-sampling: feature_stacking is the Transformer-native default; stacking and
+    # stacking_norm are also supported.
+    subsampling: feature_stacking
+    subsampling_factor: 8
+
+    # Feed-forward expansion
+    ff_expansion: 4.0
+
+    # Self-attention / positional encoding
+    self_attention_model: rel_pos
+    pos_emb_max_len: 5000
+    xscaling: false
+
+    # Attention block options
+    qkv_bias: false
+    qk_norm: false
+    pre_block_norm: true
+    attn_mode: full
+
+    # Regularization
+    drop_rate: 0.1
+    dropout_pre_encoder: 0.1
+    dropout_emb: 0.0
+
+    sync_max_audio_length: true
+  
+  transformer_encoder:
+    _target_: nemo.collections.asr.modules.transformer.transformer_encoders.TransformerEncoder
+    num_layers: 18
+    hidden_size: ${model.model_defaults.tf_d_model}
+    inner_size: 768
+    num_attention_heads: 8
+    attn_score_dropout: 0.5
+    attn_layer_dropout: 0.5
+    ffn_dropout: 0.5
+    hidden_act: relu
+    pre_ln: False
+    pre_ln_final_layer_norm: True
+  
+  loss: 
+    _target_: nemo.collections.asr.losses.bce_loss.BCELoss
+    weight: null
+    reduction: mean
+
+  lr: 0.0001
+  optim:
+    name: adamw
+    lr: ${model.lr}
+    betas: [0.9, 0.98]
+    weight_decay: 1e-3
+
+    sched:
+      name: InverseSquareRootAnnealing
+      warmup_steps: 500
+      warmup_ratio: null
+      min_lr: 1e-06
+
+trainer:
+  devices: 1
+  accelerator: gpu
+  precision: 32
+  max_epochs: 800
+  max_steps: -1
+  num_nodes: 1
+  strategy: ddp_find_unused_parameters_true
+  accumulate_grad_batches: 1
+  deterministic: True
+  enable_checkpointing: False
+  logger: False
+  log_every_n_steps: 1
+  val_check_interval: 1.0
+
+exp_manager:
+  use_datetime_version: False
+  exp_dir: null
+  name: ${name}
+  resume_if_exists: True
+  resume_from_checkpoint: null
+  resume_ignore_no_checkpoint: True
+  create_tensorboard_logger: True
+  create_checkpoint_callback: True
+  create_wandb_logger: False
+  checkpoint_callback_params:
+    monitor: "val_f1_acc"
+    mode: "max"
+    save_top_k: 9
+    every_n_epochs: 1
+  wandb_logger_kwargs:
+    resume: True
+    name: null
+    project: null
