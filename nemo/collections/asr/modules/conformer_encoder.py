@@ -34,6 +34,8 @@ from nemo.collections.asr.parts.submodules.multi_head_attention import (
     RelPositionalEncoding,
     RelPositionMultiHeadAttention,
     RelPositionMultiHeadAttentionLongformer,
+    RoPEMultiHeadAttention,
+    RotaryPositionalEncoding,
 )
 from nemo.collections.asr.parts.submodules.subsampling import (
     ConvSubsampling,
@@ -98,8 +100,14 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 overlapping chunks. Attention context is determined by att_context_size parameter.
             'abs_pos':
                 absolute positional embedding and Transformer
+            'rope':
+                rotary position embedding
 
             Default is rel_pos.
+        rope_base (float): theta base for the rotary position embedding. Only used when
+            ``self_attention_model='rope'``. Defaults to 10000.0.
+        rotary_fraction (float): fraction of the per-head dim to rotate. Only used when
+            ``self_attention_model='rope'``. Defaults to 1.0.
         pos_emb_max_len (int): the maximum length of positional embeddings
             Defaults to 5000
         n_heads (int): number of heads in multi-headed attention layers
@@ -326,6 +334,8 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         use_pytorch_sdpa: bool = False,
         use_pytorch_sdpa_backends=None,
         sync_max_audio_length: bool = True,
+        rope_base: float = 10000.0,
+        rotary_fraction: float = 1.0,
     ):
         super().__init__()
         d_ff = d_model * ff_expansion_factor
@@ -444,9 +454,24 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             self.pos_enc = PositionalEncoding(
                 d_model=d_model, dropout_rate=dropout_pre_encoder, max_len=pos_emb_max_len, xscale=self.xscale
             )
+        elif self_attention_model == "rope":
+            pos_bias_u = None
+            pos_bias_v = None
+            # 'rope' applies no additive positional embedding to the signal, so the
+            # pre-encoder dropout (normally inside the positional encoding) is applied here.
+            self.dropout_pre_encoder = torch.nn.Dropout(dropout_pre_encoder)
+            self.pos_enc = RotaryPositionalEncoding(
+                d_k=d_model // n_heads,
+                rotary_fraction=rotary_fraction,
+                rope_base=rope_base,
+                max_len=pos_emb_max_len,
+            )
         else:
             raise ValueError(f"Not valid self_attention_model: '{self_attention_model}'!")
 
+        # For 'rope', the shared RotaryPositionalEncoding is passed into each layer so the
+        # cos/sin buffers are computed once and reused across all attention modules.
+        layer_pos_enc = self.pos_enc if self_attention_model == 'rope' else None
         self.layers = nn.ModuleList()
         for i in range(n_layers):
             layer = ConformerLayer(
@@ -468,6 +493,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 use_bias=use_bias,
                 use_pytorch_sdpa=self.use_pytorch_sdpa,
                 use_pytorch_sdpa_backends=self.use_pytorch_sdpa_backends,
+                pos_enc=layer_pos_enc,
             )
             self.layers.append(layer)
 
@@ -653,7 +679,15 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             cache_len = 0
             offset = None
 
-        audio_signal, pos_emb = self.pos_enc(x=audio_signal, cache_len=cache_len)
+        if self.self_attention_model == 'rope':
+            # 'rope' adds no positional embedding to the signal; rotation is applied to
+            # Q/K inside each attention layer. xscale + pre-encoder dropout are applied here.
+            if self.xscale:
+                audio_signal = audio_signal * self.xscale
+            audio_signal = self.dropout_pre_encoder(audio_signal)
+            pos_emb = None
+        else:
+            audio_signal, pos_emb = self.pos_enc(x=audio_signal, cache_len=cache_len)
 
         # Create the self-attention and padding masks
         pad_mask, att_mask = self._create_masks(
@@ -712,7 +746,8 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 max_audio_length = audio_signal.size(1)
                 # Don't update the audio_signal here because then it will again scale the audio_signal
                 # and cause an increase in the WER
-                _, pos_emb = self.pos_enc(x=audio_signal, cache_len=cache_len)
+                if self.self_attention_model != 'rope':
+                    _, pos_emb = self.pos_enc(x=audio_signal, cache_len=cache_len)
                 pad_mask, att_mask = self._create_masks(
                     att_context_size=cur_att_context_size,
                     padding_length=length,
@@ -1077,6 +1112,8 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         att_context_size: List[int] = None,
         update_config: bool = True,
         device: torch.device = None,
+        rope_base: float = None,
+        rotary_fraction: float = None,
     ):
         """
         Update the self_attention_model which changes the positional encoding and attention layers.
@@ -1094,6 +1131,9 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 'abs_pos':
                     absolute positional embedding and Transformer
 
+                'rope':
+                    rotary position embedding
+
                 If None is provided, the self_attention_model isn't changed. Defaults to None.
             att_context_size (List[int]): List of 2 ints corresponding to left and right attention context sizes,
                 or None to keep as it is. Defaults to None.
@@ -1101,6 +1141,10 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 Defaults to True.
             device (torch.device): If provided, new layers will be moved to the device.
                 Defaults to None.
+            rope_base (float): Theta base for rotary position embedding. Only used when
+                ``self_attention_model='rope'``. If None, the stored config value is kept.
+            rotary_fraction (float): Fraction of the per-head dim to rotate. Only used when
+                ``self_attention_model='rope'``. If None, the stored config value is kept.
         """
 
         if att_context_size:
@@ -1110,6 +1154,11 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
 
         if self_attention_model is None:
             self_attention_model = self.self_attention_model
+
+        if rope_base is None:
+            rope_base = getattr(self._cfg, 'rope_base', 10000.0)
+        if rotary_fraction is None:
+            rotary_fraction = getattr(self._cfg, 'rotary_fraction', 1.0)
 
         if self_attention_model == 'rel_pos_local_attn' and max(att_context_size) <= 0:
             raise ValueError("When using local attention, context size must be set > 0")
@@ -1137,6 +1186,14 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 dropout_rate=self._cfg.dropout,
                 max_len=self._cfg.pos_emb_max_len,
                 xscale=self.xscale,
+            )
+        elif self_attention_model == "rope":
+            self.dropout_pre_encoder = torch.nn.Dropout(getattr(self._cfg, 'dropout_pre_encoder', 0.1))
+            new_pos_enc = RotaryPositionalEncoding(
+                d_k=self._cfg.d_model // self._cfg.n_heads,
+                rotary_fraction=rotary_fraction,
+                rope_base=rope_base,
+                max_len=self._cfg.pos_emb_max_len,
             )
         else:
             raise ValueError(f"Not valid self_attention_model: '{self_attention_model}'!")
@@ -1183,10 +1240,20 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                         use_pytorch_sdpa=self.use_pytorch_sdpa,
                         use_pytorch_sdpa_backends=self.use_pytorch_sdpa_backends,
                     )
+                elif self_attention_model == 'rope':
+                    new_attn = RoPEMultiHeadAttention(
+                        n_head=self._cfg.n_heads,
+                        n_feat=self._cfg.d_model,
+                        dropout_rate=self._cfg.dropout_att,
+                        pos_enc=new_pos_enc,
+                        max_cache_len=att_context_size[0],
+                        use_pytorch_sdpa=self.use_pytorch_sdpa,
+                        use_pytorch_sdpa_backends=self.use_pytorch_sdpa_backends,
+                    )
                 else:
                     raise ValueError(
                         f"'{self_attention_model}' is not not a valid value for 'self_attention_model', "
-                        f"valid values can be from ['rel_pos', 'rel_pos_local_attn', 'abs_pos']"
+                        f"valid values can be from ['rel_pos', 'rel_pos_local_attn', 'abs_pos', 'rope']"
                     )
                 if device is not None:
                     new_attn = new_attn.to(device=device)
@@ -1199,6 +1266,9 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             with open_dict(self._cfg):
                 self._cfg.self_attention_model = self_attention_model
                 self._cfg.att_context_size = att_context_size
+                if self_attention_model == 'rope':
+                    self._cfg.rope_base = rope_base
+                    self._cfg.rotary_fraction = rotary_fraction
 
     def change_subsampling_conv_chunking_factor(self, subsampling_conv_chunking_factor: int):
         """
@@ -1932,6 +2002,7 @@ class ConformerChangeConfig:
      'rel_pos_local_attn': relative positional embedding and Transformer-XL with local attention using
       overlapping chunks. Attention context is determined by att_context_size parameter.
      'abs_pos': absolute positional embedding and Transformer
+     'rope': rotary position embedding
     """
 
     # If None is provided, self_attention_model is not changed.
@@ -1941,3 +2012,9 @@ class ConformerChangeConfig:
     # corresponding to left and right context, or -1 for full context.
     # If None is provided, the attention context size isn't changed.
     att_context_size: Optional[List[int]] = None
+
+    # Rotary position embedding parameters; only used when self_attention_model is
+    # being set to (or already is) 'rope'. If None, the values from the stored
+    # config are kept.
+    rope_base: Optional[float] = None
+    rotary_fraction: Optional[float] = None
