@@ -94,6 +94,7 @@ class SortformerModules(NeuralModule, Exportable):
         strong_boost_rate: float = 0.75,
         weak_boost_rate: float = 1.5,
         min_pos_scores_rate: float = 0.5,
+        use_learnable_sil_emb: bool = False,
     ):
         super().__init__()
         # General params
@@ -139,6 +140,13 @@ class SortformerModules(NeuralModule, Exportable):
         self.strong_boost_rate = strong_boost_rate
         self.weak_boost_rate = weak_boost_rate
         self.min_pos_scores_rate = min_pos_scores_rate
+
+        # Silence embedding used to fill disabled (placeholder) speaker-cache slots.
+        # Default (False): data-dependent running mean of silence frames (`mean_sil_emb`).
+        # Optional (True): a single learned embedding, bypassing the running-mean machinery.
+        self.use_learnable_sil_emb = use_learnable_sil_emb
+        if self.use_learnable_sil_emb:
+            self.learnable_sil_emb = nn.Parameter(torch.zeros(self.fc_d_model))
 
     def _check_streaming_parameters(self):
         """
@@ -771,15 +779,16 @@ class SortformerModules(NeuralModule, Exportable):
                 streaming_state.spkcache_lengths[batch_index] += pop_out_len
                 pop_out_embs = updated_fifo[batch_index, :pop_out_len, :]
                 pop_out_preds = updated_fifo_preds[batch_index, :pop_out_len, :]
-                (
-                    streaming_state.mean_sil_emb[batch_index : batch_index + 1],
-                    streaming_state.n_sil_frames[batch_index : batch_index + 1],
-                ) = self._get_silence_profile(
-                    streaming_state.mean_sil_emb[batch_index : batch_index + 1],
-                    streaming_state.n_sil_frames[batch_index : batch_index + 1],
-                    pop_out_embs.unsqueeze(0),
-                    pop_out_preds.unsqueeze(0),
-                )
+                if not self.use_learnable_sil_emb:
+                    (
+                        streaming_state.mean_sil_emb[batch_index : batch_index + 1],
+                        streaming_state.n_sil_frames[batch_index : batch_index + 1],
+                    ) = self._get_silence_profile(
+                        streaming_state.mean_sil_emb[batch_index : batch_index + 1],
+                        streaming_state.n_sil_frames[batch_index : batch_index + 1],
+                        pop_out_embs.unsqueeze(0),
+                        pop_out_preds.unsqueeze(0),
+                    )
                 updated_spkcache[batch_index, spkcache_len : spkcache_len + pop_out_len, :] = pop_out_embs
                 if updated_spkcache_preds[batch_index, 0, 0] >= 0:
                     # speaker cache already compressed at least once
@@ -879,12 +888,13 @@ class SortformerModules(NeuralModule, Exportable):
 
             pop_out_embs = streaming_state.fifo[:, :pop_out_len]
             pop_out_preds = streaming_state.fifo_preds[:, :pop_out_len]
-            streaming_state.mean_sil_emb, streaming_state.n_sil_frames = self._get_silence_profile(
-                streaming_state.mean_sil_emb,
-                streaming_state.n_sil_frames,
-                pop_out_embs,
-                pop_out_preds,
-            )
+            if not self.use_learnable_sil_emb:
+                streaming_state.mean_sil_emb, streaming_state.n_sil_frames = self._get_silence_profile(
+                    streaming_state.mean_sil_emb,
+                    streaming_state.n_sil_frames,
+                    pop_out_embs,
+                    pop_out_preds,
+                )
             streaming_state.fifo = streaming_state.fifo[:, pop_out_len:]
             streaming_state.fifo_preds = streaming_state.fifo_preds[:, pop_out_len:]
 
@@ -1163,6 +1173,10 @@ class SortformerModules(NeuralModule, Exportable):
                 Shape: (batch_size, n_spk)
         """
         batch_size, n_frames, n_spk = preds.shape
+        if self.use_learnable_sil_emb:
+            # Use the learned silence embedding instead of the data-dependent running mean.
+            mean_sil_emb = self.learnable_sil_emb.to(dtype=emb_seq.dtype, device=emb_seq.device)
+            mean_sil_emb = mean_sil_emb.unsqueeze(0).expand(batch_size, -1)
         spkcache_len_per_spk = self.spkcache_len // n_spk - self.spkcache_sil_frames_per_spk
         strong_boost_per_spk = math.floor(spkcache_len_per_spk * self.strong_boost_rate)
         weak_boost_per_spk = math.floor(spkcache_len_per_spk * self.weak_boost_rate)

@@ -141,6 +141,7 @@ model:
     max_index: 99999 # Maximum allowed index value for internal processing in speaker cache update
     scores_boost_latest: 0.05 # Gain for scores for recently added frames in speaker cache update
     sil_threshold: 0.2 # Threshold for determining silence frames to calculate average silence embedding
+    use_learnable_sil_emb: false # If true, fill disabled speaker-cache slots with a single learned embedding instead of the running mean of silence frames
     strong_boost_rate: 0.75 # Rate determining number of frames per speaker that receive strong score boosting
     weak_boost_rate: 1.5 # Rate determining number of frames per speaker that receive weak score boosting
     min_pos_scores_rate: 0.5 # Rate threshold for dropping overlapping frames when enough non-overlapping exist
