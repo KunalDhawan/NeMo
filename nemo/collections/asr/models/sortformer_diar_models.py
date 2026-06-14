@@ -66,11 +66,23 @@ class _OversamplingDistributedSampler(torch.utils.data.DistributedSampler):
             samples, cycling through the dataset as many times as needed.
     """
 
-    def __init__(self, dataset, *, num_samples_per_epoch: int, **kwargs):
+    def __init__(self, dataset, *, num_samples_per_epoch: int, trainer=None, **kwargs):
         super().__init__(dataset, **kwargs)
         self._target = max(math.ceil(num_samples_per_epoch / self.num_replicas), 1)
+        # Handle on the PTL trainer so the shuffle epoch can follow the *restored* global
+        # epoch on resume. A freshly-constructed sampler starts at epoch 0, and on a mid-epoch
+        # resume its iterator is built (FitLoop.setup_data) before Lightning calls set_epoch(),
+        # which would otherwise replay the epoch-0 ordering instead of continuing the schedule.
+        self._trainer = trainer
 
     def __iter__(self):
+        # Align the shuffle epoch with the trainer's (restored) epoch before the base
+        # DistributedSampler permutation is computed, so a resumed run continues the data
+        # schedule rather than rewinding to the epoch-0 ordering.
+        if self._trainer is not None:
+            current_epoch = getattr(self._trainer, "current_epoch", None)
+            if current_epoch is not None:
+                self.epoch = current_epoch
         base = list(super().__iter__())
         if len(base) == 0:
             raise ValueError(
@@ -359,6 +371,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 num_replicas=self.world_size,
                 rank=global_rank,
                 shuffle=shuffle,
+                trainer=self._trainer,
             )
             shuffle = False
 

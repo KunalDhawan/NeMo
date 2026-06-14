@@ -1433,6 +1433,7 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
     def _create_subsegment(self, sample, offset):
         duration = sample.duration
 
+        random_dbg = random.random() # DELETE ME
         # Pre-crop: for very long files, randomly select a window to avoid
         # loading the entire file from disk (major I/O bottleneck for 30min+ files).
         if self.session_len_sec > 0 and duration > self.session_len_sec * 6:
@@ -1674,7 +1675,7 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
 
         actual_n_spk = (targets >= self.soft_label_thres).any(dim=0).sum().item()
         logging.info(
-            f"uniq_id: {sample.uniq_id}, targets shape: {targets.shape}, target_len: {target_len}, actual n_spk: {actual_n_spk}, speaker_names: {speaker_names}"
+            f"uniq_id: {sample.uniq_id}, random_dbg: {random_dbg}, targets shape: {targets.shape}, target_len: {target_len}, actual n_spk: {actual_n_spk}, speaker_names: {speaker_names}"
         )
         return audio_signal, audio_signal_length, targets, target_len, speaker_names
 
