@@ -1169,6 +1169,28 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         }
         return train_metrics
 
+    def on_train_start(self):
+        super().on_train_start()
+        # Ad-hoc fix: on resume PL restores the LR scheduler's `max_steps` from the
+        # checkpoint, overwriting the (possibly extended) value built from config.
+        # For InverseSquareRootAnnealing this re-activates the
+        # `step > max_steps -> min_lr` clamp and pins the LR at min_lr. Re-apply the
+        # trainer's max_steps here, after restoration and before training begins.
+        max_steps = self.trainer.max_steps if self.trainer is not None else None
+        if max_steps is not None and max_steps > 0:
+            schedulers = self.lr_schedulers()
+            if schedulers is None:
+                schedulers = []
+            elif not isinstance(schedulers, (list, tuple)):
+                schedulers = [schedulers]
+            for sched in schedulers:
+                if hasattr(sched, "max_steps") and sched.max_steps != max_steps:
+                    logging.info(
+                        f"Overriding restored scheduler max_steps "
+                        f"{sched.max_steps} -> {max_steps} from trainer config."
+                    )
+                    sched.max_steps = max_steps
+
     def training_step(self, batch: list, batch_idx: int) -> dict:
         """
         Performs a single training step.
