@@ -75,6 +75,29 @@ class _OversamplingDistributedSampler(torch.utils.data.DistributedSampler):
         # which would otherwise replay the epoch-0 ordering instead of continuing the schedule.
         self._trainer = trainer
 
+    def _partial_resume_offset(self) -> int:
+        """Return a nonzero shuffle offset when resuming into a partially completed epoch.
+
+        On a mid-epoch resume the trainer restores ``current_epoch`` with some batches
+        already consumed, then replays the *same* epoch ordering for the remaining steps.
+        Because the shuffle seed is derived from the epoch index alone, those remaining
+        steps would re-show samples already seen earlier in this very epoch. Deriving an
+        offset from the number of already-processed batches lets us shift to a disjoint
+        seed so the rest of the epoch draws fresh data instead.
+
+        The offset is deterministic for a given resume point and is 0 at normal epoch
+        starts (``processed == 0``), so uninterrupted runs are unaffected and only the
+        partially completed epoch is perturbed. The offset may occasionally coincide with
+        another epoch's seed; such collisions are rare and harmless.
+        """
+        if self._trainer is None:
+            return 0
+        try:
+            processed = int(self._trainer.fit_loop.epoch_loop.batch_progress.current.processed)
+        except AttributeError:
+            return 0
+        return max(processed, 0)
+
     def __iter__(self):
         # Align the shuffle epoch with the trainer's (restored) epoch before the base
         # DistributedSampler permutation is computed, so a resumed run continues the data
@@ -83,6 +106,10 @@ class _OversamplingDistributedSampler(torch.utils.data.DistributedSampler):
             current_epoch = getattr(self._trainer, "current_epoch", None)
             if current_epoch is not None:
                 self.epoch = current_epoch
+        # On a mid-epoch resume, shift to a disjoint seed namespace so that both the base
+        # DistributedSampler permutation and the oversampling cycles below produce a fresh
+        # ordering, rather than replaying the samples already consumed this epoch.
+        self.epoch += self._partial_resume_offset()
         base = list(super().__iter__())
         if len(base) == 0:
             raise ValueError(
