@@ -204,6 +204,15 @@ model:
     weight: null # Weight for binary cross-entropy loss. Either `null` or list type input. (e.g. [0.5,0.5])
     reduction: mean
 
+  # Loss-only target softening. Applied exclusively to the targets fed to the BCE loss;
+  # F1/accuracy metrics keep using the original hard (0/1) targets, so reported metrics
+  # stay comparable. Useful at fine output resolution (output_subsampling_factor near 1),
+  # where targets are hard 0/1 with abrupt jumps at speaker onsets/offsets. Disabled by default.
+  loss_target_smooth_kernel: 1 # Temporal boundary smoothing window in output frames (odd). 1 disables it (e.g. 5 ~= 50ms at 10ms frames).
+  loss_target_smooth_type: gaussian # Smoothing kernel type: 'gaussian' or 'uniform' (ignored when loss_target_smooth_kernel <= 1).
+  loss_target_smooth_sigma: null # Gaussian std in frames; null defaults to (kernel-1)/4 (ignored for 'uniform').
+  loss_label_smoothing: 0.0 # Clamp loss targets to [eps, 1-eps] to curb BCE overconfidence. 0.0 disables it (e.g. 0.05).
+
   lr: 0.0001
   optim:
     name: adamw

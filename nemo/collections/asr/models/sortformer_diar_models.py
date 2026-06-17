@@ -281,6 +281,38 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.negative_init_val = -99
         self.loss = instantiate(self._cfg.loss)
 
+        # Loss-only target softening. These transforms are applied exclusively to the
+        # targets fed to the BCE loss; the F1/accuracy metrics keep using the original
+        # hard (0/1) targets, so reported metrics remain comparable across runs.
+        #   (1) loss_target_smooth_kernel: temporal boundary smoothing window (in output
+        #       frames, must be odd). 1 disables it. Softens the abrupt 0->1 jumps at
+        #       speaker onsets/offsets, which is especially relevant at fine output
+        #       resolution (output_subsampling_factor close to 1).
+        #   (2) loss_label_smoothing: clamps targets to [eps, 1 - eps] to curb BCE
+        #       overconfidence. 0.0 disables it.
+        # Both default to disabled, so existing configs are unaffected.
+        self.loss_target_smooth_kernel = int(self._cfg.get("loss_target_smooth_kernel", 1))
+        self.loss_target_smooth_type = self._cfg.get("loss_target_smooth_type", "gaussian")
+        self.loss_target_smooth_sigma = self._cfg.get("loss_target_smooth_sigma", None)
+        self.loss_label_smoothing = float(self._cfg.get("loss_label_smoothing", 0.0))
+        if not 0.0 <= self.loss_label_smoothing < 0.5:
+            raise ValueError(
+                f"loss_label_smoothing must be in [0.0, 0.5), got {self.loss_label_smoothing}"
+            )
+        self._loss_smooth_kernel_1d = None
+        if self.loss_target_smooth_kernel > 1:
+            if self.loss_target_smooth_kernel % 2 == 0:
+                raise ValueError(
+                    "loss_target_smooth_kernel must be odd to preserve sequence length, "
+                    f"got {self.loss_target_smooth_kernel}"
+                )
+            if self.loss_target_smooth_type not in ("gaussian", "uniform"):
+                raise ValueError(
+                    "loss_target_smooth_type must be 'gaussian' or 'uniform', "
+                    f"got {self.loss_target_smooth_type}"
+                )
+            self._loss_smooth_kernel_1d = self._build_loss_smooth_kernel()
+
         self.async_streaming = self._cfg.get("async_streaming", False)
         self.streaming_mode = self._cfg.get("streaming_mode", False)
         if self.streaming_mode:
@@ -1143,6 +1175,71 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         return streaming_state, total_preds
 
+    def _build_loss_smooth_kernel(self) -> torch.Tensor:
+        """Build the 1-D temporal smoothing kernel for loss-target softening.
+
+        Returns a length-``loss_target_smooth_kernel`` float32 tensor that sums to 1.
+        For 'gaussian', the standard deviation defaults to ``(K - 1) / 4`` (so the
+        window spans roughly +/- 2 sigma) unless ``loss_target_smooth_sigma`` is set.
+        """
+        kernel_len = self.loss_target_smooth_kernel
+        if self.loss_target_smooth_type == "uniform":
+            kernel = torch.ones(kernel_len, dtype=torch.float32)
+        else:
+            sigma = self.loss_target_smooth_sigma
+            if sigma is None or sigma <= 0:
+                sigma = max((kernel_len - 1) / 4.0, 1e-6)
+            positions = torch.arange(kernel_len, dtype=torch.float32) - (kernel_len - 1) / 2.0
+            kernel = torch.exp(-0.5 * (positions / sigma) ** 2)
+        return kernel / kernel.sum()
+
+    def _soften_targets_for_loss(self, targets: torch.Tensor, target_lens: torch.Tensor) -> torch.Tensor:
+        """Produce soft training targets for the BCE loss without affecting metrics.
+
+        Applies, in order: (1) temporal boundary smoothing via a mask-normalized
+        depthwise 1-D convolution along time (independently per speaker channel), and
+        (2) label smoothing by clamping to ``[eps, 1 - eps]``. Returns ``targets``
+        unchanged when both transforms are disabled.
+
+        The convolution is normalized using a validity mask derived from
+        ``target_lens`` so that zero-padded frames beyond each sample's length do not
+        bleed into valid frames (and the activity plateau at a sample's true end is
+        not spuriously ramped toward zero).
+
+        Args:
+            targets (torch.Tensor): Hard targets of shape (B, T, S).
+            target_lens (torch.Tensor): Valid sequence lengths of shape (B,).
+
+        Returns:
+            torch.Tensor: Softened targets of shape (B, T, S).
+        """
+        if self.loss_target_smooth_kernel <= 1 and self.loss_label_smoothing <= 0.0:
+            return targets
+
+        soft = targets
+        if self.loss_target_smooth_kernel > 1:
+            _, num_frames, num_spks = targets.shape
+            kernel_len = self.loss_target_smooth_kernel
+            pad = kernel_len // 2
+            kernel = self._loss_smooth_kernel_1d.to(device=targets.device, dtype=targets.dtype)
+
+            # Validity mask from target_lens: (B, 1, T), 1 inside each sample, 0 on padding.
+            frame_idx = torch.arange(num_frames, device=targets.device).unsqueeze(0)  # (1, T)
+            valid = (frame_idx < target_lens.to(targets.device).unsqueeze(1)).to(targets.dtype)  # (B, T)
+            valid = valid.unsqueeze(1)  # (B, 1, T)
+
+            signal = targets.transpose(1, 2) * valid  # (B, S, T), zeroed outside valid region
+            depthwise_w = kernel.view(1, 1, kernel_len).repeat(num_spks, 1, 1).contiguous()  # (S, 1, K)
+            numerator = torch.nn.functional.conv1d(signal, depthwise_w, padding=pad, groups=num_spks)
+            denominator = torch.nn.functional.conv1d(valid, kernel.view(1, 1, kernel_len), padding=pad)
+            smoothed = numerator / denominator.clamp_min(self.eps)  # (B, S, T)
+            soft = (smoothed * valid).transpose(1, 2)  # (B, T, S), padding restored to 0
+
+        if self.loss_label_smoothing > 0.0:
+            eps = self.loss_label_smoothing
+            soft = soft.clamp(min=eps, max=1.0 - eps)
+        return soft
+
     def _get_aux_train_evaluations(self, preds, targets, target_lens) -> dict:
         """
         Compute auxiliary training evaluations including losses and metrics.
@@ -1174,8 +1271,14 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             preds = preds[:, : targets.shape[1], :]
         targets_ats, _ = get_ats_targets_hungarian(targets.clone(), preds, apply_sigmoid=False)
         targets_pil, _ = get_pil_targets_hungarian(targets.clone(), preds, apply_sigmoid=False)
-        ats_loss = self.loss(probs=preds, labels=targets_ats, target_lens=target_lens)
-        pil_loss = self.loss(probs=preds, labels=targets_pil, target_lens=target_lens)
+        # Soften only the loss targets (boundary + label smoothing); metrics below
+        # keep using the original hard targets so F1/accuracy stay unaffected.
+        ats_loss = self.loss(
+            probs=preds, labels=self._soften_targets_for_loss(targets_ats, target_lens), target_lens=target_lens
+        )
+        pil_loss = self.loss(
+            probs=preds, labels=self._soften_targets_for_loss(targets_pil, target_lens), target_lens=target_lens
+        )
         loss = self.ats_weight * ats_loss + self.pil_weight * pil_loss
 
         self._accuracy_train(preds, targets_pil, target_lens)
@@ -1273,8 +1376,14 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         targets_ats, _ = get_ats_targets_hungarian(targets.clone(), preds, apply_sigmoid=False)
         targets_pil, _ = get_pil_targets_hungarian(targets.clone(), preds, apply_sigmoid=False)
 
-        val_ats_loss = self.loss(probs=preds, labels=targets_ats, target_lens=target_lens)
-        val_pil_loss = self.loss(probs=preds, labels=targets_pil, target_lens=target_lens)
+        # Soften only the loss targets (boundary + label smoothing); metrics below
+        # keep using the original hard targets so F1/accuracy stay unaffected.
+        val_ats_loss = self.loss(
+            probs=preds, labels=self._soften_targets_for_loss(targets_ats, target_lens), target_lens=target_lens
+        )
+        val_pil_loss = self.loss(
+            probs=preds, labels=self._soften_targets_for_loss(targets_pil, target_lens), target_lens=target_lens
+        )
         val_loss = self.ats_weight * val_ats_loss + self.pil_weight * val_pil_loss
 
         self._accuracy_valid(preds, targets_pil, target_lens)
