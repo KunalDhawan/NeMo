@@ -20,6 +20,7 @@ model:
   sample_rate: 16000
   pil_weight: 0.5
   ats_weight: 0.5
+  pairwise_ats_weight: 0.0 # Weight for pairwise ATS loss (enforces arrival ordering per speaker-pair; 0 disables)
   max_num_of_spks: 4
   output_subsampling_factor: 8
   upsample_smooth_kernel: 9
