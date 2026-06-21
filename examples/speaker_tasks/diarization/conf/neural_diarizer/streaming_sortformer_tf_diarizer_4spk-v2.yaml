@@ -21,6 +21,7 @@ model:
   pil_weight: 0.5
   ats_weight: 0.5
   pairwise_ats_weight: 0.0 # Weight for pairwise ATS loss (enforces arrival ordering per speaker-pair; 0 disables)
+  self_ats_weight: 0.0 # Weight for self-ATS loss (orders channels by predicted onset; NOT normalized with the others; 0 disables)
   max_num_of_spks: 4
   output_subsampling_factor: 8
   upsample_smooth_kernel: 9

@@ -340,6 +340,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.pil_weight = pil_weight / total_weight
         self.ats_weight = ats_weight / total_weight
         self.pairwise_ats_weight = pairwise_ats_weight / total_weight
+        # self_ats_weight is applied as a raw multiplier on top of the normalized
+        # PIL/ATS/pairwise-ATS combination (intentionally NOT normalized with them).
+        self.self_ats_weight = self._cfg.get("self_ats_weight", 0.0)
 
     def _init_eval_metrics(self):
         """
@@ -1301,6 +1304,49 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         return torch.stack(pair_losses).mean()
 
+    def _self_ats_loss(self, preds, target_lens):
+        """
+        Compute a self-referential Arrival Time Sort (self-ATS) loss.
+
+        Unlike ats_loss / pairwise_ats_loss, whose ordering target is derived from the
+        ground-truth arrival times, self-ATS derives the target from the model's OWN
+        predictions: it sorts the predicted channels by their predicted onset and asks the
+        model to already be in that order. The loss is therefore (near) zero whenever the
+        predicted channels are self-consistently ordered by onset, regardless of ground
+        truth, and produces a gradient that pushes mis-ordered channels toward onset order.
+        PIL is expected to supply the separation/detection signal; this term only
+        canonicalizes the ordering of whatever the model predicts. By construction it does
+        not penalize ordering for speakers the model fails to detect (e.g. a missed short
+        early speaker), since the target is built only from predicted channels.
+
+        Notes:
+            - The target is the (detached) onset-sorted copy of preds. Because it is soft,
+              the BCE has an entropy floor, so the logged value is not exactly zero at
+              perfect ordering; its gradient, however, is ~zero when already sorted.
+            - Ties in predicted onset are broken by a stable sort (current channel order is
+              kept), avoiding spurious swap gradients between equally-onset channels.
+
+        Args:
+            preds (torch.Tensor): Predicted probabilities of shape (B, T, N).
+            target_lens (torch.Tensor): Valid sequence lengths of shape (B,).
+
+        Returns:
+            torch.Tensor: Scalar self-ATS loss.
+        """
+        num_spks = preds.shape[2]
+        if num_spks < 2:
+            return torch.zeros((), device=preds.device, dtype=preds.dtype)
+
+        # Predicted onset (first frame above threshold) per channel; empty channels -> T.
+        onsets = find_first_nonzero(preds.detach(), max_cap_val=preds.shape[1])  # (B, N)
+        # Permutation sorting channels by predicted onset; stable keeps current order on ties.
+        perm = torch.argsort(onsets, dim=1, stable=True)  # (B, N)
+        # Onset-sorted target: position k receives the content of the k-th earliest channel.
+        index = perm.unsqueeze(1).expand(-1, preds.shape[1], -1)  # (B, T, N)
+        self_ats_target = torch.gather(preds, dim=2, index=index).detach()  # (B, T, N)
+
+        return self.loss(probs=preds, labels=self_ats_target, target_lens=target_lens)
+
     def _get_aux_train_evaluations(self, preds, targets, target_lens) -> dict:
         """
         Compute auxiliary training evaluations including losses and metrics.
@@ -1340,11 +1386,16 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         pil_loss = self.loss(
             probs=preds, labels=self._soften_targets_for_loss(targets_pil, target_lens), target_lens=target_lens
         )
-        pairwise_ats_loss = self._pairwise_ats_loss(preds, targets_pil, target_lens)
+        if self.pairwise_ats_weight > 0:
+            pairwise_ats_loss = self._pairwise_ats_loss(preds, targets_pil, target_lens)
+        else:
+            pairwise_ats_loss = torch.zeros((), device=preds.device, dtype=preds.dtype)
+        self_ats_loss = self._self_ats_loss(preds, target_lens)
         loss = (
             self.ats_weight * ats_loss
             + self.pil_weight * pil_loss
             + self.pairwise_ats_weight * pairwise_ats_loss
+            + self.self_ats_weight * self_ats_loss
         )
 
         self._accuracy_train(preds, targets_pil, target_lens)
@@ -1358,6 +1409,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'ats_loss': ats_loss,
             'pil_loss': pil_loss,
             'pairwise_ats_loss': pairwise_ats_loss,
+            'self_ats_loss': self_ats_loss,
             'learning_rate': self._optimizer.param_groups[0]['lr'],
             'train_f1_acc': train_f1_acc,
             'train_precision': train_precision,
@@ -1451,11 +1503,16 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         val_pil_loss = self.loss(
             probs=preds, labels=self._soften_targets_for_loss(targets_pil, target_lens), target_lens=target_lens
         )
-        val_pairwise_ats_loss = self._pairwise_ats_loss(preds, targets_pil, target_lens)
+        if self.pairwise_ats_weight > 0:
+            val_pairwise_ats_loss = self._pairwise_ats_loss(preds, targets_pil, target_lens)
+        else:
+            val_pairwise_ats_loss = torch.zeros((), device=preds.device, dtype=preds.dtype)
+        val_self_ats_loss = self._self_ats_loss(preds, target_lens)
         val_loss = (
             self.ats_weight * val_ats_loss
             + self.pil_weight * val_pil_loss
             + self.pairwise_ats_weight * val_pairwise_ats_loss
+            + self.self_ats_weight * val_self_ats_loss
         )
 
         self._accuracy_valid(preds, targets_pil, target_lens)
@@ -1472,6 +1529,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'val_ats_loss': val_ats_loss,
             'val_pil_loss': val_pil_loss,
             'val_pairwise_ats_loss': val_pairwise_ats_loss,
+            'val_self_ats_loss': val_self_ats_loss,
             'val_f1_acc': val_f1_acc,
             'val_precision': val_precision,
             'val_recall': val_recall,
@@ -1544,6 +1602,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         val_ats_loss_mean = torch.stack([x['val_ats_loss'] for x in outputs]).mean()
         val_pil_loss_mean = torch.stack([x['val_pil_loss'] for x in outputs]).mean()
         val_pairwise_ats_loss_mean = torch.stack([x['val_pairwise_ats_loss'] for x in outputs]).mean()
+        val_self_ats_loss_mean = torch.stack([x['val_self_ats_loss'] for x in outputs]).mean()
         val_f1_acc_mean = torch.stack([x['val_f1_acc'] for x in outputs]).mean()
         val_precision_mean = torch.stack([x['val_precision'] for x in outputs]).mean()
         val_recall_mean = torch.stack([x['val_recall'] for x in outputs]).mean()
@@ -1556,6 +1615,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'val_ats_loss': val_ats_loss_mean,
             'val_pil_loss': val_pil_loss_mean,
             'val_pairwise_ats_loss': val_pairwise_ats_loss_mean,
+            'val_self_ats_loss': val_self_ats_loss_mean,
             'val_f1_acc': val_f1_acc_mean,
             'val_precision': val_precision_mean,
             'val_recall': val_recall_mean,
