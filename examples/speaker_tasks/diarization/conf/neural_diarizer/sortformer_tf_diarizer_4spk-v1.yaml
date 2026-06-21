@@ -16,6 +16,7 @@ model:
   sample_rate: 16000
   pil_weight: 0.5
   ats_weight: 0.5
+  ats_tolerance: 0 # Arrival-time tolerance (output frames) for ATS targets; speakers within this many frames are treated as tied/reorderable (0 = exact sort)
   pairwise_ats_weight: 0.0 # Weight for pairwise ATS loss (enforces arrival ordering per speaker-pair; 0 disables)
   self_ats_weight: 0.0 # Weight for self-ATS loss (orders channels by predicted onset; NOT normalized with the others; 0 disables)
   max_num_of_spks: 4
