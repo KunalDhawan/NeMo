@@ -330,19 +330,28 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
     def _init_loss_weights(self):
         pil_weight = self._cfg.get("pil_weight", 0.0)
         ats_weight = self._cfg.get("ats_weight", 1.0)
-        pairwise_ats_weight = self._cfg.get("pairwise_ats_weight", 0.0)
-        total_weight = pil_weight + ats_weight + pairwise_ats_weight
+        total_weight = pil_weight + ats_weight
         if total_weight == 0:
-            raise ValueError(
-                f"weights for PIL {pil_weight}, ATS {ats_weight} and pairwise ATS "
-                f"{pairwise_ats_weight} cannot sum to 0"
-            )
+            raise ValueError(f"weights for PIL {pil_weight} and ATS {ats_weight} cannot sum to 0")
         self.pil_weight = pil_weight / total_weight
         self.ats_weight = ats_weight / total_weight
-        self.pairwise_ats_weight = pairwise_ats_weight / total_weight
-        # self_ats_weight is applied as a raw multiplier on top of the normalized
-        # PIL/ATS/pairwise-ATS combination (intentionally NOT normalized with them).
+        # pairwise_ats_weight and self_ats_weight are applied as raw multipliers on top of the
+        # normalized PIL/ATS combination (intentionally NOT normalized with them).
+        self.pairwise_ats_weight = self._cfg.get("pairwise_ats_weight", 0.0)
         self.self_ats_weight = self._cfg.get("self_ats_weight", 0.0)
+        # Distance used by the self-ATS loss: 'bce' (default; matches the other losses but has
+        # an entropy floor, so the logged value is > 0 even when perfectly self-consistent) or
+        # 'mse' (no floor: value is 0 when self-consistent, and a gentler bounded gradient).
+        self.self_ats_metric = str(self._cfg.get("self_ats_metric", "bce")).lower()
+        if self.self_ats_metric not in ("bce", "mse"):
+            raise ValueError(f"self_ats_metric must be 'bce' or 'mse', got '{self.self_ats_metric}'")
+        # Temperature for the self-ATS loss, applied symmetrically to both the probs side and
+        # the target. T < 1 sharpens predictions toward 0/1 (countering the softening a soft
+        # self-target induces and amplifying the reordering gradient by ~1/T) while preserving
+        # the zero-loss / zero-gradient-when-sorted property; T == 1.0 disables sharpening.
+        self.self_ats_temperature = float(self._cfg.get("self_ats_temperature", 1.0))
+        if self.self_ats_temperature <= 0:
+            raise ValueError(f"self_ats_temperature must be > 0, got {self.self_ats_temperature}")
         # Arrival-time tolerance (in output frames) for ATS target construction. Speakers whose
         # arrival times differ by at most this value are treated as tied and may be reordered by
         # the model (the Hungarian step then uses predictions to assign them). Relaxes ordering
@@ -1255,59 +1264,65 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             soft = soft.clamp(min=eps, max=1.0 - eps)
         return soft
 
-    def _pairwise_ats_loss(self, preds, targets_pil, target_lens):
+    def _pairwise_ats_loss(self, preds, target_lens):
         """
-        Compute a pairwise variant of the Arrival Time Sort (ATS) loss.
+        Onset-based pairwise Arrival Time Sort loss (duration-invariant, self-referential).
 
-        Standard ATS builds a single global arrival-time permutation of the targets, so a
-        single misplaced speaker shifts the assignment of every output channel and is
-        penalized as if the whole prediction were wrong (e.g. a perfect separation emitted
-        in cyclically shifted channels). This pairwise version instead enforces arrival
-        ordering one channel-pair at a time, anchored on the PIL assignment
-        (``targets_pil[:, :, k]`` is the ground-truth speaker the model placed in channel
-        ``k``). For each pair of channels ``(i, j)`` with ``i < j``, the lower-index channel
-        should carry the earlier-arriving of the two PIL-assigned speakers; if the PIL
-        assignment already respects arrival order the pair target is unchanged, otherwise the
-        two targets are swapped. A binary cross-entropy is then computed per pair and averaged
-        over all pairs. The resulting penalty grows with the number of arrival-order
-        inversions (Kendall-tau distance) rather than collapsing to an all-or-nothing global
-        mismatch, so a single misplaced speaker only affects the pairs that involve it.
+        For each output channel a differentiable first-onset distribution is built from the
+        predictions via a survival product, and the pairwise "arrives-before" probabilities
+
+            P[i, j] = Pr(onset_i < onset_j) = sum_t f_i(t) * Sv_j(t)
+
+        are computed, where ``Sv_i(t)`` is the probability that channel ``i`` is still silent
+        through frame ``t`` and ``f_i(t) = Sv_i(t-1) * preds[t, i]`` is its first-onset pmf.
+        The canonical convention is that lower channel indices onset earlier, so the target is
+        ``P[i, j] = 0`` for every ``i > j`` (the strictly-lower triangle); the upper triangle is
+        left unsupervised (it is pulled toward ``1 - tie`` automatically and must stay free to
+        allow genuine ties and undetected speakers). The penalty is a single scalar per channel
+        pair, so unlike a per-frame loss it does NOT depend on how much each speaker talks (a
+        brief speaker's ordering counts as much as a talkative one). Undetected channels (no
+        predicted activity) contribute no spurious penalty when correctly placed at high indices
+        (``P = 0`` there), and an empty channel sitting below a detected one is penalized
+        (``P ~= 1``), pushing detected speakers toward the low channels.
+
+        Note: this is computed purely from predictions (no ground-truth arrival times), so like
+        any self-referential ordering term it relies on PIL to keep the predictions faithful
+        (otherwise the ordering can be satisfied by suppressing or fabricating onsets).
 
         Args:
             preds (torch.Tensor): Predicted probabilities of shape (B, T, N).
-            targets_pil (torch.Tensor): PIL-aligned hard targets of shape (B, T, N), where
-                channel ``k`` holds the ground-truth speaker assigned to output ``k``.
             target_lens (torch.Tensor): Valid sequence lengths of shape (B,).
 
         Returns:
-            torch.Tensor: Scalar pairwise ATS loss (mean over all channel pairs).
+            torch.Tensor: Scalar pairwise ATS loss (mean BCE-to-0 over i>j channel pairs).
         """
-        num_spks = preds.shape[2]
+        batch_size, num_frames, num_spks = preds.shape
         if num_spks < 2:
             return torch.zeros((), device=preds.device, dtype=preds.dtype)
 
-        # Arrival frame of each channel's PIL-assigned speaker, derived from hard targets
-        # (matches how get_ats_targets_hungarian defines arrival times).
-        arrivals = find_first_nonzero(targets_pil, max_cap_val=preds.shape[1])  # (B, N)
-        # Soften once on the full tensor; softening is per-channel so it commutes with the
-        # per-pair column selection / swap below.
-        soft_pil = self._soften_targets_for_loss(targets_pil, target_lens)  # (B, T, N)
+        # Zero out padding frames so they never create spurious onset mass, and compute the
+        # survival product in float32/log-space for numerical stability over long sequences.
+        valid = (
+            torch.arange(num_frames, device=preds.device).unsqueeze(0)
+            < target_lens.to(preds.device).unsqueeze(1)
+        ).to(preds.dtype).unsqueeze(-1)  # (B, T, 1)
+        p = (preds * valid).clamp(max=1.0 - self.eps).float()  # (B, T, N)
 
-        pair_losses = []
-        for i in range(num_spks):
-            for j in range(i + 1, num_spks):
-                # swap is True where channel i (lower index) holds the LATER-arriving speaker.
-                swap = (arrivals[:, i] > arrivals[:, j]).view(-1, 1, 1)  # (B, 1, 1)
-                gi = soft_pil[:, :, i : i + 1]  # (B, T, 1)
-                gj = soft_pil[:, :, j : j + 1]  # (B, T, 1)
-                # Lower channel -> earlier speaker; swap the pair targets when inverted.
-                tgt_i = torch.where(swap, gj, gi)
-                tgt_j = torch.where(swap, gi, gj)
-                pair_preds = torch.cat([preds[:, :, i : i + 1], preds[:, :, j : j + 1]], dim=2)  # (B, T, 2)
-                pair_target = torch.cat([tgt_i, tgt_j], dim=2)  # (B, T, 2)
-                pair_losses.append(self.loss(probs=pair_preds, labels=pair_target, target_lens=target_lens))
+        log_sv = torch.cumsum(torch.log1p(-p), dim=1)  # log Sv_i(t) = log P(onset_i > t)
+        sv = log_sv.exp()  # Sv_i(t)
+        sv_prev = torch.cat([torch.ones_like(sv[:, :1]), sv[:, :-1]], dim=1)  # Sv_i(t-1)
+        onset_pmf = sv_prev * p  # f_i(t) = P(first onset at t), (B, T, N)
 
-        return torch.stack(pair_losses).mean()
+        # P[i, j] = sum_t f_i(t) * Sv_j(t) = Pr(onset_i < onset_j), shape (B, N, N).
+        p_before = torch.einsum('bti,btj->bij', onset_pmf, sv)
+
+        # Target P[i, j] = 0 for i > j (strictly-lower triangle); penalize via BCE toward 0.
+        lower_tri = torch.tril(
+            torch.ones(num_spks, num_spks, device=preds.device, dtype=torch.bool), diagonal=-1
+        )  # (N, N), True where i > j
+        p_lower = p_before[:, lower_tri].clamp(max=1.0 - self.eps)  # (B, num_pairs)
+        loss = -torch.log1p(-p_lower)  # BCE(P, target=0) = -log(1 - P)
+        return loss.mean().to(preds.dtype)
 
     def _self_ats_loss(self, preds, target_lens):
         """
@@ -1325,9 +1340,16 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         early speaker), since the target is built only from predicted channels.
 
         Notes:
-            - The target is the (detached) onset-sorted copy of preds. Because it is soft,
-              the BCE has an entropy floor, so the logged value is not exactly zero at
-              perfect ordering; its gradient, however, is ~zero when already sorted.
+            - The target is the (detached) onset-sorted copy of preds. With ``self_ats_metric
+              == 'bce'`` (default) the BCE has an entropy floor, so the logged value is not
+              exactly zero at perfect ordering (its gradient is still ~zero when sorted). With
+              ``self_ats_metric == 'mse'`` there is no floor: the value is 0 when
+              self-consistent and the gradient is bounded/gentler.
+            - ``self_ats_temperature`` < 1 sharpens predictions toward 0/1, applied
+              symmetrically to both the probs side and the target. Because both sides use the
+              same sharpened tensor, the loss is still 0 / zero-gradient when already sorted
+              (no self-distillation bias), but mis-ordered channels are pulled toward sharp
+              targets (less softening) with a ~1/T-amplified gradient (more reordering muscle).
             - Ties in predicted onset are broken by a stable sort (current channel order is
               kept), avoiding spurious swap gradients between equally-onset channels.
 
@@ -1343,14 +1365,36 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             return torch.zeros((), device=preds.device, dtype=preds.dtype)
 
         # Predicted onset (first frame above threshold) per channel; empty channels -> T.
+        # Temperature sharpening is monotonic and preserves the 0.5 threshold, so onsets (and
+        # therefore the permutation) are computed from the original predictions.
         onsets = find_first_nonzero(preds.detach(), max_cap_val=preds.shape[1])  # (B, N)
         # Permutation sorting channels by predicted onset; stable keeps current order on ties.
         perm = torch.argsort(onsets, dim=1, stable=True)  # (B, N)
+
+        # Optionally sharpen predictions; applied symmetrically so the loss stays
+        # zero/zero-gradient when sorted (see docstring). T == 1.0 leaves preds untouched.
+        if self.self_ats_temperature == 1.0:
+            preds_s = preds
+        else:
+            p = preds.clamp(min=self.eps, max=1.0 - self.eps)
+            preds_s = torch.sigmoid(torch.log(p / (1.0 - p)) / self.self_ats_temperature)
+
         # Onset-sorted target: position k receives the content of the k-th earliest channel.
         index = perm.unsqueeze(1).expand(-1, preds.shape[1], -1)  # (B, T, N)
-        self_ats_target = torch.gather(preds, dim=2, index=index).detach()  # (B, T, N)
+        self_ats_target = torch.gather(preds_s, dim=2, index=index).detach()  # (B, T, N)
 
-        return self.loss(probs=preds, labels=self_ats_target, target_lens=target_lens)
+        if self.self_ats_metric == "mse":
+            # Masked mean squared error over valid frames (no entropy floor; 0 when sorted).
+            num_frames = preds.shape[1]
+            valid = (
+                torch.arange(num_frames, device=preds.device).unsqueeze(0)
+                < target_lens.to(preds.device).unsqueeze(1)
+            ).to(preds.dtype)  # (B, T)
+            sq_err = ((preds_s - self_ats_target) ** 2) * valid.unsqueeze(-1)  # (B, T, N)
+            denom = valid.sum() * preds.shape[2]  # valid (frame, channel) element count
+            return sq_err.sum() / denom.clamp_min(1.0)
+
+        return self.loss(probs=preds_s, labels=self_ats_target, target_lens=target_lens)
 
     def _get_aux_train_evaluations(self, preds, targets, target_lens) -> dict:
         """
@@ -1393,10 +1437,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         pil_loss = self.loss(
             probs=preds, labels=self._soften_targets_for_loss(targets_pil, target_lens), target_lens=target_lens
         )
-        if self.pairwise_ats_weight > 0:
-            pairwise_ats_loss = self._pairwise_ats_loss(preds, targets_pil, target_lens)
-        else:
-            pairwise_ats_loss = torch.zeros((), device=preds.device, dtype=preds.dtype)
+        pairwise_ats_loss = self._pairwise_ats_loss(preds, target_lens)
         self_ats_loss = self._self_ats_loss(preds, target_lens)
         loss = (
             self.ats_weight * ats_loss
@@ -1512,10 +1553,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         val_pil_loss = self.loss(
             probs=preds, labels=self._soften_targets_for_loss(targets_pil, target_lens), target_lens=target_lens
         )
-        if self.pairwise_ats_weight > 0:
-            val_pairwise_ats_loss = self._pairwise_ats_loss(preds, targets_pil, target_lens)
-        else:
-            val_pairwise_ats_loss = torch.zeros((), device=preds.device, dtype=preds.dtype)
+        val_pairwise_ats_loss = self._pairwise_ats_loss(preds, target_lens)
         val_self_ats_loss = self._self_ats_loss(preds, target_lens)
         val_loss = (
             self.ats_weight * val_ats_loss

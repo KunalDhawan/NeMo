@@ -17,8 +17,10 @@ model:
   pil_weight: 0.5
   ats_weight: 0.5
   ats_tolerance: 0 # Arrival-time tolerance (output frames) for ATS targets; speakers within this many frames are treated as tied/reorderable (0 = exact sort)
-  pairwise_ats_weight: 0.0 # Weight for pairwise ATS loss (enforces arrival ordering per speaker-pair; 0 disables)
+  pairwise_ats_weight: 0.0 # Weight for onset-based pairwise ATS sort loss (raw multiplier, NOT normalized with pil/ats; 0 disables)
   self_ats_weight: 0.0 # Weight for self-ATS loss (orders channels by predicted onset; NOT normalized with the others; 0 disables)
+  self_ats_metric: bce # Distance for self-ATS loss: 'bce' (default, entropy-floored) or 'mse' (no floor, 0 when self-consistent, gentler gradient)
+  self_ats_temperature: 1.0 # Temperature for self-ATS (symmetric on probs+target); <1 sharpens toward 0/1 (less softening, ~1/T more muscle); 1.0 disables
   max_num_of_spks: 4
   output_subsampling_factor: 8
   upsample_smooth_kernel: 9
