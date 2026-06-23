@@ -339,6 +339,12 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         # normalized PIL/ATS combination (intentionally NOT normalized with them).
         self.pairwise_ats_weight = self._cfg.get("pairwise_ats_weight", 0.0)
         self.self_ats_weight = self._cfg.get("self_ats_weight", 0.0)
+        # Auxiliary supervised loss on the cumulative number of arrived (onset-so-far) speakers.
+        # GT-anchored and assignment-free; it turns a brief early-onset "blip" into a persistent
+        # arrival-schedule error (a Wasserstein/EMD-style cost), which counters the pairwise-ATS
+        # "early blip" cheat. Raw multiplier on top of the normalized PIL/ATS combination
+        # (intentionally NOT normalized with them); 0 disables.
+        self.spkcount_weight = self._cfg.get("spkcount_weight", 0.0)
         # Distance used by the self-ATS loss: 'bce' (default; matches the other losses but has
         # an entropy floor, so the logged value is > 0 even when perfectly self-consistent) or
         # 'mse' (no floor: value is 0 when self-consistent, and a gentler bounded gradient).
@@ -1396,6 +1402,70 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         return self.loss(probs=preds_s, labels=self_ats_target, target_lens=target_lens)
 
+    def _spkcount_loss(self, preds, targets, target_lens):
+        """
+        Auxiliary supervised loss on the cumulative number of arrived speakers.
+
+        For every frame ``t`` this matches the expected number of speakers whose onset has
+        occurred by ``t`` against the ground-truth count. The predicted count reuses the same
+        first-onset survival product as the pairwise-ATS loss: the probability that channel
+        ``i`` has arrived by ``t`` is its onset CDF ``A_i(t) = 1 - Sv_i(t)``, and by linearity
+        of expectation (exact regardless of inter-channel correlation)
+
+            C_pred(t) = sum_i A_i(t) = N - sum_i Sv_i(t).
+
+        The target is the GT arrival staircase ``C_gt(t) = #{speakers active at some s <= t}``,
+        built as a cumulative-max over time summed over channels (e.g. 0 0 0 1 1 1 2 2 ...). Both
+        curves are normalized by ``N`` (fraction arrived) and compared with a Huber/Smooth-L1
+        distance averaged over valid frames.
+
+        Why this helps: both curves are non-decreasing (each ``Sv_i`` is monotone), so the L1
+        distance between them equals the 1-Wasserstein (earth-mover) distance between the
+        predicted and true arrival schedules. A spurious early "blip" on a low channel collapses
+        that channel's survival permanently, inflating ``C_pred`` for the entire tail; the penalty
+        therefore scales with how early the blip is displaced from the true onset. This is a
+        persistent, GT-anchored cost that matches the persistent self-referential reward the
+        pairwise-ATS loss would otherwise grant the blip (a 1-frame blip is only a 1-frame false
+        positive to PIL/ATS, but corrupts this whole curve). It is permutation-invariant across
+        channels (a sum over channels), so it constrains only the arrival schedule, never the
+        channel assignment, and needs no Hungarian matching. As a symmetric regressor it also
+        penalizes under-counting, reinforcing detection of missed speakers.
+
+        Args:
+            preds (torch.Tensor): Predicted probabilities of shape (B, T, N).
+            targets (torch.Tensor): Ground-truth (hard 0/1) labels of shape (B, T, N).
+            target_lens (torch.Tensor): Valid sequence lengths of shape (B,).
+
+        Returns:
+            torch.Tensor: Scalar arrival-count loss (Huber on the normalized count curve).
+        """
+        num_frames, num_spks = preds.shape[1], preds.shape[2]
+
+        # Validity mask (B, T): 1 inside each sample, 0 on padding. Built in float32 since the
+        # survival product runs in float32 for numerical stability over long sequences.
+        valid = (
+            torch.arange(num_frames, device=preds.device).unsqueeze(0)
+            < target_lens.to(preds.device).unsqueeze(1)
+        ).float()  # (B, T)
+
+        # Predicted expected arrival fraction C_pred(t) / N via the first-onset survival product.
+        # Padding frames are zeroed so they never create spurious arrival mass.
+        p = (preds * valid.unsqueeze(-1)).clamp(min=0.0, max=1.0 - self.eps).float()  # (B, T, N)
+        sv = torch.cumsum(torch.log1p(-p), dim=1).exp()  # Sv_i(t) = P(onset_i > t)
+        c_pred = (1.0 - sv).sum(dim=2) / num_spks  # (B, T)
+
+        # GT arrival fraction C_gt(t) / N: "arrived" = ever active by t -> cumulative max in time.
+        c_gt = torch.cummax(targets.float(), dim=1).values.sum(dim=2) / num_spks  # (B, T)
+
+        # Huber on the normalized count curve, averaged over valid frames. beta = one speaker's
+        # worth of count error, so it is L1-like (= EMD, bounded gradient) for the large persistent
+        # errors that matter and only quadratic once the schedule is essentially correct.
+        err = torch.nn.functional.smooth_l1_loss(
+            c_pred, c_gt, beta=1.0 / num_spks, reduction="none"
+        ) * valid  # (B, T)
+        loss = err.sum() / valid.sum().clamp_min(1.0)
+        return loss.to(preds.dtype)
+
     def _get_aux_train_evaluations(self, preds, targets, target_lens) -> dict:
         """
         Compute auxiliary training evaluations including losses and metrics.
@@ -1439,11 +1509,13 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         )
         pairwise_ats_loss = self._pairwise_ats_loss(preds, target_lens)
         self_ats_loss = self._self_ats_loss(preds, target_lens)
+        spkcount_loss = self._spkcount_loss(preds, targets, target_lens)
         loss = (
             self.ats_weight * ats_loss
             + self.pil_weight * pil_loss
             + self.pairwise_ats_weight * pairwise_ats_loss
             + self.self_ats_weight * self_ats_loss
+            + self.spkcount_weight * spkcount_loss
         )
 
         self._accuracy_train(preds, targets_pil, target_lens)
@@ -1458,6 +1530,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'pil_loss': pil_loss,
             'pairwise_ats_loss': pairwise_ats_loss,
             'self_ats_loss': self_ats_loss,
+            'spkcount_loss': spkcount_loss,
             'learning_rate': self._optimizer.param_groups[0]['lr'],
             'train_f1_acc': train_f1_acc,
             'train_precision': train_precision,
@@ -1555,11 +1628,13 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         )
         val_pairwise_ats_loss = self._pairwise_ats_loss(preds, target_lens)
         val_self_ats_loss = self._self_ats_loss(preds, target_lens)
+        val_spkcount_loss = self._spkcount_loss(preds, targets, target_lens)
         val_loss = (
             self.ats_weight * val_ats_loss
             + self.pil_weight * val_pil_loss
             + self.pairwise_ats_weight * val_pairwise_ats_loss
             + self.self_ats_weight * val_self_ats_loss
+            + self.spkcount_weight * val_spkcount_loss
         )
 
         self._accuracy_valid(preds, targets_pil, target_lens)
@@ -1577,6 +1652,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'val_pil_loss': val_pil_loss,
             'val_pairwise_ats_loss': val_pairwise_ats_loss,
             'val_self_ats_loss': val_self_ats_loss,
+            'val_spkcount_loss': val_spkcount_loss,
             'val_f1_acc': val_f1_acc,
             'val_precision': val_precision,
             'val_recall': val_recall,
@@ -1650,6 +1726,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         val_pil_loss_mean = torch.stack([x['val_pil_loss'] for x in outputs]).mean()
         val_pairwise_ats_loss_mean = torch.stack([x['val_pairwise_ats_loss'] for x in outputs]).mean()
         val_self_ats_loss_mean = torch.stack([x['val_self_ats_loss'] for x in outputs]).mean()
+        val_spkcount_loss_mean = torch.stack([x['val_spkcount_loss'] for x in outputs]).mean()
         val_f1_acc_mean = torch.stack([x['val_f1_acc'] for x in outputs]).mean()
         val_precision_mean = torch.stack([x['val_precision'] for x in outputs]).mean()
         val_recall_mean = torch.stack([x['val_recall'] for x in outputs]).mean()
@@ -1663,6 +1740,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'val_pil_loss': val_pil_loss_mean,
             'val_pairwise_ats_loss': val_pairwise_ats_loss_mean,
             'val_self_ats_loss': val_self_ats_loss_mean,
+            'val_spkcount_loss': val_spkcount_loss_mean,
             'val_f1_acc': val_f1_acc_mean,
             'val_precision': val_precision_mean,
             'val_recall': val_recall_mean,
