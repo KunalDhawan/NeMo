@@ -278,7 +278,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         self._init_loss_weights()
 
-        self.eps = 1e-3
+        self.eps = 0.004   # bf16-safe epsilon
         self.negative_init_val = -99
         self.loss = instantiate(self._cfg.loss)
 
@@ -338,6 +338,15 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         # pairwise_ats_weight and self_ats_weight are applied as raw multipliers on top of the
         # normalized PIL/ATS combination (intentionally NOT normalized with them).
         self.pairwise_ats_weight = self._cfg.get("pairwise_ats_weight", 0.0)
+        # Temperature for the pairwise-ATS loss: sharpens predictions (T < 1) before the survival
+        # product so faint/low-confidence hedges don't accumulate into a confident onset (relaxing
+        # the penalty on tentative onsets) while confident out-of-order onsets stay suppressible;
+        # T == 1.0 disables.
+        self.pairwise_ats_temperature = float(self._cfg.get("pairwise_ats_temperature", 1.0))
+        if self.pairwise_ats_temperature <= 0:
+            raise ValueError(
+                f"pairwise_ats_temperature must be > 0, got {self.pairwise_ats_temperature}"
+            )
         self.self_ats_weight = self._cfg.get("self_ats_weight", 0.0)
         # Auxiliary supervised loss on the cumulative number of arrived (onset-so-far) speakers.
         # GT-anchored and assignment-free; it turns a brief early-onset "blip" into a persistent
@@ -345,6 +354,12 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         # "early blip" cheat. Raw multiplier on top of the normalized PIL/ATS combination
         # (intentionally NOT normalized with them); 0 disables.
         self.spkcount_weight = self._cfg.get("spkcount_weight", 0.0)
+        # Temperature for the spkcount loss: sharpens predictions (T < 1) before the survival
+        # product so faint/low-confidence hedges don't inflate the cumulative arrival count;
+        # T == 1.0 disables.
+        self.spkcount_temperature = float(self._cfg.get("spkcount_temperature", 1.0))
+        if self.spkcount_temperature <= 0:
+            raise ValueError(f"spkcount_temperature must be > 0, got {self.spkcount_temperature}")
         # Distance used by the self-ATS loss: 'bce' (default; matches the other losses but has
         # an entropy floor, so the logged value is > 0 even when perfectly self-consistent) or
         # 'mse' (no floor: value is 0 when self-consistent, and a gentler bounded gradient).
@@ -1270,6 +1285,26 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             soft = soft.clamp(min=eps, max=1.0 - eps)
         return soft
 
+    def _sharpen_probs(self, probs, temperature):
+        """
+        Temperature-sharpen probabilities in logit space: ``sigmoid(logit(p) / T)``.
+
+        ``T < 1`` sharpens toward 0/1, so faint/low-confidence predictions are squashed toward 0
+        and no longer accumulate into a confident first onset in the survival product (while
+        confident predictions stay near 1). ``T == 1.0`` is a no-op. The transform is monotonic,
+        so it preserves onset ordering and the 0.5 threshold.
+
+        Args:
+            probs (torch.Tensor): Probabilities in [0, 1].
+            temperature (float): Sharpening temperature (> 0); < 1 sharpens, 1.0 disables.
+
+        Returns:
+            torch.Tensor: Sharpened probabilities (same shape/dtype as ``probs``).
+        """
+        if temperature == 1.0:
+            return probs
+        return torch.sigmoid(torch.logit(probs, eps=self.eps) / temperature)
+
     def _pairwise_ats_loss(self, preds, target_lens):
         """
         Onset-based pairwise Arrival Time Sort loss (duration-invariant, self-referential).
@@ -1312,7 +1347,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             torch.arange(num_frames, device=preds.device).unsqueeze(0)
             < target_lens.to(preds.device).unsqueeze(1)
         ).to(preds.dtype).unsqueeze(-1)  # (B, T, 1)
-        p = (preds * valid).clamp(max=1.0 - self.eps).float()  # (B, T, N)
+        # Optionally sharpen first so faint hedges don't accumulate into a confident onset.
+        preds_s = self._sharpen_probs(preds, self.pairwise_ats_temperature)
+        p = (preds_s * valid).clamp(max=1.0 - self.eps).float()  # (B, T, N)
 
         log_sv = torch.cumsum(torch.log1p(-p), dim=1)  # log Sv_i(t) = log P(onset_i > t)
         sv = log_sv.exp()  # Sv_i(t)
@@ -1379,11 +1416,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         # Optionally sharpen predictions; applied symmetrically so the loss stays
         # zero/zero-gradient when sorted (see docstring). T == 1.0 leaves preds untouched.
-        if self.self_ats_temperature == 1.0:
-            preds_s = preds
-        else:
-            p = preds.clamp(min=self.eps, max=1.0 - self.eps)
-            preds_s = torch.sigmoid(torch.log(p / (1.0 - p)) / self.self_ats_temperature)
+        preds_s = self._sharpen_probs(preds, self.self_ats_temperature)
 
         # Onset-sorted target: position k receives the content of the k-th earliest channel.
         index = perm.unsqueeze(1).expand(-1, preds.shape[1], -1)  # (B, T, N)
@@ -1449,8 +1482,10 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         ).float()  # (B, T)
 
         # Predicted expected arrival fraction C_pred(t) / N via the first-onset survival product.
-        # Padding frames are zeroed so they never create spurious arrival mass.
-        p = (preds * valid.unsqueeze(-1)).clamp(min=0.0, max=1.0 - self.eps).float()  # (B, T, N)
+        # Padding frames are zeroed so they never create spurious arrival mass. Optionally sharpen
+        # first so faint hedges don't accumulate into a confident onset / inflate the count.
+        preds_s = self._sharpen_probs(preds, self.spkcount_temperature)
+        p = (preds_s * valid.unsqueeze(-1)).clamp(min=0.0, max=1.0 - self.eps).float()  # (B, T, N)
         sv = torch.cumsum(torch.log1p(-p), dim=1).exp()  # Sv_i(t) = P(onset_i > t)
         c_pred = (1.0 - sv).sum(dim=2) / num_spks  # (B, T)
 
