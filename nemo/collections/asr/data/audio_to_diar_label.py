@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
+import importlib
 import os
 import random
 from collections import OrderedDict
@@ -1155,6 +1157,9 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         subsegment_min_chunk_len_sec: float = 10.0,
         subsegment_margin_frames: int = 0,
         subsegment_nspk_bias: float = 1.0,
+        opus_roundtrip_prob: float = 0.0,
+        opus_roundtrip_compression_level: Optional[float] = None,
+        opus_roundtrip_bitrate_mode: str = 'CONSTANT',
     ):
         super().__init__()
         self.collection = EndtoEndDiarizationSpeechLabel(
@@ -1190,6 +1195,16 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         self.subsegment_min_chunk_len_sec = subsegment_min_chunk_len_sec
         self.subsegment_margin_frames = subsegment_margin_frames
         self.subsegment_nspk_bias = subsegment_nspk_bias
+        if not 0.0 <= opus_roundtrip_prob <= 1.0:
+            raise ValueError(f"opus_roundtrip_prob must be between 0 and 1, got {opus_roundtrip_prob}")
+        if opus_roundtrip_compression_level is not None and not 0.0 <= opus_roundtrip_compression_level <= 1.0:
+            raise ValueError(
+                "opus_roundtrip_compression_level must be between 0 and 1, "
+                f"got {opus_roundtrip_compression_level}"
+            )
+        self.opus_roundtrip_prob = opus_roundtrip_prob
+        self.opus_roundtrip_compression_level = opus_roundtrip_compression_level
+        self.opus_roundtrip_bitrate_mode = opus_roundtrip_bitrate_mode
         if self.session_len_sec > 0:
             assert self.subsegment_min_len_sec <= self.session_len_sec, (
                 f"subsegment_min_len_sec ({self.subsegment_min_len_sec}) cannot be greater than "
@@ -1201,6 +1216,57 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
 
     def __len__(self):
         return len(self.collection)
+
+    def _maybe_apply_opus_roundtrip(self, audio_signal):
+        if self.opus_roundtrip_prob <= 0.0 or random.random() >= self.opus_roundtrip_prob:
+            return audio_signal
+        return self._opus_roundtrip(audio_signal)
+
+    def _opus_roundtrip(self, audio_signal):
+        try:
+            sf = importlib.import_module('soundfile')
+        except ModuleNotFoundError as exc:
+            raise RuntimeError("opus_roundtrip_prob > 0 requires the soundfile package with OGG/OPUS support") from exc
+
+        original_dtype = audio_signal.dtype
+        original_device = audio_signal.device
+        original_num_samples = audio_signal.shape[0]
+
+        audio_np = audio_signal.detach().cpu().float().numpy()
+        if audio_np.ndim not in (1, 2):
+            raise ValueError(f"Opus roundtrip supports 1D or 2D audio tensors, got shape {audio_signal.shape}")
+
+        opus_buffer = io.BytesIO()
+        write_kwargs = {}
+        if self.opus_roundtrip_compression_level is not None:
+            write_kwargs['compression_level'] = self.opus_roundtrip_compression_level
+        if self.opus_roundtrip_bitrate_mode is not None:
+            write_kwargs['bitrate_mode'] = self.opus_roundtrip_bitrate_mode
+
+        try:
+            sf.write(
+                opus_buffer,
+                audio_np,
+                self.featurizer.sample_rate,
+                format='OGG',
+                subtype='OPUS',
+                **write_kwargs,
+            )
+            opus_buffer.seek(0)
+            decoded, _ = sf.read(opus_buffer, dtype='float32', always_2d=audio_np.ndim == 2)
+        except Exception as exc:
+            raise RuntimeError("soundfile OGG/OPUS roundtrip failed") from exc
+
+        if decoded.shape[0] > original_num_samples:
+            decoded = decoded[:original_num_samples]
+        elif decoded.shape[0] < original_num_samples:
+            pad_width = original_num_samples - decoded.shape[0]
+            if audio_np.ndim == 1:
+                decoded = np.pad(decoded, (0, pad_width))
+            else:
+                decoded = np.pad(decoded, ((0, pad_width), (0, 0)))
+
+        return torch.as_tensor(decoded.copy(), dtype=original_dtype, device=original_device)
 
     def get_frame_count_from_time_series_length(self, seq_len):
         """
@@ -1663,6 +1729,7 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
                 [None] * self.max_spks,
             )
 
+        audio_signal = self._maybe_apply_opus_roundtrip(audio_signal)
         audio_signal_length = torch.tensor(audio_signal.shape[0]).long()
         #logging.info(f"uniq_id: {sample.uniq_id}, audio_signal_length: {audio_signal_length}")
         session_len_sec = audio_signal.shape[0] / self.featurizer.sample_rate
@@ -1701,6 +1768,7 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
             np.floor(audio_signal.shape[0] / self.featurizer.sample_rate * self.floor_decimal) / self.floor_decimal
         )
         audio_signal = audio_signal[: round(self.featurizer.sample_rate * session_len_sec)]
+        audio_signal = self._maybe_apply_opus_roundtrip(audio_signal)
         audio_signal_length = torch.tensor(audio_signal.shape[0]).long()
 
         # Target length should be following the ASR feature extraction convention: Use self.get_frame_count_from_time_series_length.
@@ -1846,6 +1914,9 @@ class AudioToSpeechE2ESpkDiarDataset(_AudioToSpeechE2ESpkDiarDataset):
         subsegment_min_chunk_len_sec: float = 10.0,
         subsegment_margin_frames: int = 0,
         subsegment_nspk_bias: float = 1.0,
+        opus_roundtrip_prob: float = 0.0,
+        opus_roundtrip_compression_level: Optional[float] = None,
+        opus_roundtrip_bitrate_mode: str = 'CONSTANT',
     ):
         super().__init__(
             manifest_filepath=manifest_filepath,
@@ -1865,6 +1936,9 @@ class AudioToSpeechE2ESpkDiarDataset(_AudioToSpeechE2ESpkDiarDataset):
             subsegment_min_chunk_len_sec=subsegment_min_chunk_len_sec,
             subsegment_margin_frames=subsegment_margin_frames,
             subsegment_nspk_bias=subsegment_nspk_bias,
+            opus_roundtrip_prob=opus_roundtrip_prob,
+            opus_roundtrip_compression_level=opus_roundtrip_compression_level,
+            opus_roundtrip_bitrate_mode=opus_roundtrip_bitrate_mode,
         )
 
     def eesd_train_collate_fn(self, batch):

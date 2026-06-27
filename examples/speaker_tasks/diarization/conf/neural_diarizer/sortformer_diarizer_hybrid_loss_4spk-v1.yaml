@@ -43,6 +43,9 @@ model:
     session_len_sec: 90 # Maximum session length in seconds
     soft_label_thres: 0.5 # Threshold for binarizing target values; higher values make the model more conservative in predicting speaker activity.
     soft_targets: False # If True, use continuous values as target values when calculating cross-entropy loss
+    opus_roundtrip_prob: 0.0 # Probability of in-memory Opus encode/decode per training sample; 0 disables.
+    opus_roundtrip_compression_level: null # Higher values produce smaller/more compressed Opus payloads.
+    opus_roundtrip_bitrate_mode: "CONSTANT"
     labels: null
     batch_size: ${batch_size}
     shuffle: True
