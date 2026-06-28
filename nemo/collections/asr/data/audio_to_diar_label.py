@@ -1159,7 +1159,6 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         subsegment_nspk_bias: float = 1.0,
         opus_roundtrip_prob: float = 0.0,
         opus_roundtrip_compression_level: Optional[float] = None,
-        opus_roundtrip_bitrate_mode: str = 'CONSTANT',
     ):
         super().__init__()
         self.collection = EndtoEndDiarizationSpeechLabel(
@@ -1204,7 +1203,6 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
             )
         self.opus_roundtrip_prob = opus_roundtrip_prob
         self.opus_roundtrip_compression_level = opus_roundtrip_compression_level
-        self.opus_roundtrip_bitrate_mode = opus_roundtrip_bitrate_mode
         if self.session_len_sec > 0:
             assert self.subsegment_min_len_sec <= self.session_len_sec, (
                 f"subsegment_min_len_sec ({self.subsegment_min_len_sec}) cannot be greater than "
@@ -1240,8 +1238,6 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         write_kwargs = {}
         if self.opus_roundtrip_compression_level is not None:
             write_kwargs['compression_level'] = self.opus_roundtrip_compression_level
-        if self.opus_roundtrip_bitrate_mode is not None:
-            write_kwargs['bitrate_mode'] = self.opus_roundtrip_bitrate_mode
 
         try:
             sf.write(
@@ -1916,7 +1912,6 @@ class AudioToSpeechE2ESpkDiarDataset(_AudioToSpeechE2ESpkDiarDataset):
         subsegment_nspk_bias: float = 1.0,
         opus_roundtrip_prob: float = 0.0,
         opus_roundtrip_compression_level: Optional[float] = None,
-        opus_roundtrip_bitrate_mode: str = 'CONSTANT',
     ):
         super().__init__(
             manifest_filepath=manifest_filepath,
@@ -1938,7 +1933,6 @@ class AudioToSpeechE2ESpkDiarDataset(_AudioToSpeechE2ESpkDiarDataset):
             subsegment_nspk_bias=subsegment_nspk_bias,
             opus_roundtrip_prob=opus_roundtrip_prob,
             opus_roundtrip_compression_level=opus_roundtrip_compression_level,
-            opus_roundtrip_bitrate_mode=opus_roundtrip_bitrate_mode,
         )
 
     def eesd_train_collate_fn(self, batch):

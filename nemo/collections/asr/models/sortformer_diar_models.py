@@ -462,7 +462,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             subsegment_nspk_bias=config.get('subsegment_nspk_bias', 1.0),
             opus_roundtrip_prob=config.get('opus_roundtrip_prob', 0.0),
             opus_roundtrip_compression_level=config.get('opus_roundtrip_compression_level', None),
-            opus_roundtrip_bitrate_mode=config.get('opus_roundtrip_bitrate_mode', 'CONSTANT'),
         )
 
         self.data_collection = dataset.collection
@@ -755,7 +754,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'subsegment_nspk_bias': config.get('subsegment_nspk_bias', 1.0),
             'opus_roundtrip_prob': config.get('opus_roundtrip_prob', 0.0),
             'opus_roundtrip_compression_level': config.get('opus_roundtrip_compression_level', None),
-            'opus_roundtrip_bitrate_mode': config.get('opus_roundtrip_bitrate_mode', 'CONSTANT'),
         }
         temporary_datalayer = self.__setup_dataloader_from_config(config=DictConfig(dl_config))
         return temporary_datalayer
