@@ -145,6 +145,12 @@ model:
     chunk_left_context: 1 # Number of previous frames for each streaming chunk
     chunk_right_context: 1 # Number of future frames for each streaming chunk
     # Speaker cache update parameters
+    spkcache_permute_speakers: true # If true, randomly permute active speaker cache slots during training
+    spkcache_mode: topk # Speaker cache compression mode: "topk" or "query_pool"
+    spkcache_num_queries: 30 # Query-pool mode: number of learned query vectors per speaker
+    spkcache_query_pool_threshold: 0.5 # Query-pool mode: hard activity threshold for pooling frames
+    spkcache_query_pool_score_weight: 1.0 # Query-pool mode: weight for confidence-score attention bias
+    spkcache_query_pool_detach_preds: true # Query-pool mode: detach predictions before hard-mask construction
     spkcache_sil_frames_per_spk: 3 # Number of silence frames allocated per speaker in the speaker cache
     scores_add_rnd: 0 # Standard deviation of random noise added to scores in speaker cache update (training only)
     pred_score_threshold: 0.25 # Probability threshold for internal scores processing in speaker cache update

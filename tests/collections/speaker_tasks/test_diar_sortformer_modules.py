@@ -1353,6 +1353,142 @@ class TestSortformerModules_StreamingScoreComputations:
             assert edge_spkcache.shape == (batch_size, spkcache_len, emb_dim)
             assert edge_spkcache_preds.shape == (batch_size, spkcache_len, n_spk)
 
+    @pytest.mark.unit
+    def test_compress_spkcache_query_pool(self):
+        """Test query-pool speaker-cache compression with inactive-speaker fallback tokens."""
+        batch_size, n_frames, n_spk = 2, 8, 3
+        spkcache_num_queries = 4
+        spkcache_sil_frames_per_spk = 2
+        emb_dim = 16
+        spkcache_len = n_spk * (spkcache_num_queries + spkcache_sil_frames_per_spk)
+        sortformer_modules = SortformerModules(
+            num_spks=n_spk,
+            fc_d_model=emb_dim,
+            spkcache_len=spkcache_len,
+            spkcache_mode="query_pool",
+            spkcache_num_queries=spkcache_num_queries,
+            spkcache_sil_frames_per_spk=spkcache_sil_frames_per_spk,
+            use_learnable_sil_emb=True,
+        )
+
+        assert sortformer_modules.spkcache_queries.shape == (spkcache_num_queries, emb_dim)
+
+        fallback = torch.arange(emb_dim, dtype=torch.float32)
+        with torch.no_grad():
+            sortformer_modules.learnable_sil_emb.copy_(fallback)
+
+        emb_seq = torch.randn(batch_size, n_frames, emb_dim)
+        preds = torch.zeros(batch_size, n_frames, n_spk)
+        preds[:, 1:4, 0] = 0.8
+        preds[:, 5:7, 2] = 0.9
+        mean_sil_emb = torch.zeros(batch_size, emb_dim)
+
+        spkcache, spkcache_preds, spk_perm = sortformer_modules._compress_spkcache(
+            emb_seq, preds, mean_sil_emb, permute_spk=False
+        )
+
+        assert spkcache.shape == (batch_size, spkcache_len, emb_dim)
+        assert spkcache_preds.shape == (batch_size, spkcache_len, n_spk)
+        assert spk_perm is None
+        assert spkcache.dtype == emb_seq.dtype
+        assert spkcache_preds.dtype == preds.dtype
+
+        tokens_per_spk = spkcache_num_queries + spkcache_sil_frames_per_spk
+        fallback_block = fallback.view(1, 1, emb_dim)
+
+        # Speaker 1 has no active frames, so both query and silence slots use fallback silence.
+        inactive_start = tokens_per_spk
+        inactive_end = inactive_start + tokens_per_spk
+        assert torch.allclose(
+            spkcache[:, inactive_start:inactive_end, :],
+            fallback_block.expand(batch_size, tokens_per_spk, emb_dim),
+        )
+        assert torch.all(spkcache_preds[:, inactive_start:inactive_end, :] == 0)
+
+        # Active speakers get attention-pooled predictions, while silence slots remain zero.
+        for spk_index in (0, 2):
+            block_start = spk_index * tokens_per_spk
+            query_end = block_start + spkcache_num_queries
+            block_end = query_end + spkcache_sil_frames_per_spk
+            active_value = preds[:, :, spk_index].max()
+            assert torch.all(spkcache_preds[:, block_start:query_end, spk_index] > 0.5)
+            assert torch.all(spkcache_preds[:, block_start:query_end, spk_index] <= active_value + 1e-6)
+            assert torch.all(spkcache_preds[:, query_end:block_end, :] == 0)
+            assert torch.allclose(
+                spkcache[:, query_end:block_end, :],
+                fallback_block.expand(batch_size, spkcache_sil_frames_per_spk, emb_dim),
+            )
+
+    @pytest.mark.unit
+    def test_compress_spkcache_query_pool_permutation(self):
+        """Test optional speaker permutation in query-pool speaker-cache compression."""
+        batch_size, n_frames, n_spk = 2, 8, 4
+        spkcache_num_queries = 3
+        spkcache_sil_frames_per_spk = 1
+        emb_dim = 8
+        spkcache_len = n_spk * (spkcache_num_queries + spkcache_sil_frames_per_spk)
+        sortformer_modules = SortformerModules(
+            num_spks=n_spk,
+            fc_d_model=emb_dim,
+            spkcache_len=spkcache_len,
+            spkcache_mode="query_pool",
+            spkcache_num_queries=spkcache_num_queries,
+            spkcache_sil_frames_per_spk=spkcache_sil_frames_per_spk,
+        )
+
+        emb_seq = torch.randn(batch_size, n_frames, emb_dim)
+        preds = torch.zeros(batch_size, n_frames, n_spk)
+        preds[:, 0:3, 0] = 0.9
+        preds[:, 4:7, 1] = 0.9
+        mean_sil_emb = torch.zeros(batch_size, emb_dim)
+
+        spkcache, spkcache_preds, spk_perm = sortformer_modules._compress_spkcache(
+            emb_seq, preds, mean_sil_emb, permute_spk=True
+        )
+
+        assert spkcache.shape == (batch_size, spkcache_len, emb_dim)
+        assert spkcache_preds.shape == (batch_size, spkcache_len, n_spk)
+        assert spk_perm.shape == (batch_size, n_spk)
+        for batch_index in range(batch_size):
+            assert torch.all(torch.sort(spk_perm[batch_index]).values == torch.arange(n_spk))
+            assert torch.all(torch.sort(spk_perm[batch_index, :2]).values == torch.arange(2))
+            assert torch.all(spk_perm[batch_index, 2:] == torch.arange(2, n_spk))
+
+    @pytest.mark.unit
+    def test_query_pool_spkcache_len_override(self):
+        """Test that query-pool mode derives its fixed cache layout length."""
+        sortformer_modules = SortformerModules(
+            num_spks=4,
+            spkcache_len=188,
+            spkcache_mode="query_pool",
+            spkcache_num_queries=30,
+            spkcache_sil_frames_per_spk=3,
+        )
+        assert sortformer_modules.spkcache_len == 4 * (30 + 3)
+        sortformer_modules._check_streaming_parameters()
+
+    @pytest.mark.unit
+    def test_spkcache_permute_speakers_disabled(self):
+        """Test that spkcache_permute_speakers disables cache speaker permutation."""
+        batch_size, n_frames, n_spk, spkcache_len = 2, 20, 4, 12
+        emb_dim = 16
+        sortformer_modules = SortformerModules(
+            num_spks=n_spk,
+            fc_d_model=emb_dim,
+            spkcache_len=spkcache_len,
+            spkcache_sil_frames_per_spk=2,
+            spkcache_permute_speakers=False,
+        )
+        emb_seq = torch.randn(batch_size, n_frames, emb_dim)
+        preds = torch.rand(batch_size, n_frames, n_spk)
+        mean_sil_emb = torch.zeros(batch_size, emb_dim)
+
+        _, _, spk_perm = sortformer_modules._compress_spkcache(
+            emb_seq, preds, mean_sil_emb, permute_spk=True
+        )
+
+        assert spk_perm is None
+
 
 class TestSortformerModules_StreamingUpdate:
     @pytest.mark.unit

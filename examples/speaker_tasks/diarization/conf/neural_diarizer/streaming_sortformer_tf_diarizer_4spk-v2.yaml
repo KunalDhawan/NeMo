@@ -148,6 +148,12 @@ model:
     chunk_left_context: 1
     chunk_right_context: 1
     # Speaker cache update parameters
+    spkcache_permute_speakers: true
+    spkcache_mode: topk
+    spkcache_num_queries: 30
+    spkcache_query_pool_threshold: 0.5
+    spkcache_query_pool_score_weight: 1.0
+    spkcache_query_pool_detach_preds: true
     spkcache_sil_frames_per_spk: 3
     scores_add_rnd: 0
     pred_score_threshold: 0.25

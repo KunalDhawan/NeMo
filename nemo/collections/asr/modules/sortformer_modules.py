@@ -95,6 +95,12 @@ class SortformerModules(NeuralModule, Exportable):
         weak_boost_rate: float = 1.5,
         min_pos_scores_rate: float = 0.5,
         use_learnable_sil_emb: bool = False,
+        spkcache_permute_speakers: bool = True,
+        spkcache_mode: str = "topk",
+        spkcache_num_queries: int = 30,
+        spkcache_query_pool_threshold: float = 0.5,
+        spkcache_query_pool_score_weight: float = 1.0,
+        spkcache_query_pool_detach_preds: bool = True,
     ):
         super().__init__()
         # General params
@@ -140,6 +146,21 @@ class SortformerModules(NeuralModule, Exportable):
         self.strong_boost_rate = strong_boost_rate
         self.weak_boost_rate = weak_boost_rate
         self.min_pos_scores_rate = min_pos_scores_rate
+        self.spkcache_permute_speakers = spkcache_permute_speakers
+        self.spkcache_mode = spkcache_mode
+        self.spkcache_num_queries = spkcache_num_queries
+        self.spkcache_query_pool_threshold = spkcache_query_pool_threshold
+        self.spkcache_query_pool_score_weight = spkcache_query_pool_score_weight
+        self.spkcache_query_pool_detach_preds = spkcache_query_pool_detach_preds
+        if self.spkcache_mode == "query_pool" and isinstance(self.spkcache_num_queries, int):
+            expected_spkcache_len = self.n_spk * (self.spkcache_num_queries + self.spkcache_sil_frames_per_spk)
+            if self.spkcache_len != expected_spkcache_len:
+                logging.warning(
+                    "Overriding spkcache_len for query-pool speaker cache: "
+                    f"{self.spkcache_len} -> {expected_spkcache_len} "
+                    "(num_spks * (spkcache_num_queries + spkcache_sil_frames_per_spk))."
+                )
+                self.spkcache_len = expected_spkcache_len
 
         # Silence embedding used to fill disabled (placeholder) speaker-cache slots.
         # Default (False): data-dependent running mean of silence frames (`mean_sil_emb`).
@@ -147,6 +168,18 @@ class SortformerModules(NeuralModule, Exportable):
         self.use_learnable_sil_emb = use_learnable_sil_emb
         if self.use_learnable_sil_emb:
             self.learnable_sil_emb = nn.Parameter(torch.zeros(self.fc_d_model))
+
+        if self.spkcache_mode == "query_pool":
+            self.spkcache_queries = nn.Parameter(torch.empty(self.spkcache_num_queries, self.fc_d_model))
+            self.spkcache_key_proj = nn.Linear(self.fc_d_model, self.fc_d_model)
+            self.spkcache_pool_norm = nn.LayerNorm(self.fc_d_model)
+            self.spkcache_pool_out = nn.Linear(self.fc_d_model, self.fc_d_model)
+            nn.init.normal_(self.spkcache_queries, mean=0.0, std=0.02)
+            with torch.no_grad():
+                self.spkcache_key_proj.weight.copy_(torch.eye(self.fc_d_model))
+                self.spkcache_key_proj.bias.zero_()
+                self.spkcache_pool_out.weight.zero_()
+                self.spkcache_pool_out.bias.zero_()
 
     def _check_streaming_parameters(self):
         """
@@ -174,6 +207,28 @@ class SortformerModules(NeuralModule, Exportable):
                 raise TypeError(f"Parameter '{param}' must be an integer, but got {param}: {val}")
             if val < min_val:
                 raise ValueError(f"Parameter '{param}' must be at least {min_val}, but got {val}.")
+
+        if self.spkcache_mode not in ("topk", "query_pool"):
+            raise ValueError(f"spkcache_mode must be either 'topk' or 'query_pool', got '{self.spkcache_mode}'.")
+        if not isinstance(self.spkcache_num_queries, int):
+            raise TypeError(
+                "Parameter 'spkcache_num_queries' must be an integer, "
+                f"but got spkcache_num_queries: {self.spkcache_num_queries}"
+            )
+        if self.spkcache_num_queries < 1:
+            raise ValueError(
+                f"Parameter 'spkcache_num_queries' must be at least 1, got {self.spkcache_num_queries}."
+            )
+        if not 0.0 <= self.spkcache_query_pool_threshold <= 1.0:
+            raise ValueError(
+                "spkcache_query_pool_threshold must be in [0.0, 1.0], "
+                f"got {self.spkcache_query_pool_threshold}."
+            )
+        if self.spkcache_query_pool_score_weight < 0.0:
+            raise ValueError(
+                "spkcache_query_pool_score_weight must be non-negative, "
+                f"got {self.spkcache_query_pool_score_weight}."
+            )
 
         if self.spkcache_update_period < self.chunk_len:
             logging.warning(
@@ -1149,10 +1204,17 @@ class SortformerModules(NeuralModule, Exportable):
         scores = torch.stack(scores_list).to(scores.device)
         return scores, spk_perm
 
+    def _get_spkcache_sil_emb(self, mean_sil_emb, batch_size: int, dtype: torch.dtype, device: torch.device):
+        """Return the silence embedding used for disabled speaker-cache slots."""
+        if self.use_learnable_sil_emb:
+            sil_emb = self.learnable_sil_emb.to(dtype=dtype, device=device)
+            return sil_emb.unsqueeze(0).expand(batch_size, -1)
+        return mean_sil_emb.to(dtype=dtype, device=device)
+
     def _compress_spkcache(self, emb_seq, preds, mean_sil_emb, permute_spk: bool = False):
         """
         Compress speaker cache for streaming inference.
-        Keep spkcache_len most important frames out of input n_frames, based on preds.
+        Keep a fixed-size speaker cache using the configured compression mode.
 
         Args:
             emb_seq (torch.Tensor): Tensor containing n_frames > spkcache_len embeddings
@@ -1172,11 +1234,15 @@ class SortformerModules(NeuralModule, Exportable):
             spk_perm (torch.Tensor): random speaker permutation tensor if permute_spk=True, otherwise None
                 Shape: (batch_size, n_spk)
         """
+        permute_spk = permute_spk and self.spkcache_permute_speakers
+        if self.spkcache_mode == "query_pool":
+            return self._compress_spkcache_query_pool(emb_seq, preds, mean_sil_emb, permute_spk=permute_spk)
+        return self._compress_spkcache_topk(emb_seq, preds, mean_sil_emb, permute_spk=permute_spk)
+
+    def _compress_spkcache_topk(self, emb_seq, preds, mean_sil_emb, permute_spk: bool = False):
+        """Compress speaker cache by keeping top-scored frames, matching the original behavior."""
         batch_size, n_frames, n_spk = preds.shape
-        if self.use_learnable_sil_emb:
-            # Use the learned silence embedding instead of the data-dependent running mean.
-            mean_sil_emb = self.learnable_sil_emb.to(dtype=emb_seq.dtype, device=emb_seq.device)
-            mean_sil_emb = mean_sil_emb.unsqueeze(0).expand(batch_size, -1)
+        mean_sil_emb = self._get_spkcache_sil_emb(mean_sil_emb, batch_size, emb_seq.dtype, emb_seq.device)
         spkcache_len_per_spk = self.spkcache_len // n_spk - self.spkcache_sil_frames_per_spk
         strong_boost_per_spk = math.floor(spkcache_len_per_spk * self.strong_boost_rate)
         weak_boost_per_spk = math.floor(spkcache_len_per_spk * self.weak_boost_rate)
@@ -1211,4 +1277,69 @@ class SortformerModules(NeuralModule, Exportable):
         spkcache, spkcache_preds = self._gather_spkcache_and_preds(
             emb_seq, preds, topk_indices, is_disabled, mean_sil_emb
         )
+        return spkcache, spkcache_preds, spk_perm
+
+    def _compress_spkcache_query_pool(self, emb_seq, preds, mean_sil_emb, permute_spk: bool = False):
+        """Compress speaker cache with shared learned-query attention pooling."""
+        batch_size, _, emb_dim = emb_seq.shape
+        _, _, n_spk = preds.shape
+        sil_emb = self._get_spkcache_sil_emb(mean_sil_emb, batch_size, emb_seq.dtype, emb_seq.device)
+        preds_for_mask = preds.detach() if self.spkcache_query_pool_detach_preds else preds
+        confidence_scores = self._get_log_pred_scores(preds_for_mask)
+
+        if permute_spk:
+            speaker_exists = (preds_for_mask > self.spkcache_query_pool_threshold).any(dim=1)
+            missing_speakers = torch.where(~speaker_exists)
+            max_perm_index = torch.full((batch_size,), n_spk, dtype=torch.long, device=preds.device)
+            max_perm_index.scatter_reduce_(0, missing_speakers[0], missing_speakers[1], reduce="amin", include_self=False)
+            _, spk_perm = self._permute_speakers(confidence_scores, max_perm_index)
+            speaker_order = spk_perm
+        else:
+            spk_perm = None
+            speaker_order = torch.arange(n_spk, device=preds.device).unsqueeze(0).expand(batch_size, -1)
+
+        tokens_per_spk = self.spkcache_num_queries + self.spkcache_sil_frames_per_spk
+        keys = self.spkcache_key_proj(emb_seq)
+        scale = 1.0 / math.sqrt(self.fc_d_model)
+
+        queries = (
+            self.spkcache_queries.to(dtype=emb_seq.dtype, device=emb_seq.device)
+            .unsqueeze(0)
+            .unsqueeze(0)
+            .expand(batch_size, n_spk, -1, -1)
+        )  # (B, S, Q, D)
+
+        pred_source_index = speaker_order.unsqueeze(1).expand(-1, preds.shape[1], -1)
+        speaker_preds = torch.gather(preds_for_mask, dim=2, index=pred_source_index)
+        active_mask = (speaker_preds > self.spkcache_query_pool_threshold).transpose(1, 2)  # (B, S, T)
+        has_active = active_mask.any(dim=2)  # (B, S)
+
+        attn_logits = torch.einsum('bsqd,btd->bsqt', queries, keys) * scale
+        if self.spkcache_query_pool_score_weight > 0.0:
+            speaker_scores = torch.gather(confidence_scores, dim=2, index=pred_source_index).transpose(1, 2)
+            attn_logits = attn_logits + self.spkcache_query_pool_score_weight * speaker_scores.unsqueeze(2).to(
+                attn_logits.dtype
+            )
+        masked_logits = attn_logits.masked_fill(~active_mask.unsqueeze(2), torch.finfo(attn_logits.dtype).min)
+        safe_logits = torch.where(has_active.unsqueeze(-1).unsqueeze(-1), masked_logits, torch.zeros_like(masked_logits))
+        attn_weights = torch.softmax(safe_logits, dim=-1)
+        attn_weights = attn_weights * active_mask.unsqueeze(2).to(attn_weights.dtype)
+
+        pooled = torch.einsum('bsqt,btd->bsqd', attn_weights, emb_seq)
+        pooled = pooled + self.spkcache_pool_out(self.spkcache_pool_norm(pooled))
+        fallback_queries = sil_emb.unsqueeze(1).unsqueeze(2).expand(-1, n_spk, self.spkcache_num_queries, -1)
+        pooled = torch.where(has_active.unsqueeze(-1).unsqueeze(-1), pooled, fallback_queries)
+
+        spkcache_blocks = sil_emb.unsqueeze(1).unsqueeze(2).expand(-1, n_spk, tokens_per_spk, -1).clone()
+        spkcache_blocks[:, :, : self.spkcache_num_queries, :] = pooled
+        spkcache = spkcache_blocks.reshape(batch_size, self.spkcache_len, emb_dim)
+
+        spkcache_pred_blocks = torch.zeros(
+            batch_size, n_spk, tokens_per_spk, n_spk, dtype=preds.dtype, device=preds.device
+        )
+        query_pred_blocks = torch.einsum('bsqt,btn->bsqn', attn_weights.to(preds.dtype), preds)
+        query_pred_blocks = query_pred_blocks * has_active.unsqueeze(-1).unsqueeze(-1).to(preds.dtype)
+        spkcache_pred_blocks[:, :, : self.spkcache_num_queries, :] = query_pred_blocks
+        spkcache_preds = spkcache_pred_blocks.reshape(batch_size, self.spkcache_len, n_spk)
+
         return spkcache, spkcache_preds, spk_perm
