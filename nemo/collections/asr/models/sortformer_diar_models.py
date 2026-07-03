@@ -1024,14 +1024,22 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 input_spec=processed_signal, length=processed_signal_length
             )
 
+        # Tail-attention regularization (TransformerEncoder backbone only; ConformerEncoder has no
+        # ``tail_len`` and is skipped). The encoder's attn_mode is fixed (e.g. "tail_causal"); only
+        # the tail size varies: sampled from [0, max_tail_attn_len] during training, 0 at eval (and
+        # 0 disables it, since tail_len=0 -> full attention). NOTE: only the backbone is masked; the
+        # post-encoder (self.transformer_encoder) stays at full attention, so future can still leak
+        # through it — mask it too for a fully faithful low-latency simulation.
+        if hasattr(self.encoder, 'tail_len'):
+            max_tail = getattr(self.sortformer_modules, 'max_tail_attn_len', 0)
+            self.encoder.tail_len = random.randint(0, max_tail) if (self.training and max_tail > 0) else 0
+
         att_mod = False
         if self.training:
             rand_num = random.random()
             if rand_num < self.sortformer_modules.causal_attn_rate:
                 if hasattr(self.encoder, 'att_context_size'):
                     self.encoder.att_context_size = [-1, self.sortformer_modules.causal_attn_rc]
-                elif hasattr(self.encoder, 'attn_mode'):
-                    self.encoder.attn_mode = "causal"
                 self.transformer_encoder.diag = self.sortformer_modules.causal_attn_rc
                 att_mod = True
 
@@ -1064,8 +1072,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         if att_mod:
             if hasattr(self.encoder, 'att_context_size'):
                 self.encoder.att_context_size = [-1, -1]
-            elif hasattr(self.encoder, 'attn_mode'):
-                self.encoder.attn_mode = "full"
             self.transformer_encoder.diag = None
 
         del processed_signal, processed_signal_length

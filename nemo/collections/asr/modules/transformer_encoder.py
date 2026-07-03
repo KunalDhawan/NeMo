@@ -62,8 +62,14 @@ class TransformerEncoderConfig:
         pre_block_norm: If True, apply ``LayerNorm`` to embeddings before the first Transformer block
             (BERT/ViT-style). Set False to match pre-norm Transformers such as Whisper or GPT-2.
         subsampling_factor: Frame-level subsampling factor performed by the pre-encoder.
-        attn_mode: Attention pattern. Currently only ``"full"`` (bidirectional) is supported.
-            Future modes: ``"causal"``, ``"lookahead"``, ``"local"``, ``"sliding_window"``.
+        attn_mode: Attention pattern. One of ``"full"`` (bidirectional), ``"causal"`` (each query
+            attends only to itself and earlier keys), ``"tail_isolated"`` (keys in the last
+            ``tail_len`` frames are visible only to queries inside that tail, while the earlier
+            "prefix" is visible to all — the tail attends to the full sequence bidirectionally but
+            cannot leak back into the prefix), or ``"tail_causal"`` (same prefix/tail split, but
+            the tail is causal so every tail frame gets full left context and zero right context —
+            a low-latency streaming simulation). Both tail modes read the ``tail_len`` attribute.
+            Future modes: ``"lookahead"``, ``"local"``, ``"sliding_window"``.
         self_attention_model: Positional encoding / attention scoring scheme.
 
             - ``"rel_pos"`` (default): Transformer-XL relative positional encoding
@@ -95,8 +101,10 @@ class TransformerEncoderConfig:
     ff_expansion: float = 4.0
     pre_block_norm: bool = True
     subsampling_factor: int = 4
-    # Attention mode: "full" (bidirectional) or "causal" (each token only attends to itself and earlier tokens).
-    # Future: "lookahead", "local", "sliding_window".
+    # Attention mode: "full" (bidirectional), "causal" (each token only attends to itself and
+    # earlier tokens), "tail_isolated" (the last ``tail_len`` frames attend to everything but are
+    # invisible to the earlier "prefix" frames), or "tail_causal" (same, but the tail is causal so
+    # each tail frame has zero right context). Future: "lookahead", "local", "sliding_window".
     attn_mode: str = "full"
     self_attention_model: str = "rel_pos"
     rope_base: float = 10000.0
@@ -121,7 +129,44 @@ def _make_causal_mod():
     return causal
 
 
-_SUPPORTED_ATTENTION_MODES = ("full", "causal")
+def _make_tail_isolated_mod(tail_start):
+    """Isolate a tail region so it cannot leak into the earlier "prefix".
+
+    Keys in the tail ``[tail_start, end)`` are visible only to queries that are
+    themselves in the tail; keys in the prefix ``[0, tail_start)`` are visible to
+    every query. Equivalently, the pair ``(q_idx, kv_idx)`` is blocked iff the key
+    is in the tail while the query is in the prefix. ``tail_start`` is a per-sample
+    ``(B,)`` tensor, so the boundary can differ across the batch (e.g. derived from
+    each sample's valid length, which keeps it padding-aware).
+    """
+
+    def tail_mask(b, h, q_idx, kv_idx):
+        return (kv_idx < tail_start[b]) | (q_idx >= tail_start[b])
+
+    return tail_mask
+
+
+def _make_tail_causal_mod(tail_start):
+    """Like ``_make_tail_isolated_mod`` but the tail is *causal* instead of bidirectional.
+
+    Keys in the prefix ``[0, tail_start)`` are visible to every query (the prefix stays a
+    bidirectional block). Keys in the tail ``[tail_start, end)`` are visible only causally,
+    i.e. tail key ``kv_idx`` is visible to query ``q_idx`` iff ``q_idx >= kv_idx``. As a
+    result every tail frame sees full left context but *zero* right context — a dense,
+    compute-efficient simulation of low-latency streaming (small-chunk / frame-synchronous
+    emission) computed over a large training chunk. Prefix queries still cannot see the tail
+    (for tail key ``kv_idx >= tail_start > q_idx`` of a prefix query, ``q_idx >= kv_idx`` is
+    false). ``tail_start`` is a per-sample ``(B,)`` tensor. Degenerates to full causal when
+    ``tail_start <= 0`` and to full attention when ``tail_start >= length``.
+    """
+
+    def tail_mask(b, h, q_idx, kv_idx):
+        return (kv_idx < tail_start[b]) | (q_idx >= kv_idx)
+
+    return tail_mask
+
+
+_SUPPORTED_ATTENTION_MODES = ("full", "causal", "tail_isolated", "tail_causal")
 _SUPPORTED_SELF_ATTENTION_MODELS = ("abs_pos", "rel_pos", "no_pos", "rope")
 
 
@@ -365,7 +410,14 @@ class TransformerEncoder(nn.Module):
             pre-encoders and the LayerNorm directly after the positional sum, this scaling is
             largely a no-op for activation magnitudes. Only meaningful when ``pre_block_norm=False``
             or when matching pretrained checkpoints that expect this scaling.
-        attn_mode: Attention pattern — currently only "full" (bidirectional) is supported.
+        attn_mode: Attention pattern — one of "full" (bidirectional), "causal", "tail_isolated"
+            (the last ``tail_len`` frames attend to everything but are hidden from the earlier
+            prefix; the tail is bidirectional internally), or "tail_causal" (same prefix/tail
+            split, but the tail is causal so each tail frame has full left and zero right context —
+            a low-latency streaming simulation). For both tail modes, set the ``tail_len``
+            attribute on the instance to the desired tail size; it defaults to 0 (no tail == full
+            attention for both). "tail_causal" only becomes fully causal when ``tail_len`` covers
+            the whole sequence.
         sync_max_audio_length: When true, sync positional encoding allocation length across distributed ranks.
     """
 
@@ -437,6 +489,11 @@ class TransformerEncoder(nn.Module):
         self.sync_max_audio_length = sync_max_audio_length
         self.self_attention_model = self_attention_model
         self.attn_mode = attn_mode
+        # Tail size (number of trailing valid frames) for attn_mode in ("tail_isolated",
+        # "tail_causal"). The prefix/tail boundary is per-sample: length - tail_len. Set at runtime
+        # by the caller (e.g. sampled during training, 0 at eval). tail_len=0 == no tail, i.e. the
+        # mask collapses to plain full attention regardless of the tail attn_mode.
+        self.tail_len = 0
 
         if subsampling == 'feature_stacking':
             self.pre_encode = FeatureStacking(subsampling_factor, feat_in, d_model)
@@ -575,6 +632,15 @@ class TransformerEncoder(nn.Module):
         B, T, _ = x.shape
         if self.attn_mode == "causal":
             mask_mod = and_masks(_make_causal_mod(), _make_padding_mod(length))
+        elif self.attn_mode in ("tail_isolated", "tail_causal") and self.tail_len > 0:
+            # Tail = each sample's last ``tail_len`` valid frames (boundary measured from the
+            # per-sample length, so it tracks real content, not padding). tail_len=0 falls through
+            # to the plain padding mask below (full attention).
+            # "tail_isolated": tail is bidirectional but hidden from the prefix.
+            # "tail_causal": same split, but the tail is causal (each tail frame: full left, zero right).
+            tail_start = length - self.tail_len
+            tail_factory = _make_tail_isolated_mod if self.attn_mode == "tail_isolated" else _make_tail_causal_mod
+            mask_mod = and_masks(tail_factory(tail_start), _make_padding_mod(length))
         else:
             mask_mod = _make_padding_mod(length)
         block_mask = create_block_mask(mask_mod, B=B, H=1, Q_LEN=T, KV_LEN=T, device=x.device)

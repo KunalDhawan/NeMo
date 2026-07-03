@@ -86,6 +86,7 @@ class SortformerModules(NeuralModule, Exportable):
         spkcache_sil_frames_per_spk: int = 3,
         causal_attn_rate: float = 0,
         causal_attn_rc: int = 7,
+        max_tail_attn_len: int = 0,
         scores_add_rnd: float = 0,
         pred_score_threshold: float = 0.25,
         max_index: int = 99999,
@@ -132,6 +133,12 @@ class SortformerModules(NeuralModule, Exportable):
         self.spkcache_update_period = spkcache_update_period
         self.causal_attn_rate = causal_attn_rate
         self.causal_attn_rc = causal_attn_rc
+        # Tail-attention regularization (TransformerEncoder backbone only; ignored by ConformerEncoder).
+        # During training the backbone's ``tail_len`` is sampled uniformly from [0, max_tail_attn_len]
+        # per utterance; the tail (the newest frames) is masked according to the encoder's fixed
+        # attn_mode ("tail_causal" -> zero right context, or "tail_isolated" -> bidirectional tail).
+        # max_tail_attn_len=0 disables it (tail_len always 0 -> full attention). Always 0 at eval.
+        self.max_tail_attn_len = max_tail_attn_len
         self.scores_add_rnd = scores_add_rnd
         self.max_index = max_index
         self.pred_score_threshold = pred_score_threshold
