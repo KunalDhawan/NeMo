@@ -36,6 +36,7 @@ test_eartts_config = {
         "pretrained_lm_name": "nvidia/NVIDIA-Nemotron-Nano-9B-v2",
         "pretrained_ae_dir": None,
         "pretrained_tts_model": None,
+        "trust_remote_code": True,
         "scoring_asr": "stt_en_fastconformer_transducer_large",
         "freeze_params": [
             r"^audio_codec\..+$",  # Keep audio codec frozen as it only provides supervision for training.
@@ -53,6 +54,7 @@ test_eartts_config = {
         "inference_guidance_enabled": False,
         "subword_mask_exactly_as_eartts": False,
         "context_hidden_mask_exactly_as_eartts": False,
+        "exclude_norm_from_wd": True,
         "optimizer": {
             "_target_": "torch.optim.AdamW",
             "lr": 4e-5,
@@ -190,7 +192,7 @@ test_eartts_config = {
 }
 
 # set CI cached path
-if os.path.exists("/home/TestData/"):
+if os.path.exists("/home/TestData/nvidia--NVIDIA-Nemotron-Nano-9B-v2/"):
     test_eartts_config["model"]["pretrained_lm_name"] = "/home/TestData/nvidia--NVIDIA-Nemotron-Nano-9B-v2/"
 
 
