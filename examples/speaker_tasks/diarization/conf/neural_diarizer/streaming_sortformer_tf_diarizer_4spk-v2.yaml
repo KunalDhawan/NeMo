@@ -160,13 +160,16 @@ model:
     # Self-attention parameters (training only)
     causal_attn_rate: 0.5
     causal_attn_rc: 7
-    # Tail-attention regularization for the TransformerEncoder backbone (training only). Each
-    # training utterance samples encoder.tail_len ~ Uniform[0, max_tail_attn_len]; the newest
-    # tail_len frames are masked per encoder.attn_mode ("tail_causal" -> zero right context, or
-    # "tail_isolated" -> bidirectional tail). 0 disables it (tail_len always 0 -> full attention).
-    # Independent of causal_attn_* above: that only affects the post-encoder (transformer_encoder.diag)
-    # for a TransformerEncoder backbone, while this masks the backbone itself.
+    # Tail-attention regularization for the TransformerEncoder backbone (training only). With
+    # probability tail_attn_rate, encoder.tail_len ~ Uniform[1, max_tail_attn_len]; otherwise
+    # tail_len=0 (full attention). The newest tail_len frames are masked per encoder.attn_mode
+    # ("tail_causal" -> zero right context, or "tail_isolated" -> bidirectional tail).
+    # max_tail_attn_len=0 disables it (tail_len always 0 -> full attention). tail_attn_rate<1 keeps a
+    # fraction of steps at full context so high-right-context (large chunk_len) inference isn't
+    # under-trained. Independent of causal_attn_* above: that only affects the post-encoder
+    # (transformer_encoder.diag) for a TransformerEncoder backbone, while this masks the backbone.
     max_tail_attn_len: 0
+    tail_attn_rate: 1.0
 
   encoder:
     _target_: nemo.collections.asr.modules.TransformerEncoder
