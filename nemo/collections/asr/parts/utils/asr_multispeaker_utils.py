@@ -350,6 +350,7 @@ def get_ats_targets_hungarian(
     logits: torch.Tensor,
     thres: float = 0.5,
     tolerance: float = 0,
+    metric: str = 'dot_product',
     **kwargs,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -371,8 +372,11 @@ def get_ats_targets_hungarian(
         tolerance (float): Tolerance in frames for arrival time comparison. Speakers whose
             arrival times differ by at most this value are considered tied and may be
             assigned to each other's positions. Default is 0.
+        metric (str): Match metric used by the Hungarian assignment to resolve tied arrival times.
+            One of 'dot_product' (default), 'accuracy' or 'bce'. Forwarded to
+            get_pil_targets_hungarian.
         **kwargs: Additional keyword arguments forwarded to get_pil_targets_hungarian
-            (e.g., cls_preds, cls_preds_weight, metric, apply_sigmoid).
+            (e.g., cls_preds, cls_preds_weight, apply_sigmoid).
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
@@ -403,7 +407,7 @@ def get_ats_targets_hungarian(
     # arrival: (B, S, 1), target_arrival: (B, 1, N) -> ats_mask: (B, S, N)
     ats_mask = torch.abs(arrival.unsqueeze(2) - target_arrival.unsqueeze(1)) <= tolerance
 
-    return get_pil_targets_hungarian(labels, logits, assignment_mask=ats_mask, **kwargs)
+    return get_pil_targets_hungarian(labels, logits, assignment_mask=ats_mask, metric=metric, **kwargs)
 
 
 def find_segments_from_rttm(

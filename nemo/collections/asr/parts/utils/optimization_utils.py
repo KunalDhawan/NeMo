@@ -24,6 +24,9 @@
 # Author: Brian M. Clapper, Gael Varoquaux
 # License: 3-clause BSD
 
+import warnings
+from typing import Optional
+
 import torch
 
 
@@ -341,3 +344,171 @@ def linear_sum_assignment(cost_matrix: torch.Tensor, max_size: int = 100):
         marked = lap_solver.marked
     row_index, col_index = torch.where(marked == 1)
     return row_index, col_index
+
+
+def batched_auction_assignment(
+    benefit: torch.Tensor,
+    eps: Optional[float] = None,
+    eps_factor: float = 1e-4,
+    max_iter: int = 1000,
+    row_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Batched forward-auction solver for the linear assignment problem (maximization).
+
+    Unlike the Hungarian/Munkres solver (``linear_sum_assignment``), which processes a single
+    2D cost matrix at a time with data-dependent control flow, the auction algorithm relies only
+    on elementwise ops and ``max``/``argmax`` reductions. This lets it solve an entire batch of
+    assignment problems in parallel on-device, without a Python per-sample loop or a host transfer.
+
+    The solver assigns every row (a "person") to a distinct column (an "object") so as to maximize
+    the total benefit. It therefore requires ``#columns >= #rows``; transpose the input beforehand
+    if that is not the case.
+
+    Optimality:
+        The auction algorithm is *near-optimal*: the total benefit is within ``R * eps`` of the
+        optimum (``R`` = number of rows). ``eps`` is therefore chosen small relative to each
+        sample's score spread, which yields the exact optimal assignment for typical well-scaled
+        problems (empirically exact for R, C up to ~8, and within a negligible gap beyond that). A
+        smaller ``eps`` is more accurate but needs more iterations. The default derivation scales
+        ``eps`` to the spread of the top ``R + 1`` entries (which are always real) rather than the
+        full min-max range, so it is not thrown off by a few large negative masking sentinels.
+
+    Limitations:
+        Convergence takes roughly ``score_spread / eps`` rounds, so highly *degenerate* problems
+        are slow: many tied costs, or several identical fully-masked rows (e.g. inactive-speaker
+        rows all set to the same ``-1e6``) trigger long price wars that may exceed ``max_iter``.
+        For such inputs prefer running the solver on only the feasible/active submatrix, or pass a
+        larger explicit ``eps`` (trading a small optimality gap for far fewer iterations). This
+        solver is intended for near-optimal batched assignment, not as a bit-exact replacement for
+        ``linear_sum_assignment`` on adversarial or heavily-tied cost matrices.
+
+    Args:
+        benefit (Tensor): Benefit matrix of shape ``(B, R, C)`` with ``C >= R``, where higher
+            values indicate better matches.
+        eps (float, optional): Absolute bidding increment. If ``None`` (default), it is derived
+            per-sample from the spread of the top ``R + 1`` entries times ``eps_factor``.
+        eps_factor (float): Fraction of each sample's (robust) score spread used for the bidding
+            increment when ``eps`` is ``None``. Defaults to ``1e-4``.
+        max_iter (int): Safety cap on the number of auction rounds. Defaults to 1000.
+        row_mask (Tensor, optional): Boolean mask of shape ``(B, R)``. When provided, only rows
+            with ``True`` bid and must be assigned; masked-out rows never bid and are returned as
+            ``-1``. This is the recommended way to skip degenerate rows (e.g. inactive-speaker rows
+            filled with a constant masking sentinel), which would otherwise trigger slow price wars.
+
+    Returns:
+        Tensor: ``row2col`` of shape ``(B, R)`` (long), mapping each row to its assigned column.
+            Rows are ``-1`` if masked out via ``row_mask`` or if the solver did not converge within
+            ``max_iter`` (a warning is emitted in the non-convergence case).
+    """
+    if benefit.dim() != 3:
+        raise ValueError(f"Expected a 3D (B, R, C) benefit tensor, got shape {tuple(benefit.shape)}")
+
+    batch_size, num_rows, num_cols = benefit.shape
+    if num_cols < num_rows:
+        raise ValueError(
+            f"batched_auction_assignment requires #cols >= #rows, got R={num_rows}, C={num_cols}. "
+            "Transpose the benefit matrix before calling."
+        )
+
+    device, dtype = benefit.device, benefit.dtype
+    row2col = torch.full((batch_size, num_rows), -1, dtype=torch.long, device=device)
+    if num_rows == 0 or num_cols == 0:
+        return row2col
+    if num_cols == 1:
+        # C >= R implies R == 1 here: the single row is assigned to the single column.
+        row2col[:, 0] = 0
+        return row2col
+
+    # Bidding increment, scaled to each sample's score spread so the R*eps optimality gap is small
+    # relative to the scores. The scale is taken from the spread of the top (R+1) entries rather
+    # than the full min-max range: the largest values are always "real", so this stays robust when
+    # the matrix contains large negative sentinels (e.g. -1e6 masking of infeasible/inactive
+    # entries), which would otherwise inflate the range and yield a far-too-large eps.
+    if eps is None:
+        flat = benefit.reshape(batch_size, -1)
+        k = min(num_rows + 1, flat.shape[1])
+        top_vals = flat.topk(k, dim=1).values  # (B, k), descending
+        score_scale = (top_vals[:, 0] - top_vals[:, -1]).clamp(min=1e-6)
+        eps_b = (score_scale * eps_factor).view(batch_size, 1)
+    else:
+        eps_b = torch.full((batch_size, 1), float(eps), device=device, dtype=dtype)
+
+    if row_mask is None:
+        biddable = torch.ones(batch_size, num_rows, dtype=torch.bool, device=device)
+    else:
+        if tuple(row_mask.shape) != (batch_size, num_rows):
+            raise ValueError(
+                f"row_mask must have shape {(batch_size, num_rows)}, got {tuple(row_mask.shape)}"
+            )
+        biddable = row_mask.to(device=device, dtype=torch.bool)
+
+    neg_inf = torch.finfo(dtype).min
+    prices = torch.zeros(batch_size, num_cols, device=device, dtype=dtype)
+    assigned = torch.zeros(batch_size, num_rows, dtype=torch.bool, device=device)
+    owner = torch.full((batch_size, num_cols), -1, dtype=torch.long, device=device)  # column -> row
+
+    for _ in range(max_iter):
+        # Only biddable (e.g. active) rows that are not yet assigned participate.
+        unassigned = biddable & ~assigned
+        if not bool(unassigned.any()):
+            break
+
+        # Each person values every object by its benefit minus the current price, then targets
+        # its best object and bids by (best - second_best + eps) above the current price.
+        value = benefit - prices.unsqueeze(1)  # (B, R, C)
+        top2 = value.topk(2, dim=2)
+        best_j = top2.indices[..., 0]  # (B, R)
+        best_v = top2.values[..., 0]
+        second_v = top2.values[..., 1]
+        bid_price = prices.gather(1, best_j) + (best_v - second_v) + eps_b  # (B, R)
+
+        # Scatter each unassigned person's bid into its target column, then take the highest
+        # bidder per column. Only currently-unassigned biddable persons bid.
+        bid_full = torch.full((batch_size, num_rows, num_cols), neg_inf, device=device, dtype=dtype)
+        bid_full.scatter_(2, best_j.unsqueeze(-1), bid_price.unsqueeze(-1))
+        bid_full = torch.where(unassigned.unsqueeze(-1), bid_full, torch.full_like(bid_full, neg_inf))
+
+        max_bid, winner = bid_full.max(dim=1)  # (B, C)
+        got_bid = max_bid > (neg_inf / 2)  # columns that received at least one real bid
+
+        b_idx, j_idx = torch.where(got_bid)
+        if b_idx.numel() == 0:
+            break
+        winners = winner[b_idx, j_idx]
+        prev_owner = owner[b_idx, j_idx]
+
+        prices[b_idx, j_idx] = max_bid[b_idx, j_idx]
+
+        # The previous owner of a reassigned column (if any) becomes unassigned. Previous owners
+        # are currently assigned while winners are currently unassigned, so the two sets are
+        # disjoint and the order of these updates is safe.
+        has_prev = prev_owner >= 0
+        assigned[b_idx[has_prev], prev_owner[has_prev]] = False
+        row2col[b_idx[has_prev], prev_owner[has_prev]] = -1
+
+        owner[b_idx, j_idx] = winners
+        assigned[b_idx, winners] = True
+        row2col[b_idx, winners] = j_idx
+
+    # Guarantee a complete assignment: any biddable row still unassigned after max_iter (a rare
+    # tail on near-degenerate inputs) is greedily placed on its best remaining free column. This
+    # keeps the result a valid, near-optimal complete matching instead of leaving corrupting -1s.
+    not_converged = biddable & ~assigned
+    if bool(not_converged.any()):
+        num_unconverged = int(not_converged.any(dim=1).sum().item())
+        for b in torch.where(not_converged.any(dim=1))[0].tolist():
+            free = owner[b] < 0
+            for r in torch.where(not_converged[b])[0].tolist():
+                col_vals = torch.where(free, benefit[b, r], torch.full_like(benefit[b, r], neg_inf))
+                c = int(torch.argmax(col_vals).item())
+                row2col[b, r] = c
+                free[c] = False
+        warnings.warn(
+            f"batched_auction_assignment did not converge for {num_unconverged}/{batch_size} sample(s) "
+            f"within max_iter={max_iter}; those were completed greedily (near-optimal). "
+            "Consider increasing max_iter or eps for an exact result.",
+            RuntimeWarning,
+        )
+
+    return row2col

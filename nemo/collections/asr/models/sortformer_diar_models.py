@@ -378,6 +378,18 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         # the model (the Hungarian step then uses predictions to assign them). Relaxes ordering
         # only for near-simultaneous onsets, reducing label-noise harm; 0 = exact arrival sort.
         self.ats_tolerance = self._cfg.get("ats_tolerance", 0)
+        # match_metric: metric used by the Hungarian assignment when building both PIL and ATS targets.
+        #   'dot_product' (default): scores only true-positive overlap (label==1 & high prob) and
+        #       ignores the silence/negative class, so it does not penalize false alarms. Bounded
+        #       and numerically stable; matches the previous behavior.
+        #   'accuracy': accounts for both the positive and negative classes (soft accuracy).
+        #   'bce': matches the BCE training objective directly (most assignment-consistent), at
+        #       the cost of the usual BCE numerical sensitivity near 0/1 probabilities.
+        self.match_metric = str(self._cfg.get("match_metric", "dot_product")).lower()
+        if self.match_metric not in ("dot_product", "accuracy", "bce"):
+            raise ValueError(
+                f"match_metric must be 'dot_product', 'accuracy', or 'bce', got '{self.match_metric}'"
+            )
 
     def _init_eval_metrics(self):
         """
@@ -1547,9 +1559,11 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         elif preds.shape[1] > targets.shape[1]:
             preds = preds[:, : targets.shape[1], :]
         targets_ats, _ = get_ats_targets_hungarian(
-            targets.clone(), preds, tolerance=self.ats_tolerance, apply_sigmoid=False
+            targets.clone(), preds, tolerance=self.ats_tolerance, metric=self.match_metric, apply_sigmoid=False
         )
-        targets_pil, _ = get_pil_targets_hungarian(targets.clone(), preds, apply_sigmoid=False)
+        targets_pil, _ = get_pil_targets_hungarian(
+            targets.clone(), preds, metric=self.match_metric, apply_sigmoid=False
+        )
         # Soften only the loss targets (boundary + label smoothing); metrics below
         # keep using the original hard targets so F1/accuracy stay unaffected.
         ats_loss = self.loss(
@@ -1665,9 +1679,11 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         elif preds.shape[1] > targets.shape[1]:
             preds = preds[:, : targets.shape[1], :]
         targets_ats, _ = get_ats_targets_hungarian(
-            targets.clone(), preds, tolerance=self.ats_tolerance, apply_sigmoid=False
+            targets.clone(), preds, tolerance=self.ats_tolerance, metric=self.match_metric, apply_sigmoid=False
         )
-        targets_pil, _ = get_pil_targets_hungarian(targets.clone(), preds, apply_sigmoid=False)
+        targets_pil, _ = get_pil_targets_hungarian(
+            targets.clone(), preds, metric=self.match_metric, apply_sigmoid=False
+        )
 
         # Soften only the loss targets (boundary + label smoothing); metrics below
         # keep using the original hard targets so F1/accuracy stay unaffected.
@@ -1826,9 +1842,11 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         elif preds.shape[1] > targets.shape[1]:
             preds = preds[:, : targets.shape[1], :]
         targets_ats, _ = get_ats_targets_hungarian(
-            targets.clone(), preds, tolerance=self.ats_tolerance, apply_sigmoid=False
+            targets.clone(), preds, tolerance=self.ats_tolerance, metric=self.match_metric, apply_sigmoid=False
         )
-        targets_pil, _ = get_pil_targets_hungarian(targets.clone(), preds, apply_sigmoid=False)
+        targets_pil, _ = get_pil_targets_hungarian(
+            targets.clone(), preds, metric=self.match_metric, apply_sigmoid=False
+        )
         self._accuracy_test(preds, targets_pil, target_lens)
         f1_acc, precision, recall = self._accuracy_test.compute()
         self.batch_f1_accs_list.append(f1_acc)
