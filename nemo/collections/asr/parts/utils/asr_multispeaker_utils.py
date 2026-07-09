@@ -254,9 +254,14 @@ def get_pil_targets_hungarian(
                 logits_expanded, labels_expanded.to(logits_expanded.dtype), reduction='none'
             ).mean(dim=1)
         else:
-            match_score_matrix = -F.binary_cross_entropy(
-                logits_expanded, labels_expanded.to(logits_expanded.dtype), reduction='none'
-            ).mean(dim=1)
+            # Inputs are already probabilities, so use F.binary_cross_entropy. It is unsafe under
+            # autocast (the guard triggers on the autocast context, not the dtype, so upcasting the
+            # inputs alone is not enough), hence we run it with autocast disabled in float32. torch's
+            # BCE clamps its log terms internally (to -100), so saturated 0/1 probs stay finite.
+            with torch.autocast(device_type=logits_expanded.device.type, enabled=False):
+                match_score_matrix = -F.binary_cross_entropy(
+                    logits_expanded.float(), labels_expanded.float(), reduction='none'
+                ).mean(dim=1)
     elif metric == 'dot_product':
         preds_expanded = torch.sigmoid(logits_expanded) if apply_sigmoid else logits_expanded
         match_score_matrix = (preds_expanded * labels_expanded).mean(dim=1)
