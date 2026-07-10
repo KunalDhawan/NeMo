@@ -111,6 +111,8 @@ def sortformer_model():
             'pil_weight': 0.5,
             'ats_weight': 0.5,
             'activity_weight': 0.1,
+            'presence_weight': 0.1,
+            'presence_window_radius': 1,
             'max_num_of_spks': 4,
             'model_defaults': DictConfig(model_defaults),
             'encoder': DictConfig(encoder),
@@ -208,6 +210,85 @@ class TestSortformerEncLabelModelOffline:
 
         activity_loss.backward()
         assert perfect_activity_logits.grad is not None
+
+    @pytest.mark.unit
+    def test_pil_aligned_windowed_presence_loss(self, sortformer_model):
+        model = sortformer_model.eval()
+        num_spks = model.sortformer_modules.n_spk
+        targets_pil = torch.zeros(1, 6, num_spks)
+        targets_pil[0, 2, 1] = 1.0
+        target_lens = torch.tensor([5])
+
+        aligned_preds = torch.full_like(targets_pil, 0.001)
+        aligned_preds[0, 2, 1] = 0.999
+        aligned_preds.requires_grad_()
+        aligned_loss = model._presence_loss(aligned_preds, targets_pil, target_lens)
+
+        misaligned_preds = torch.full_like(targets_pil, 0.001)
+        misaligned_preds[0, 2, 0] = 0.999
+        misaligned_loss = model._presence_loss(misaligned_preds, targets_pil, target_lens)
+
+        padded_fake_preds = aligned_preds.detach().clone()
+        padded_fake_preds[0, 5, 0] = 0.999
+        padded_fake_loss = model._presence_loss(padded_fake_preds, targets_pil, target_lens)
+
+        assert aligned_loss < 0.01
+        assert misaligned_loss > aligned_loss + 1.0
+        assert torch.allclose(padded_fake_loss, aligned_loss)
+
+        aligned_loss.backward()
+        assert aligned_preds.grad is not None
+
+    @pytest.mark.unit
+    def test_global_speaker_count_metrics(self, sortformer_model):
+        num_spks = sortformer_model.sortformer_modules.n_spk
+        preds = torch.zeros(3, 4, num_spks)
+        targets = torch.zeros_like(preds)
+        target_lens = torch.tensor([4, 3, 2])
+
+        # Sample 0: predict three speakers when two are present (absolute error 1).
+        targets[0, 0, :2] = 1.0
+        preds[0, 0, :3] = 0.9
+        # Sample 1: count is correct even though the active channel differs.
+        targets[1, 1, 2] = 1.0
+        preds[1, 1, 0] = 0.9
+        # Sample 2: activity only in padding must not count as a speaker.
+        preds[2, 2, 3] = 0.9
+
+        count_mae, count_accuracy = sortformer_model._speaker_count_metrics(
+            preds, targets, target_lens
+        )
+
+        assert torch.allclose(count_mae, torch.tensor(1.0 / 3.0))
+        assert torch.allclose(count_accuracy, torch.tensor(2.0 / 3.0))
+
+    @pytest.mark.unit
+    def test_multi_validation_epoch_end_includes_auxiliary_losses(self, sortformer_model):
+        scalar_keys = [
+            'val_loss',
+            'val_ats_loss',
+            'val_pil_loss',
+            'val_pairwise_ats_loss',
+            'val_self_ats_loss',
+            'val_spkcount_loss',
+            'val_activity_loss',
+            'val_presence_loss',
+            'val_f1_acc',
+            'val_precision',
+            'val_recall',
+            'val_f1_acc_ats',
+            'val_speaker_count_mae',
+            'val_speaker_count_accuracy',
+        ]
+        outputs = [
+            {key: torch.tensor(1.0) for key in scalar_keys},
+            {key: torch.tensor(3.0) for key in scalar_keys},
+        ]
+
+        metrics = sortformer_model.multi_validation_epoch_end(outputs)['log']
+
+        assert torch.equal(metrics['val_activity_loss'], torch.tensor(2.0))
+        assert torch.equal(metrics['val_presence_loss'], torch.tensor(2.0))
 
 
 class TestSortformerEncLabelModelStreaming:

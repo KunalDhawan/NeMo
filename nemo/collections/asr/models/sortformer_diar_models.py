@@ -367,6 +367,23 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.activity_weight = float(self._cfg.get("activity_weight", 0.0))
         if self.activity_weight < 0.0:
             raise ValueError(f"activity_weight must be >= 0, got {self.activity_weight}")
+        # PIL-aligned local speaker-presence loss. For every output frame and speaker
+        # channel, max-pool predictions and PIL-matched targets over [t-d, t+d].
+        # This makes a short high-confidence false speaker incur a neighborhood-wide
+        # penalty while preserving short ground-truth speakers.
+        self.presence_weight = float(self._cfg.get("presence_weight", 0.0))
+        if self.presence_weight < 0.0:
+            raise ValueError(f"presence_weight must be >= 0, got {self.presence_weight}")
+        self.presence_window_radius = self._cfg.get("presence_window_radius", 3)
+        if not isinstance(self.presence_window_radius, int) or isinstance(
+            self.presence_window_radius, bool
+        ):
+            raise TypeError(
+                "presence_window_radius must be a non-negative integer, "
+                f"got {type(self.presence_window_radius).__name__}: {self.presence_window_radius}"
+            )
+        if self.presence_window_radius < 0:
+            raise ValueError(f"presence_window_radius must be >= 0, got {self.presence_window_radius}")
         # Distance used by the self-ATS loss: 'bce' (default; matches the other losses but has
         # an entropy floor, so the logged value is > 0 even when perfectly self-consistent) or
         # 'mse' (no floor: value is 0 when self-consistent, and a gentler bounded gradient).
@@ -1666,6 +1683,64 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         activity_targets = hard_activity.sum(dim=-1).clamp(max=2)
         return self._masked_cross_entropy(activity_logits, activity_targets, target_lens)
 
+    @staticmethod
+    def _speaker_count_metrics(preds, targets, target_lens):
+        """Compute per-sample global speaker-count MAE and exact-match accuracy."""
+        valid = (
+            torch.arange(preds.shape[1], device=preds.device).unsqueeze(0)
+            < target_lens.to(preds.device).unsqueeze(1)
+        ).unsqueeze(-1)
+        pred_present = ((preds > 0.5) & valid).any(dim=1)
+        target_present = ((targets > 0.5) & valid).any(dim=1)
+        pred_count = pred_present.sum(dim=1)
+        target_count = target_present.sum(dim=1)
+        count_error = (pred_count - target_count).abs().float()
+        count_mae = count_error.mean()
+        count_accuracy = (pred_count == target_count).float().mean()
+        return count_mae, count_accuracy
+
+    def _presence_loss(self, preds, targets_pil, target_lens):
+        """
+        Compare local speaker presence after PIL alignment.
+
+        For every frame ``t`` and channel ``s``, presence is the maximum activity
+        in ``[t-d, t+d]`` where ``d`` is ``presence_window_radius``. Padding is
+        zeroed before pooling and excluded from the final mean.
+        """
+        num_frames, num_spks = preds.shape[1], preds.shape[2]
+        valid = (
+            torch.arange(num_frames, device=preds.device).unsqueeze(0)
+            < target_lens.to(preds.device).unsqueeze(1)
+        )
+        valid_expanded = valid.unsqueeze(-1)
+        preds_valid = preds * valid_expanded
+        targets_valid = (targets_pil > 0.5).to(preds.dtype) * valid_expanded
+
+        radius = self.presence_window_radius
+        kernel_size = 2 * radius + 1
+        pred_presence = torch.nn.functional.max_pool1d(
+            preds_valid.transpose(1, 2),
+            kernel_size=kernel_size,
+            stride=1,
+            padding=radius,
+        ).transpose(1, 2)
+        target_presence = torch.nn.functional.max_pool1d(
+            targets_valid.transpose(1, 2),
+            kernel_size=kernel_size,
+            stride=1,
+            padding=radius,
+        ).transpose(1, 2)
+
+        with torch.autocast(device_type=preds.device.type, enabled=False):
+            element_loss = torch.nn.functional.binary_cross_entropy(
+                pred_presence.float().clamp(min=self.eps, max=1.0 - self.eps),
+                target_presence.float(),
+                reduction="none",
+            )
+        element_loss = element_loss * valid_expanded
+        denominator = valid.sum() * num_spks
+        return (element_loss.sum() / denominator.clamp_min(1)).to(preds.dtype)
+
     def _get_aux_train_evaluations(
         self, preds, targets, target_lens, activity_logits=None
     ) -> dict:
@@ -1717,6 +1792,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self_ats_loss = self._self_ats_loss(preds, target_lens)
         spkcount_loss = self._spkcount_loss(preds, targets, target_lens)
         activity_loss = self._activity_loss(activity_logits, targets, target_lens)
+        presence_loss = self._presence_loss(preds, targets_pil, target_lens)
         loss = (
             self.ats_weight * ats_loss
             + self.pil_weight * pil_loss
@@ -1724,6 +1800,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             + self.self_ats_weight * self_ats_loss
             + self.spkcount_weight * spkcount_loss
             + self.activity_weight * activity_loss
+            + self.presence_weight * presence_loss
         )
 
         self._accuracy_train(preds, targets_pil, target_lens)
@@ -1731,6 +1808,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         self._accuracy_train_ats(preds, targets_ats, target_lens)
         train_f1_acc_ats, _, _ = self._accuracy_train_ats.compute()
+        train_speaker_count_mae, train_speaker_count_accuracy = self._speaker_count_metrics(
+            preds, targets, target_lens
+        )
 
         train_metrics = {
             'loss': loss,
@@ -1740,11 +1820,14 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'self_ats_loss': self_ats_loss,
             'spkcount_loss': spkcount_loss,
             'activity_loss': activity_loss,
+            'presence_loss': presence_loss,
             'learning_rate': self._optimizer.param_groups[0]['lr'],
             'train_f1_acc': train_f1_acc,
             'train_precision': train_precision,
             'train_recall': train_recall,
             'train_f1_acc_ats': train_f1_acc_ats,
+            'train_speaker_count_mae': train_speaker_count_mae,
+            'train_speaker_count_accuracy': train_speaker_count_accuracy,
         }
         return train_metrics
 
@@ -1856,6 +1939,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         val_self_ats_loss = self._self_ats_loss(preds, target_lens)
         val_spkcount_loss = self._spkcount_loss(preds, targets, target_lens)
         val_activity_loss = self._activity_loss(activity_logits, targets, target_lens)
+        val_presence_loss = self._presence_loss(preds, targets_pil, target_lens)
         val_loss = (
             self.ats_weight * val_ats_loss
             + self.pil_weight * val_pil_loss
@@ -1863,6 +1947,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             + self.self_ats_weight * val_self_ats_loss
             + self.spkcount_weight * val_spkcount_loss
             + self.activity_weight * val_activity_loss
+            + self.presence_weight * val_presence_loss
         )
 
         self._accuracy_valid(preds, targets_pil, target_lens)
@@ -1870,6 +1955,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         self._accuracy_valid_ats(preds, targets_ats, target_lens)
         valid_f1_acc_ats, _, _ = self._accuracy_valid_ats.compute()
+        val_speaker_count_mae, val_speaker_count_accuracy = self._speaker_count_metrics(
+            preds, targets, target_lens
+        )
 
         self._accuracy_valid.reset()
         self._accuracy_valid_ats.reset()
@@ -1882,10 +1970,13 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'val_self_ats_loss': val_self_ats_loss,
             'val_spkcount_loss': val_spkcount_loss,
             'val_activity_loss': val_activity_loss,
+            'val_presence_loss': val_presence_loss,
             'val_f1_acc': val_f1_acc,
             'val_precision': val_precision,
             'val_recall': val_recall,
             'val_f1_acc_ats': valid_f1_acc_ats,
+            'val_speaker_count_mae': val_speaker_count_mae,
+            'val_speaker_count_accuracy': val_speaker_count_accuracy,
         }
         return val_metrics
 
@@ -1964,10 +2055,16 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         val_pairwise_ats_loss_mean = torch.stack([x['val_pairwise_ats_loss'] for x in outputs]).mean()
         val_self_ats_loss_mean = torch.stack([x['val_self_ats_loss'] for x in outputs]).mean()
         val_spkcount_loss_mean = torch.stack([x['val_spkcount_loss'] for x in outputs]).mean()
+        val_activity_loss_mean = torch.stack([x['val_activity_loss'] for x in outputs]).mean()
+        val_presence_loss_mean = torch.stack([x['val_presence_loss'] for x in outputs]).mean()
         val_f1_acc_mean = torch.stack([x['val_f1_acc'] for x in outputs]).mean()
         val_precision_mean = torch.stack([x['val_precision'] for x in outputs]).mean()
         val_recall_mean = torch.stack([x['val_recall'] for x in outputs]).mean()
         val_f1_acc_ats_mean = torch.stack([x['val_f1_acc_ats'] for x in outputs]).mean()
+        val_speaker_count_mae_mean = torch.stack([x['val_speaker_count_mae'] for x in outputs]).mean()
+        val_speaker_count_accuracy_mean = torch.stack(
+            [x['val_speaker_count_accuracy'] for x in outputs]
+        ).mean()
 
         self._reset_valid_metrics()
 
@@ -1978,10 +2075,14 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'val_pairwise_ats_loss': val_pairwise_ats_loss_mean,
             'val_self_ats_loss': val_self_ats_loss_mean,
             'val_spkcount_loss': val_spkcount_loss_mean,
+            'val_activity_loss': val_activity_loss_mean,
+            'val_presence_loss': val_presence_loss_mean,
             'val_f1_acc': val_f1_acc_mean,
             'val_precision': val_precision_mean,
             'val_recall': val_recall_mean,
             'val_f1_acc_ats': val_f1_acc_ats_mean,
+            'val_speaker_count_mae': val_speaker_count_mae_mean,
+            'val_speaker_count_accuracy': val_speaker_count_accuracy_mean,
         }
         return {'log': multi_val_metrics}
 
