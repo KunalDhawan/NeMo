@@ -1382,8 +1382,18 @@ class EndtoEndDiarizationSpeechLabel(EndtoEndDiarizationLabel):
             [],
             [],
         )
+        checked_paths = set()
 
         for item in manifest.item_iter(manifests_files, parse_func=self.__parse_item_rttm):
+            for path, path_type in (
+                (item['audio_file'], 'Audio'),
+                (item['rttm_file'], 'RTTM'),
+            ):
+                if isinstance(path, str) and path not in checked_paths:
+                    if not os.path.exists(path):
+                        raise FileNotFoundError(f"{path_type} file not found: {path}")
+                    checked_paths.add(path)
+
             # Training mode
             audio_files.append(item['audio_file'])
             uniq_ids.append(item['uniq_id'])
@@ -1428,8 +1438,6 @@ class EndtoEndDiarizationSpeechLabel(EndtoEndDiarizationLabel):
             item['audio_file'] = audio_file_list
         elif isinstance(item['audio_file'], str):
             item['audio_file'] = get_full_path(audio_file=item['audio_file'], manifest_file=manifest_file)
-            if not os.path.exists(item['audio_file']):
-                raise FileNotFoundError(f"Audio file not found: {item['audio_file']}")
         else:
             raise ValueError(
                 f"Manifest file has invalid json line "
@@ -1446,11 +1454,9 @@ class EndtoEndDiarizationSpeechLabel(EndtoEndDiarizationLabel):
         else:
             item['rttm_file'] = None
 
-        # If item['rttm_file'] is not None and the RTTM file exists, get the full path
+        # If item['rttm_file'] is not None, get the full path.
         if item['rttm_file'] is not None:
             item['rttm_file'] = get_full_path(audio_file=item['rttm_file'], manifest_file=manifest_file)
-            if not os.path.exists(item['rttm_file']):
-                raise FileNotFoundError(f"RTTM file not found: {item['rttm_file']}")
 
         # Handling `uniq_id` string
         if 'uniq_id' not in item:

@@ -22,6 +22,7 @@ import torch.cuda
 from nemo.collections.asr.data.audio_to_diar_label import AudioToSpeechE2ESpkDiarDataset
 from nemo.collections.asr.parts.preprocessing.features import FilterbankFeatures, WaveformFeaturizer
 from nemo.collections.asr.parts.utils.speaker_utils import get_vad_out_from_rttm_line, read_rttm_lines
+from nemo.collections.common.parts.preprocessing.collections import EndtoEndDiarizationSpeechLabel
 
 
 def is_rttm_length_too_long(rttm_file_path, wav_len_in_sec):
@@ -115,3 +116,34 @@ class TestAudioToSpeechE2ESpkDiarDataset:
                 assert not torch.isnan(audio_signal_len).any(), "audio_signal_len tensor contains NaN values"
                 assert not torch.isnan(targets).any(), "targets tensor contains NaN values"
                 assert not torch.isnan(target_lens).any(), "target_lens tensor contains NaN values"
+
+    @pytest.mark.unit
+    def test_repeated_manifest_paths_are_checked_once(self, tmp_path, monkeypatch):
+        audio_path = tmp_path / "audio.wav"
+        rttm_path = tmp_path / "audio.rttm"
+        manifest_path = tmp_path / "manifest.json"
+        audio_path.touch()
+        rttm_path.touch()
+
+        entry = {
+            "audio_filepath": str(audio_path),
+            "duration": 1.0,
+            "rttm_filepath": str(rttm_path),
+        }
+        manifest_path.write_text("\n".join(json.dumps(entry) for _ in range(3)), encoding="utf-8")
+
+        checked_paths = []
+        original_exists = os.path.exists
+
+        def counting_exists(path):
+            if path in (str(audio_path), str(rttm_path)):
+                checked_paths.append(path)
+            return original_exists(path)
+
+        monkeypatch.setattr(os.path, "exists", counting_exists)
+
+        collection = EndtoEndDiarizationSpeechLabel(manifests_files=str(manifest_path))
+
+        assert len(collection) == 3
+        assert checked_paths.count(str(audio_path)) == 1
+        assert checked_paths.count(str(rttm_path)) == 1
