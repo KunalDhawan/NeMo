@@ -277,6 +277,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 self.sortformer_modules.fusion_block = self.sortformer_modules.fusion_block.to(self.device)
 
         self._init_loss_weights()
+        self._init_activity_auxiliary_heads()
 
         self.eps = 0.004   # bf16-safe epsilon
         self.negative_init_val = -99
@@ -360,6 +361,12 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.spkcount_temperature = float(self._cfg.get("spkcount_temperature", 1.0))
         if self.spkcount_temperature <= 0:
             raise ValueError(f"spkcount_temperature must be > 0, got {self.spkcount_temperature}")
+        # Assignment-free side task operating directly on post-encoder hidden states.
+        # Its three mutually exclusive classes are silence, single-speaker speech, and
+        # overlapped speech (two or more active speakers).
+        self.activity_weight = float(self._cfg.get("activity_weight", 0.0))
+        if self.activity_weight < 0.0:
+            raise ValueError(f"activity_weight must be >= 0, got {self.activity_weight}")
         # Distance used by the self-ATS loss: 'bce' (default; matches the other losses but has
         # an entropy floor, so the logged value is > 0 even when perfectly self-consistent) or
         # 'mse' (no floor: value is 0 when self-consistent, and a gentler bounded gradient).
@@ -390,6 +397,11 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             raise ValueError(
                 f"match_metric must be 'dot_product', 'accuracy', or 'bce', got '{self.match_metric}'"
             )
+
+    def _init_activity_auxiliary_heads(self):
+        """Create the training-only three-class activity head when enabled."""
+        if self.activity_weight > 0.0:
+            self.sortformer_modules.init_activity_head()
 
     def _init_eval_metrics(self):
         """
@@ -630,7 +642,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             emb_seq = self.sortformer_modules.encoder_proj(emb_seq)
         return emb_seq, emb_seq_length, pre_encode_feats
 
-    def forward_infer(self, emb_seq, emb_seq_length, pre_encode_feats=None):
+    def forward_infer(self, emb_seq, emb_seq_length, pre_encode_feats=None, return_aux_logits: bool = False):
         """
         The main forward pass for diarization for offline diarization inference.
 
@@ -642,6 +654,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             pre_encode_feats (torch.Tensor, optional): Pre-encoder embeddings from
                 ConvSubsampling, passed through to the upsampler for ``single_preenc*`` modes.
                 Shape: (batch_size, diar_frame_count, fc_d_model)
+            return_aux_logits (bool): If true, also return three-class activity logits.
 
         Returns:
             preds (torch.Tensor): Sorted tensor containing Sigmoid values for predicted speaker labels.
@@ -654,6 +667,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             encoder_mask = encoder_mask.repeat_interleave(self.upsample_factor, dim=1)
         _preds = self.sortformer_modules.forward_speaker_sigmoids(trans_emb_seq)
         preds = _preds * encoder_mask.unsqueeze(-1)
+        if return_aux_logits:
+            activity_logits = self.sortformer_modules.forward_activity_logits(trans_emb_seq)
+            return preds, activity_logits
         return preds
 
     def _diarize_forward(self, batch: Any):
@@ -861,6 +877,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self,
         audio_signal,
         audio_signal_length,
+        return_aux_logits: bool = False,
     ):
         """
         Forward pass for training and inference.
@@ -870,6 +887,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 Shape: (batch_size, num_samples)
             audio_signal_length (torch.Tensor): Tensor containing lengths of audio waveforms
                 Shape: (batch_size,)
+            return_aux_logits (bool): If true, also return three-class activity logits.
 
         Returns:
             preds (torch.Tensor): Sorted tensor containing predicted speaker labels
@@ -880,7 +898,13 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         )
         processed_signal = processed_signal[:, :, : processed_signal_length.max()]
         if self.streaming_mode:
-            preds = self.forward_streaming(processed_signal, processed_signal_length)
+            outputs = self.forward_streaming(
+                processed_signal, processed_signal_length, return_aux_logits=return_aux_logits
+            )
+            if return_aux_logits:
+                preds, activity_logits = outputs
+            else:
+                preds = outputs
             # When upsample_factor > 1, forward_streaming_step already collects
             # fine-resolution chunk preds from the learnable upsampler, so
             # total_preds is already at target resolution — no further upsampling.
@@ -890,18 +914,44 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                     upsample_factor=self.output_subsampling_factor,
                     smooth_kernel=self.val_upsample_smooth_kernel,
                 )
+                if return_aux_logits:
+                    activity_logits = self._upsample_activity_logits(activity_logits)
         else:
             emb_seq, emb_seq_length, pre_encode_feats = self.frontend_encoder(
                 processed_signal=processed_signal, processed_signal_length=processed_signal_length
             )
-            preds = self.forward_infer(emb_seq, emb_seq_length, pre_encode_feats=pre_encode_feats)
+            outputs = self.forward_infer(
+                emb_seq,
+                emb_seq_length,
+                pre_encode_feats=pre_encode_feats,
+                return_aux_logits=return_aux_logits,
+            )
+            if return_aux_logits:
+                preds, activity_logits = outputs
+            else:
+                preds = outputs
             if self.val_upsample_preds and not self.training:
                 preds = self.sortformer_modules.upsample_preds(
                     preds,
                     upsample_factor=self.output_subsampling_factor,
                     smooth_kernel=self.val_upsample_smooth_kernel,
                 )
+                if return_aux_logits:
+                    activity_logits = self._upsample_activity_logits(activity_logits)
+        if return_aux_logits:
+            return preds, activity_logits
         return preds
+
+    def _upsample_activity_logits(self, logits):
+        """Upsample three-class probabilities consistently with validation predictions."""
+        if logits is None:
+            return None
+        probs = self.sortformer_modules.upsample_preds(
+            torch.softmax(logits, dim=-1),
+            upsample_factor=self.output_subsampling_factor,
+            smooth_kernel=self.val_upsample_smooth_kernel,
+        )
+        return torch.log(probs.clamp_min(self.eps))
 
     @property
     def input_names(self):
@@ -989,6 +1039,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self,
         processed_signal,
         processed_signal_length,
+        return_aux_logits: bool = False,
     ):
         """
         The main forward pass for diarization inference in streaming mode.
@@ -998,6 +1049,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 Shape: (batch_size, num_samples)
             processed_signal_length (torch.Tensor): Tensor containing lengths of audio waveforms
                 Shape: (batch_size,)
+            return_aux_logits (bool): If true, also collect three-class activity logits.
 
         Returns:
             total_preds (torch.Tensor): Tensor containing predicted speaker labels for the current chunk
@@ -1062,6 +1114,11 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 att_mod = True
 
         total_preds = torch.zeros((batch_size, 0, self.sortformer_modules.n_spk), device=self.device)
+        total_activity_logits = (
+            torch.zeros((batch_size, 0, 3), device=self.device)
+            if return_aux_logits and self.sortformer_modules.activity_head is not None
+            else None
+        )
 
         feat_len = processed_signal.shape[2]
         num_chunks = math.ceil(
@@ -1078,14 +1135,21 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             desc="Streaming Steps",
             disable=self.training,
         ):
-            streaming_state, total_preds = self.forward_streaming_step(
+            step_outputs = self.forward_streaming_step(
                 processed_signal=chunk_feat_seq_t,
                 processed_signal_length=feat_lengths,
                 streaming_state=streaming_state,
                 total_preds=total_preds,
                 left_offset=left_offset,
                 right_offset=right_offset,
+                return_aux_logits=return_aux_logits,
             )
+            if return_aux_logits:
+                streaming_state, total_preds, chunk_activity_logits = step_outputs
+                if total_activity_logits is not None:
+                    total_activity_logits = torch.cat([total_activity_logits, chunk_activity_logits], dim=1)
+            else:
+                streaming_state, total_preds = step_outputs
 
         if att_mod:
             if hasattr(self.encoder, 'att_context_size'):
@@ -1099,6 +1163,10 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             if self.upsample_factor > 1:
                 n_frames *= self.upsample_factor
             total_preds = total_preds[:, :n_frames, :]
+            if total_activity_logits is not None:
+                total_activity_logits = total_activity_logits[:, :n_frames, :]
+        if return_aux_logits:
+            return total_preds, total_activity_logits
         return total_preds
 
     def forward_streaming_step(
@@ -1109,6 +1177,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         total_preds,
         left_offset=0,
         right_offset=0,
+        return_aux_logits: bool = False,
     ):
         """
         One-step forward pass for diarization inference in streaming mode.
@@ -1135,6 +1204,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 Shape: (batch_size, cumulative pred length, num_speakers)
             left_offset (int): left offset for the current chunk
             right_offset (int): right offset for the current chunk
+            return_aux_logits (bool): If true, also return chunk three-class activity logits.
 
         Returns:
             streaming_state (SortformerStreamingState):
@@ -1177,15 +1247,56 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             processed_signal_length=spkcache_fifo_chunk_pre_encode_lengths,
             bypass_pre_encode=True,
         )
-        spkcache_fifo_chunk_preds = self.forward_infer(
+        infer_outputs = self.forward_infer(
             emb_seq=spkcache_fifo_chunk_fc_encoder_embs,
             emb_seq_length=spkcache_fifo_chunk_fc_encoder_lengths,
             pre_encode_feats=spkcache_fifo_chunk_pre_encode_embs,
+            return_aux_logits=return_aux_logits,
         )
+        if return_aux_logits:
+            spkcache_fifo_chunk_preds, all_activity_logits = infer_outputs
+        else:
+            spkcache_fifo_chunk_preds = infer_outputs
 
         lc_enc = round(left_offset / self.encoder.subsampling_factor)
         rc_enc = math.ceil(right_offset / self.encoder.subsampling_factor)
         uf = self.upsample_factor
+
+        # The activity task is speaker-assignment invariant, so it only needs the same temporal
+        # cache/FIFO/chunk slicing as the diarization output, not the speaker permutation.
+        if return_aux_logits:
+            if self.async_streaming:
+                saved_spkcache_lengths_aux = streaming_state.spkcache_lengths.clone()
+                saved_fifo_lengths_aux = streaming_state.fifo_lengths.clone()
+                max_chunk_len = chunk_pre_encode_embs.shape[1] - lc_enc - rc_enc
+                chunk_lengths_enc = (chunk_pre_encode_lengths - lc_enc).clamp(min=0, max=max_chunk_len)
+                if all_activity_logits is not None:
+                    chunk_activity_logits = torch.zeros(
+                        (all_activity_logits.shape[0], max_chunk_len * uf, 3),
+                        device=all_activity_logits.device,
+                        dtype=all_activity_logits.dtype,
+                    )
+                    for batch_index in range(all_activity_logits.shape[0]):
+                        start = (
+                            saved_spkcache_lengths_aux[batch_index]
+                            + saved_fifo_lengths_aux[batch_index]
+                            + lc_enc
+                        ).item() * uf
+                        length = chunk_lengths_enc[batch_index].item() * uf
+                        chunk_activity_logits[batch_index, :length, :] = all_activity_logits[
+                            batch_index, start : start + length, :
+                        ]
+                else:
+                    chunk_activity_logits = None
+            else:
+                saved_spkcache_len_aux = streaming_state.spkcache.shape[1]
+                saved_fifo_len_aux = streaming_state.fifo.shape[1]
+                chunk_len_aux = chunk_pre_encode_embs.shape[1] - lc_enc - rc_enc
+                start_aux = (saved_spkcache_len_aux + saved_fifo_len_aux + lc_enc) * uf
+                end_aux = start_aux + chunk_len_aux * uf
+                chunk_activity_logits = (
+                    all_activity_logits[:, start_aux:end_aux, :] if all_activity_logits is not None else None
+                )
 
         if uf > 1:
             preds_fine = spkcache_fifo_chunk_preds
@@ -1246,6 +1357,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         total_preds = torch.cat([total_preds, chunk_preds], dim=1)
 
+        if return_aux_logits:
+            return streaming_state, total_preds, chunk_activity_logits
         return streaming_state, total_preds
 
     def _build_loss_smooth_kernel(self) -> torch.Tensor:
@@ -1529,7 +1642,33 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         loss = err.sum() / valid.sum().clamp_min(1.0)
         return loss.to(preds.dtype)
 
-    def _get_aux_train_evaluations(self, preds, targets, target_lens) -> dict:
+    @staticmethod
+    def _masked_cross_entropy(logits, labels, target_lens):
+        """Compute three-class cross entropy over valid frames in float32."""
+        if logits is None:
+            return labels.new_zeros((), dtype=torch.float32)
+
+        loss = torch.nn.functional.cross_entropy(
+            logits.float().transpose(1, 2),
+            labels.to(device=logits.device, dtype=torch.long),
+            reduction="none",
+        )
+        valid = (
+            torch.arange(logits.shape[1], device=logits.device).unsqueeze(0)
+            < target_lens.to(logits.device).unsqueeze(1)
+        )
+        loss = loss * valid
+        return (loss.sum() / valid.sum().clamp_min(1)).to(logits.dtype)
+
+    def _activity_loss(self, activity_logits, targets, target_lens):
+        """Classify each frame as silence, single-speaker speech, or overlap."""
+        hard_activity = targets > 0.5
+        activity_targets = hard_activity.sum(dim=-1).clamp(max=2)
+        return self._masked_cross_entropy(activity_logits, activity_targets, target_lens)
+
+    def _get_aux_train_evaluations(
+        self, preds, targets, target_lens, activity_logits=None
+    ) -> dict:
         """
         Compute auxiliary training evaluations including losses and metrics.
 
@@ -1558,6 +1697,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             target_lens = target_lens.clamp(max=preds.shape[1])
         elif preds.shape[1] > targets.shape[1]:
             preds = preds[:, : targets.shape[1], :]
+            if activity_logits is not None:
+                activity_logits = activity_logits[:, : targets.shape[1], :]
         targets_ats, _ = get_ats_targets_hungarian(
             targets.clone(), preds, tolerance=self.ats_tolerance, metric=self.match_metric, apply_sigmoid=False
         )
@@ -1575,12 +1716,14 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         pairwise_ats_loss = self._pairwise_ats_loss(preds, target_lens)
         self_ats_loss = self._self_ats_loss(preds, target_lens)
         spkcount_loss = self._spkcount_loss(preds, targets, target_lens)
+        activity_loss = self._activity_loss(activity_logits, targets, target_lens)
         loss = (
             self.ats_weight * ats_loss
             + self.pil_weight * pil_loss
             + self.pairwise_ats_weight * pairwise_ats_loss
             + self.self_ats_weight * self_ats_loss
             + self.spkcount_weight * spkcount_loss
+            + self.activity_weight * activity_loss
         )
 
         self._accuracy_train(preds, targets_pil, target_lens)
@@ -1596,6 +1739,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'pairwise_ats_loss': pairwise_ats_loss,
             'self_ats_loss': self_ats_loss,
             'spkcount_loss': spkcount_loss,
+            'activity_loss': activity_loss,
             'learning_rate': self._optimizer.param_groups[0]['lr'],
             'train_f1_acc': train_f1_acc,
             'train_precision': train_precision,
@@ -1643,13 +1787,26 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         """
         audio_signal, audio_signal_length, targets, target_lens, *_ = batch
         logging.info(f"audio_signal.shape: {audio_signal.shape}, targets.shape: {targets.shape}, target_lens: {target_lens}")
-        preds = self.forward(audio_signal=audio_signal, audio_signal_length=audio_signal_length)
-        train_metrics = self._get_aux_train_evaluations(preds, targets, target_lens)
+        return_aux_logits = self.sortformer_modules.activity_head is not None
+        outputs = self.forward(
+            audio_signal=audio_signal,
+            audio_signal_length=audio_signal_length,
+            return_aux_logits=return_aux_logits,
+        )
+        if return_aux_logits:
+            preds, activity_logits = outputs
+        else:
+            preds, activity_logits = outputs, None
+        train_metrics = self._get_aux_train_evaluations(
+            preds, targets, target_lens, activity_logits=activity_logits
+        )
         self._reset_train_metrics()
         self.log_dict(train_metrics, sync_dist=True, on_step=True, on_epoch=False, logger=True)
         return {'loss': train_metrics['loss']}
 
-    def _get_aux_validation_evaluations(self, preds, targets, target_lens) -> dict:
+    def _get_aux_validation_evaluations(
+        self, preds, targets, target_lens, activity_logits=None
+    ) -> dict:
         """
         Compute auxiliary validation evaluations including losses and metrics.
 
@@ -1678,6 +1835,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             target_lens = target_lens.clamp(max=preds.shape[1])
         elif preds.shape[1] > targets.shape[1]:
             preds = preds[:, : targets.shape[1], :]
+            if activity_logits is not None:
+                activity_logits = activity_logits[:, : targets.shape[1], :]
         targets_ats, _ = get_ats_targets_hungarian(
             targets.clone(), preds, tolerance=self.ats_tolerance, metric=self.match_metric, apply_sigmoid=False
         )
@@ -1696,12 +1855,14 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         val_pairwise_ats_loss = self._pairwise_ats_loss(preds, target_lens)
         val_self_ats_loss = self._self_ats_loss(preds, target_lens)
         val_spkcount_loss = self._spkcount_loss(preds, targets, target_lens)
+        val_activity_loss = self._activity_loss(activity_logits, targets, target_lens)
         val_loss = (
             self.ats_weight * val_ats_loss
             + self.pil_weight * val_pil_loss
             + self.pairwise_ats_weight * val_pairwise_ats_loss
             + self.self_ats_weight * val_self_ats_loss
             + self.spkcount_weight * val_spkcount_loss
+            + self.activity_weight * val_activity_loss
         )
 
         self._accuracy_valid(preds, targets_pil, target_lens)
@@ -1720,6 +1881,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'val_pairwise_ats_loss': val_pairwise_ats_loss,
             'val_self_ats_loss': val_self_ats_loss,
             'val_spkcount_loss': val_spkcount_loss,
+            'val_activity_loss': val_activity_loss,
             'val_f1_acc': val_f1_acc,
             'val_precision': val_precision,
             'val_recall': val_recall,
@@ -1750,11 +1912,19 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         """
         audio_signal, audio_signal_length, targets, target_lens, *_ = batch
         logging.info(f"audio_signal.shape: {audio_signal.shape}, targets.shape: {targets.shape}, target_lens: {target_lens}")
-        preds = self.forward(
+        return_aux_logits = self.sortformer_modules.activity_head is not None
+        outputs = self.forward(
             audio_signal=audio_signal,
             audio_signal_length=audio_signal_length,
+            return_aux_logits=return_aux_logits,
         )
-        val_metrics = self._get_aux_validation_evaluations(preds, targets, target_lens)
+        if return_aux_logits:
+            preds, activity_logits = outputs
+        else:
+            preds, activity_logits = outputs, None
+        val_metrics = self._get_aux_validation_evaluations(
+            preds, targets, target_lens, activity_logits=activity_logits
+        )
         if isinstance(self.trainer.val_dataloaders, list) and len(self.trainer.val_dataloaders) > 1:
             self.validation_step_outputs[dataloader_idx].append(val_metrics)
         else:

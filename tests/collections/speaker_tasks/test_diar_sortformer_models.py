@@ -110,6 +110,7 @@ def sortformer_model():
             'sample_rate': 16000,
             'pil_weight': 0.5,
             'ats_weight': 0.5,
+            'activity_weight': 0.1,
             'max_num_of_spks': 4,
             'model_defaults': DictConfig(model_defaults),
             'encoder': DictConfig(encoder),
@@ -170,6 +171,44 @@ class TestSortformerEncLabelModelOffline:
         diff = torch.max(torch.abs(preds_instance - preds_batch))
         assert diff <= 1e-6
 
+    @pytest.mark.unit
+    def test_activity_side_head_and_masked_loss(self, sortformer_model):
+        model = sortformer_model.eval()
+        hidden = torch.randn(2, 5, model.transformer_encoder.d_model)
+        hidden_lens = torch.tensor([5, 3])
+
+        with torch.no_grad():
+            preds, activity_logits = model.forward_infer(hidden, hidden_lens, return_aux_logits=True)
+
+        assert preds.shape == (2, 5, model.sortformer_modules.n_spk)
+        assert activity_logits.shape == (2, 5, 3)
+
+        # Valid frames contain silence, single-speaker speech, and overlap. The final
+        # padded frame is intentionally predicted incorrectly and must not affect loss.
+        targets = torch.zeros(1, 4, model.sortformer_modules.n_spk)
+        targets[0, 1, 0] = 1.0
+        targets[0, 2, :2] = 1.0
+        target_lens = torch.tensor([3])
+        perfect_activity_logits = torch.tensor(
+            [
+                [
+                    [10.0, -10.0, -10.0],
+                    [-10.0, 10.0, -10.0],
+                    [-10.0, -10.0, 10.0],
+                    [-10.0, -10.0, 10.0],
+                ]
+            ],
+            requires_grad=True,
+        )
+
+        activity_loss = model._activity_loss(
+            perfect_activity_logits, targets, target_lens
+        )
+        assert activity_loss < 1e-3
+
+        activity_loss.backward()
+        assert perfect_activity_logits.grad is not None
+
 
 class TestSortformerEncLabelModelStreaming:
     @pytest.mark.unit
@@ -179,6 +218,22 @@ class TestSortformerEncLabelModelStreaming:
         confdict = sortformer_diar_model.to_config_dict()
         instance2 = SortformerEncLabelModel.from_config_dict(confdict)
         assert isinstance(instance2, SortformerEncLabelModel)
+
+    @pytest.mark.unit
+    def test_forward_with_activity_logits(self, sortformer_model):
+        model = sortformer_model.eval()
+        model.streaming_mode = True
+        sample_len = model.preprocessor._cfg.sample_rate
+        input_signal = torch.randn(1, sample_len)
+        input_signal_length = torch.tensor([sample_len])
+
+        with torch.no_grad():
+            preds, activity_logits = model.forward(
+                input_signal, input_signal_length, return_aux_logits=True
+            )
+
+        assert activity_logits.shape[:2] == preds.shape[:2]
+        assert activity_logits.shape[2] == 3
 
     @pytest.mark.unit
     @pytest.mark.parametrize(

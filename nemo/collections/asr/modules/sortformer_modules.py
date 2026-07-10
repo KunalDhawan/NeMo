@@ -110,6 +110,9 @@ class SortformerModules(NeuralModule, Exportable):
         self.single_hidden_to_spks = nn.Linear(self.hidden_size, self.n_spk)
         self.dropout = nn.Dropout(dropout_rate)
         self.encoder_proj = nn.Linear(self.fc_d_model, self.tf_d_model)
+        # Optional three-class activity head. It is initialized by the parent model only
+        # when the auxiliary activity loss is enabled, preserving old state dictionaries.
+        self.activity_head = None
         self.log = False
 
         # Learnable sub-pixel upsampling (initialized by the model when needed)
@@ -286,6 +289,33 @@ class SortformerModules(NeuralModule, Exportable):
         spk_preds = self.single_hidden_to_spks(hidden_out)
         preds = F.sigmoid(spk_preds)
         return preds
+
+    def init_activity_head(self):
+        """Initialize the optional silence/single-speaker/overlap classification head."""
+        if self.activity_head is None:
+            self.activity_head = nn.Sequential(
+                nn.LayerNorm(self.hidden_size),
+                nn.Linear(self.hidden_size, 3),
+            ).to(
+                device=self.single_hidden_to_spks.weight.device,
+                dtype=self.single_hidden_to_spks.weight.dtype,
+            )
+
+    def forward_activity_logits(self, hidden_out):
+        """
+        Compute frame-level activity-state logits.
+
+        Args:
+            hidden_out (torch.Tensor): Post-encoder hidden states of shape
+                (batch_size, n_frames, hidden_dim).
+
+        Returns:
+            torch.Tensor or None: Logits of shape (batch_size, n_frames, 3), or
+                None when the auxiliary head is disabled.
+        """
+        if self.activity_head is None:
+            return None
+        return self.activity_head(hidden_out)
 
     @staticmethod
     def _validate_odd_kernel_size(kernel_size: int, kernel_name: str):

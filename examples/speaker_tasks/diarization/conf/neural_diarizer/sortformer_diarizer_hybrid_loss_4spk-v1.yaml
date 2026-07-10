@@ -23,6 +23,7 @@ model:
   self_ats_temperature: 1.0 # Temperature for self-ATS (symmetric on probs+target); <1 sharpens toward 0/1 (less softening, ~1/T more muscle); 1.0 disables
   spkcount_weight: 0.0 # Weight for arrival-count loss (GT-anchored Huber on cumulative #speakers-arrived; counters pairwise-ATS early-blip cheat; raw multiplier; 0 disables)
   spkcount_temperature: 1.0 # Sharpen preds (T<1) before the spkcount survival product so faint hedges don't inflate the arrival count; 1.0 disables
+  activity_weight: 0.0 # Weight for 3-class activity CE: silence, single speaker, or overlap (>=2 speakers); 0 disables the head
   max_num_of_spks: 4 # Maximum number of speakers per model; currently set to 4
   output_subsampling_factor: 8 # Output resolution factor. Set to 1 for 10ms output (upsampled from encoder's 80ms).
   upsample_smooth_kernel: 9 # Smoothing kernel for repeat/avg-pool upsample paths (must be odd).

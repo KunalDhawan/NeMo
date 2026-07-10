@@ -219,6 +219,21 @@ class TestSortformerModules_GeneralUtils:
         assert hidden_out_with_grad.grad.shape == hidden_out_with_grad.shape
 
     @pytest.mark.unit
+    def test_activity_head(self):
+        sortformer_modules = SortformerModules()
+        hidden_out = torch.randn(2, 7, sortformer_modules.hidden_size, requires_grad=True)
+
+        assert sortformer_modules.forward_activity_logits(hidden_out) is None
+        assert not any("activity_head" in key for key in sortformer_modules.state_dict())
+        sortformer_modules.init_activity_head()
+        logits = sortformer_modules.forward_activity_logits(hidden_out)
+
+        assert logits.shape == (2, 7, 3)
+        assert any("activity_head" in key for key in sortformer_modules.state_dict())
+        logits.sum().backward()
+        assert hidden_out.grad is not None
+
+    @pytest.mark.unit
     @pytest.mark.parametrize(
         "batch_size, n_frames, n_spk, encoder_lengths",
         [
