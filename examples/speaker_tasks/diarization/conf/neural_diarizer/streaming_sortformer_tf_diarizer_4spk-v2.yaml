@@ -31,6 +31,7 @@ model:
   activity_weight: 0.0 # Weight for 3-class activity CE: silence, single speaker, or overlap (>=2 speakers); 0 disables the head
   presence_weight: 0.0 # Weight for PIL-aligned local speaker-presence BCE; penalizes short fake speakers independent of segment duration
   presence_window_radius: 3 # Presence max-pooling radius d in output frames, using [t-d, t+d] (3 = +/-240ms at 80ms output)
+  presence_negative_margin: 0.4 # Locally absent channels are penalized only above this probability, preserving low-confidence hedging
   max_num_of_spks: 4
   output_subsampling_factor: 8
   upsample_smooth_kernel: 9

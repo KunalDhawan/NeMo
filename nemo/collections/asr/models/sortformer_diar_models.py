@@ -384,6 +384,11 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             )
         if self.presence_window_radius < 0:
             raise ValueError(f"presence_window_radius must be >= 0, got {self.presence_window_radius}")
+        self.presence_negative_margin = float(self._cfg.get("presence_negative_margin", 0.4))
+        if not 0.0 <= self.presence_negative_margin < 1.0:
+            raise ValueError(
+                f"presence_negative_margin must be in [0, 1), got {self.presence_negative_margin}"
+            )
         # Distance used by the self-ATS loss: 'bce' (default; matches the other losses but has
         # an entropy floor, so the logged value is > 0 even when perfectly self-consistent) or
         # 'mse' (no floor: value is 0 when self-consistent, and a gentler bounded gradient).
@@ -1705,7 +1710,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         For every frame ``t`` and channel ``s``, presence is the maximum activity
         in ``[t-d, t+d]`` where ``d`` is ``presence_window_radius``. Padding is
-        zeroed before pooling and excluded from the final mean.
+        zeroed before pooling and excluded from the final mean. Locally absent
+        channels incur no penalty below ``presence_negative_margin``, preserving
+        low-confidence hedging while suppressing cache-threatening false speakers.
         """
         num_frames, num_spks = preds.shape[1], preds.shape[2]
         valid = (
@@ -1732,11 +1739,15 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         ).transpose(1, 2)
 
         with torch.autocast(device_type=preds.device.type, enabled=False):
-            element_loss = torch.nn.functional.binary_cross_entropy(
-                pred_presence.float().clamp(min=self.eps, max=1.0 - self.eps),
-                target_presence.float(),
-                reduction="none",
-            )
+            pred_presence_f = pred_presence.float().clamp(min=self.eps, max=1.0 - self.eps)
+            target_presence_f = target_presence.float()
+            positive_loss = -target_presence_f * torch.log(pred_presence_f)
+            negative_excess = (
+                (pred_presence_f - self.presence_negative_margin)
+                / (1.0 - self.presence_negative_margin)
+            ).clamp(min=0.0, max=1.0 - self.eps)
+            negative_loss = -(1.0 - target_presence_f) * torch.log1p(-negative_excess)
+            element_loss = positive_loss + negative_loss
         element_loss = element_loss * valid_expanded
         denominator = valid.sum() * num_spks
         return (element_loss.sum() / denominator.clamp_min(1)).to(preds.dtype)

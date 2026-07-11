@@ -113,6 +113,7 @@ def sortformer_model():
             'activity_weight': 0.1,
             'presence_weight': 0.1,
             'presence_window_radius': 1,
+            'presence_negative_margin': 0.4,
             'max_num_of_spks': 4,
             'model_defaults': DictConfig(model_defaults),
             'encoder': DictConfig(encoder),
@@ -236,8 +237,21 @@ class TestSortformerEncLabelModelOffline:
         assert misaligned_loss > aligned_loss + 1.0
         assert torch.allclose(padded_fake_loss, aligned_loss)
 
+        absent_targets = torch.zeros_like(targets_pil)
+        safe_hedge_preds = torch.full_like(targets_pil, model.presence_negative_margin - 0.01)
+        safe_hedge_preds.requires_grad_()
+        safe_hedge_loss = model._presence_loss(safe_hedge_preds, absent_targets, target_lens)
+        unsafe_hedge_preds = safe_hedge_preds.detach().clone()
+        unsafe_hedge_preds[0, 2, 0] = model.presence_negative_margin + 0.2
+        unsafe_hedge_loss = model._presence_loss(unsafe_hedge_preds, absent_targets, target_lens)
+
+        assert torch.equal(safe_hedge_loss, torch.tensor(0.0))
+        assert unsafe_hedge_loss > safe_hedge_loss
+
         aligned_loss.backward()
         assert aligned_preds.grad is not None
+        safe_hedge_loss.backward()
+        assert torch.count_nonzero(safe_hedge_preds.grad) == 0
 
     @pytest.mark.unit
     def test_global_speaker_count_metrics(self, sortformer_model):
