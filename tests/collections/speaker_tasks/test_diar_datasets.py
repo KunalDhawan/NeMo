@@ -147,3 +147,33 @@ class TestAudioToSpeechE2ESpkDiarDataset:
         assert len(collection) == 3
         assert checked_paths.count(str(audio_path)) == 1
         assert checked_paths.count(str(rttm_path)) == 1
+
+    @pytest.mark.unit
+    def test_manifest_path_validation_can_be_disabled(self, tmp_path, monkeypatch):
+        audio_path = tmp_path / "missing.wav"
+        rttm_path = tmp_path / "missing.rttm"
+        manifest_path = tmp_path / "manifest.json"
+        entry = {
+            "audio_filepath": str(audio_path),
+            "duration": 1.0,
+            "rttm_filepath": str(rttm_path),
+        }
+        manifest_path.write_text(json.dumps(entry), encoding="utf-8")
+
+        checked_paths = []
+        original_exists = os.path.exists
+
+        def counting_exists(path):
+            if path in (str(audio_path), str(rttm_path)):
+                checked_paths.append(path)
+            return original_exists(path)
+
+        monkeypatch.setattr(os.path, "exists", counting_exists)
+
+        collection = EndtoEndDiarizationSpeechLabel(
+            manifests_files=str(manifest_path),
+            validate_manifest_paths=False,
+        )
+
+        assert len(collection) == 1
+        assert checked_paths == []

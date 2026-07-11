@@ -1359,6 +1359,7 @@ class EndtoEndDiarizationSpeechLabel(EndtoEndDiarizationLabel):
         manifests_files: Union[str, List[str]],
         round_digits: int = 2,
         *args,
+        validate_manifest_paths: bool = True,
         **kwargs,
     ):
         """
@@ -1372,6 +1373,8 @@ class EndtoEndDiarizationSpeechLabel(EndtoEndDiarizationLabel):
             round_digit (int):
                 Number of digits to be rounded.
             *args: Args to pass to `SpeechLabel` constructor.
+            validate_manifest_paths (bool):
+                If True, verify that each unique audio and RTTM path exists while loading the manifest.
             **kwargs: Kwargs to pass to `SpeechLabel` constructor.
         """
         self.round_digits = round_digits
@@ -1385,14 +1388,15 @@ class EndtoEndDiarizationSpeechLabel(EndtoEndDiarizationLabel):
         checked_paths = set()
 
         for item in manifest.item_iter(manifests_files, parse_func=self.__parse_item_rttm):
-            for path, path_type in (
-                (item['audio_file'], 'Audio'),
-                (item['rttm_file'], 'RTTM'),
-            ):
-                if isinstance(path, str) and path not in checked_paths:
-                    if not os.path.exists(path):
-                        raise FileNotFoundError(f"{path_type} file not found: {path}")
-                    checked_paths.add(path)
+            if validate_manifest_paths:
+                for path, path_type in (
+                    (item['audio_file'], 'Audio'),
+                    (item['rttm_file'], 'RTTM'),
+                ):
+                    if isinstance(path, str) and path not in checked_paths:
+                        if not os.path.exists(path):
+                            raise FileNotFoundError(f"{path_type} file not found: {path}")
+                        checked_paths.add(path)
 
             # Training mode
             audio_files.append(item['audio_file'])

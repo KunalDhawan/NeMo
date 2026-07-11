@@ -320,6 +320,8 @@ class _AudioMSDDTrainDataset(Dataset):
             Featurizer instance for generating features from the raw waveform.
         window_stride (float):
             Window stride for acoustic feature. This value is used for calculating the numbers of feature-level frames.
+        validate_manifest_paths (bool):
+            If True, verify that each unique audio and RTTM path in the manifest exists.
         emb_batch_size (int):
             Number of embedding vectors that are trained with attached computational graphs.
         pairwise_infer (bool):
@@ -1159,11 +1161,13 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         subsegment_nspk_bias: float = 1.0,
         opus_roundtrip_prob: float = 0.0,
         opus_roundtrip_compression_level: Optional[float] = None,
+        validate_manifest_paths: bool = True,
     ):
         super().__init__()
         self.collection = EndtoEndDiarizationSpeechLabel(
             manifests_files=manifest_filepath.split(','),
             round_digits=round_digits,
+            validate_manifest_paths=validate_manifest_paths,
         )
 
         self.featurizer = featurizer
@@ -1912,6 +1916,7 @@ class AudioToSpeechE2ESpkDiarDataset(_AudioToSpeechE2ESpkDiarDataset):
         subsegment_nspk_bias: float = 1.0,
         opus_roundtrip_prob: float = 0.0,
         opus_roundtrip_compression_level: Optional[float] = None,
+        validate_manifest_paths: bool = True,
     ):
         super().__init__(
             manifest_filepath=manifest_filepath,
@@ -1933,6 +1938,7 @@ class AudioToSpeechE2ESpkDiarDataset(_AudioToSpeechE2ESpkDiarDataset):
             subsegment_nspk_bias=subsegment_nspk_bias,
             opus_roundtrip_prob=opus_roundtrip_prob,
             opus_roundtrip_compression_level=opus_roundtrip_compression_level,
+            validate_manifest_paths=validate_manifest_paths,
         )
 
     def eesd_train_collate_fn(self, batch):

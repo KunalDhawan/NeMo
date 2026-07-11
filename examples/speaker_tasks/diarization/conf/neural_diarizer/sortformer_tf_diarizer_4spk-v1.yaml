@@ -43,6 +43,7 @@ model:
 
   train_ds:
     manifest_filepath: ???
+    validate_manifest_paths: False
     sample_rate: ${model.sample_rate}
     num_spks: ${model.max_num_of_spks}
     session_len_sec: 90

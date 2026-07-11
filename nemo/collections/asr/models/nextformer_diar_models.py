@@ -381,6 +381,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             subsegment_min_chunk_len_sec=config.get('subsegment_min_chunk_len_sec', 10.0),
             subsegment_margin_frames=config.get('subsegment_margin_frames', 0),
             subsegment_nspk_bias=config.get('subsegment_nspk_bias', 1.0),
+            validate_manifest_paths=config.get('validate_manifest_paths', True),
         )
 
         self.data_collection = dataset.collection
@@ -1819,6 +1820,7 @@ class NextformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'subsegment_min_chunk_len_sec': config.get('subsegment_min_chunk_len_sec', 10.0),
             'subsegment_margin_frames': config.get('subsegment_margin_frames', 0),
             'subsegment_nspk_bias': config.get('subsegment_nspk_bias', 1.0),
+            'validate_manifest_paths': config.get('validate_manifest_paths', True),
         }
         temporary_datalayer = self.__setup_dataloader_from_config(config=DictConfig(dl_config))
         return temporary_datalayer
