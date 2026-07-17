@@ -361,12 +361,22 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.spkcount_temperature = float(self._cfg.get("spkcount_temperature", 1.0))
         if self.spkcount_temperature <= 0:
             raise ValueError(f"spkcount_temperature must be > 0, got {self.spkcount_temperature}")
-        # Assignment-free side task operating directly on post-encoder hidden states.
-        # Its three mutually exclusive classes are silence, single-speaker speech, and
-        # overlapped speech (two or more active speakers).
+        # Assignment-free side task with three mutually exclusive classes: silence,
+        # single-speaker speech, and overlapped speech (two or more active speakers).
+        # It can operate on either a dedicated hidden-state head or the speaker predictions.
         self.activity_weight = float(self._cfg.get("activity_weight", 0.0))
         if self.activity_weight < 0.0:
             raise ValueError(f"activity_weight must be >= 0, got {self.activity_weight}")
+        # Source for the three-class activity loss:
+        #   'aux_head': classify post-encoder hidden states with a dedicated head.
+        #   'speaker_preds': derive silence/exactly-one/overlap probabilities directly
+        #       from the existing per-speaker activity probabilities.
+        self.activity_loss_mode = str(self._cfg.get("activity_loss_mode", "aux_head")).lower()
+        if self.activity_loss_mode not in ("aux_head", "speaker_preds"):
+            raise ValueError(
+                "activity_loss_mode must be 'aux_head' or 'speaker_preds', "
+                f"got '{self.activity_loss_mode}'"
+            )
         # PIL-aligned local speaker-presence loss. For every output frame and speaker
         # channel, max-pool predictions and PIL-matched targets over [t-d, t+d].
         # This makes a short high-confidence false speaker incur a neighborhood-wide
@@ -422,7 +432,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
     def _init_activity_auxiliary_heads(self):
         """Create the training-only three-class activity head when enabled."""
-        if self.activity_weight > 0.0:
+        if self.activity_weight > 0.0 and self.activity_loss_mode == "aux_head":
             self.sortformer_modules.init_activity_head()
 
     def _init_eval_metrics(self):
@@ -1684,6 +1694,39 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         loss = loss * valid
         return (loss.sum() / valid.sum().clamp_min(1)).to(logits.dtype)
 
+    def _activity_logits_from_speaker_preds(self, preds):
+        """
+        Derive silence, exactly-one-speaker, and overlap logits from speaker probabilities.
+
+        The recurrence computes a Poisson-binomial count distribution while merging all
+        counts of two or more active speakers into the overlap class. It is permutation
+        invariant across speaker channels and remains fully differentiable.
+        """
+        with torch.autocast(device_type=preds.device.type, enabled=False):
+            speaker_probs = preds.float().clamp(min=0.0, max=1.0)
+            inactive_probs = 1.0 - speaker_probs
+
+            # Prefix/suffix products provide prod_{j != i}(1 - p_j) for every
+            # speaker without division, remaining well-defined when p_i == 1.
+            prefix_products = torch.cumprod(inactive_probs, dim=-1)
+            suffix_products = torch.flip(
+                torch.cumprod(torch.flip(inactive_probs, dims=(-1,)), dim=-1),
+                dims=(-1,),
+            )
+            ones = torch.ones_like(inactive_probs[..., :1])
+            exclusive_inactive_products = torch.cat((ones, prefix_products[..., :-1]), dim=-1) * torch.cat(
+                (suffix_products[..., 1:], ones), dim=-1
+            )
+
+            prob_zero = prefix_products[..., -1]
+            prob_one = (speaker_probs * exclusive_inactive_products).sum(dim=-1)
+            prob_overlap = (1.0 - prob_zero - prob_one).clamp_min(0.0)
+
+            activity_probs = torch.stack((prob_zero, prob_one, prob_overlap), dim=-1)
+            # The common additive floor keeps cross entropy finite for saturated
+            # probabilities; cross_entropy normalizes these log scores internally.
+            return torch.log(activity_probs + self.eps)
+
     def _activity_loss(self, activity_logits, targets, target_lens):
         """Classify each frame as silence, single-speaker speech, or overlap."""
         hard_activity = targets > 0.5
@@ -1804,6 +1847,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         pairwise_ats_loss = self._pairwise_ats_loss(preds, target_lens)
         self_ats_loss = self._self_ats_loss(preds, target_lens)
         spkcount_loss = self._spkcount_loss(preds, targets, target_lens)
+        if self.activity_weight > 0.0 and self.activity_loss_mode == "speaker_preds":
+            activity_logits = self._activity_logits_from_speaker_preds(preds)
         activity_loss = self._activity_loss(activity_logits, targets, target_lens)
         presence_loss = self._presence_loss(preds, targets_pil, target_lens)
         loss = (
@@ -1951,6 +1996,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         val_pairwise_ats_loss = self._pairwise_ats_loss(preds, target_lens)
         val_self_ats_loss = self._self_ats_loss(preds, target_lens)
         val_spkcount_loss = self._spkcount_loss(preds, targets, target_lens)
+        if self.activity_weight > 0.0 and self.activity_loss_mode == "speaker_preds":
+            activity_logits = self._activity_logits_from_speaker_preds(preds)
         val_activity_loss = self._activity_loss(activity_logits, targets, target_lens)
         val_presence_loss = self._presence_loss(preds, targets_pil, target_lens)
         val_loss = (

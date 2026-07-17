@@ -111,7 +111,7 @@ class SortformerModules(NeuralModule, Exportable):
         self.dropout = nn.Dropout(dropout_rate)
         self.encoder_proj = nn.Linear(self.fc_d_model, self.tf_d_model)
         # Optional three-class activity head. It is initialized by the parent model only
-        # when the auxiliary activity loss is enabled, preserving old state dictionaries.
+        # when the activity loss uses the auxiliary-head mode, preserving old state dictionaries.
         self.activity_head = None
         self.log = False
 
