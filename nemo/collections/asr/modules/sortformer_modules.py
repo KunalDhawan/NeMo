@@ -84,6 +84,8 @@ class SortformerModules(NeuralModule, Exportable):
         chunk_left_context: int = 1,
         chunk_right_context: int = 1,
         spkcache_sil_frames_per_spk: int = 3,
+        spkcache_slot_tokens_per_spk: int = 0,
+        spkcache_slot_token_type: str = "shared",
         causal_attn_rate: float = 0,
         causal_attn_rc: int = 7,
         max_tail_attn_len: int = 0,
@@ -134,6 +136,21 @@ class SortformerModules(NeuralModule, Exportable):
         self.chunk_left_context = chunk_left_context
         self.chunk_right_context = chunk_right_context
         self.spkcache_sil_frames_per_spk = spkcache_sil_frames_per_spk
+        self.spkcache_slot_tokens_per_spk = spkcache_slot_tokens_per_spk
+        self.spkcache_slot_token_type = spkcache_slot_token_type
+        if self.spkcache_slot_token_type not in ("shared", "per_speaker"):
+            raise ValueError(
+                "spkcache_slot_token_type must be 'shared' or 'per_speaker', "
+                f"got '{self.spkcache_slot_token_type}'."
+            )
+        num_slot_token_embeddings = 1 if self.spkcache_slot_token_type == "shared" else self.n_spk
+        # One vector is repeated `spkcache_slot_tokens_per_spk` times. In per-speaker
+        # mode each physical cache block has its own vector.
+        if isinstance(self.spkcache_slot_tokens_per_spk, int) and self.spkcache_slot_tokens_per_spk > 0:
+            self.spkcache_slot_tokens = nn.Parameter(torch.empty(num_slot_token_embeddings, self.fc_d_model))
+            nn.init.normal_(self.spkcache_slot_tokens, mean=0.0, std=0.02)
+        else:
+            self.register_parameter("spkcache_slot_tokens", None)
         self.spkcache_update_period = spkcache_update_period
         self.causal_attn_rate = causal_attn_rate
         self.causal_attn_rc = causal_attn_rc
@@ -170,17 +187,22 @@ class SortformerModules(NeuralModule, Exportable):
         Restrictions:
             - All streaming parameters should be non-negative integers.
             - Chunk length and speaker cache update period should be greater than 0.
-            - Speaker cache length should be greater than or equal to `(1 + spkcache_sil_frames_per_spk ) * n_spk`.
+            - Speaker cache length should be greater than or equal to
+              `(1 + spkcache_sil_frames_per_spk + spkcache_slot_tokens_per_spk) * n_spk`.
             - The effective range of self.spkcache_update_period is: chunk_len <= spkcache_update_period <= fifo_len + chunk_len
         """
         param_constraints = {
-            'spkcache_len': (1 + self.spkcache_sil_frames_per_spk) * self.n_spk,
+            'spkcache_len': (
+                1 + self.spkcache_sil_frames_per_spk + self.spkcache_slot_tokens_per_spk
+            )
+            * self.n_spk,
             'fifo_len': 0,
             'chunk_len': 1,
             'spkcache_update_period': 1,
             'chunk_left_context': 0,
             'chunk_right_context': 0,
             'spkcache_sil_frames_per_spk': 0,
+            'spkcache_slot_tokens_per_spk': 0,
         }
 
         for param, min_val in param_constraints.items():
@@ -1044,40 +1066,65 @@ class SortformerModules(NeuralModule, Exportable):
     def _get_topk_indices(self, scores):
         """
         Get indices corresponding to spkcache_len highest scores, and binary mask for frames in topk to be disabled.
-        Disabled frames correspond to either '-inf' score or spkcache_sil_frames_per_spk frames of extra silence
-        Mean silence embedding will be used for these frames.
+        The first `spkcache_slot_tokens_per_spk` score positions represent mandatory
+        slot tokens, while the final `spkcache_sil_frames_per_spk` positions represent
+        mandatory mean-silence frames. Disabled frames correspond to either '-inf'
+        scores or the extra silence positions.
 
         Args:
-            scores (torch.Tensor): Tensor containing speaker scores, including for extra silence frames
+            scores (torch.Tensor): Tensor containing speaker scores, including slot-token
+                positions at the start and extra silence positions at the end.
                 Shape: (batch_size, n_frames, n_spk)
 
         Returns:
-            topk_indices_sorted (torch.Tensor): Tensor containing frame indices of spkcache_len highest scores
+            frame_indices (torch.Tensor): Tensor containing source frame indices for
+                selected real acoustic frames. Special positions use index zero.
                 Shape: (batch_size, spkcache_len)
             is_disabled (torch.Tensor): Tensor containing binary mask for frames in topk to be disabled
                 Shape: (batch_size, spkcache_len)
+            is_slot_token (torch.Tensor): Tensor marking mandatory slot-token positions
+                Shape: (batch_size, spkcache_len)
+            slot_indices (torch.Tensor): Physical speaker-block index for each selected position
+                Shape: (batch_size, spkcache_len)
         """
         batch_size, n_frames, _ = scores.shape
-        n_frames_no_sil = n_frames - self.spkcache_sil_frames_per_spk
+        first_real_frame = self.spkcache_slot_tokens_per_spk
+        first_sil_frame = n_frames - self.spkcache_sil_frames_per_spk
         # Concatenate scores for all speakers and get spkcache_len frames with highest scores.
         # Replace topk_indices corresponding to '-inf' score with a placeholder index self.max_index.
         scores_flatten = scores.permute(0, 2, 1).reshape(batch_size, -1)
         topk_values, topk_indices = torch.topk(scores_flatten, self.spkcache_len, dim=1, sorted=False)
         valid_topk_mask = topk_values != float('-inf')
-        topk_indices = torch.where(valid_topk_mask, topk_indices, torch.tensor(self.max_index))
+        topk_indices = torch.where(valid_topk_mask, topk_indices, torch.full_like(topk_indices, self.max_index))
         # Sort topk_indices to preserve the original order of the frames.
-        # Get correct indices corresponding to the original frames
+        # Get correct speaker-block and temporal indices corresponding to the original frames.
         topk_indices_sorted, _ = torch.sort(topk_indices, dim=1)  # Shape: (batch_size, spkcache_len)
-        is_disabled = topk_indices_sorted == self.max_index
-        topk_indices_sorted = torch.remainder(topk_indices_sorted, n_frames)
-        is_disabled += topk_indices_sorted >= n_frames_no_sil
-        topk_indices_sorted[is_disabled] = 0  # Set a placeholder index to make gather work
-        return topk_indices_sorted, is_disabled
+        is_invalid = topk_indices_sorted == self.max_index
+        slot_indices = torch.div(topk_indices_sorted, n_frames, rounding_mode='floor')
+        indices_within_block = torch.remainder(topk_indices_sorted, n_frames)
+        is_slot_token = (~is_invalid) & (indices_within_block < first_real_frame)
+        is_silence = (~is_invalid) & (indices_within_block >= first_sil_frame)
+        is_disabled = is_invalid | is_silence
+        is_real_frame = ~(is_disabled | is_slot_token)
+        frame_indices = indices_within_block - first_real_frame
+        frame_indices = torch.where(is_real_frame, frame_indices, torch.zeros_like(frame_indices))
+        slot_indices = torch.where(is_invalid, torch.zeros_like(slot_indices), slot_indices)
+        return frame_indices, is_disabled, is_slot_token, slot_indices
 
-    def _gather_spkcache_and_preds(self, emb_seq, preds, topk_indices, is_disabled, mean_sil_emb):
+    def _gather_spkcache_and_preds(
+        self,
+        emb_seq,
+        preds,
+        topk_indices,
+        is_disabled,
+        mean_sil_emb,
+        is_slot_token=None,
+        slot_indices=None,
+    ):
         """
         Gather embeddings from emb_seq and speaker activities from preds corresponding to topk_indices.
         For disabled frames, use mean silence embedding and zero probability instead.
+        For slot positions, use the learned shared or per-speaker slot token and zero probability.
 
         Args:
             emb_seq (torch.Tensor): Tensor containing sequence of embeddings.
@@ -1090,6 +1137,11 @@ class SortformerModules(NeuralModule, Exportable):
                 Shape: (batch_size, spkcache_len)
             mean_sil_emb (torch.Tensor): Tensor containing mean silence embedding
                 Shape: (batch_size, emb_dim)
+            is_slot_token (torch.Tensor): Optional binary mask for slot-token positions
+                Shape: (batch_size, spkcache_len)
+            slot_indices (torch.Tensor): Optional physical speaker-block indices used
+                to select per-speaker slot tokens
+                Shape: (batch_size, spkcache_len)
 
         Returns:
             emb_seq_gathered (torch.Tensor): Tensor containing gathered embeddings.
@@ -1100,7 +1152,7 @@ class SortformerModules(NeuralModule, Exportable):
         # To use `torch.gather`, expand `topk_indices` along the last dimension to match `emb_dim`.
         # Gather the speaker cache embeddings, including the placeholder embeddings for silence frames.
         # Finally, replace the placeholder embeddings with actual mean silence embedding.
-        emb_dim, n_spk = emb_seq.shape[2], preds.shape[2]
+        batch_size, emb_dim, n_spk = emb_seq.shape[0], emb_seq.shape[2], preds.shape[2]
         indices_expanded_emb = topk_indices.unsqueeze(-1).expand(-1, -1, emb_dim)
         emb_seq_gathered = torch.gather(emb_seq, 1, indices_expanded_emb)  # (batch_size, spkcache_len, emb_dim)
         mean_sil_emb_expanded = mean_sil_emb.unsqueeze(1).expand(-1, self.spkcache_len, -1)
@@ -1111,29 +1163,21 @@ class SortformerModules(NeuralModule, Exportable):
         # Finally, replace the placeholder `preds` with zeros.
         indices_expanded_spk = topk_indices.unsqueeze(-1).expand(-1, -1, n_spk)
         preds_gathered = torch.gather(preds, 1, indices_expanded_spk)  # (batch_size, spkcache_len, n_spk)
-        preds_gathered = torch.where(is_disabled.unsqueeze(-1), torch.tensor(0.0), preds_gathered)
+        preds_gathered = torch.where(is_disabled.unsqueeze(-1), torch.zeros_like(preds_gathered), preds_gathered)
+
+        if is_slot_token is not None and self.spkcache_slot_tokens is not None:
+            if slot_indices is None:
+                raise ValueError("slot_indices must be provided when is_slot_token is provided.")
+            if self.spkcache_slot_token_type == "shared":
+                slot_embs = self.spkcache_slot_tokens[0].view(1, 1, -1).expand(batch_size, self.spkcache_len, -1)
+            else:
+                slot_embs = self.spkcache_slot_tokens[slot_indices]
+            slot_embs = slot_embs.to(dtype=emb_seq_gathered.dtype)
+            emb_seq_gathered = torch.where(is_slot_token.unsqueeze(-1), slot_embs, emb_seq_gathered)
+            preds_gathered = torch.where(
+                is_slot_token.unsqueeze(-1), torch.zeros_like(preds_gathered), preds_gathered
+            )
         return emb_seq_gathered, preds_gathered
-
-    def _get_max_perm_index(self, scores):
-        """
-        Get number of first speakers having at least one positive score.
-        These speakers will be randomly permuted during _compress_spkcache (training only).
-
-        Args:
-            scores (torch.Tensor): Tensor containing speaker scores
-                Shape: (batch_size, n_frames, n_spk)
-
-        Returns:
-            max_perm_index (torch.Tensor): Tensor with number of first speakers to permute
-                Shape: (batch_size)
-        """
-
-        batch_size, _, n_spk = scores.shape
-        is_pos = scores > 0  # positive score usually means that only current speaker is speaking
-        zero_indices = torch.where(is_pos.sum(dim=1) == 0)
-        max_perm_index = torch.full((batch_size,), n_spk, dtype=torch.long, device=scores.device)
-        max_perm_index.scatter_reduce_(0, zero_indices[0], zero_indices[1], reduce="amin", include_self=False)
-        return max_perm_index
 
     def _disable_low_scores(self, preds, scores, min_pos_scores_per_spk: int):
         """
@@ -1163,15 +1207,13 @@ class SortformerModules(NeuralModule, Exportable):
         scores = torch.where(is_nonpos_replace, torch.tensor(float('-inf')), scores)
         return scores
 
-    def _permute_speakers(self, scores, max_perm_index):
+    def _permute_speakers(self, scores):
         """
-        Create a random permutation of scores max_perm_index first speakers.
+        Create a random permutation of all speaker-score channels.
 
         Args:
             scores (torch.Tensor): Tensor containing speaker scores
                 Shape: (batch_size, n_frames, n_spk)
-            max_perm_index (torch.Tensor): Tensor with number of first speakers to permute
-                Shape: (batch_size)
 
         Returns:
             scores (torch.Tensor): Tensor with permuted scores.
@@ -1182,13 +1224,11 @@ class SortformerModules(NeuralModule, Exportable):
         spk_perm_list, scores_list = [], []
         batch_size, _, n_spk = scores.shape
         for batch_index in range(batch_size):
-            rand_perm_inds = torch.randperm(max_perm_index[batch_index].item())
-            linear_inds = torch.arange(max_perm_index[batch_index].item(), n_spk)
-            permutation = torch.cat([rand_perm_inds, linear_inds])
+            permutation = torch.randperm(n_spk, device=scores.device)
             spk_perm_list.append(permutation)
             scores_list.append(scores[batch_index, :, permutation])
-        spk_perm = torch.stack(spk_perm_list).to(scores.device)
-        scores = torch.stack(scores_list).to(scores.device)
+        spk_perm = torch.stack(spk_perm_list)
+        scores = torch.stack(scores_list)
         return scores, spk_perm
 
     def _compress_spkcache(self, emb_seq, preds, mean_sil_emb, permute_spk: bool = False):
@@ -1203,7 +1243,7 @@ class SortformerModules(NeuralModule, Exportable):
                 Shape: (batch_size, n_frames, n_spk)
             mean_sil_emb (torch.Tensor): Tensor containing mean silence embedding
                 Shape: (batch_size, emb_dim)
-            permute_spk (bool): If true, will generate a random permutation of existing speakers
+            permute_spk (bool): If true, will generate a random permutation of all speaker slots
 
         Returns:
             spkcache (torch.Tensor): Tensor containing spkcache_len most important embeddings from emb_seq.
@@ -1219,7 +1259,11 @@ class SortformerModules(NeuralModule, Exportable):
             # Use the learned silence embedding instead of the data-dependent running mean.
             mean_sil_emb = self.learnable_sil_emb.to(dtype=emb_seq.dtype, device=emb_seq.device)
             mean_sil_emb = mean_sil_emb.unsqueeze(0).expand(batch_size, -1)
-        spkcache_len_per_spk = self.spkcache_len // n_spk - self.spkcache_sil_frames_per_spk
+        spkcache_len_per_spk = (
+            self.spkcache_len // n_spk
+            - self.spkcache_sil_frames_per_spk
+            - self.spkcache_slot_tokens_per_spk
+        )
         strong_boost_per_spk = math.floor(spkcache_len_per_spk * self.strong_boost_rate)
         weak_boost_per_spk = math.floor(spkcache_len_per_spk * self.weak_boost_rate)
         min_pos_scores_per_spk = math.floor(spkcache_len_per_spk * self.min_pos_scores_rate)
@@ -1227,9 +1271,8 @@ class SortformerModules(NeuralModule, Exportable):
         scores = self._get_log_pred_scores(preds)
         scores = self._disable_low_scores(preds, scores, min_pos_scores_per_spk)
 
-        if permute_spk:  # Generate a random permutation of speakers
-            max_perm_index = self._get_max_perm_index(scores)
-            scores, spk_perm = self._permute_speakers(scores, max_perm_index)
+        if permute_spk:  # Generate a random permutation of all speaker slots
+            scores, spk_perm = self._permute_speakers(scores)
         else:
             spk_perm = None
 
@@ -1245,12 +1288,26 @@ class SortformerModules(NeuralModule, Exportable):
         # Weak boosting to prevent dominance of one speaker in speaker cache
         scores = self._boost_topk_scores(scores, weak_boost_per_spk, scale_factor=1)
 
+        if self.spkcache_slot_tokens_per_spk > 0:
+            # Infinite scores make every slot token mandatory. Prepending these
+            # positions places the tokens at the start of each speaker block.
+            slot_pad = torch.full(
+                (batch_size, self.spkcache_slot_tokens_per_spk, n_spk), float('inf'), device=scores.device
+            )
+            scores = torch.cat([slot_pad, scores], dim=1)
+
         if self.spkcache_sil_frames_per_spk > 0:  # Add number of silence frames in the end of each block
             pad = torch.full((batch_size, self.spkcache_sil_frames_per_spk, n_spk), float('inf'), device=scores.device)
             scores = torch.cat([scores, pad], dim=1)  # (batch_size, n_frames + spkcache_sil_frames_per_spk, n_spk)
 
-        topk_indices, is_disabled = self._get_topk_indices(scores)
+        topk_indices, is_disabled, is_slot_token, slot_indices = self._get_topk_indices(scores)
         spkcache, spkcache_preds = self._gather_spkcache_and_preds(
-            emb_seq, preds, topk_indices, is_disabled, mean_sil_emb
+            emb_seq,
+            preds,
+            topk_indices,
+            is_disabled,
+            mean_sil_emb,
+            is_slot_token=is_slot_token,
+            slot_indices=slot_indices,
         )
         return spkcache, spkcache_preds, spk_perm

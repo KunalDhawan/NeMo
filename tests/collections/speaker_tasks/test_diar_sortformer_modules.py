@@ -27,7 +27,7 @@ class TestSortformerModules_CheckStreamingParameters:
         [
             (4, 188, 376, 376, 1, 1, 376, 0),  # Example 1: All equal values
             (3, 100, 200, 150, 0, 0, 150, 3),  # Example 2: Different values, zero contexts
-            (5, 50, 100, 50, 2, 2, 75, 9),  # Example 3: Small values, larger contexts
+            (5, 55, 100, 50, 2, 2, 75, 9),  # Example 3: Small values, larger contexts
         ],
     )
     def test_valid_parameters(
@@ -57,6 +57,7 @@ class TestSortformerModules_CheckStreamingParameters:
             ("chunk_right_context", -3, 0),
             ("spkcache_update_period", 0, 1),
             ("spkcache_sil_frames_per_spk", -1, 0),
+            ("spkcache_slot_tokens_per_spk", -1, 0),
         ],
     )
     def test_invalid_parameters(self, param_name, param_value, expected_min):
@@ -90,6 +91,7 @@ class TestSortformerModules_CheckStreamingParameters:
             ("chunk_right_context", 3.21),
             ("spkcache_update_period", 7.3),
             ("spkcache_sil_frames_per_spk", 2.5),
+            ("spkcache_slot_tokens_per_spk", 1.5),
         ],
     )
     def test_invalid_float_parameters(self, param_name, param_value):
@@ -116,17 +118,18 @@ class TestSortformerModules_CheckStreamingParameters:
     @pytest.mark.parametrize(
         "spkcache_len, n_spk, spkcache_sil_frames_per_spk",
         [
-            (15, 4, 3),  # spkcache_len is 15, minimum is (1+3)*4=16
-            (1, 1, 1),  # spkcache_len is 1, minimum is (1+1)*1=2
+            (15, 4, 3),  # spkcache_len is 15, minimum is (1+3+1)*4=20
+            (1, 1, 1),  # spkcache_len is 1, minimum is (1+1+1)*1=3
         ],
     )
     def test_invalid_spkcache_len(self, spkcache_len, n_spk, spkcache_sil_frames_per_spk):
         """Test that spkcache_len is validated against the minimum required length."""
-        min_spkcache_len = (1 + spkcache_sil_frames_per_spk) * n_spk
+        min_spkcache_len = (1 + spkcache_sil_frames_per_spk + 1) * n_spk
         params = {
             "num_spks": n_spk,
             "spkcache_len": spkcache_len,
             "spkcache_sil_frames_per_spk": spkcache_sil_frames_per_spk,
+            "spkcache_slot_tokens_per_spk": 1,
             "fifo_len": 376,
             "chunk_len": 12,
             "chunk_left_context": 1,
@@ -139,6 +142,14 @@ class TestSortformerModules_CheckStreamingParameters:
         ):
             sortformer_modules = SortformerModules(**params)
             sortformer_modules._check_streaming_parameters()
+
+    @pytest.mark.unit
+    def test_invalid_spkcache_slot_token_type(self):
+        with pytest.raises(
+            ValueError,
+            match="spkcache_slot_token_type must be 'shared' or 'per_speaker'",
+        ):
+            SortformerModules(spkcache_slot_token_type="invalid")
 
 
 class TestSortformerModules_GeneralUtils:
@@ -899,6 +910,7 @@ class TestSortformerModules_StreamingScoreComputations:
             chunk_right_context=1,
             spkcache_update_period=376,
             spkcache_sil_frames_per_spk=spkcache_sil_frames_per_spk,
+            spkcache_slot_tokens_per_spk=0,
             max_index=99999,
         )
 
@@ -910,11 +922,14 @@ class TestSortformerModules_StreamingScoreComputations:
             scores[:, 2:4, :] = float('-inf')  # Make some frames have -inf scores
 
         # Call the method
-        topk_indices_sorted, is_disabled = sortformer_modules._get_topk_indices(scores)
+        topk_indices_sorted, is_disabled, is_slot_token, slot_indices = sortformer_modules._get_topk_indices(scores)
 
         # Check output shapes
         assert topk_indices_sorted.shape == (batch_size, spkcache_len)
         assert is_disabled.shape == (batch_size, spkcache_len)
+        assert is_slot_token.shape == (batch_size, spkcache_len)
+        assert slot_indices.shape == (batch_size, spkcache_len)
+        assert not is_slot_token.any()
 
         # Check device consistency
         assert topk_indices_sorted.device == scores.device
@@ -943,16 +958,17 @@ class TestSortformerModules_StreamingScoreComputations:
 
         # Test edge case: all scores are -inf
         all_inf_scores = torch.full((batch_size, n_frames, n_spk), float('-inf'))
-        all_inf_indices, all_inf_disabled = sortformer_modules._get_topk_indices(all_inf_scores)
+        all_inf_indices, all_inf_disabled, all_inf_slots, _ = sortformer_modules._get_topk_indices(all_inf_scores)
 
         # All frames should be disabled
         assert torch.all(all_inf_disabled)
+        assert not all_inf_slots.any()
         # All indices should be placeholder (0)
         assert torch.all(all_inf_indices == 0)
 
         # Test edge case: scores with some frames in silence region
         normal_scores = torch.randn(batch_size, n_frames, n_spk)
-        normal_indices, normal_disabled = sortformer_modules._get_topk_indices(normal_scores)
+        normal_indices, normal_disabled, _, _ = sortformer_modules._get_topk_indices(normal_scores)
 
         # Check that silence frames (last spkcache_sil_frames_per_spk frames) are properly handled
         for b in range(batch_size):
@@ -1087,69 +1103,6 @@ class TestSortformerModules_StreamingScoreComputations:
 
     @pytest.mark.unit
     @pytest.mark.parametrize(
-        "batch_size, n_frames, n_spk",
-        [
-            (2, 10, 4),  # Example 1: Default parameters
-            (1, 8, 2),  # Example 2: Smaller dimensions
-            (3, 12, 6),  # Example 3: Larger dimensions
-            (2, 6, 3),  # Example 4: Small dimensions
-        ],
-    )
-    def test_get_max_perm_index(self, batch_size, n_frames, n_spk):
-        """Test the _get_max_perm_index method that finds the number of speakers with positive scores."""
-        sortformer_modules = SortformerModules(
-            num_spks=n_spk,
-            spkcache_len=188,
-            fifo_len=376,
-            chunk_len=376,
-            chunk_left_context=1,
-            chunk_right_context=1,
-            spkcache_update_period=376,
-        )
-
-        # Create test scores with various patterns
-        scores = torch.randn(batch_size, n_frames, n_spk)
-
-        # Call the method
-        max_perm_index = sortformer_modules._get_max_perm_index(scores)
-
-        # Check output shape
-        assert max_perm_index.shape == (batch_size,)
-
-        # Check device consistency
-        assert max_perm_index.device == scores.device
-
-        # Check data type
-        assert max_perm_index.dtype == torch.long
-
-        # Verify that max_perm_index is within valid range [0, n_spk]
-        assert torch.all(max_perm_index >= 0)
-        assert torch.all(max_perm_index <= n_spk)
-
-        # Test case: all scores positive
-        all_positive_scores = torch.abs(torch.randn(batch_size, n_frames, n_spk)) + 0.1  # Ensure all > 0
-        all_pos_max_perm = sortformer_modules._get_max_perm_index(all_positive_scores)
-
-        # All speakers should have positive scores, so max_perm_index should be n_spk
-        assert torch.all(all_pos_max_perm == n_spk)
-
-        # Test case: all scores negative
-        all_negative_scores = -torch.abs(torch.randn(batch_size, n_frames, n_spk)) - 0.1  # Ensure all < 0
-        all_neg_max_perm = sortformer_modules._get_max_perm_index(all_negative_scores)
-
-        # No speakers should have positive scores, so max_perm_index should be 0
-        assert torch.all(all_neg_max_perm == 0)
-
-        # Test case: mixed positive and negative scores
-        mixed_scores = torch.randn(batch_size, n_frames, n_spk)
-        mixed_max_perm = sortformer_modules._get_max_perm_index(mixed_scores)
-
-        # Check that max_perm_index is within valid range [0, n_spk]
-        assert torch.all(mixed_max_perm >= 0)
-        assert torch.all(mixed_max_perm <= n_spk)
-
-    @pytest.mark.unit
-    @pytest.mark.parametrize(
         "batch_size, n_frames, n_spk, min_pos_scores_per_spk",
         [
             (2, 10, 4, 3),  # Example 1: Default parameters
@@ -1221,7 +1174,7 @@ class TestSortformerModules_StreamingScoreComputations:
             (3, 12, 6),  # Example 3: Larger dimensions
         ],
     )
-    def test_permute_speakers(self, batch_size, n_frames, n_spk):
+    def test_permute_speakers(self, batch_size, n_frames, n_spk, monkeypatch):
         """Test the _permute_speakers method that creates random permutations of speaker scores."""
         sortformer_modules = SortformerModules(
             num_spks=n_spk,
@@ -1233,12 +1186,17 @@ class TestSortformerModules_StreamingScoreComputations:
             spkcache_update_period=376,
         )
 
-        # Create test scores and max_perm_index
+        # Create test scores
         scores = torch.randn(batch_size, n_frames, n_spk)
-        max_perm_index = torch.randint(1, n_spk + 1, (batch_size,))  # Random number of speakers to permute
+        expected_perm = torch.arange(n_spk - 1, -1, -1)
+        monkeypatch.setattr(
+            torch,
+            "randperm",
+            lambda size, device=None: expected_perm.to(device=device),
+        )
 
         # Call the method
-        permuted_scores, spk_perm = sortformer_modules._permute_speakers(scores, max_perm_index)
+        permuted_scores, spk_perm = sortformer_modules._permute_speakers(scores)
 
         # Check output shapes
         assert permuted_scores.shape == (batch_size, n_frames, n_spk)
@@ -1251,6 +1209,7 @@ class TestSortformerModules_StreamingScoreComputations:
         # Check data types
         assert permuted_scores.dtype == scores.dtype
         assert spk_perm.dtype == torch.long
+        assert torch.all(spk_perm == expected_perm.unsqueeze(0))
 
         # Test 1: Verify that permutation is valid (contains all speaker indices)
         for b in range(batch_size):
@@ -1269,26 +1228,90 @@ class TestSortformerModules_StreamingScoreComputations:
                 original_idx = batch_perm[i]
                 assert torch.allclose(batch_permuted[:, i], batch_scores[:, original_idx], atol=1e-6)
 
-        # Test edge case: max_perm_index = 0 (no permutation)
-        zero_perm_index = torch.zeros((batch_size,), dtype=torch.long)
-        zero_perm_scores, zero_perm_spk = sortformer_modules._permute_speakers(scores, zero_perm_index)
+    @pytest.mark.unit
+    @pytest.mark.parametrize("slot_token_type", ["shared", "per_speaker"])
+    def test_compress_spkcache_prepends_slot_tokens(self, slot_token_type):
+        batch_size, n_spk, n_frames, emb_dim = 1, 3, 9, 4
+        slot_tokens_per_spk, sil_frames_per_spk = 2, 1
+        spkcache_len = 18
+        sortformer_modules = SortformerModules(
+            num_spks=n_spk,
+            spkcache_len=spkcache_len,
+            fifo_len=0,
+            chunk_len=n_frames,
+            fc_d_model=emb_dim,
+            spkcache_update_period=n_frames,
+            spkcache_sil_frames_per_spk=sil_frames_per_spk,
+            spkcache_slot_tokens_per_spk=slot_tokens_per_spk,
+            spkcache_slot_token_type=slot_token_type,
+            scores_boost_latest=0,
+        )
+        with torch.no_grad():
+            if slot_token_type == "shared":
+                sortformer_modules.spkcache_slot_tokens[0] = 10.0
+            else:
+                for speaker_index in range(n_spk):
+                    sortformer_modules.spkcache_slot_tokens[speaker_index] = 10.0 + speaker_index
 
-        # Scores should be unchanged
-        assert torch.allclose(zero_perm_scores, scores, atol=1e-6)
-        # Permutation should be identity
-        for b in range(batch_size):
-            assert torch.all(zero_perm_spk[b] == torch.arange(n_spk, device=scores.device))
+        emb_seq = torch.arange(batch_size * n_frames * emb_dim, dtype=torch.float32).reshape(
+            batch_size, n_frames, emb_dim
+        )
+        preds = torch.zeros(batch_size, n_frames, n_spk)
+        for speaker_index in range(n_spk):
+            preds[:, speaker_index * 3 : (speaker_index + 1) * 3, speaker_index] = 0.9
+        mean_sil_emb = torch.full((batch_size, emb_dim), -1.0)
 
-        # Test edge case: max_perm_index = n_spk (all speakers permuted)
-        all_perm_index = torch.full((batch_size,), n_spk, dtype=torch.long)
-        _, all_perm_spk = sortformer_modules._permute_speakers(scores, all_perm_index)
+        spkcache, spkcache_preds, _ = sortformer_modules._compress_spkcache(
+            emb_seq, preds, mean_sil_emb, permute_spk=False
+        )
 
-        # All speakers should be permuted
-        for b in range(batch_size):
-            perm_indices = all_perm_spk[b]
-            original_indices = torch.arange(n_spk, device=scores.device)
-            # Check that permutation is valid but not identity
-            assert torch.all(torch.sort(perm_indices)[0] == original_indices)
+        for speaker_index in range(n_spk):
+            block_start = speaker_index * 6
+            expected_token_value = 10.0 if slot_token_type == "shared" else 10.0 + speaker_index
+            expected_tokens = torch.full((slot_tokens_per_spk, emb_dim), expected_token_value)
+            assert torch.allclose(
+                spkcache[0, block_start : block_start + slot_tokens_per_spk],
+                expected_tokens,
+            )
+            assert torch.allclose(
+                spkcache[0, block_start + slot_tokens_per_spk : block_start + 5],
+                emb_seq[0, speaker_index * 3 : (speaker_index + 1) * 3],
+            )
+            assert torch.allclose(spkcache[0, block_start + 5], mean_sil_emb[0])
+            assert torch.all(spkcache_preds[0, block_start : block_start + slot_tokens_per_spk] == 0)
+            assert torch.all(spkcache_preds[0, block_start + 5] == 0)
+
+        spkcache.sum().backward()
+        assert sortformer_modules.spkcache_slot_tokens.grad is not None
+
+    @pytest.mark.unit
+    def test_compress_spkcache_without_slot_tokens(self):
+        batch_size, n_spk, n_frames, emb_dim = 1, 2, 8, 4
+        sortformer_modules = SortformerModules(
+            num_spks=n_spk,
+            spkcache_len=8,
+            fifo_len=0,
+            chunk_len=n_frames,
+            fc_d_model=emb_dim,
+            spkcache_update_period=n_frames,
+            spkcache_sil_frames_per_spk=1,
+            spkcache_slot_tokens_per_spk=0,
+            scores_boost_latest=0,
+        )
+        emb_seq = torch.randn(batch_size, n_frames, emb_dim)
+        preds = torch.zeros(batch_size, n_frames, n_spk)
+        preds[:, :4, 0] = 0.9
+        preds[:, 4:, 1] = 0.9
+        mean_sil_emb = torch.full((batch_size, emb_dim), -1.0)
+
+        spkcache, spkcache_preds, spk_perm = sortformer_modules._compress_spkcache(
+            emb_seq, preds, mean_sil_emb, permute_spk=False
+        )
+
+        assert sortformer_modules.spkcache_slot_tokens is None
+        assert spkcache.shape == (batch_size, sortformer_modules.spkcache_len, emb_dim)
+        assert spkcache_preds.shape == (batch_size, sortformer_modules.spkcache_len, n_spk)
+        assert spk_perm is None
 
     @pytest.mark.unit
     @pytest.mark.parametrize(
@@ -1302,11 +1325,13 @@ class TestSortformerModules_StreamingScoreComputations:
     )
     def test_compress_spkcache(self, batch_size, n_frames, n_spk, spkcache_len):
         """Test the _compress_spkcache method that compresses speaker cache for streaming inference."""
+        emb_dim = 192
         sortformer_modules = SortformerModules(
             num_spks=n_spk,
             spkcache_len=spkcache_len,
             fifo_len=376,
             chunk_len=376,
+            fc_d_model=emb_dim,
             chunk_left_context=1,
             chunk_right_context=1,
             spkcache_update_period=376,
@@ -1314,7 +1339,6 @@ class TestSortformerModules_StreamingScoreComputations:
         )
 
         # Create test embeddings and predictions
-        emb_dim = 192
         emb_seq = torch.randn(batch_size, n_frames, emb_dim)
         preds = torch.rand(batch_size, n_frames, n_spk)  # Random probabilities between 0 and 1
 
