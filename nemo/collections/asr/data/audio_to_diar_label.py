@@ -1841,7 +1841,7 @@ def _eesd_train_collate_fn(self, batch):
         target_len_list.append(segment_ct.clone().detach())
         targets_list.append(padded_tgt)
         speaker_names_list.append(spk_names)
-        audio_signal = torch.stack(audio_signal_list)
+    audio_signal = torch.stack(audio_signal_list)
     feature_length = torch.stack(feature_length_list)
     target_lens = torch.stack(target_len_list).squeeze(1)
     targets = torch.stack(targets_list)
