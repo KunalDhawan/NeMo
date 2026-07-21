@@ -1285,6 +1285,56 @@ class TestSortformerModules_StreamingScoreComputations:
         assert sortformer_modules.spkcache_slot_tokens.grad is not None
 
     @pytest.mark.unit
+    def test_per_speaker_slot_tokens_follow_logical_speaker_permutation(self, monkeypatch):
+        batch_size, n_spk, n_frames, emb_dim = 1, 3, 9, 4
+        slot_tokens_per_spk, sil_frames_per_spk = 1, 1
+        spkcache_len = 15
+        sortformer_modules = SortformerModules(
+            num_spks=n_spk,
+            spkcache_len=spkcache_len,
+            fifo_len=0,
+            chunk_len=n_frames,
+            fc_d_model=emb_dim,
+            spkcache_update_period=n_frames,
+            spkcache_sil_frames_per_spk=sil_frames_per_spk,
+            spkcache_slot_tokens_per_spk=slot_tokens_per_spk,
+            spkcache_slot_token_type="per_speaker",
+            scores_boost_latest=0,
+        )
+        with torch.no_grad():
+            for speaker_index in range(n_spk):
+                sortformer_modules.spkcache_slot_tokens[speaker_index] = 10.0 + speaker_index
+
+        permutation = torch.tensor([2, 0, 1])
+        monkeypatch.setattr(torch, "randperm", lambda size, device=None: permutation.to(device=device))
+
+        emb_seq = torch.arange(batch_size * n_frames * emb_dim, dtype=torch.float32).reshape(
+            batch_size, n_frames, emb_dim
+        )
+        preds = torch.zeros(batch_size, n_frames, n_spk)
+        for speaker_index in range(n_spk):
+            preds[:, speaker_index * 3 : (speaker_index + 1) * 3, speaker_index] = 0.9
+        mean_sil_emb = torch.full((batch_size, emb_dim), -1.0)
+
+        spkcache, _, spk_perm = sortformer_modules._compress_spkcache(
+            emb_seq, preds, mean_sil_emb, permute_spk=True
+        )
+
+        assert torch.equal(spk_perm[0], permutation)
+        for physical_index, logical_index in enumerate(permutation):
+            logical_index = logical_index.item()
+            block_start = physical_index * 5
+            assert torch.allclose(
+                spkcache[0, block_start],
+                torch.full((emb_dim,), 10.0 + logical_index),
+            )
+            assert torch.allclose(
+                spkcache[0, block_start + 1 : block_start + 4],
+                emb_seq[0, logical_index * 3 : (logical_index + 1) * 3],
+            )
+            assert torch.allclose(spkcache[0, block_start + 4], mean_sil_emb[0])
+
+    @pytest.mark.unit
     def test_compress_spkcache_without_slot_tokens(self):
         batch_size, n_spk, n_frames, emb_dim = 1, 2, 8, 4
         sortformer_modules = SortformerModules(

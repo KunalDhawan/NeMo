@@ -145,7 +145,8 @@ class SortformerModules(NeuralModule, Exportable):
             )
         num_slot_token_embeddings = 1 if self.spkcache_slot_token_type == "shared" else self.n_spk
         # One vector is repeated `spkcache_slot_tokens_per_spk` times. In per-speaker
-        # mode each physical cache block has its own vector.
+        # mode each logical speaker slot has its own vector, which follows that slot
+        # when cache blocks are permuted during training.
         if isinstance(self.spkcache_slot_tokens_per_spk, int) and self.spkcache_slot_tokens_per_spk > 0:
             self.spkcache_slot_tokens = nn.Parameter(torch.empty(num_slot_token_embeddings, self.fc_d_model))
             nn.init.normal_(self.spkcache_slot_tokens, mean=0.0, std=0.02)
@@ -1139,8 +1140,8 @@ class SortformerModules(NeuralModule, Exportable):
                 Shape: (batch_size, emb_dim)
             is_slot_token (torch.Tensor): Optional binary mask for slot-token positions
                 Shape: (batch_size, spkcache_len)
-            slot_indices (torch.Tensor): Optional physical speaker-block indices used
-                to select per-speaker slot tokens
+            slot_indices (torch.Tensor): Optional speaker-slot indices used to select
+                per-speaker slot tokens
                 Shape: (batch_size, spkcache_len)
 
         Returns:
@@ -1301,6 +1302,10 @@ class SortformerModules(NeuralModule, Exportable):
             scores = torch.cat([scores, pad], dim=1)  # (batch_size, n_frames + spkcache_sil_frames_per_spk, n_spk)
 
         topk_indices, is_disabled, is_slot_token, slot_indices = self._get_topk_indices(scores)
+        if spk_perm is not None and self.spkcache_slot_token_type == "per_speaker":
+            # spk_perm maps physical cache-block positions to logical speaker slots.
+            # Make each distinct token follow its logical slot through the shuffle.
+            slot_indices = torch.gather(spk_perm, dim=1, index=slot_indices)
         spkcache, spkcache_preds = self._gather_spkcache_and_preds(
             emb_seq,
             preds,
