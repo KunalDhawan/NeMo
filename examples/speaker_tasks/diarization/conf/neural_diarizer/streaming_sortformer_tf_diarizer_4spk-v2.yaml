@@ -43,6 +43,14 @@ model:
   val_upsample_smooth_kernel: 9
   streaming_mode: True
 
+  # Add quiet, independently RMS-scaled whole samples from the current batch as babble.
+  batch_noise_augmentation:
+    probability: 0.5
+    min_num_noise_samples: 2
+    max_num_noise_samples: 3
+    min_snr_db: 30.0
+    max_snr_db: 40.0
+
   model_defaults:
     fc_d_model: 512
     tf_d_model: 192

@@ -142,6 +142,66 @@ class TestSortformerEncLabelModelOffline:
         assert isinstance(instance2, SortformerEncLabelModel)
 
     @pytest.mark.unit
+    def test_batch_active_speech_rms_uses_activity_and_lengths(self, sortformer_model):
+        samples_per_target_frame = (
+            sortformer_model.preprocessor.hop_length * sortformer_model.output_subsampling_factor
+        )
+        half_frame = samples_per_target_frame // 2
+        max_audio_len = samples_per_target_frame + half_frame
+        audio_signal = torch.full((2, max_audio_len), 100.0)
+        audio_signal[0, :half_frame] = 2.0
+        audio_signal[0, half_frame:samples_per_target_frame] = 4.0
+        audio_signal[1, :half_frame] = 6.0
+        audio_signal_length = torch.tensor([max_audio_len, half_frame])
+        targets = torch.zeros(2, 2, 1)
+        targets[0, 0, 0] = 1.0
+        targets[1, 0, 0] = 1.0
+        target_lens = torch.tensor([2, 1])
+
+        active_rms, valid_audio_mask = sortformer_model._get_batch_active_speech_rms(
+            audio_signal, audio_signal_length, targets, target_lens
+        )
+
+        assert torch.allclose(active_rms, torch.tensor([10.0**0.5, 6.0]))
+        assert valid_audio_mask[0].all()
+        assert valid_audio_mask[1, :half_frame].all()
+        assert not valid_audio_mask[1, half_frame:].any()
+
+    @pytest.mark.unit
+    def test_batch_noise_augmentation_uses_individual_rms_and_original_batch(self, sortformer_model):
+        sortformer_model.batch_noise_probability = 1.0
+        sortformer_model.batch_noise_min_num_samples = 1
+        sortformer_model.batch_noise_max_num_samples = 1
+        sortformer_model.batch_noise_min_snr_db = 40.0
+        sortformer_model.batch_noise_max_snr_db = 40.0
+
+        audio_signal = torch.tensor(
+            [
+                [2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0],
+                [4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 0.0, 0.0],
+            ]
+        )
+        original_audio = audio_signal.clone()
+        audio_signal_length = torch.tensor([8, 6])
+        targets = torch.zeros(2, 4, 1)
+        targets[0, :4, 0] = 1.0
+        targets[1, :3, 0] = 1.0
+        target_lens = torch.tensor([4, 3])
+
+        augmented = sortformer_model._apply_batch_noise_augmentation(
+            audio_signal, audio_signal_length, targets, target_lens
+        )
+
+        expected = torch.tensor(
+            [
+                [2.02, 2.02, 2.02, 2.02, 2.02, 2.02, 2.0, 2.0],
+                [4.04, 4.04, 4.04, 4.04, 4.04, 4.04, 0.0, 0.0],
+            ]
+        )
+        assert torch.allclose(augmented, expected)
+        assert torch.equal(audio_signal, original_audio)
+
+    @pytest.mark.unit
     @pytest.mark.parametrize(
         "batch_size, sample_len",
         [

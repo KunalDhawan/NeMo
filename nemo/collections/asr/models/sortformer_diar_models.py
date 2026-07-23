@@ -277,6 +277,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 self.sortformer_modules.fusion_block = self.sortformer_modules.fusion_block.to(self.device)
 
         self._init_loss_weights()
+        self._init_batch_noise_augmentation()
         self._init_activity_auxiliary_heads()
 
         self.eps = 0.004   # bf16-safe epsilon
@@ -327,6 +328,49 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         self.max_batch_dur = self._cfg.get("max_batch_dur", 20000)
         self.concat_and_pad_script = torch.jit.script(self.sortformer_modules.concat_and_pad)
+
+    def _init_batch_noise_augmentation(self):
+        """Initialize waveform-level in-batch babble augmentation settings."""
+        config = self._cfg.get("batch_noise_augmentation", None)
+        self.batch_noise_probability = 0.0
+        self.batch_noise_min_num_samples = 2
+        self.batch_noise_max_num_samples = 3
+        self.batch_noise_min_snr_db = 30.0
+        self.batch_noise_max_snr_db = 40.0
+
+        if config is None or config is False:
+            return
+
+        self.batch_noise_probability = float(config.get("probability", 0.5))
+        self.batch_noise_min_num_samples = config.get("min_num_noise_samples", 2)
+        self.batch_noise_max_num_samples = config.get("max_num_noise_samples", 3)
+        self.batch_noise_min_snr_db = float(config.get("min_snr_db", 30.0))
+        self.batch_noise_max_snr_db = float(config.get("max_snr_db", 40.0))
+
+        if not 0.0 <= self.batch_noise_probability <= 1.0:
+            raise ValueError(
+                f"batch_noise_augmentation.probability must be in [0, 1], "
+                f"got {self.batch_noise_probability}"
+            )
+        for name, value in (
+            ("min_num_noise_samples", self.batch_noise_min_num_samples),
+            ("max_num_noise_samples", self.batch_noise_max_num_samples),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"batch_noise_augmentation.{name} must be an integer, got {value!r}")
+            if value < 1:
+                raise ValueError(f"batch_noise_augmentation.{name} must be >= 1, got {value}")
+        if self.batch_noise_min_num_samples > self.batch_noise_max_num_samples:
+            raise ValueError(
+                "batch_noise_augmentation.min_num_noise_samples must be <= "
+                "batch_noise_augmentation.max_num_noise_samples"
+            )
+        if not math.isfinite(self.batch_noise_min_snr_db) or not math.isfinite(self.batch_noise_max_snr_db):
+            raise ValueError("batch_noise_augmentation SNR bounds must be finite")
+        if self.batch_noise_min_snr_db > self.batch_noise_max_snr_db:
+            raise ValueError(
+                "batch_noise_augmentation.min_snr_db must be <= batch_noise_augmentation.max_snr_db"
+            )
 
     def _init_loss_weights(self):
         pil_weight = self._cfg.get("pil_weight", 0.0)
@@ -819,6 +863,132 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         }
         temporary_datalayer = self.__setup_dataloader_from_config(config=DictConfig(dl_config))
         return temporary_datalayer
+
+    def _get_batch_active_speech_rms(self, audio_signal, audio_signal_length, targets, target_lens):
+        """Calculate one active-speech waveform RMS value per batch sample."""
+        if audio_signal.ndim != 2:
+            raise ValueError(f"batch noise augmentation expects audio shape (B, T), got {audio_signal.shape}")
+        if targets.ndim != 3:
+            raise ValueError(f"batch noise augmentation expects target shape (B, T, S), got {targets.shape}")
+        if audio_signal.shape[0] != targets.shape[0]:
+            raise ValueError(
+                f"audio and target batch sizes must match, got {audio_signal.shape[0]} and {targets.shape[0]}"
+            )
+
+        batch_size, max_audio_len = audio_signal.shape
+        max_target_len = targets.shape[1]
+        device = audio_signal.device
+        compute_dtype = (
+            torch.float32 if audio_signal.dtype in (torch.float16, torch.bfloat16) else audio_signal.dtype
+        )
+        if not audio_signal.is_floating_point():
+            compute_dtype = torch.float32
+
+        audio_lens = audio_signal_length.to(device=device, dtype=torch.long).clamp(min=0, max=max_audio_len)
+        target_lens = target_lens.to(device=device, dtype=torch.long).clamp(min=0, max=max_target_len)
+        sample_positions = torch.arange(max_audio_len, device=device).unsqueeze(0)
+        valid_audio_mask = sample_positions < audio_lens.unsqueeze(1)
+
+        if max_audio_len == 0 or max_target_len == 0:
+            return torch.zeros(batch_size, device=device, dtype=compute_dtype), valid_audio_mask
+
+        target_positions = torch.arange(max_target_len, device=device).unsqueeze(0)
+        valid_target_mask = target_positions < target_lens.unsqueeze(1)
+        frame_activity = (targets.to(device=device) >= 0.5).any(dim=-1) & valid_target_mask
+
+        # Each target frame covers a fixed number of waveform samples. For example,
+        # a 10 ms feature hop (160 samples) with 8x subsampling gives 1280 samples
+        # per target frame. Repeat each frame's activity over exactly those samples.
+        samples_per_target_frame = self.preprocessor.hop_length * self.output_subsampling_factor
+        active_audio_mask = frame_activity.repeat_interleave(samples_per_target_frame, dim=1)
+        if active_audio_mask.shape[1] < max_audio_len:
+            missing_samples = max_audio_len - active_audio_mask.shape[1]
+            inactive_padding = torch.zeros(batch_size, missing_samples, dtype=torch.bool, device=device)
+            active_audio_mask = torch.cat((active_audio_mask, inactive_padding), dim=1)
+        active_audio_mask = active_audio_mask[:, :max_audio_len] & valid_audio_mask
+
+        waveform = audio_signal.to(dtype=compute_dtype)
+        active_sample_count = active_audio_mask.sum(dim=1)
+        active_energy = torch.where(active_audio_mask, waveform.square(), 0.0).sum(dim=1)
+        active_rms = torch.sqrt(active_energy / active_sample_count.clamp_min(1).to(compute_dtype))
+        active_rms = active_rms.masked_fill(active_sample_count == 0, 0.0)
+        return active_rms, valid_audio_mask
+
+    def _apply_batch_noise_augmentation(self, audio_signal, audio_signal_length, targets, target_lens):
+        """Mix whole in-batch waveforms using independently RMS-scaled donor gains."""
+        if self.batch_noise_probability <= 0.0 or audio_signal.shape[0] < 2:
+            return audio_signal
+
+        active_rms, valid_audio_mask = self._get_batch_active_speech_rms(
+            audio_signal=audio_signal,
+            audio_signal_length=audio_signal_length,
+            targets=targets,
+            target_lens=target_lens,
+        )
+        rms_epsilon = torch.finfo(active_rms.dtype).eps
+        eligible = active_rms > rms_epsilon
+        eligible_indices = torch.nonzero(eligible, as_tuple=False).flatten()
+        if eligible_indices.numel() < 2:
+            return audio_signal
+
+        if self.batch_noise_probability >= 1.0:
+            augment = eligible
+        else:
+            augment = torch.rand(audio_signal.shape[0], device=audio_signal.device) < self.batch_noise_probability
+            augment &= eligible
+
+        waveform = audio_signal.to(dtype=active_rms.dtype)
+        augmented_audio = None
+        for target_idx in torch.nonzero(augment, as_tuple=False).flatten().tolist():
+            donor_candidates = eligible_indices[eligible_indices != target_idx]
+            max_num_samples = min(self.batch_noise_max_num_samples, donor_candidates.numel())
+            if max_num_samples == 0:
+                continue
+            min_num_samples = min(self.batch_noise_min_num_samples, max_num_samples)
+            if min_num_samples == max_num_samples:
+                num_noise_samples = max_num_samples
+            else:
+                num_noise_samples = int(
+                    torch.randint(
+                        min_num_samples,
+                        max_num_samples + 1,
+                        size=(1,),
+                        device=audio_signal.device,
+                    ).item()
+                )
+
+            if num_noise_samples < donor_candidates.numel():
+                donor_order = torch.randperm(donor_candidates.numel(), device=audio_signal.device)
+                donor_indices = donor_candidates[donor_order[:num_noise_samples]]
+            else:
+                donor_indices = donor_candidates
+
+            if self.batch_noise_min_snr_db == self.batch_noise_max_snr_db:
+                snr_db = torch.full(
+                    (num_noise_samples,),
+                    self.batch_noise_min_snr_db,
+                    device=audio_signal.device,
+                    dtype=active_rms.dtype,
+                )
+            else:
+                snr_db = torch.empty(
+                    num_noise_samples, device=audio_signal.device, dtype=active_rms.dtype
+                ).uniform_(self.batch_noise_min_snr_db, self.batch_noise_max_snr_db)
+
+            gains = (
+                active_rms[target_idx]
+                / active_rms[donor_indices]
+                * torch.pow(10.0, -snr_db / 20.0)
+            )
+            donor_audio = waveform[donor_indices] * valid_audio_mask[donor_indices].to(active_rms.dtype)
+            noise = (donor_audio * gains.unsqueeze(1)).sum(dim=0)
+            mixed_audio = waveform[target_idx] + noise * valid_audio_mask[target_idx].to(active_rms.dtype)
+
+            if augmented_audio is None:
+                augmented_audio = audio_signal.clone()
+            augmented_audio[target_idx] = mixed_audio.to(dtype=audio_signal.dtype)
+
+        return audio_signal if augmented_audio is None else augmented_audio
 
     def oom_safe_feature_extraction(self, input_signal, input_signal_length):
         """
@@ -1928,6 +2098,12 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         """
         audio_signal, audio_signal_length, targets, target_lens, *_ = batch
         logging.info(f"audio_signal.shape: {audio_signal.shape}, targets.shape: {targets.shape}, target_lens: {target_lens}")
+        audio_signal = self._apply_batch_noise_augmentation(
+            audio_signal=audio_signal,
+            audio_signal_length=audio_signal_length,
+            targets=targets,
+            target_lens=target_lens,
+        )
         return_aux_logits = self.sortformer_modules.activity_head is not None
         outputs = self.forward(
             audio_signal=audio_signal,
