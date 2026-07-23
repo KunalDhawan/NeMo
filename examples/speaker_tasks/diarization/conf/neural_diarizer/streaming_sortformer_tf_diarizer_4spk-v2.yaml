@@ -157,6 +157,7 @@ model:
     spkcache_sil_frames_per_spk: 3
     spkcache_slot_tokens_per_spk: 1
     spkcache_slot_token_type: shared # shared or per_speaker
+    spkcache_permutation_mode: occupied # none, occupied, or all
     scores_add_rnd: 0
     pred_score_threshold: 0.25
     max_index: 99999

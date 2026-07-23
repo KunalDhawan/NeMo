@@ -86,6 +86,7 @@ class SortformerModules(NeuralModule, Exportable):
         spkcache_sil_frames_per_spk: int = 3,
         spkcache_slot_tokens_per_spk: int = 0,
         spkcache_slot_token_type: str = "shared",
+        spkcache_permutation_mode: str = "occupied",
         causal_attn_rate: float = 0,
         causal_attn_rc: int = 7,
         max_tail_attn_len: int = 0,
@@ -138,10 +139,16 @@ class SortformerModules(NeuralModule, Exportable):
         self.spkcache_sil_frames_per_spk = spkcache_sil_frames_per_spk
         self.spkcache_slot_tokens_per_spk = spkcache_slot_tokens_per_spk
         self.spkcache_slot_token_type = spkcache_slot_token_type
+        self.spkcache_permutation_mode = spkcache_permutation_mode
         if self.spkcache_slot_token_type not in ("shared", "per_speaker"):
             raise ValueError(
                 "spkcache_slot_token_type must be 'shared' or 'per_speaker', "
                 f"got '{self.spkcache_slot_token_type}'."
+            )
+        if self.spkcache_permutation_mode not in ("none", "occupied", "all"):
+            raise ValueError(
+                "spkcache_permutation_mode must be 'none', 'occupied', or 'all', "
+                f"got '{self.spkcache_permutation_mode}'."
             )
         num_slot_token_embeddings = 1 if self.spkcache_slot_token_type == "shared" else self.n_spk
         # One vector is repeated `spkcache_slot_tokens_per_spk` times. In per-speaker
@@ -1180,6 +1187,26 @@ class SortformerModules(NeuralModule, Exportable):
             )
         return emb_seq_gathered, preds_gathered
 
+    def _get_max_perm_index(self, scores):
+        """
+        Get the length of the first contiguous speaker prefix having positive scores.
+        Only this occupied prefix is permuted in `occupied` mode.
+
+        Args:
+            scores (torch.Tensor): Tensor containing speaker scores
+                Shape: (batch_size, n_frames, n_spk)
+
+        Returns:
+            max_perm_index (torch.Tensor): Number of leading occupied speakers
+                Shape: (batch_size)
+        """
+        batch_size, _, n_spk = scores.shape
+        is_pos = scores > 0
+        zero_indices = torch.where(is_pos.sum(dim=1) == 0)
+        max_perm_index = torch.full((batch_size,), n_spk, dtype=torch.long, device=scores.device)
+        max_perm_index.scatter_reduce_(0, zero_indices[0], zero_indices[1], reduce="amin", include_self=False)
+        return max_perm_index
+
     def _disable_low_scores(self, preds, scores, min_pos_scores_per_spk: int):
         """
         Sets scores for non-speech to '-inf'.
@@ -1208,13 +1235,16 @@ class SortformerModules(NeuralModule, Exportable):
         scores = torch.where(is_nonpos_replace, torch.tensor(float('-inf')), scores)
         return scores
 
-    def _permute_speakers(self, scores):
+    def _permute_speakers(self, scores, max_perm_index=None):
         """
-        Create a random permutation of all speaker-score channels.
+        Create a random permutation of speaker-score channels.
 
         Args:
             scores (torch.Tensor): Tensor containing speaker scores
                 Shape: (batch_size, n_frames, n_spk)
+            max_perm_index (torch.Tensor): Optional number of leading speakers to
+                permute per batch item. If None, all speakers are permuted.
+                Shape: (batch_size)
 
         Returns:
             scores (torch.Tensor): Tensor with permuted scores.
@@ -1225,7 +1255,10 @@ class SortformerModules(NeuralModule, Exportable):
         spk_perm_list, scores_list = [], []
         batch_size, _, n_spk = scores.shape
         for batch_index in range(batch_size):
-            permutation = torch.randperm(n_spk, device=scores.device)
+            perm_count = n_spk if max_perm_index is None else max_perm_index[batch_index].item()
+            rand_perm_inds = torch.randperm(perm_count, device=scores.device)
+            linear_inds = torch.arange(perm_count, n_spk, device=scores.device)
+            permutation = torch.cat([rand_perm_inds, linear_inds])
             spk_perm_list.append(permutation)
             scores_list.append(scores[batch_index, :, permutation])
         spk_perm = torch.stack(spk_perm_list)
@@ -1244,7 +1277,8 @@ class SortformerModules(NeuralModule, Exportable):
                 Shape: (batch_size, n_frames, n_spk)
             mean_sil_emb (torch.Tensor): Tensor containing mean silence embedding
                 Shape: (batch_size, emb_dim)
-            permute_spk (bool): If true, will generate a random permutation of all speaker slots
+            permute_spk (bool): If true, will generate a random speaker permutation
+                according to `spkcache_permutation_mode`
 
         Returns:
             spkcache (torch.Tensor): Tensor containing spkcache_len most important embeddings from emb_seq.
@@ -1272,8 +1306,12 @@ class SortformerModules(NeuralModule, Exportable):
         scores = self._get_log_pred_scores(preds)
         scores = self._disable_low_scores(preds, scores, min_pos_scores_per_spk)
 
-        if permute_spk:  # Generate a random permutation of all speaker slots
-            scores, spk_perm = self._permute_speakers(scores)
+        if permute_spk and self.spkcache_permutation_mode != "none":
+            if self.spkcache_permutation_mode == "occupied":
+                max_perm_index = self._get_max_perm_index(scores)
+                scores, spk_perm = self._permute_speakers(scores, max_perm_index)
+            else:
+                scores, spk_perm = self._permute_speakers(scores)
         else:
             spk_perm = None
 

@@ -153,6 +153,7 @@ model:
     spkcache_sil_frames_per_spk: 3 # Number of silence frames allocated per speaker in the speaker cache
     spkcache_slot_tokens_per_spk: 1 # Number of learned slot tokens prepended to each speaker block
     spkcache_slot_token_type: shared # shared or per_speaker
+    spkcache_permutation_mode: occupied # none, occupied, or all
     scores_add_rnd: 0 # Standard deviation of random noise added to scores in speaker cache update (training only)
     pred_score_threshold: 0.25 # Probability threshold for internal scores processing in speaker cache update
     max_index: 99999 # Maximum allowed index value for internal processing in speaker cache update

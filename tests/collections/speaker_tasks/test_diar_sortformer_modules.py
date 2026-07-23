@@ -151,6 +151,14 @@ class TestSortformerModules_CheckStreamingParameters:
         ):
             SortformerModules(spkcache_slot_token_type="invalid")
 
+    @pytest.mark.unit
+    def test_invalid_spkcache_permutation_mode(self):
+        with pytest.raises(
+            ValueError,
+            match="spkcache_permutation_mode must be 'none', 'occupied', or 'all'",
+        ):
+            SortformerModules(spkcache_permutation_mode="invalid")
+
 
 class TestSortformerModules_GeneralUtils:
     @pytest.mark.unit
@@ -1229,6 +1237,50 @@ class TestSortformerModules_StreamingScoreComputations:
                 assert torch.allclose(batch_permuted[:, i], batch_scores[:, original_idx], atol=1e-6)
 
     @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "permutation_mode, expected_perm",
+        [
+            ("none", None),
+            ("occupied", [1, 0, 2, 3]),
+            ("all", [3, 2, 1, 0]),
+        ],
+    )
+    def test_spkcache_permutation_mode(self, permutation_mode, expected_perm, monkeypatch):
+        batch_size, n_spk, n_frames, emb_dim = 1, 4, 16, 4
+        sortformer_modules = SortformerModules(
+            num_spks=n_spk,
+            spkcache_len=16,
+            fifo_len=0,
+            chunk_len=n_frames,
+            fc_d_model=emb_dim,
+            spkcache_update_period=n_frames,
+            spkcache_sil_frames_per_spk=1,
+            spkcache_slot_tokens_per_spk=0,
+            spkcache_permutation_mode=permutation_mode,
+            scores_boost_latest=0,
+        )
+        monkeypatch.setattr(
+            torch,
+            "randperm",
+            lambda size, device=None: torch.arange(size - 1, -1, -1, device=device),
+        )
+
+        emb_seq = torch.randn(batch_size, n_frames, emb_dim)
+        preds = torch.zeros(batch_size, n_frames, n_spk)
+        preds[:, :4, 0] = 0.9
+        preds[:, 4:8, 1] = 0.9
+        mean_sil_emb = torch.full((batch_size, emb_dim), -1.0)
+
+        _, _, spk_perm = sortformer_modules._compress_spkcache(
+            emb_seq, preds, mean_sil_emb, permute_spk=True
+        )
+
+        if expected_perm is None:
+            assert spk_perm is None
+        else:
+            assert torch.equal(spk_perm[0], torch.tensor(expected_perm))
+
+    @pytest.mark.unit
     @pytest.mark.parametrize("slot_token_type", ["shared", "per_speaker"])
     def test_compress_spkcache_prepends_slot_tokens(self, slot_token_type):
         batch_size, n_spk, n_frames, emb_dim = 1, 3, 9, 4
@@ -1299,6 +1351,7 @@ class TestSortformerModules_StreamingScoreComputations:
             spkcache_sil_frames_per_spk=sil_frames_per_spk,
             spkcache_slot_tokens_per_spk=slot_tokens_per_spk,
             spkcache_slot_token_type="per_speaker",
+            spkcache_permutation_mode="all",
             scores_boost_latest=0,
         )
         with torch.no_grad():
