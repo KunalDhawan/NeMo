@@ -45,11 +45,18 @@ model:
 
   # Add quiet, independently RMS-scaled whole samples from the current batch as babble.
   batch_noise_augmentation:
-    probability: 0.5
+    probability: 0
     min_num_noise_samples: 2
     max_num_noise_samples: 3
     min_snr_db: 30.0
     max_snr_db: 40.0
+
+  # Replace post-compression chunks with valid prefixes from a speaker-disjoint batch sample.
+  batch_chunk_replace_augmentation:
+    probability: 0.25
+    min_num_chunks: 1
+    max_num_chunks: 3
+    num_preserved_chunks: 2
 
   model_defaults:
     fc_d_model: 512

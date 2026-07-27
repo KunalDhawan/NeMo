@@ -480,6 +480,264 @@ class TestSortformerEncLabelModelStreaming:
         assert isinstance(instance2, SortformerEncLabelModel)
 
     @pytest.mark.unit
+    def test_chunk_replaced_targets_preserve_returning_recipient_speakers(self, sortformer_model):
+        recipient_targets = torch.zeros(10, 4)
+        recipient_targets[:4, 0] = 1.0
+        recipient_targets[8:, 0] = 1.0
+        recipient_targets[8:, 2] = 1.0
+        donor_targets = torch.zeros(10, 4)
+        donor_targets[:2, 0] = 1.0
+        donor_targets[2:4, 1] = 0.4
+
+        replaced_targets = sortformer_model._build_chunk_replaced_targets(
+            recipient_targets=recipient_targets,
+            donor_targets=donor_targets,
+            recipient_speaker_names=["A1", None, "A2", None],
+            donor_speaker_names=["B1", "B2", None, None],
+            recipient_target_len=10,
+            donor_target_len=10,
+            target_frames_per_chunk=2,
+            destination_chunks=(2, 3),
+        )
+
+        assert torch.equal(replaced_targets[:4], recipient_targets[:4])
+        assert torch.all(replaced_targets[4:6, 1] == 1.0)
+        assert torch.all(replaced_targets[6:8, 3] == 0.4)
+        assert torch.all(replaced_targets[8:, 0] == 1.0)
+        assert torch.all(replaced_targets[8:, 2] == 1.0)
+
+        with pytest.raises(RuntimeError, match="overlaps the retained recipient"):
+            sortformer_model._build_chunk_replaced_targets(
+                recipient_targets=recipient_targets,
+                donor_targets=donor_targets,
+                recipient_speaker_names=["A1", None, "A2", None],
+                donor_speaker_names=["A1", "B2", None, None],
+                recipient_target_len=10,
+                donor_target_len=10,
+                target_frames_per_chunk=2,
+                destination_chunks=(2, 3),
+            )
+
+    @pytest.mark.unit
+    def test_batch_chunk_replacement_uses_original_donor_prefixes(self, sortformer_model):
+        model = sortformer_model
+        model.batch_chunk_replace_probability = 1.0
+        model.batch_chunk_replace_min_num_chunks = 2
+        model.batch_chunk_replace_max_num_chunks = 2
+        model.batch_chunk_replace_num_preserved_chunks = 2
+        model.sortformer_modules.chunk_len = 2
+
+        feature_frames_per_chunk = (
+            model.sortformer_modules.chunk_len * model.sortformer_modules.subsampling_factor
+        )
+        processed_signal = torch.zeros(2, 1, 4 * feature_frames_per_chunk)
+        for chunk_index, value in enumerate((1.0, 2.0, 3.0, 4.0)):
+            start = chunk_index * feature_frames_per_chunk
+            processed_signal[0, :, start : start + feature_frames_per_chunk] = value
+        for chunk_index, value in enumerate((10.0, 20.0, 30.0, 40.0)):
+            start = chunk_index * feature_frames_per_chunk
+            processed_signal[1, :, start : start + feature_frames_per_chunk] = value
+        original_signal = processed_signal.clone()
+        processed_signal_length = torch.tensor([processed_signal.shape[2]] * 2)
+
+        targets = torch.zeros(2, 8, 4)
+        targets[0, :, 0] = 1.0
+        targets[1, :2, 0] = 1.0
+        targets[1, 2:4, 1] = 1.0
+        original_targets = targets.clone()
+        target_lens = torch.tensor([8, 8])
+        speaker_names = [
+            ["A1", None, None, None],
+            ["B1", "B2", None, None],
+        ]
+
+        augmented_signal, augmented_targets, replacement_rate = (
+            model._apply_batch_chunk_replace_augmentation(
+                processed_signal=processed_signal,
+                processed_signal_length=processed_signal_length,
+                targets=targets,
+                target_lens=target_lens,
+                speaker_names=speaker_names,
+            )
+        )
+
+        assert torch.equal(
+            augmented_signal[0, :, : 2 * feature_frames_per_chunk],
+            original_signal[0, :, : 2 * feature_frames_per_chunk],
+        )
+        assert torch.all(
+            augmented_signal[0, :, 2 * feature_frames_per_chunk : 3 * feature_frames_per_chunk] == 10.0
+        )
+        assert torch.all(augmented_signal[0, :, 3 * feature_frames_per_chunk :] == 20.0)
+        assert torch.all(
+            augmented_signal[1, :, 2 * feature_frames_per_chunk : 3 * feature_frames_per_chunk] == 1.0
+        )
+        assert torch.all(augmented_signal[1, :, 3 * feature_frames_per_chunk :] == 2.0)
+        assert torch.equal(augmented_targets[0, :4, 0], original_targets[0, :4, 0])
+        assert torch.equal(processed_signal, original_signal)
+        assert torch.equal(targets, original_targets)
+        assert replacement_rate == 1.0
+
+    @pytest.mark.unit
+    def test_batch_chunk_replacement_uses_only_valid_partial_donor_data(self, sortformer_model):
+        model = sortformer_model
+        model.batch_chunk_replace_probability = 1.0
+        model.batch_chunk_replace_min_num_chunks = 1
+        model.batch_chunk_replace_max_num_chunks = 1
+        model.batch_chunk_replace_num_preserved_chunks = 2
+        model.sortformer_modules.chunk_len = 2
+
+        feature_frames_per_chunk = (
+            model.sortformer_modules.chunk_len * model.sortformer_modules.subsampling_factor
+        )
+        partial_chunk_length = feature_frames_per_chunk // 2
+        recipient_length = 2 * feature_frames_per_chunk + partial_chunk_length
+        processed_signal = torch.full((2, 1, recipient_length), -99.0)
+        processed_signal[0, :, :recipient_length] = 1.0
+        processed_signal[1, :, :partial_chunk_length] = 7.0
+        processed_signal_length = torch.tensor([recipient_length, partial_chunk_length])
+
+        targets = torch.zeros(2, 5, 4)
+        targets[0, :, 0] = 1.0
+        targets[1, 0, 0] = 1.0
+        target_lens = torch.tensor([5, 1])
+        speaker_names = [["A1", None, None, None], ["B1", None, None, None]]
+
+        augmented_signal, augmented_targets, replacement_rate = (
+            model._apply_batch_chunk_replace_augmentation(
+                processed_signal,
+                processed_signal_length,
+                targets,
+                target_lens,
+                speaker_names,
+            )
+        )
+        destination_start = 2 * feature_frames_per_chunk
+        assert torch.all(augmented_signal[0, :, destination_start:recipient_length] == 7.0)
+        assert augmented_targets[0, 4, 1] == 1.0
+        assert replacement_rate == 0.5
+
+        # One fewer valid donor feature makes the plan ineligible; padded values are never copied.
+        too_short_lengths = torch.tensor([recipient_length, partial_chunk_length - 1])
+        skipped_signal, skipped_targets, skipped_rate = model._apply_batch_chunk_replace_augmentation(
+            processed_signal,
+            too_short_lengths,
+            targets,
+            target_lens,
+            speaker_names,
+        )
+        assert torch.equal(skipped_signal, processed_signal)
+        assert torch.equal(skipped_targets, targets)
+        assert skipped_rate == 0.0
+
+    @pytest.mark.unit
+    def test_batch_chunk_replacement_enforces_speaker_constraints(self, sortformer_model, monkeypatch):
+        model = sortformer_model
+        model.batch_chunk_replace_probability = 1.0
+        model.batch_chunk_replace_min_num_chunks = 2
+        model.batch_chunk_replace_max_num_chunks = 2
+        model.batch_chunk_replace_num_preserved_chunks = 2
+        model.sortformer_modules.chunk_len = 2
+
+        feature_frames_per_chunk = (
+            model.sortformer_modules.chunk_len * model.sortformer_modules.subsampling_factor
+        )
+        processed_signal = torch.randn(2, 1, 4 * feature_frames_per_chunk)
+        processed_signal_length = torch.tensor([processed_signal.shape[2]] * 2)
+        target_lens = torch.tensor([8, 8])
+
+        # Three recipient speakers plus two disjoint donor speakers would exceed the four-speaker limit.
+        targets = torch.zeros(2, 8, 4)
+        targets[0, :4, :3] = 1.0
+        targets[1, :4, :2] = 1.0
+        speaker_names = [
+            ["A1", "A2", "A3", None],
+            ["B1", "B2", None, None],
+        ]
+        capped_signal, capped_targets, capped_rate = model._apply_batch_chunk_replace_augmentation(
+            processed_signal, processed_signal_length, targets, target_lens, speaker_names
+        )
+        assert torch.equal(capped_signal, processed_signal)
+        assert torch.equal(capped_targets, targets)
+        assert capped_rate == 0.0
+
+        # Reusing an RTTM speaker ID across the pair also makes both directions ineligible.
+        overlapping_targets = torch.zeros(2, 8, 4)
+        overlapping_targets[0, :4, 0] = 1.0
+        overlapping_targets[1, :4, :2] = 1.0
+        overlapping_names = [
+            ["shared", None, None, None],
+            ["shared", "B2", None, None],
+        ]
+        monkeypatch.setattr(
+            model,
+            "_select_chunk_replacement_plan",
+            lambda *args, **kwargs: pytest.fail("incompatible recipient should not run plan search"),
+        )
+        overlap_signal, overlap_targets, overlap_rate = model._apply_batch_chunk_replace_augmentation(
+            processed_signal,
+            processed_signal_length,
+            overlapping_targets,
+            target_lens,
+            overlapping_names,
+        )
+        assert torch.equal(overlap_signal, processed_signal)
+        assert torch.equal(overlap_targets, overlapping_targets)
+        assert overlap_rate == 0.0
+
+    @pytest.mark.unit
+    def test_training_step_uses_chunk_augmented_targets(self, sortformer_model, monkeypatch):
+        model = sortformer_model.train()
+        model.streaming_mode = True
+        model.batch_noise_probability = 0.0
+        model.batch_chunk_replace_probability = 1.0
+        model.sortformer_modules.activity_head = None
+
+        audio_signal = torch.zeros(2, 8)
+        audio_signal_length = torch.tensor([8, 8])
+        targets = torch.zeros(2, 4, 4)
+        augmented_targets = torch.ones_like(targets)
+        target_lens = torch.tensor([4, 4])
+        speaker_names = [["A", None, None, None], ["B", None, None, None]]
+        processed_signal = torch.zeros(2, 80, 8)
+        processed_signal_length = torch.tensor([8, 8])
+        captured = {}
+
+        monkeypatch.setattr(
+            model,
+            "process_signal",
+            lambda audio_signal, audio_signal_length: (processed_signal, processed_signal_length),
+        )
+
+        def fake_chunk_augmentation(**kwargs):
+            assert kwargs["speaker_names"] == speaker_names
+            return kwargs["processed_signal"], augmented_targets, torch.tensor(0.5)
+
+        monkeypatch.setattr(model, "_apply_batch_chunk_replace_augmentation", fake_chunk_augmentation)
+        monkeypatch.setattr(
+            model,
+            "forward_streaming",
+            lambda processed_signal, processed_signal_length, return_aux_logits: torch.zeros_like(targets),
+        )
+
+        def fake_train_evaluations(preds, augmented, lengths, activity_logits=None):
+            captured["targets"] = augmented
+            return {"loss": torch.tensor(1.0)}
+
+        monkeypatch.setattr(model, "_get_aux_train_evaluations", fake_train_evaluations)
+        monkeypatch.setattr(model, "_reset_train_metrics", lambda: None)
+        monkeypatch.setattr(model, "log_dict", lambda metrics, **kwargs: captured.update(metrics))
+
+        output = model.training_step(
+            (audio_signal, audio_signal_length, targets, target_lens, speaker_names),
+            batch_idx=0,
+        )
+
+        assert torch.equal(captured["targets"], augmented_targets)
+        assert captured["batch_chunk_replace_rate"] == 0.5
+        assert output["loss"] == 1.0
+
+    @pytest.mark.unit
     def test_forward_with_activity_logits(self, sortformer_model):
         model = sortformer_model.eval()
         model.streaming_mode = True

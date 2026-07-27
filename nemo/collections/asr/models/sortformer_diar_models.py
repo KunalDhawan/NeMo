@@ -18,6 +18,8 @@ import math
 import os
 import random
 from collections import OrderedDict
+from dataclasses import dataclass
+
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -53,6 +55,38 @@ from nemo.core.neural_types.elements import ProbsType
 from nemo.utils import logging
 
 __all__ = ['SortformerEncLabelModel']
+
+# Long sessions can have combinatorially many post-cache chunk subsets. Search
+# exhaustively below this limit and sample a bounded subset above it.
+_MAX_CHUNK_REPLACEMENT_PLANS_PER_COUNT = 32
+# Count and copy every positive soft target consistently. This conservatively
+# rejects some plans with tiny soft tails rather than dropping labeled speakers.
+_CHUNK_REPLACEMENT_ACTIVITY_THRESHOLD = 0.0
+
+
+class _ChunkReplacementInvariantError(RuntimeError):
+    """A prevalidated replacement plan violated a target-construction invariant."""
+
+
+@dataclass(frozen=True)
+class _ChunkReplacementPlan:
+    recipient_index: int
+    donor_index: int
+    destination_chunks: Tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _ChunkReplacementMetadata:
+    target_values: torch.Tensor
+    valid_speaker_activity: torch.Tensor
+    feature_lengths: torch.Tensor
+    target_lengths: torch.Tensor
+    channel_speaker_indices: torch.Tensor
+    full_speaker_presence: torch.Tensor
+    chunk_speaker_presence: torch.Tensor
+    compatible_pairs: torch.Tensor
+    feature_frames_per_chunk: int
+    target_frames_per_chunk: int
 
 
 class _OversamplingDistributedSampler(torch.utils.data.DistributedSampler):
@@ -278,6 +312,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         self._init_loss_weights()
         self._init_batch_noise_augmentation()
+        self._init_batch_chunk_replace_augmentation()
         self._init_activity_auxiliary_heads()
 
         self.eps = 0.004   # bf16-safe epsilon
@@ -318,6 +353,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         self.async_streaming = self._cfg.get("async_streaming", False)
         self.streaming_mode = self._cfg.get("streaming_mode", False)
+        if self.batch_chunk_replace_probability > 0.0 and not self.streaming_mode:
+            raise ValueError("batch_chunk_replace_augmentation requires streaming_mode=True")
         if self.streaming_mode:
             # Validate streaming parameters once at initialization for streaming models
             self.sortformer_modules._check_streaming_parameters()
@@ -370,6 +407,45 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         if self.batch_noise_min_snr_db > self.batch_noise_max_snr_db:
             raise ValueError(
                 "batch_noise_augmentation.min_snr_db must be <= batch_noise_augmentation.max_snr_db"
+            )
+
+    def _init_batch_chunk_replace_augmentation(self):
+        """Initialize streaming in-batch chunk replacement settings."""
+        config = self._cfg.get("batch_chunk_replace_augmentation", None)
+        self.batch_chunk_replace_probability = 0.0
+        self.batch_chunk_replace_min_num_chunks = 1
+        self.batch_chunk_replace_max_num_chunks = 3
+        self.batch_chunk_replace_num_preserved_chunks = 2
+        self._batch_chunk_replace_warned_missing_speaker_ids = False
+
+        if config is None or config is False:
+            return
+
+        self.batch_chunk_replace_probability = float(config.get("probability", 0.25))
+        self.batch_chunk_replace_min_num_chunks = config.get("min_num_chunks", 1)
+        self.batch_chunk_replace_max_num_chunks = config.get("max_num_chunks", 3)
+        self.batch_chunk_replace_num_preserved_chunks = config.get("num_preserved_chunks", 2)
+
+        if not 0.0 <= self.batch_chunk_replace_probability <= 1.0:
+            raise ValueError(
+                f"batch_chunk_replace_augmentation.probability must be in [0, 1], "
+                f"got {self.batch_chunk_replace_probability}"
+            )
+        for name, value, minimum in (
+            ("min_num_chunks", self.batch_chunk_replace_min_num_chunks, 1),
+            ("max_num_chunks", self.batch_chunk_replace_max_num_chunks, 1),
+            ("num_preserved_chunks", self.batch_chunk_replace_num_preserved_chunks, 0),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"batch_chunk_replace_augmentation.{name} must be an integer, got {value!r}")
+            if value < minimum:
+                raise ValueError(
+                    f"batch_chunk_replace_augmentation.{name} must be >= {minimum}, got {value}"
+                )
+        if self.batch_chunk_replace_min_num_chunks > self.batch_chunk_replace_max_num_chunks:
+            raise ValueError(
+                "batch_chunk_replace_augmentation.min_num_chunks must be <= "
+                "batch_chunk_replace_augmentation.max_num_chunks"
             )
 
     def _init_loss_weights(self):
@@ -989,6 +1065,412 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             augmented_audio[target_idx] = mixed_audio.to(dtype=audio_signal.dtype)
 
         return audio_signal if augmented_audio is None else augmented_audio
+
+    @staticmethod
+    def _channel_activity_to_speaker_presence(
+        channel_activity, channel_speaker_indices, num_speaker_ids
+    ):
+        """Convert per-channel activity to globally indexed speaker presence."""
+        squeeze_batch = channel_activity.ndim == 1
+        if squeeze_batch:
+            channel_activity = channel_activity.unsqueeze(0)
+            channel_speaker_indices = channel_speaker_indices.unsqueeze(0)
+
+        batch_size, num_channels = channel_activity.shape
+        presence = torch.zeros(
+            batch_size, num_speaker_ids, dtype=torch.bool, device=channel_activity.device
+        )
+        batch_indices = torch.arange(batch_size, device=channel_activity.device)
+        for channel in range(num_channels):
+            speaker_indices = channel_speaker_indices[:, channel]
+            valid = channel_activity[:, channel] & (speaker_indices >= 0)
+            presence[batch_indices[valid], speaker_indices[valid]] = True
+        return presence[0] if squeeze_batch else presence
+
+    def _build_chunk_replacement_metadata(
+        self,
+        processed_signal,
+        processed_signal_length,
+        targets,
+        target_lens,
+        speaker_names,
+    ):
+        """Precompute speaker tensors and pair compatibility once per batch."""
+        batch_size, _, max_feature_length = processed_signal.shape
+        max_target_length, num_channels = targets.shape[1:]
+        feature_lengths = (
+            processed_signal_length.detach().long().cpu().clamp(min=0, max=max_feature_length)
+        )
+        target_lengths = target_lens.detach().long().cpu().clamp(min=0, max=max_target_length)
+        target_values = targets.detach().cpu()
+        speaker_activity = target_values > _CHUNK_REPLACEMENT_ACTIVITY_THRESHOLD
+
+        feature_frames_per_chunk = (
+            self.sortformer_modules.chunk_len * self.sortformer_modules.subsampling_factor
+        )
+        if feature_frames_per_chunk % self.output_subsampling_factor != 0:
+            raise ValueError(
+                "Streaming chunk feature length must be divisible by output_subsampling_factor "
+                "for batch chunk replacement."
+            )
+        target_frames_per_chunk = feature_frames_per_chunk // self.output_subsampling_factor
+
+        speaker_id_to_index = {}
+        channel_speaker_indices = torch.full((batch_size, num_channels), -1, dtype=torch.long)
+        valid_samples = torch.ones(batch_size, dtype=torch.bool)
+        for batch_index, sample_names in enumerate(speaker_names):
+            if not isinstance(sample_names, (list, tuple)):
+                valid_samples[batch_index] = False
+                continue
+            for channel in range(min(num_channels, len(sample_names))):
+                speaker_id = sample_names[channel]
+                if speaker_id is None or speaker_id == "":
+                    continue
+                if speaker_id not in speaker_id_to_index:
+                    speaker_id_to_index[speaker_id] = len(speaker_id_to_index)
+                channel_speaker_indices[batch_index, channel] = speaker_id_to_index[speaker_id]
+
+        valid_target_mask = torch.arange(max_target_length).unsqueeze(0) < target_lengths.unsqueeze(1)
+        valid_speaker_activity = speaker_activity & valid_target_mask.unsqueeze(-1)
+        full_channel_activity = valid_speaker_activity.any(dim=1)
+        valid_samples &= ~((channel_speaker_indices < 0) & full_channel_activity).any(dim=1)
+        full_speaker_presence = self._channel_activity_to_speaker_presence(
+            full_channel_activity,
+            channel_speaker_indices,
+            len(speaker_id_to_index),
+        )
+
+        num_target_chunks = math.ceil(max_target_length / target_frames_per_chunk)
+        padded_target_length = num_target_chunks * target_frames_per_chunk
+        padded_targets = torch.nn.functional.pad(
+            valid_speaker_activity,
+            (0, 0, 0, padded_target_length - max_target_length),
+        )
+        chunk_channel_activity = padded_targets.reshape(
+            batch_size,
+            num_target_chunks,
+            target_frames_per_chunk,
+            num_channels,
+        ).any(dim=2)
+        chunk_speaker_presence = self._channel_activity_to_speaker_presence(
+            chunk_channel_activity.flatten(0, 1),
+            channel_speaker_indices.repeat_interleave(num_target_chunks, dim=0),
+            len(speaker_id_to_index),
+        ).reshape(batch_size, num_target_chunks, len(speaker_id_to_index))
+
+        shared_speakers = (
+            full_speaker_presence[:, None, :] & full_speaker_presence[None, :, :]
+        ).any(dim=-1)
+        compatible_pairs = valid_samples[:, None] & valid_samples[None, :] & ~shared_speakers
+        compatible_pairs.fill_diagonal_(False)
+
+        return _ChunkReplacementMetadata(
+            target_values=target_values,
+            valid_speaker_activity=valid_speaker_activity,
+            feature_lengths=feature_lengths,
+            target_lengths=target_lengths,
+            channel_speaker_indices=channel_speaker_indices,
+            full_speaker_presence=full_speaker_presence,
+            chunk_speaker_presence=chunk_speaker_presence,
+            compatible_pairs=compatible_pairs,
+            feature_frames_per_chunk=feature_frames_per_chunk,
+            target_frames_per_chunk=target_frames_per_chunk,
+        )
+
+    def _candidate_chunk_replacement_plans(self, recipient_index, metadata):
+        """Return randomized destination-chunk combinations for one recipient."""
+        feature_length = int(metadata.feature_lengths[recipient_index])
+        target_length = int(metadata.target_lengths[recipient_index])
+        recipient_chunk_count = math.ceil(feature_length / metadata.feature_frames_per_chunk)
+        candidates = [
+            chunk_index
+            for chunk_index in range(
+                self.batch_chunk_replace_num_preserved_chunks, recipient_chunk_count
+            )
+            if chunk_index * metadata.target_frames_per_chunk < target_length
+        ]
+        max_num_chunks = min(self.batch_chunk_replace_max_num_chunks, len(candidates))
+        if max_num_chunks < self.batch_chunk_replace_min_num_chunks:
+            return []
+
+        chunk_counts = list(range(self.batch_chunk_replace_min_num_chunks, max_num_chunks + 1))
+        random.shuffle(chunk_counts)
+        plans = []
+        for num_replacements in chunk_counts:
+            total_combinations = math.comb(len(candidates), num_replacements)
+            if total_combinations <= _MAX_CHUNK_REPLACEMENT_PLANS_PER_COUNT:
+                plans_for_count = list(itertools.combinations(candidates, num_replacements))
+            else:
+                plans_for_count = set()
+                while len(plans_for_count) < _MAX_CHUNK_REPLACEMENT_PLANS_PER_COUNT:
+                    plans_for_count.add(
+                        tuple(sorted(random.sample(candidates, num_replacements)))
+                    )
+                plans_for_count = list(plans_for_count)
+            random.shuffle(plans_for_count)
+            plans.extend(plans_for_count)
+        return plans
+
+    def _select_chunk_replacement_plan(self, recipient_index, metadata):
+        """Select one valid plan while evaluating all donors in parallel."""
+        target_length = int(metadata.target_lengths[recipient_index])
+        feature_length = int(metadata.feature_lengths[recipient_index])
+        original_speaker_count = int(metadata.full_speaker_presence[recipient_index].sum())
+        num_speaker_ids = metadata.full_speaker_presence.shape[1]
+        recipient_chunk_count = math.ceil(target_length / metadata.target_frames_per_chunk)
+        max_output_speakers = min(
+            self._cfg.max_num_of_spks, metadata.channel_speaker_indices.shape[1]
+        )
+
+        for destination_chunks in self._candidate_chunk_replacement_plans(recipient_index, metadata):
+            retained_chunk_mask = torch.ones(recipient_chunk_count, dtype=torch.bool)
+            retained_chunk_mask[list(destination_chunks)] = False
+            retained_presence = metadata.chunk_speaker_presence[
+                recipient_index, :recipient_chunk_count
+            ][retained_chunk_mask].any(dim=0)
+
+            inserted_presence = torch.zeros_like(metadata.full_speaker_presence)
+            donors_have_data = torch.ones(metadata.feature_lengths.shape[0], dtype=torch.bool)
+            for source_rank, destination_chunk in enumerate(destination_chunks):
+                destination_feature_start = destination_chunk * metadata.feature_frames_per_chunk
+                destination_feature_length = min(
+                    metadata.feature_frames_per_chunk,
+                    feature_length - destination_feature_start,
+                )
+                source_feature_end = (
+                    source_rank * metadata.feature_frames_per_chunk + destination_feature_length
+                )
+                donors_have_data &= metadata.feature_lengths >= source_feature_end
+
+                destination_target_start = destination_chunk * metadata.target_frames_per_chunk
+                destination_target_length = min(
+                    metadata.target_frames_per_chunk,
+                    target_length - destination_target_start,
+                )
+                source_target_start = source_rank * metadata.target_frames_per_chunk
+                source_target_end = source_target_start + destination_target_length
+                donors_have_data &= metadata.target_lengths >= source_target_end
+                if destination_target_length == metadata.target_frames_per_chunk:
+                    inserted_presence |= metadata.chunk_speaker_presence[:, source_rank]
+                else:
+                    source_channel_activity = metadata.valid_speaker_activity[
+                        :, source_target_start:source_target_end
+                    ].any(dim=1)
+                    inserted_presence |= self._channel_activity_to_speaker_presence(
+                        source_channel_activity,
+                        metadata.channel_speaker_indices,
+                        num_speaker_ids,
+                    )
+
+            final_presence = inserted_presence | retained_presence.unsqueeze(0)
+            final_speaker_count = final_presence.sum(dim=1)
+            valid_donors = (
+                metadata.compatible_pairs[recipient_index]
+                & donors_have_data
+                & inserted_presence.any(dim=1)
+                & (final_speaker_count > original_speaker_count)
+                & (final_speaker_count <= max_output_speakers)
+            )
+            donor_indices = torch.nonzero(valid_donors, as_tuple=False).flatten().tolist()
+            if donor_indices:
+                return _ChunkReplacementPlan(
+                    recipient_index=recipient_index,
+                    donor_index=random.choice(donor_indices),
+                    destination_chunks=destination_chunks,
+                )
+        return None
+
+    def _sample_chunk_replacement_plans(self, metadata):
+        """Sample at most one replacement plan per eligible recipient."""
+        plans = []
+        for recipient_index in range(metadata.feature_lengths.shape[0]):
+            if not metadata.compatible_pairs[recipient_index].any():
+                continue
+            if (
+                self.batch_chunk_replace_probability < 1.0
+                and random.random() >= self.batch_chunk_replace_probability
+            ):
+                continue
+            plan = self._select_chunk_replacement_plan(recipient_index, metadata)
+            if plan is not None:
+                plans.append(plan)
+        return plans
+
+    def _build_chunk_replaced_targets(
+        self,
+        recipient_targets,
+        donor_targets,
+        recipient_speaker_names,
+        donor_speaker_names,
+        recipient_target_len,
+        donor_target_len,
+        target_frames_per_chunk,
+        destination_chunks,
+    ):
+        """Build speaker-ID-consistent targets for an explicit chunk replacement plan."""
+        recipient_target_len = min(int(recipient_target_len), recipient_targets.shape[0])
+        donor_target_len = min(int(donor_target_len), donor_targets.shape[0])
+        replaced_targets = recipient_targets.clone()
+        for chunk_index in destination_chunks:
+            start = chunk_index * target_frames_per_chunk
+            replaced_targets[start : start + target_frames_per_chunk] = 0.0
+
+        retained_channels = (
+            replaced_targets[:recipient_target_len] > _CHUNK_REPLACEMENT_ACTIVITY_THRESHOLD
+        ).any(dim=0)
+        used_channels = torch.nonzero(retained_channels, as_tuple=False).flatten().tolist()
+        speaker_to_output_channel = {}
+        for channel in used_channels:
+            if channel >= len(recipient_speaker_names):
+                raise _ChunkReplacementInvariantError(
+                    f"Recipient active channel {channel} has no RTTM speaker-ID entry"
+                )
+            speaker_id = recipient_speaker_names[channel]
+            if speaker_id is None or speaker_id == "":
+                raise _ChunkReplacementInvariantError(
+                    f"Recipient active channel {channel} has an empty RTTM speaker ID"
+                )
+            speaker_to_output_channel[speaker_id] = channel
+
+        recipient_speaker_ids = set(speaker_to_output_channel)
+        free_channels = [
+            channel for channel in range(recipient_targets.shape[1]) if channel not in used_channels
+        ]
+        for source_rank, destination_chunk in enumerate(destination_chunks):
+            destination_start = destination_chunk * target_frames_per_chunk
+            destination_end = min(destination_start + target_frames_per_chunk, recipient_target_len)
+            destination_length = destination_end - destination_start
+            source_start = source_rank * target_frames_per_chunk
+            source_end = source_start + destination_length
+            if source_end > donor_target_len:
+                raise _ChunkReplacementInvariantError(
+                    f"Donor target ends at frame {donor_target_len}, but plan requires {source_end}"
+                )
+            source_targets = donor_targets[source_start:source_end]
+            active_donor_channels = torch.nonzero(
+                (source_targets > _CHUNK_REPLACEMENT_ACTIVITY_THRESHOLD).any(dim=0),
+                as_tuple=False,
+            ).flatten().tolist()
+            for source_channel in active_donor_channels:
+                if source_channel >= len(donor_speaker_names):
+                    raise _ChunkReplacementInvariantError(
+                        f"Donor active channel {source_channel} has no RTTM speaker-ID entry"
+                    )
+                speaker_id = donor_speaker_names[source_channel]
+                if speaker_id is None or speaker_id == "":
+                    raise _ChunkReplacementInvariantError(
+                        f"Donor active channel {source_channel} has an empty RTTM speaker ID"
+                    )
+                if speaker_id in recipient_speaker_ids:
+                    raise _ChunkReplacementInvariantError(
+                        f"Donor speaker ID {speaker_id!r} overlaps the retained recipient speakers"
+                    )
+                if speaker_id not in speaker_to_output_channel:
+                    if not free_channels:
+                        raise _ChunkReplacementInvariantError(
+                            "Replacement plan has more speakers than available target channels"
+                        )
+                    output_channel = free_channels.pop(0)
+                    speaker_to_output_channel[speaker_id] = output_channel
+                    replaced_targets[:recipient_target_len, output_channel] = 0.0
+                output_channel = speaker_to_output_channel[speaker_id]
+                current = replaced_targets[destination_start:destination_end, output_channel]
+                replaced_targets[destination_start:destination_end, output_channel] = torch.maximum(
+                    current, source_targets[:, source_channel]
+                )
+        return replaced_targets
+
+    def _apply_chunk_replacement_plans(
+        self,
+        processed_signal,
+        targets,
+        speaker_names,
+        metadata,
+        plans,
+    ):
+        """Apply prevalidated plans while reading every donor from the original batch."""
+        replacement_rate = processed_signal.new_tensor(0.0)
+        if not plans:
+            return processed_signal, targets, replacement_rate
+
+        resolved_targets = []
+        for plan in plans:
+            recipient_index = plan.recipient_index
+            donor_index = plan.donor_index
+            replaced_targets = self._build_chunk_replaced_targets(
+                recipient_targets=metadata.target_values[recipient_index],
+                donor_targets=metadata.target_values[donor_index],
+                recipient_speaker_names=speaker_names[recipient_index],
+                donor_speaker_names=speaker_names[donor_index],
+                recipient_target_len=metadata.target_lengths[recipient_index],
+                donor_target_len=metadata.target_lengths[donor_index],
+                target_frames_per_chunk=metadata.target_frames_per_chunk,
+                destination_chunks=plan.destination_chunks,
+            )
+            resolved_targets.append(replaced_targets)
+
+        augmented_signal = processed_signal.clone()
+        augmented_targets = targets.clone()
+        for plan, replaced_targets in zip(plans, resolved_targets):
+            recipient_index = plan.recipient_index
+            donor_index = plan.donor_index
+            recipient_length = int(metadata.feature_lengths[recipient_index])
+            for source_rank, destination_chunk in enumerate(plan.destination_chunks):
+                destination_start = destination_chunk * metadata.feature_frames_per_chunk
+                destination_length = min(
+                    metadata.feature_frames_per_chunk,
+                    recipient_length - destination_start,
+                )
+                source_start = source_rank * metadata.feature_frames_per_chunk
+                augmented_signal[
+                    recipient_index, :, destination_start : destination_start + destination_length
+                ] = processed_signal[
+                    donor_index, :, source_start : source_start + destination_length
+                ]
+            augmented_targets[recipient_index] = replaced_targets.to(
+                device=targets.device, dtype=targets.dtype
+            )
+
+        replacement_rate = processed_signal.new_tensor(len(plans) / processed_signal.shape[0])
+        return augmented_signal, augmented_targets, replacement_rate
+
+    def _apply_batch_chunk_replace_augmentation(
+        self,
+        processed_signal,
+        processed_signal_length,
+        targets,
+        target_lens,
+        speaker_names,
+    ):
+        """Replace post-compression chunks with valid donor prefixes and remap targets by RTTM speaker ID."""
+        batch_size = processed_signal.shape[0]
+        replacement_rate = processed_signal.new_tensor(0.0)
+        if self.batch_chunk_replace_probability <= 0.0 or batch_size < 2:
+            return processed_signal, targets, replacement_rate
+        if speaker_names is None or len(speaker_names) != batch_size:
+            if not self._batch_chunk_replace_warned_missing_speaker_ids:
+                logging.warning(
+                    "Skipping batch_chunk_replace_augmentation because the batch does not contain "
+                    "per-channel RTTM speaker IDs."
+                )
+                self._batch_chunk_replace_warned_missing_speaker_ids = True
+            return processed_signal, targets, replacement_rate
+
+        metadata = self._build_chunk_replacement_metadata(
+            processed_signal,
+            processed_signal_length,
+            targets,
+            target_lens,
+            speaker_names,
+        )
+        plans = self._sample_chunk_replacement_plans(metadata)
+        return self._apply_chunk_replacement_plans(
+            processed_signal,
+            targets,
+            speaker_names,
+            metadata,
+            plans,
+        )
 
     def oom_safe_feature_extraction(self, input_signal, input_signal_length):
         """
@@ -2096,7 +2578,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         Returns:
             (dict): A dictionary containing the 'loss' key with the calculated loss value.
         """
-        audio_signal, audio_signal_length, targets, target_lens, *_ = batch
+        audio_signal, audio_signal_length, targets, target_lens, *batch_metadata = batch
+        speaker_names = batch_metadata[0] if batch_metadata else None
         logging.info(f"audio_signal.shape: {audio_signal.shape}, targets.shape: {targets.shape}, target_lens: {target_lens}")
         audio_signal = self._apply_batch_noise_augmentation(
             audio_signal=audio_signal,
@@ -2105,11 +2588,33 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             target_lens=target_lens,
         )
         return_aux_logits = self.sortformer_modules.activity_head is not None
-        outputs = self.forward(
-            audio_signal=audio_signal,
-            audio_signal_length=audio_signal_length,
-            return_aux_logits=return_aux_logits,
-        )
+        chunk_replace_rate = None
+        if self.streaming_mode and self.batch_chunk_replace_probability > 0.0:
+            processed_signal, processed_signal_length = self.process_signal(
+                audio_signal=audio_signal,
+                audio_signal_length=audio_signal_length,
+            )
+            processed_signal = processed_signal[:, :, : processed_signal_length.max()]
+            processed_signal, targets, chunk_replace_rate = (
+                self._apply_batch_chunk_replace_augmentation(
+                    processed_signal=processed_signal,
+                    processed_signal_length=processed_signal_length,
+                    targets=targets,
+                    target_lens=target_lens,
+                    speaker_names=speaker_names,
+                )
+            )
+            outputs = self.forward_streaming(
+                processed_signal=processed_signal,
+                processed_signal_length=processed_signal_length,
+                return_aux_logits=return_aux_logits,
+            )
+        else:
+            outputs = self.forward(
+                audio_signal=audio_signal,
+                audio_signal_length=audio_signal_length,
+                return_aux_logits=return_aux_logits,
+            )
         if return_aux_logits:
             preds, activity_logits = outputs
         else:
@@ -2117,6 +2622,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         train_metrics = self._get_aux_train_evaluations(
             preds, targets, target_lens, activity_logits=activity_logits
         )
+        if chunk_replace_rate is not None:
+            train_metrics['batch_chunk_replace_rate'] = chunk_replace_rate
         self._reset_train_metrics()
         self.log_dict(train_metrics, sync_dist=True, on_step=True, on_epoch=False, logger=True)
         return {'loss': train_metrics['loss']}
