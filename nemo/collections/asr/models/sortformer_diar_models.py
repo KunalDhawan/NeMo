@@ -519,6 +519,11 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             raise ValueError(
                 f"presence_negative_margin must be in [0, 1), got {self.presence_negative_margin}"
             )
+        # PIL-aligned soft Dice loss over every sample/speaker channel, including
+        # channels with no target activity so phantom speakers are penalized.
+        self.dice_weight = float(self._cfg.get("dice_weight", 0.0))
+        if self.dice_weight < 0.0:
+            raise ValueError(f"dice_weight must be >= 0, got {self.dice_weight}")
         # Distance used by the self-ATS loss: 'bce' (default; matches the other losses but has
         # an entropy floor, so the logged value is > 0 even when perfectly self-consistent) or
         # 'mse' (no floor: value is 0 when self-consistent, and a gentler bounded gradient).
@@ -2449,6 +2454,31 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         denominator = valid.sum() * num_spks
         return (element_loss.sum() / denominator.clamp_min(1)).to(preds.dtype)
 
+    @staticmethod
+    def _dice_loss(preds, targets_pil, target_lens):
+        """
+        Compute PIL-aligned soft Dice loss over valid frames.
+
+        Dice is reduced independently over time for every sample/speaker channel,
+        then averaged across all channels. The additive smooth value is 1.0, so
+        target-absent channels receive a loss of ``pred_mass / (pred_mass + 1)``
+        and therefore penalize phantom speakers. Hard PIL targets are used directly.
+        """
+        valid = (
+            torch.arange(preds.shape[1], device=preds.device).unsqueeze(0)
+            < target_lens.to(preds.device).unsqueeze(1)
+        ).unsqueeze(-1)
+
+        with torch.autocast(device_type=preds.device.type, enabled=False):
+            preds_valid = preds.float() * valid
+            targets_valid = targets_pil.float() * valid
+            intersection = (preds_valid * targets_valid).sum(dim=1)
+            pred_mass = preds_valid.sum(dim=1)
+            target_mass = targets_valid.sum(dim=1)
+            dice_score = (2.0 * intersection + 1.0) / (pred_mass + target_mass + 1.0)
+            loss = (1.0 - dice_score).mean()
+        return loss.to(preds.dtype)
+
     def _get_aux_train_evaluations(
         self, preds, targets, target_lens, activity_logits=None
     ) -> dict:
@@ -2503,6 +2533,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             activity_logits = self._activity_logits_from_speaker_preds(preds)
         activity_loss = self._activity_loss(activity_logits, targets, target_lens)
         presence_loss = self._presence_loss(preds, targets_pil, target_lens)
+        dice_loss = self._dice_loss(preds, targets_pil, target_lens)
         loss = (
             self.ats_weight * ats_loss
             + self.pil_weight * pil_loss
@@ -2511,6 +2542,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             + self.spkcount_weight * spkcount_loss
             + self.activity_weight * activity_loss
             + self.presence_weight * presence_loss
+            + self.dice_weight * dice_loss
         )
 
         self._accuracy_train(preds, targets_pil, target_lens)
@@ -2531,6 +2563,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'spkcount_loss': spkcount_loss,
             'activity_loss': activity_loss,
             'presence_loss': presence_loss,
+            'dice_loss': dice_loss,
             'learning_rate': self._optimizer.param_groups[0]['lr'],
             'train_f1_acc': train_f1_acc,
             'train_precision': train_precision,
@@ -2683,6 +2716,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             activity_logits = self._activity_logits_from_speaker_preds(preds)
         val_activity_loss = self._activity_loss(activity_logits, targets, target_lens)
         val_presence_loss = self._presence_loss(preds, targets_pil, target_lens)
+        val_dice_loss = self._dice_loss(preds, targets_pil, target_lens)
         val_loss = (
             self.ats_weight * val_ats_loss
             + self.pil_weight * val_pil_loss
@@ -2691,6 +2725,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             + self.spkcount_weight * val_spkcount_loss
             + self.activity_weight * val_activity_loss
             + self.presence_weight * val_presence_loss
+            + self.dice_weight * val_dice_loss
         )
 
         self._accuracy_valid(preds, targets_pil, target_lens)
@@ -2714,6 +2749,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'val_spkcount_loss': val_spkcount_loss,
             'val_activity_loss': val_activity_loss,
             'val_presence_loss': val_presence_loss,
+            'val_dice_loss': val_dice_loss,
             'val_f1_acc': val_f1_acc,
             'val_precision': val_precision,
             'val_recall': val_recall,
@@ -2800,6 +2836,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         val_spkcount_loss_mean = torch.stack([x['val_spkcount_loss'] for x in outputs]).mean()
         val_activity_loss_mean = torch.stack([x['val_activity_loss'] for x in outputs]).mean()
         val_presence_loss_mean = torch.stack([x['val_presence_loss'] for x in outputs]).mean()
+        val_dice_loss_mean = torch.stack([x['val_dice_loss'] for x in outputs]).mean()
         val_f1_acc_mean = torch.stack([x['val_f1_acc'] for x in outputs]).mean()
         val_precision_mean = torch.stack([x['val_precision'] for x in outputs]).mean()
         val_recall_mean = torch.stack([x['val_recall'] for x in outputs]).mean()
@@ -2820,6 +2857,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'val_spkcount_loss': val_spkcount_loss_mean,
             'val_activity_loss': val_activity_loss_mean,
             'val_presence_loss': val_presence_loss_mean,
+            'val_dice_loss': val_dice_loss_mean,
             'val_f1_acc': val_f1_acc_mean,
             'val_precision': val_precision_mean,
             'val_recall': val_recall_mean,

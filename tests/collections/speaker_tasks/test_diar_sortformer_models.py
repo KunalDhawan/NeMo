@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from omegaconf import DictConfig
@@ -419,6 +421,31 @@ class TestSortformerEncLabelModelOffline:
         assert torch.count_nonzero(safe_hedge_preds.grad) == 0
 
     @pytest.mark.unit
+    def test_pil_aligned_dice_loss_penalizes_phantom_speakers(self, sortformer_model):
+        targets_pil = torch.zeros(1, 4, 2)
+        targets_pil[0, :2, 0] = 1.0
+        target_lens = torch.tensor([3])
+
+        perfect_preds = targets_pil.clone()
+        # Predictions in padding must not affect the loss.
+        perfect_preds[0, 3, :] = 1.0
+        perfect_loss = sortformer_model._dice_loss(perfect_preds, targets_pil, target_lens)
+
+        phantom_preds = perfect_preds.clone()
+        phantom_preds[0, 2, 1] = 1.0
+        phantom_preds.requires_grad_()
+        phantom_loss = sortformer_model._dice_loss(phantom_preds, targets_pil, target_lens)
+
+        # The phantom channel has pred_mass=1 and no target mass, so its Dice
+        # loss is 1 / (1 + 1) = 0.5; averaging over two channels gives 0.25.
+        assert torch.equal(perfect_loss, torch.tensor(0.0))
+        assert torch.allclose(phantom_loss, torch.tensor(0.25))
+
+        phantom_loss.backward()
+        assert phantom_preds.grad[0, 2, 1] > 0
+        assert torch.count_nonzero(phantom_preds.grad[0, 3]) == 0
+
+    @pytest.mark.unit
     def test_global_speaker_count_metrics(self, sortformer_model):
         num_spks = sortformer_model.sortformer_modules.n_spk
         preds = torch.zeros(3, 4, num_spks)
@@ -452,6 +479,7 @@ class TestSortformerEncLabelModelOffline:
             'val_spkcount_loss',
             'val_activity_loss',
             'val_presence_loss',
+            'val_dice_loss',
             'val_f1_acc',
             'val_precision',
             'val_recall',
@@ -468,6 +496,7 @@ class TestSortformerEncLabelModelOffline:
 
         assert torch.equal(metrics['val_activity_loss'], torch.tensor(2.0))
         assert torch.equal(metrics['val_presence_loss'], torch.tensor(2.0))
+        assert torch.equal(metrics['val_dice_loss'], torch.tensor(2.0))
 
 
 class TestSortformerEncLabelModelStreaming:
@@ -522,30 +551,30 @@ class TestSortformerEncLabelModelStreaming:
     def test_batch_chunk_replacement_uses_original_donor_prefixes(self, sortformer_model):
         model = sortformer_model
         model.batch_chunk_replace_probability = 1.0
-        model.batch_chunk_replace_min_num_chunks = 2
-        model.batch_chunk_replace_max_num_chunks = 2
+        model.batch_chunk_replace_min_num_chunks = 3
+        model.batch_chunk_replace_max_num_chunks = 3
         model.batch_chunk_replace_num_preserved_chunks = 2
         model.sortformer_modules.chunk_len = 2
 
         feature_frames_per_chunk = (
             model.sortformer_modules.chunk_len * model.sortformer_modules.subsampling_factor
         )
-        processed_signal = torch.zeros(2, 1, 4 * feature_frames_per_chunk)
-        for chunk_index, value in enumerate((1.0, 2.0, 3.0, 4.0)):
+        processed_signal = torch.zeros(2, 1, 5 * feature_frames_per_chunk)
+        for chunk_index, value in enumerate((1.0, 2.0, 3.0, 4.0, 5.0)):
             start = chunk_index * feature_frames_per_chunk
             processed_signal[0, :, start : start + feature_frames_per_chunk] = value
-        for chunk_index, value in enumerate((10.0, 20.0, 30.0, 40.0)):
+        for chunk_index, value in enumerate((10.0, 20.0, 30.0, 40.0, 50.0)):
             start = chunk_index * feature_frames_per_chunk
             processed_signal[1, :, start : start + feature_frames_per_chunk] = value
         original_signal = processed_signal.clone()
         processed_signal_length = torch.tensor([processed_signal.shape[2]] * 2)
 
-        targets = torch.zeros(2, 8, 4)
+        targets = torch.zeros(2, 10, 4)
         targets[0, :, 0] = 1.0
         targets[1, :2, 0] = 1.0
         targets[1, 2:4, 1] = 1.0
         original_targets = targets.clone()
-        target_lens = torch.tensor([8, 8])
+        target_lens = torch.tensor([10, 10])
         speaker_names = [
             ["A1", None, None, None],
             ["B1", "B2", None, None],
@@ -566,13 +595,24 @@ class TestSortformerEncLabelModelStreaming:
             original_signal[0, :, : 2 * feature_frames_per_chunk],
         )
         assert torch.all(
-            augmented_signal[0, :, 2 * feature_frames_per_chunk : 3 * feature_frames_per_chunk] == 10.0
+            augmented_signal[0, :, 2 * feature_frames_per_chunk : 3 * feature_frames_per_chunk]
+            == 10.0
         )
-        assert torch.all(augmented_signal[0, :, 3 * feature_frames_per_chunk :] == 20.0)
         assert torch.all(
-            augmented_signal[1, :, 2 * feature_frames_per_chunk : 3 * feature_frames_per_chunk] == 1.0
+            augmented_signal[0, :, 3 * feature_frames_per_chunk : 4 * feature_frames_per_chunk]
+            == 20.0
         )
-        assert torch.all(augmented_signal[1, :, 3 * feature_frames_per_chunk :] == 2.0)
+        assert torch.all(augmented_signal[0, :, 4 * feature_frames_per_chunk :] == 30.0)
+        assert torch.all(
+            augmented_signal[1, :, 2 * feature_frames_per_chunk : 3 * feature_frames_per_chunk]
+            == 1.0
+        )
+        assert torch.all(
+            augmented_signal[1, :, 3 * feature_frames_per_chunk : 4 * feature_frames_per_chunk]
+            == 2.0
+        )
+        # The third source chunk must still be the donor's original value, not its prior replacement.
+        assert torch.all(augmented_signal[1, :, 4 * feature_frames_per_chunk :] == 3.0)
         assert torch.equal(augmented_targets[0, :4, 0], original_targets[0, :4, 0])
         assert torch.equal(processed_signal, original_signal)
         assert torch.equal(targets, original_targets)
@@ -630,6 +670,23 @@ class TestSortformerEncLabelModelStreaming:
         assert torch.equal(skipped_targets, targets)
         assert skipped_rate == 0.0
 
+        # Nonzero target padding must not make a donor with insufficient target length eligible.
+        padded_targets = targets.clone()
+        padded_targets[1, 0, 0] = 1.0
+        too_short_target_lens = torch.tensor([5, 0])
+        padded_signal, padded_result_targets, padded_rate = (
+            model._apply_batch_chunk_replace_augmentation(
+                processed_signal,
+                processed_signal_length,
+                padded_targets,
+                too_short_target_lens,
+                speaker_names,
+            )
+        )
+        assert torch.equal(padded_signal, processed_signal)
+        assert torch.equal(padded_result_targets, padded_targets)
+        assert padded_rate == 0.0
+
     @pytest.mark.unit
     def test_batch_chunk_replacement_enforces_speaker_constraints(self, sortformer_model, monkeypatch):
         model = sortformer_model
@@ -661,13 +718,16 @@ class TestSortformerEncLabelModelStreaming:
         assert torch.equal(capped_targets, targets)
         assert capped_rate == 0.0
 
-        # Reusing an RTTM speaker ID across the pair also makes both directions ineligible.
+        # A shared ID anywhere in the full sessions makes the pair ineligible, even when
+        # that donor speaker is outside the prefix that would be copied.
         overlapping_targets = torch.zeros(2, 8, 4)
         overlapping_targets[0, :4, 0] = 1.0
-        overlapping_targets[1, :4, :2] = 1.0
+        overlapping_targets[1, :2, 0] = 1.0
+        overlapping_targets[1, 2:4, 1] = 1.0
+        overlapping_targets[1, 6:8, 2] = 1.0
         overlapping_names = [
             ["shared", None, None, None],
-            ["shared", "B2", None, None],
+            ["B1", "B2", "shared", None],
         ]
         monkeypatch.setattr(
             model,
@@ -684,6 +744,84 @@ class TestSortformerEncLabelModelStreaming:
         assert torch.equal(overlap_signal, processed_signal)
         assert torch.equal(overlap_targets, overlapping_targets)
         assert overlap_rate == 0.0
+
+    @pytest.mark.unit
+    def test_chunk_replacement_requires_net_speaker_count_increase(self, sortformer_model):
+        model = sortformer_model
+        model.batch_chunk_replace_min_num_chunks = 1
+        model.batch_chunk_replace_max_num_chunks = 1
+        model.batch_chunk_replace_num_preserved_chunks = 2
+        model.sortformer_modules.chunk_len = 2
+        feature_frames_per_chunk = (
+            model.sortformer_modules.chunk_len * model.sortformer_modules.subsampling_factor
+        )
+        processed_signal = torch.zeros(2, 1, 3 * feature_frames_per_chunk)
+        processed_signal_length = torch.tensor([processed_signal.shape[2]] * 2)
+        target_lens = torch.tensor([6, 6])
+
+        targets = torch.zeros(2, 6, 4)
+        targets[0, :4, 0] = 1.0
+        targets[0, 4:, 1] = 1.0
+        targets[1, :2, 0] = 1.0
+        speaker_names = [
+            ["A1", "A2", None, None],
+            ["B1", None, None, None],
+        ]
+        metadata = model._build_chunk_replacement_metadata(
+            processed_signal,
+            processed_signal_length,
+            targets,
+            target_lens,
+            speaker_names,
+        )
+        assert model._select_chunk_replacement_plan(0, metadata) is None
+
+        # Removing A2 but inserting B1+B2 gives a genuine net increase from two to three.
+        targets[1, :2, 1] = 1.0
+        speaker_names[1][1] = "B2"
+        metadata = model._build_chunk_replacement_metadata(
+            processed_signal,
+            processed_signal_length,
+            targets,
+            target_lens,
+            speaker_names,
+        )
+        assert model._select_chunk_replacement_plan(0, metadata) is not None
+
+        # Capacity is limited by the target tensor as well as max_num_of_spks.
+        narrow_targets = torch.zeros(2, 6, 3)
+        narrow_targets[0, :4, 0] = 1.0
+        narrow_targets[1, :2, :] = 1.0
+        narrow_names = [["A1", None, None], ["B1", "B2", "B3"]]
+        narrow_metadata = model._build_chunk_replacement_metadata(
+            processed_signal,
+            processed_signal_length,
+            narrow_targets,
+            target_lens,
+            narrow_names,
+        )
+        assert model._select_chunk_replacement_plan(0, narrow_metadata) is None
+
+    @pytest.mark.unit
+    def test_chunk_replacement_probability_is_per_recipient(self, sortformer_model, monkeypatch):
+        model = sortformer_model
+        model.batch_chunk_replace_probability = 0.25
+        metadata = SimpleNamespace(
+            feature_lengths=torch.ones(4, dtype=torch.long),
+            compatible_pairs=~torch.eye(4, dtype=torch.bool),
+        )
+        draws = iter((0.10, 0.30, 0.24, 0.90))
+        monkeypatch.setattr(
+            "nemo.collections.asr.models.sortformer_diar_models.random.random",
+            lambda: next(draws),
+        )
+        monkeypatch.setattr(
+            model,
+            "_select_chunk_replacement_plan",
+            lambda recipient_index, metadata: recipient_index,
+        )
+
+        assert model._sample_chunk_replacement_plans(metadata) == [0, 2]
 
     @pytest.mark.unit
     def test_training_step_uses_chunk_augmented_targets(self, sortformer_model, monkeypatch):

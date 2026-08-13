@@ -31,6 +31,7 @@ model:
   activity_weight: 0.0 # Weight for 3-class activity CE: silence, single speaker, or overlap (>=2 speakers); 0 disables the loss
   activity_loss_mode: aux_head # 'aux_head' uses a dedicated classifier; 'speaker_preds' derives the 3 classes from existing speaker probabilities
   presence_weight: 0.0 # Weight for PIL-aligned local speaker-presence BCE; penalizes short fake speakers independent of segment duration
+  dice_weight: 0.0 # Weight for PIL-aligned soft Dice loss with smooth=1; includes absent channels to penalize phantom speakers
   presence_window_radius: 3 # Presence max-pooling radius d in output frames, using [t-d, t+d] (3 = +/-240ms at 80ms output)
   presence_negative_margin: 0.4 # Locally absent channels are penalized only above this probability, preserving low-confidence hedging
   max_num_of_spks: 4
