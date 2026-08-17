@@ -56,7 +56,7 @@ model:
 
   # Replace post-compression chunks with valid prefixes from a speaker-disjoint batch sample.
   batch_chunk_replace_augmentation:
-    probability: 0.25
+    probability: 0
     min_num_chunks: 1
     max_num_chunks: 3
     num_preserved_chunks: 2
