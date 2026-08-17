@@ -421,7 +421,8 @@ class TestSortformerEncLabelModelOffline:
         assert torch.count_nonzero(safe_hedge_preds.grad) == 0
 
     @pytest.mark.unit
-    def test_pil_aligned_dice_loss_penalizes_phantom_speakers(self, sortformer_model):
+    def test_pil_aligned_dice_loss_ignores_target_absent_speakers(self, sortformer_model):
+        sortformer_model.dice_min_target_frames = 1
         targets_pil = torch.zeros(1, 4, 2)
         targets_pil[0, :2, 0] = 1.0
         target_lens = torch.tensor([3])
@@ -436,14 +437,42 @@ class TestSortformerEncLabelModelOffline:
         phantom_preds.requires_grad_()
         phantom_loss = sortformer_model._dice_loss(phantom_preds, targets_pil, target_lens)
 
-        # The phantom channel has pred_mass=1 and no target mass, so its Dice
-        # loss is 1 / (1 + 1) = 0.5; averaging over two channels gives 0.25.
+        active_false_alarm_preds = perfect_preds.clone()
+        active_false_alarm_preds[0, 2, 0] = 1.0
+        active_false_alarm_loss = sortformer_model._dice_loss(
+            active_false_alarm_preds, targets_pil, target_lens
+        )
+
         assert torch.equal(perfect_loss, torch.tensor(0.0))
-        assert torch.allclose(phantom_loss, torch.tensor(0.25))
+        assert torch.equal(phantom_loss, perfect_loss)
+        assert active_false_alarm_loss > perfect_loss
 
         phantom_loss.backward()
-        assert phantom_preds.grad[0, 2, 1] > 0
+        assert phantom_preds.grad[0, 2, 1] == 0
         assert torch.count_nonzero(phantom_preds.grad[0, 3]) == 0
+
+    @pytest.mark.unit
+    def test_pil_aligned_dice_loss_requires_minimum_target_duration(self, sortformer_model):
+        sortformer_model.dice_min_target_frames = 2
+        targets_pil = torch.zeros(1, 4, 2)
+        targets_pil[0, :2, 0] = 1.0
+        targets_pil[0, 0, 1] = 1.0
+        target_lens = torch.tensor([3])
+
+        short_speaker_miss = targets_pil.clone()
+        short_speaker_miss[0, 0, 1] = 0.0
+        short_speaker_loss = sortformer_model._dice_loss(
+            short_speaker_miss, targets_pil, target_lens
+        )
+
+        eligible_speaker_miss = targets_pil.clone()
+        eligible_speaker_miss[0, 1, 0] = 0.0
+        eligible_speaker_loss = sortformer_model._dice_loss(
+            eligible_speaker_miss, targets_pil, target_lens
+        )
+
+        assert torch.equal(short_speaker_loss, torch.tensor(0.0))
+        assert eligible_speaker_loss > short_speaker_loss
 
     @pytest.mark.unit
     def test_phantom_loss_penalizes_only_high_confidence_empty_channels(self, sortformer_model):

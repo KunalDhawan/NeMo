@@ -524,6 +524,18 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.dice_weight = float(self._cfg.get("dice_weight", 0.0))
         if self.dice_weight < 0.0:
             raise ValueError(f"dice_weight must be >= 0, got {self.dice_weight}")
+        self.dice_min_target_frames = self._cfg.get("dice_min_target_frames", 15)
+        if not isinstance(self.dice_min_target_frames, int) or isinstance(
+            self.dice_min_target_frames, bool
+        ):
+            raise TypeError(
+                "dice_min_target_frames must be a positive integer, "
+                f"got {type(self.dice_min_target_frames).__name__}: {self.dice_min_target_frames}"
+            )
+        if self.dice_min_target_frames < 1:
+            raise ValueError(
+                f"dice_min_target_frames must be >= 1, got {self.dice_min_target_frames}"
+            )
         # Hard-negative BCE for phantom speakers. Only PIL-aligned channels with no
         # target activity are eligible, and only predictions above the threshold are
         # penalized. Each channel is reduced over its selected frames before the channel
@@ -2464,15 +2476,16 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         denominator = valid.sum() * num_spks
         return (element_loss.sum() / denominator.clamp_min(1)).to(preds.dtype)
 
-    @staticmethod
-    def _dice_loss(preds, targets_pil, target_lens):
+    def _dice_loss(self, preds, targets_pil, target_lens):
         """
-        Compute PIL-aligned soft Dice loss over valid frames.
+        Compute PIL-aligned soft Dice loss for target-present speaker channels.
 
         Dice is reduced independently over time for every sample/speaker channel,
-        then averaged across all channels. The additive smooth value is 1.0, so
-        target-absent channels receive a loss of ``pred_mass / (pred_mass + 1)``
-        and therefore penalize phantom speakers. Hard PIL targets are used directly.
+        then channels with fewer than ``dice_min_target_frames`` positive hard-target
+        frames are zeroed before averaging over the fixed batch and model speaker-slot
+        dimensions. This preserves the eligible-channel gradient scale, leaves empty
+        channel suppression to the phantom loss, and leaves very short speakers to the
+        primary BCE criterion.
         """
         valid = (
             torch.arange(preds.shape[1], device=preds.device).unsqueeze(0)
@@ -2486,7 +2499,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             pred_mass = preds_valid.sum(dim=1)
             target_mass = targets_valid.sum(dim=1)
             dice_score = (2.0 * intersection + 1.0) / (pred_mass + target_mass + 1.0)
-            loss = (1.0 - dice_score).mean()
+            target_frame_count = (targets_valid > 0.5).sum(dim=1)
+            eligible_channels = target_frame_count >= self.dice_min_target_frames
+            loss = ((1.0 - dice_score) * eligible_channels).mean()
         return loss.to(preds.dtype)
 
     def _phantom_loss(self, preds, targets_pil, target_lens):
