@@ -446,6 +446,46 @@ class TestSortformerEncLabelModelOffline:
         assert torch.count_nonzero(phantom_preds.grad[0, 3]) == 0
 
     @pytest.mark.unit
+    def test_phantom_loss_penalizes_only_high_confidence_empty_channels(self, sortformer_model):
+        num_spks = sortformer_model.sortformer_modules.n_spk
+        targets_pil = torch.zeros(1, 4, num_spks)
+        targets_pil[0, 0, 0] = 1.0
+        target_lens = torch.tensor([3])
+
+        one_phantom = torch.full_like(targets_pil, 0.1)
+        # Activity on a non-empty channel is outside the scope of this loss.
+        one_phantom[0, :3, 0] = 0.9
+        # Two selected frames on one empty channel.
+        one_phantom[0, 1, 1] = 0.5
+        one_phantom[0, 2, 1] = 0.75
+        # An empty channel below the threshold and activity in padding are ignored.
+        one_phantom[0, 1, 2] = sortformer_model.phantom_threshold - 0.01
+        one_phantom[0, 3, 3] = 0.9
+        one_phantom.requires_grad_()
+
+        one_phantom_loss = sortformer_model._phantom_loss(
+            one_phantom, targets_pil, target_lens
+        )
+        expected_channel_loss = (-torch.log(torch.tensor(0.5)) - torch.log(torch.tensor(0.25))) / 2
+        assert torch.allclose(one_phantom_loss, expected_channel_loss / num_spks)
+
+        # The fixed speaker-slot denominator makes a second identical phantom
+        # channel add an equal amount to the loss.
+        two_phantoms = one_phantom.detach().clone()
+        two_phantoms[0, 1, 2] = 0.5
+        two_phantoms[0, 2, 2] = 0.75
+        two_phantom_loss = sortformer_model._phantom_loss(
+            two_phantoms, targets_pil, target_lens
+        )
+        assert torch.allclose(two_phantom_loss, 2 * one_phantom_loss)
+
+        one_phantom_loss.backward()
+        assert torch.all(one_phantom.grad[0, 1:3, 1] > 0)
+        assert torch.count_nonzero(one_phantom.grad[0, :, 0]) == 0
+        assert one_phantom.grad[0, 1, 2] == 0
+        assert torch.count_nonzero(one_phantom.grad[0, 3]) == 0
+
+    @pytest.mark.unit
     def test_global_speaker_count_metrics(self, sortformer_model):
         num_spks = sortformer_model.sortformer_modules.n_spk
         preds = torch.zeros(3, 4, num_spks)
@@ -480,6 +520,7 @@ class TestSortformerEncLabelModelOffline:
             'val_activity_loss',
             'val_presence_loss',
             'val_dice_loss',
+            'val_phantom_loss',
             'val_f1_acc',
             'val_precision',
             'val_recall',
@@ -497,6 +538,7 @@ class TestSortformerEncLabelModelOffline:
         assert torch.equal(metrics['val_activity_loss'], torch.tensor(2.0))
         assert torch.equal(metrics['val_presence_loss'], torch.tensor(2.0))
         assert torch.equal(metrics['val_dice_loss'], torch.tensor(2.0))
+        assert torch.equal(metrics['val_phantom_loss'], torch.tensor(2.0))
 
 
 class TestSortformerEncLabelModelStreaming:

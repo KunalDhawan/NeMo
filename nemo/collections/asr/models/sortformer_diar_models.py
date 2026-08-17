@@ -524,6 +524,16 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.dice_weight = float(self._cfg.get("dice_weight", 0.0))
         if self.dice_weight < 0.0:
             raise ValueError(f"dice_weight must be >= 0, got {self.dice_weight}")
+        # Hard-negative BCE for phantom speakers. Only PIL-aligned channels with no
+        # target activity are eligible, and only predictions above the threshold are
+        # penalized. Each channel is reduced over its selected frames before the channel
+        # losses are summed and divided by the fixed number of model speaker slots.
+        self.phantom_weight = float(self._cfg.get("phantom_weight", 0.0))
+        if self.phantom_weight < 0.0:
+            raise ValueError(f"phantom_weight must be >= 0, got {self.phantom_weight}")
+        self.phantom_threshold = float(self._cfg.get("phantom_threshold", 0.25))
+        if not 0.0 <= self.phantom_threshold < 1.0:
+            raise ValueError(f"phantom_threshold must be in [0, 1), got {self.phantom_threshold}")
         # Distance used by the self-ATS loss: 'bce' (default; matches the other losses but has
         # an entropy floor, so the logged value is > 0 even when perfectly self-consistent) or
         # 'mse' (no floor: value is 0 when self-consistent, and a gentler bounded gradient).
@@ -2479,6 +2489,38 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             loss = (1.0 - dice_score).mean()
         return loss.to(preds.dtype)
 
+    def _phantom_loss(self, preds, targets_pil, target_lens):
+        """
+        Penalize high-confidence predictions on PIL-aligned empty speaker channels.
+
+        A channel is eligible only when its hard PIL target is zero over every valid
+        frame. Within each eligible channel, negative BCE is averaged over frames whose
+        detached prediction exceeds ``phantom_threshold``. Channel losses are then
+        summed and divided by the fixed number of output speaker slots, so an additional
+        phantom channel adds an additional penalty while the scale remains independent
+        of the number of ground-truth speakers. Active channels, sub-threshold
+        predictions, and padding contribute zero.
+        """
+        num_frames, num_spks = preds.shape[1], preds.shape[2]
+        valid = (
+            torch.arange(num_frames, device=preds.device).unsqueeze(0)
+            < target_lens.to(preds.device).unsqueeze(1)
+        )
+        valid_expanded = valid.unsqueeze(-1)
+        empty_channels = ~((targets_pil > 0.5) & valid_expanded).any(dim=1)
+        selected = (
+            valid_expanded
+            & empty_channels.unsqueeze(1)
+            & (preds.detach() > self.phantom_threshold)
+        )
+
+        with torch.autocast(device_type=preds.device.type, enabled=False):
+            negative_bce = -torch.log1p(-preds.float().clamp(max=1.0 - self.eps))
+            selected_count = selected.sum(dim=1)
+            channel_loss = (negative_bce * selected).sum(dim=1) / selected_count.clamp_min(1)
+            loss = (channel_loss.sum(dim=1) / num_spks).mean()
+        return loss.to(preds.dtype)
+
     def _get_aux_train_evaluations(
         self, preds, targets, target_lens, activity_logits=None
     ) -> dict:
@@ -2534,6 +2576,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         activity_loss = self._activity_loss(activity_logits, targets, target_lens)
         presence_loss = self._presence_loss(preds, targets_pil, target_lens)
         dice_loss = self._dice_loss(preds, targets_pil, target_lens)
+        phantom_loss = self._phantom_loss(preds, targets_pil, target_lens)
         loss = (
             self.ats_weight * ats_loss
             + self.pil_weight * pil_loss
@@ -2543,6 +2586,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             + self.activity_weight * activity_loss
             + self.presence_weight * presence_loss
             + self.dice_weight * dice_loss
+            + self.phantom_weight * phantom_loss
         )
 
         self._accuracy_train(preds, targets_pil, target_lens)
@@ -2564,6 +2608,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'activity_loss': activity_loss,
             'presence_loss': presence_loss,
             'dice_loss': dice_loss,
+            'phantom_loss': phantom_loss,
             'learning_rate': self._optimizer.param_groups[0]['lr'],
             'train_f1_acc': train_f1_acc,
             'train_precision': train_precision,
@@ -2717,6 +2762,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         val_activity_loss = self._activity_loss(activity_logits, targets, target_lens)
         val_presence_loss = self._presence_loss(preds, targets_pil, target_lens)
         val_dice_loss = self._dice_loss(preds, targets_pil, target_lens)
+        val_phantom_loss = self._phantom_loss(preds, targets_pil, target_lens)
         val_loss = (
             self.ats_weight * val_ats_loss
             + self.pil_weight * val_pil_loss
@@ -2726,6 +2772,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             + self.activity_weight * val_activity_loss
             + self.presence_weight * val_presence_loss
             + self.dice_weight * val_dice_loss
+            + self.phantom_weight * val_phantom_loss
         )
 
         self._accuracy_valid(preds, targets_pil, target_lens)
@@ -2750,6 +2797,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'val_activity_loss': val_activity_loss,
             'val_presence_loss': val_presence_loss,
             'val_dice_loss': val_dice_loss,
+            'val_phantom_loss': val_phantom_loss,
             'val_f1_acc': val_f1_acc,
             'val_precision': val_precision,
             'val_recall': val_recall,
@@ -2837,6 +2885,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         val_activity_loss_mean = torch.stack([x['val_activity_loss'] for x in outputs]).mean()
         val_presence_loss_mean = torch.stack([x['val_presence_loss'] for x in outputs]).mean()
         val_dice_loss_mean = torch.stack([x['val_dice_loss'] for x in outputs]).mean()
+        val_phantom_loss_mean = torch.stack([x['val_phantom_loss'] for x in outputs]).mean()
         val_f1_acc_mean = torch.stack([x['val_f1_acc'] for x in outputs]).mean()
         val_precision_mean = torch.stack([x['val_precision'] for x in outputs]).mean()
         val_recall_mean = torch.stack([x['val_recall'] for x in outputs]).mean()
@@ -2858,6 +2907,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'val_activity_loss': val_activity_loss_mean,
             'val_presence_loss': val_presence_loss_mean,
             'val_dice_loss': val_dice_loss_mean,
+            'val_phantom_loss': val_phantom_loss_mean,
             'val_f1_acc': val_f1_acc_mean,
             'val_precision': val_precision_mean,
             'val_recall': val_recall_mean,
