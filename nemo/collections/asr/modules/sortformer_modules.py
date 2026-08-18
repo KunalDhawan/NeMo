@@ -300,6 +300,23 @@ class SortformerModules(NeuralModule, Exportable):
             yield chunk_idx, chunk_feat_seq_t, feat_lengths, left_offset, right_offset
             chunk_idx += 1
 
+    def forward_speaker_logits(self, hidden_out):
+        """
+        Compute raw per-speaker activity logits.
+
+        Args:
+            hidden_out (torch.Tensor): Tensor containing hidden states from the encoder
+                Shape: (batch_size, n_frames, hidden_dim)
+
+        Returns:
+            logits (torch.Tensor): Raw speaker activity logits.
+                Shape: (batch_size, n_frames, n_spk)
+        """
+        hidden_out = self.dropout(F.relu(hidden_out))
+        hidden_out = self.first_hidden_to_hidden(hidden_out)
+        hidden_out = self.dropout(F.relu(hidden_out))
+        return self.single_hidden_to_spks(hidden_out)
+
     def forward_speaker_sigmoids(self, hidden_out):
         """
         The final layer that outputs speaker probabilities using the Sigmoid activation function.
@@ -313,12 +330,7 @@ class SortformerModules(NeuralModule, Exportable):
                 the Sigmoid activation function
                 Shape: (batch_size, n_frames, n_spk)
         """
-        hidden_out = self.dropout(F.relu(hidden_out))
-        hidden_out = self.first_hidden_to_hidden(hidden_out)
-        hidden_out = self.dropout(F.relu(hidden_out))
-        spk_preds = self.single_hidden_to_spks(hidden_out)
-        preds = F.sigmoid(spk_preds)
-        return preds
+        return torch.sigmoid(self.forward_speaker_logits(hidden_out))
 
     def init_activity_head(self):
         """Initialize the optional silence/single-speaker/overlap classification head."""

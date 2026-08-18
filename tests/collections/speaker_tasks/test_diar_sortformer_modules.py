@@ -202,7 +202,7 @@ class TestSortformerModules_GeneralUtils:
     )
     def test_forward_speaker_sigmoids(self, batch_size, n_frames, num_spks):
         """Test the forward_speaker_sigmoids method that outputs speaker probabilities using Sigmoid activation."""
-        sortformer_modules = SortformerModules(num_spks=num_spks)
+        sortformer_modules = SortformerModules(num_spks=num_spks).eval()
 
         # Use the correct hidden dimension from the model
         hidden_dim = sortformer_modules.tf_d_model  # This should be 192
@@ -211,10 +211,13 @@ class TestSortformerModules_GeneralUtils:
         hidden_out = torch.randn(batch_size, n_frames, hidden_dim)
 
         # Call the method
+        logits = sortformer_modules.forward_speaker_logits(hidden_out)
         preds = sortformer_modules.forward_speaker_sigmoids(hidden_out)
 
         # Check output shape
+        assert logits.shape == (batch_size, n_frames, num_spks)
         assert preds.shape == (batch_size, n_frames, num_spks)
+        assert torch.allclose(preds, torch.sigmoid(logits))
 
         # Check output data type
         assert preds.dtype == torch.float32

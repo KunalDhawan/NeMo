@@ -223,12 +223,14 @@ class TestSortformerEncLabelModelOffline:
             # batch size 1
             preds_list = []
             for i in range(input_signal.size(0)):
-                preds = sortformer_diar_model.forward(input_signal[i : i + 1], input_signal_length[i : i + 1])
+                preds, _, _ = sortformer_diar_model.forward(
+                    input_signal[i : i + 1], input_signal_length[i : i + 1]
+                )
                 preds_list.append(preds)
             preds_instance = torch.cat(preds_list, 0)
 
             # batch size 4
-            preds_batch = sortformer_diar_model.forward(input_signal, input_signal_length)
+            preds_batch, _, _ = sortformer_diar_model.forward(input_signal, input_signal_length)
         assert preds_instance.shape == preds_batch.shape
 
         diff = torch.mean(torch.abs(preds_instance - preds_batch))
@@ -243,10 +245,17 @@ class TestSortformerEncLabelModelOffline:
         hidden_lens = torch.tensor([5, 3])
 
         with torch.no_grad():
-            preds, activity_logits = model.forward_infer(hidden, hidden_lens, return_aux_logits=True)
+            preds, speaker_logits, activity_logits = model.forward_infer(
+                hidden,
+                hidden_lens,
+            )
 
         assert preds.shape == (2, 5, model.sortformer_modules.n_spk)
+        assert speaker_logits.shape == preds.shape
         assert activity_logits.shape == (2, 5, 3)
+        valid = torch.arange(preds.shape[1]).unsqueeze(0) < hidden_lens.unsqueeze(1)
+        assert torch.allclose(preds[valid], torch.sigmoid(speaker_logits[valid]))
+        assert torch.count_nonzero(preds[~valid]) == 0
 
         # Valid frames contain silence, single-speaker speech, and overlap. The final
         # padded frame is intentionally predicted incorrectly and must not affect loss.
@@ -378,6 +387,123 @@ class TestSortformerEncLabelModelOffline:
         activity_loss.backward()
         assert torch.count_nonzero(perfect_preds.grad[:, :3]) > 0
         assert torch.count_nonzero(perfect_preds.grad[:, 3:]) == 0
+
+    @pytest.mark.unit
+    def test_speaker_rank_loss_matches_margin_formula_and_masks_frames(self, sortformer_model):
+        model = sortformer_model.eval()
+        model.rank_margin = 0.6
+        model.rank_collar_frames = 0
+
+        speaker_logits = torch.tensor(
+            [
+                [
+                    [1.0, 0.2, -0.4],
+                    [0.1, 0.3, -0.2],
+                    [-0.5, 0.4, 0.0],
+                    [2.0, -1.0, 0.5],
+                ],
+                [
+                    [-0.2, 0.7, 0.1],
+                    [0.8, -0.3, 1.1],
+                    [0.4, 0.2, -0.1],
+                    [0.0, 0.0, 0.0],
+                ],
+            ],
+            requires_grad=True,
+        )
+        targets_pil = torch.zeros_like(speaker_logits)
+        targets_pil[0, 0, 0] = 1.0
+        targets_pil[0, 1, :2] = 1.0  # overlap: ineligible
+        targets_pil[0, 3, 0] = 1.0  # padding: ineligible
+        targets_pil[1, 0, 1] = 1.0
+        targets_pil[1, 1, 2] = 1.0
+        targets_pil[1, 2, 0] = 1.0  # padding: ineligible
+        target_lens = torch.tensor([3, 2])
+
+        rank_loss = model._speaker_rank_loss(speaker_logits, targets_pil, target_lens)
+
+        expected_terms = []
+        for batch_index, frame_index, target_index in ((0, 0, 0), (1, 0, 1), (1, 1, 2)):
+            frame_logits = speaker_logits[batch_index, frame_index]
+            competitor_mask = torch.arange(frame_logits.numel()) != target_index
+            expected_terms.append(
+                torch.log1p(
+                    torch.exp(
+                        frame_logits[competitor_mask]
+                        - frame_logits[target_index]
+                        + model.rank_margin
+                    ).sum()
+                )
+            )
+        expected_loss = torch.stack(expected_terms).mean()
+
+        assert torch.allclose(rank_loss, expected_loss)
+
+        rank_loss.backward()
+        assert speaker_logits.grad[0, 0, 0] < 0
+        assert torch.all(speaker_logits.grad[0, 0, 1:] > 0)
+        assert torch.count_nonzero(speaker_logits.grad[0, 1:]) == 0
+        assert torch.count_nonzero(speaker_logits.grad[1, :2]) > 0
+        assert torch.count_nonzero(speaker_logits.grad[1, 2:]) == 0
+
+    @pytest.mark.unit
+    def test_speaker_rank_loss_excludes_transition_collar(self, sortformer_model):
+        model = sortformer_model.eval()
+        model.rank_margin = 0.0
+        model.rank_collar_frames = 1
+
+        speaker_logits = torch.zeros(1, 7, 3, requires_grad=True)
+        targets_pil = torch.zeros_like(speaker_logits)
+        targets_pil[0, :2, 0] = 1.0
+        targets_pil[0, 2:5, 1] = 1.0
+        targets_pil[0, 5:, 0] = 1.0
+
+        rank_loss = model._speaker_rank_loss(speaker_logits, targets_pil, torch.tensor([7]))
+
+        assert torch.allclose(rank_loss, torch.log(torch.tensor(3.0)))
+
+        rank_loss.backward()
+        assert torch.count_nonzero(speaker_logits.grad[0, [0, 3, 6]]) > 0
+        assert torch.count_nonzero(speaker_logits.grad[0, [1, 2, 4, 5]]) == 0
+
+    @pytest.mark.unit
+    def test_speaker_rank_loss_uses_global_ddp_denominator(
+        self, sortformer_model, monkeypatch
+    ):
+        model = sortformer_model.eval()
+        model.rank_margin = 0.0
+        model.rank_collar_frames = 0
+
+        speaker_logits = torch.tensor(
+            [[[1.0, 0.0, -1.0], [-0.5, 0.5, 0.0]]],
+            requires_grad=True,
+        )
+        targets_pil = torch.zeros_like(speaker_logits)
+        targets_pil[0, 0, 0] = 1.0
+        targets_pil[0, 1, 1] = 1.0
+
+        def fake_all_reduce(counts, op):
+            del op
+            counts.add_(3.0)
+
+        monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+        monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+        rank_loss = model._speaker_rank_loss(speaker_logits, targets_pil, torch.tensor([2]))
+
+        local_terms = torch.stack(
+            (
+                torch.log1p(torch.exp(speaker_logits[0, 0, 1:] - speaker_logits[0, 0, 0]).sum()),
+                torch.log1p(
+                    torch.exp(
+                        speaker_logits[0, 1, [0, 2]] - speaker_logits[0, 1, 1]
+                    ).sum()
+                ),
+            )
+        )
+        assert torch.allclose(rank_loss, 2.0 * local_terms.sum() / 5.0)
 
     @pytest.mark.unit
     def test_pil_aligned_windowed_presence_loss(self, sortformer_model):
@@ -543,6 +669,7 @@ class TestSortformerEncLabelModelOffline:
             'val_loss',
             'val_ats_loss',
             'val_pil_loss',
+            'val_rank_loss',
             'val_pairwise_ats_loss',
             'val_self_ats_loss',
             'val_spkcount_loss',
@@ -564,6 +691,7 @@ class TestSortformerEncLabelModelOffline:
 
         metrics = sortformer_model.multi_validation_epoch_end(outputs)['log']
 
+        assert torch.equal(metrics['val_rank_loss'], torch.tensor(2.0))
         assert torch.equal(metrics['val_activity_loss'], torch.tensor(2.0))
         assert torch.equal(metrics['val_presence_loss'], torch.tensor(2.0))
         assert torch.equal(metrics['val_dice_loss'], torch.tensor(2.0))
@@ -923,13 +1051,21 @@ class TestSortformerEncLabelModelStreaming:
             return kwargs["processed_signal"], augmented_targets, torch.tensor(0.5)
 
         monkeypatch.setattr(model, "_apply_batch_chunk_replace_augmentation", fake_chunk_augmentation)
-        monkeypatch.setattr(
-            model,
-            "forward_streaming",
-            lambda processed_signal, processed_signal_length, return_aux_logits: torch.zeros_like(targets),
-        )
 
-        def fake_train_evaluations(preds, augmented, lengths, activity_logits=None):
+        def fake_forward_streaming(
+            processed_signal,
+            processed_signal_length,
+        ):
+            del processed_signal, processed_signal_length
+            preds = torch.zeros_like(targets)
+            return preds, torch.zeros_like(preds), None
+
+        monkeypatch.setattr(model, "forward_streaming", fake_forward_streaming)
+
+        def fake_train_evaluations(
+            preds, augmented, lengths, activity_logits=None, speaker_logits=None
+        ):
+            del preds, lengths, activity_logits, speaker_logits
             captured["targets"] = augmented
             return {"loss": torch.tensor(1.0)}
 
@@ -955,11 +1091,14 @@ class TestSortformerEncLabelModelStreaming:
         input_signal_length = torch.tensor([sample_len])
 
         with torch.no_grad():
-            preds, activity_logits = model.forward(
-                input_signal, input_signal_length, return_aux_logits=True
+            preds, speaker_logits, activity_logits = model.forward(
+                input_signal,
+                input_signal_length,
             )
 
+        assert speaker_logits.shape == preds.shape
         assert activity_logits.shape[:2] == preds.shape[:2]
+        assert torch.allclose(preds, torch.sigmoid(speaker_logits), atol=1e-6)
         assert activity_logits.shape[2] == 3
 
     @pytest.mark.unit
@@ -982,12 +1121,14 @@ class TestSortformerEncLabelModelStreaming:
             # batch size 1
             preds_list = []
             for i in range(input_signal.size(0)):
-                preds = sortformer_diar_model.forward(input_signal[i : i + 1], input_signal_length[i : i + 1])
+                preds, _, _ = sortformer_diar_model.forward(
+                    input_signal[i : i + 1], input_signal_length[i : i + 1]
+                )
                 preds_list.append(preds)
             preds_instance = torch.cat(preds_list, 0)
 
             # batch size 4
-            preds_batch = sortformer_diar_model.forward(input_signal, input_signal_length)
+            preds_batch, _, _ = sortformer_diar_model.forward(input_signal, input_signal_length)
         assert preds_instance.shape == preds_batch.shape
 
         diff = torch.mean(torch.abs(preds_instance - preds_batch))
