@@ -582,6 +582,19 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.phantom_threshold = float(self._cfg.get("phantom_threshold", 0.25))
         if not 0.0 <= self.phantom_threshold < 1.0:
             raise ValueError(f"phantom_threshold must be in [0, 1), got {self.phantom_threshold}")
+        self.phantom_logmeanexp = self._cfg.get("phantom_logmeanexp", False)
+        if not isinstance(self.phantom_logmeanexp, bool):
+            raise TypeError(
+                f"phantom_logmeanexp must be a boolean, got {self.phantom_logmeanexp!r}"
+            )
+        self.phantom_logmeanexp_temperature = float(
+            self._cfg.get("phantom_logmeanexp_temperature", 0.5)
+        )
+        if self.phantom_logmeanexp_temperature <= 0.0:
+            raise ValueError(
+                "phantom_logmeanexp_temperature must be > 0, "
+                f"got {self.phantom_logmeanexp_temperature}"
+            )
         # Hard-negative BCE for speaker activity before the speaker's first PIL-aligned
         # target arrival. Predictions within the grace window before arrival are tolerated;
         # never-active target channels remain eligible throughout the valid sequence.
@@ -604,6 +617,19 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         if self.prearrival_grace_frames < 0:
             raise ValueError(
                 f"prearrival_grace_frames must be >= 0, got {self.prearrival_grace_frames}"
+            )
+        self.prearrival_logmeanexp = self._cfg.get("prearrival_logmeanexp", False)
+        if not isinstance(self.prearrival_logmeanexp, bool):
+            raise TypeError(
+                f"prearrival_logmeanexp must be a boolean, got {self.prearrival_logmeanexp!r}"
+            )
+        self.prearrival_logmeanexp_temperature = float(
+            self._cfg.get("prearrival_logmeanexp_temperature", 0.5)
+        )
+        if self.prearrival_logmeanexp_temperature <= 0.0:
+            raise ValueError(
+                "prearrival_logmeanexp_temperature must be > 0, "
+                f"got {self.prearrival_logmeanexp_temperature}"
             )
         # Distance used by the self-ATS loss: 'bce' (default; matches the other losses but has
         # an entropy floor, so the logged value is > 0 even when perfectly self-consistent) or
@@ -2711,17 +2737,53 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             loss = ((1.0 - dice_score) * eligible_channels).mean()
         return loss.to(preds.dtype)
 
+    @staticmethod
+    def _aggregate_selected_frame_losses(
+        frame_losses,
+        selected,
+        use_logmeanexp,
+        temperature,
+    ):
+        """Aggregate selected frame losses independently for each batch/channel."""
+        if frame_losses.shape[1] == 0:
+            return frame_losses.new_zeros((frame_losses.shape[0], frame_losses.shape[2]))
+
+        selected_count = selected.sum(dim=1)
+        if not use_logmeanexp:
+            selected_losses = torch.where(
+                selected, frame_losses, torch.zeros_like(frame_losses)
+            )
+            return selected_losses.sum(dim=1) / selected_count.clamp_min(1)
+
+        scaled_losses = frame_losses / temperature
+        masked_losses = scaled_losses.masked_fill(~selected, float('-inf'))
+        has_selected = selected_count > 0
+        # Give empty channels one finite dummy value so logsumexp stays finite; they
+        # are explicitly reset to zero after aggregation.
+        safe_first_frame = torch.where(
+            has_selected.unsqueeze(1),
+            masked_losses[:, :1, :],
+            torch.zeros_like(masked_losses[:, :1, :]),
+        )
+        masked_losses = torch.cat((safe_first_frame, masked_losses[:, 1:, :]), dim=1)
+        channel_loss = temperature * (
+            torch.logsumexp(masked_losses, dim=1)
+            - torch.log(selected_count.clamp_min(1).to(frame_losses.dtype))
+        )
+        return torch.where(has_selected, channel_loss, torch.zeros_like(channel_loss))
+
     def _phantom_loss(self, preds, targets_pil, target_lens):
         """
         Penalize high-confidence predictions on PIL-aligned empty speaker channels.
 
         A channel is eligible only when its hard PIL target is zero over every valid
-        frame. Within each eligible channel, negative BCE is averaged over frames whose
-        detached prediction exceeds ``phantom_threshold``. Channel losses are then
-        summed and divided by the fixed number of output speaker slots, so an additional
-        phantom channel adds an additional penalty while the scale remains independent
-        of the number of ground-truth speakers. Active channels, sub-threshold
-        predictions, and padding contribute zero.
+        frame. Within each eligible channel, negative BCE is aggregated over frames whose
+        detached prediction exceeds ``phantom_threshold`` using either the mean or
+        temperature-controlled log-mean-exp. Channel losses are then summed and divided
+        by the fixed number of output speaker slots, so an additional phantom channel
+        adds an additional penalty while the scale remains independent of the number of
+        ground-truth speakers. Active channels, sub-threshold predictions, and padding
+        contribute zero.
         """
         num_frames, num_spks = preds.shape[1], preds.shape[2]
         valid = (
@@ -2738,8 +2800,12 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         with torch.autocast(device_type=preds.device.type, enabled=False):
             negative_bce = -torch.log1p(-preds.float().clamp(max=1.0 - self.eps))
-            selected_count = selected.sum(dim=1)
-            channel_loss = (negative_bce * selected).sum(dim=1) / selected_count.clamp_min(1)
+            channel_loss = self._aggregate_selected_frame_losses(
+                negative_bce,
+                selected,
+                use_logmeanexp=self.phantom_logmeanexp,
+                temperature=self.phantom_logmeanexp_temperature,
+            )
             loss = (channel_loss.sum(dim=1) / num_spks).mean()
         return loss.to(preds.dtype)
 
@@ -2751,7 +2817,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         ``prearrival_threshold`` and the PIL-aligned speaker has no target onset within
         the prefix ending ``prearrival_grace_frames`` after that frame. Speakers with no
         target activity in the valid sequence remain eligible throughout. Selected-frame
-        negative BCE is averaged per channel, then affected channels are summed and
+        negative BCE is aggregated per channel using either the mean or
+        temperature-controlled log-mean-exp, then affected channels are summed and
         divided by the fixed number of model speaker slots before the batch mean.
         """
         num_frames, num_spks = preds.shape[1], preds.shape[2]
@@ -2783,9 +2850,12 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         with torch.autocast(device_type=preds.device.type, enabled=False):
             negative_bce = -torch.log1p(-preds.float().clamp(max=1.0 - self.eps))
-            selected_loss = torch.where(selected, negative_bce, torch.zeros_like(negative_bce))
-            selected_count = selected.sum(dim=1)
-            channel_loss = selected_loss.sum(dim=1) / selected_count.clamp_min(1)
+            channel_loss = self._aggregate_selected_frame_losses(
+                negative_bce,
+                selected,
+                use_logmeanexp=self.prearrival_logmeanexp,
+                temperature=self.prearrival_logmeanexp_temperature,
+            )
             loss = (channel_loss.sum(dim=1) / num_spks).mean()
         return loss.to(preds.dtype)
 

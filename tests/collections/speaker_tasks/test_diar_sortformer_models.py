@@ -755,6 +755,24 @@ class TestSortformerEncLabelModelOffline:
         assert one_phantom.grad[0, 1, 2] == 0
         assert torch.count_nonzero(one_phantom.grad[0, 3]) == 0
 
+        sortformer_model.phantom_logmeanexp = True
+        sortformer_model.phantom_logmeanexp_temperature = 0.5
+        logmeanexp_loss = sortformer_model._phantom_loss(
+            one_phantom.detach(), targets_pil, target_lens
+        )
+        selected_losses = torch.stack(
+            (-torch.log(torch.tensor(0.5)), -torch.log(torch.tensor(0.25)))
+        )
+        expected_logmeanexp = sortformer_model.phantom_logmeanexp_temperature * (
+            torch.logsumexp(
+                selected_losses / sortformer_model.phantom_logmeanexp_temperature,
+                dim=0,
+            )
+            - torch.log(torch.tensor(2.0))
+        )
+        assert torch.allclose(logmeanexp_loss, expected_logmeanexp / num_spks)
+        assert logmeanexp_loss > one_phantom_loss
+
     @pytest.mark.unit
     def test_prearrival_loss_penalizes_only_activity_safely_before_first_onset(
         self, sortformer_model
@@ -805,6 +823,32 @@ class TestSortformerEncLabelModelOffline:
         selected[0, 5, 3] = True
         assert torch.all(preds.grad[selected] > 0)
         assert torch.count_nonzero(preds.grad[~selected]) == 0
+
+        model.prearrival_logmeanexp = True
+        model.prearrival_logmeanexp_temperature = 0.5
+        logmeanexp_loss = model._prearrival_loss(
+            preds.detach(), targets_pil, target_lens
+        )
+        speaker_one_losses = torch.stack(
+            (-torch.log(torch.tensor(0.5)), -torch.log(torch.tensor(0.25)))
+        )
+        speaker_one_logmeanexp = model.prearrival_logmeanexp_temperature * (
+            torch.logsumexp(
+                speaker_one_losses / model.prearrival_logmeanexp_temperature,
+                dim=0,
+            )
+            - torch.log(torch.tensor(2.0))
+        )
+        expected_logmeanexp = torch.stack(
+            (
+                -torch.log(torch.tensor(0.5)),
+                speaker_one_logmeanexp,
+                -torch.log(torch.tensor(0.4)),
+                -torch.log(torch.tensor(0.6)),
+            )
+        ).sum() / num_spks
+        assert torch.allclose(logmeanexp_loss, expected_logmeanexp)
+        assert logmeanexp_loss > prearrival_loss
 
     @pytest.mark.unit
     def test_global_speaker_count_metrics(self, sortformer_model):
