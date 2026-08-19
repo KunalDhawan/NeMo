@@ -506,6 +506,121 @@ class TestSortformerEncLabelModelOffline:
         assert torch.allclose(rank_loss, 2.0 * local_terms.sum() / 5.0)
 
     @pytest.mark.unit
+    def test_speech_bce_loss_matches_per_frame_slot_mean_and_masks_silence(
+        self, sortformer_model
+    ):
+        model = sortformer_model.eval()
+        model.speech_bce_collar_frames = 0
+
+        speaker_logits = torch.tensor(
+            [
+                [
+                    [1.0, 0.2, -0.4],
+                    [0.1, 0.3, -0.2],
+                    [-0.5, 0.4, 0.0],
+                    [2.0, -1.0, 0.5],
+                ],
+                [
+                    [-0.2, 0.7, 0.1],
+                    [0.8, -0.3, 1.1],
+                    [0.4, 0.2, -0.1],
+                    [0.0, 0.0, 0.0],
+                ],
+            ],
+            requires_grad=True,
+        )
+        targets_pil = torch.zeros_like(speaker_logits)
+        targets_pil[0, 0] = torch.tensor([0.8, 0.2, 0.0])
+        targets_pil[0, 1, :2] = torch.tensor([0.8, 0.7])  # soft overlap is eligible
+        targets_pil[0, 3, 0] = 1.0  # padding is ineligible
+        targets_pil[1, 1] = torch.tensor([0.1, 0.0, 0.9])
+        targets_pil[1, 2, 0] = 1.0  # padding is ineligible
+        target_lens = torch.tensor([3, 2])
+
+        speech_bce_loss = model._speech_bce_loss(
+            speaker_logits, targets_pil, target_lens
+        )
+        selected_logits = torch.stack(
+            (speaker_logits[0, 0], speaker_logits[0, 1], speaker_logits[1, 1])
+        )
+        selected_targets = torch.stack(
+            (targets_pil[0, 0], targets_pil[0, 1], targets_pil[1, 1])
+        )
+        expected_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+            selected_logits,
+            selected_targets,
+            reduction="none",
+        ).mean(dim=-1).mean()
+
+        assert torch.allclose(speech_bce_loss, expected_loss)
+
+        speech_bce_loss.backward()
+        assert torch.count_nonzero(speaker_logits.grad[0, :2]) > 0
+        assert torch.count_nonzero(speaker_logits.grad[0, 2:]) == 0
+        assert torch.count_nonzero(speaker_logits.grad[1, 0]) == 0
+        assert torch.count_nonzero(speaker_logits.grad[1, 1]) > 0
+        assert torch.count_nonzero(speaker_logits.grad[1, 2:]) == 0
+
+    @pytest.mark.unit
+    def test_speech_bce_loss_excludes_transition_collar(self, sortformer_model):
+        model = sortformer_model.eval()
+        model.speech_bce_collar_frames = 1
+
+        speaker_logits = torch.zeros(1, 7, 3, requires_grad=True)
+        targets_pil = torch.zeros_like(speaker_logits)
+        targets_pil[0, :2, 0] = 1.0
+        targets_pil[0, 2:5, 1] = 1.0
+        targets_pil[0, 5:, 0] = 1.0
+
+        speech_bce_loss = model._speech_bce_loss(
+            speaker_logits, targets_pil, torch.tensor([7])
+        )
+
+        assert torch.allclose(speech_bce_loss, torch.log(torch.tensor(2.0)))
+
+        speech_bce_loss.backward()
+        assert torch.count_nonzero(speaker_logits.grad[0, [0, 3, 6]]) > 0
+        assert torch.count_nonzero(speaker_logits.grad[0, [1, 2, 4, 5]]) == 0
+
+    @pytest.mark.unit
+    def test_speech_bce_loss_uses_global_ddp_frame_count(
+        self, sortformer_model, monkeypatch
+    ):
+        model = sortformer_model.eval()
+        model.speech_bce_collar_frames = 0
+
+        speaker_logits = torch.tensor(
+            [[[1.0, 0.0, -1.0], [-0.5, 0.5, 0.0]]],
+            requires_grad=True,
+        )
+        targets_pil = torch.zeros_like(speaker_logits)
+        targets_pil[0, 0, 0] = 1.0
+        targets_pil[0, 1, 1] = 1.0
+
+        def fake_all_reduce(count, op):
+            del op
+            count.add_(3.0)
+
+        monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+        monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+        speech_bce_loss = model._speech_bce_loss(
+            speaker_logits, targets_pil, torch.tensor([2])
+        )
+        local_frame_losses = torch.nn.functional.binary_cross_entropy_with_logits(
+            speaker_logits,
+            targets_pil,
+            reduction="none",
+        ).mean(dim=-1)
+
+        assert torch.allclose(
+            speech_bce_loss,
+            2.0 * local_frame_losses.sum() / 5.0,
+        )
+
+    @pytest.mark.unit
     def test_pil_aligned_windowed_presence_loss(self, sortformer_model):
         model = sortformer_model.eval()
         num_spks = model.sortformer_modules.n_spk
@@ -670,6 +785,7 @@ class TestSortformerEncLabelModelOffline:
             'val_ats_loss',
             'val_pil_loss',
             'val_rank_loss',
+            'val_speech_bce_loss',
             'val_pairwise_ats_loss',
             'val_self_ats_loss',
             'val_spkcount_loss',
@@ -692,6 +808,7 @@ class TestSortformerEncLabelModelOffline:
         metrics = sortformer_model.multi_validation_epoch_end(outputs)['log']
 
         assert torch.equal(metrics['val_rank_loss'], torch.tensor(2.0))
+        assert torch.equal(metrics['val_speech_bce_loss'], torch.tensor(2.0))
         assert torch.equal(metrics['val_activity_loss'], torch.tensor(2.0))
         assert torch.equal(metrics['val_presence_loss'], torch.tensor(2.0))
         assert torch.equal(metrics['val_dice_loss'], torch.tensor(2.0))

@@ -474,6 +474,24 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             )
         if self.rank_collar_frames < 0:
             raise ValueError(f"rank_collar_frames must be >= 0, got {self.rank_collar_frames}")
+        # PIL-aligned BCE restricted to non-silent frames. The per-frame BCE is
+        # averaged over the fixed speaker slots, then globally averaged over eligible
+        # frames across DDP workers.
+        self.speech_bce_weight = float(self._cfg.get("speech_bce_weight", 0.0))
+        if self.speech_bce_weight < 0.0:
+            raise ValueError(f"speech_bce_weight must be >= 0, got {self.speech_bce_weight}")
+        self.speech_bce_collar_frames = self._cfg.get("speech_bce_collar_frames", 0)
+        if not isinstance(self.speech_bce_collar_frames, int) or isinstance(
+            self.speech_bce_collar_frames, bool
+        ):
+            raise TypeError(
+                "speech_bce_collar_frames must be a non-negative integer, "
+                f"got {type(self.speech_bce_collar_frames).__name__}: {self.speech_bce_collar_frames}"
+            )
+        if self.speech_bce_collar_frames < 0:
+            raise ValueError(
+                f"speech_bce_collar_frames must be >= 0, got {self.speech_bce_collar_frames}"
+            )
         # pairwise_ats_weight and self_ats_weight are applied as raw multipliers on top of the
         # normalized PIL/ATS combination (intentionally NOT normalized with them).
         self.pairwise_ats_weight = self._cfg.get("pairwise_ats_weight", 0.0)
@@ -2460,6 +2478,34 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         activity_targets = hard_activity.sum(dim=-1).clamp(max=2)
         return self._masked_cross_entropy(activity_logits, activity_targets, target_lens)
 
+    @staticmethod
+    def _exclude_transition_collar(eligible, hard_targets, valid, collar_frames):
+        """Remove ``collar_frames`` on each side of every valid target transition."""
+        if collar_frames <= 0 or hard_targets.shape[1] <= 1:
+            return eligible
+
+        adjacent_valid = valid[:, :-1] & valid[:, 1:]
+        target_changes = (hard_targets[:, 1:] != hard_targets[:, :-1]).any(dim=-1)
+        target_changes &= adjacent_valid
+        transition_frames = torch.zeros_like(valid)
+        transition_frames[:, :-1] |= target_changes
+        transition_frames[:, 1:] |= target_changes
+
+        # The two transition endpoints already remove one frame on each side.
+        collar_extension = collar_frames - 1
+        if collar_extension > 0:
+            transition_frames = (
+                torch.nn.functional.max_pool1d(
+                    transition_frames.float().unsqueeze(1),
+                    kernel_size=2 * collar_extension + 1,
+                    stride=1,
+                    padding=collar_extension,
+                )
+                .squeeze(1)
+                .bool()
+            )
+        return eligible & ~transition_frames
+
     def _speaker_rank_loss(self, speaker_logits, targets_pil, target_lens):
         """
         Rank the PIL-matched active speaker above every inactive slot on exclusive frames.
@@ -2482,31 +2528,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             < target_lens.to(speaker_logits.device).unsqueeze(1)
         )
         eligible = hard_targets.sum(dim=-1) == 1
-
-        if self.rank_collar_frames > 0 and num_frames > 1:
-            adjacent_valid = valid[:, :-1] & valid[:, 1:]
-            target_changes = (hard_targets[:, 1:] != hard_targets[:, :-1]).any(dim=-1)
-            target_changes = target_changes & adjacent_valid
-            transition_frames = torch.zeros_like(valid)
-            transition_frames[:, :-1] |= target_changes
-            transition_frames[:, 1:] |= target_changes
-
-            # transition_frames already excludes one frame on each side. Expand it by
-            # collar-1 so rank_collar_frames denotes the total frames removed per side.
-            collar_extension = self.rank_collar_frames - 1
-            if collar_extension > 0:
-                transition_frames = (
-                    torch.nn.functional.max_pool1d(
-                        transition_frames.float().unsqueeze(1),
-                        kernel_size=2 * collar_extension + 1,
-                        stride=1,
-                        padding=collar_extension,
-                    )
-                    .squeeze(1)
-                    .bool()
-                )
-            eligible &= ~transition_frames
-
+        eligible = self._exclude_transition_collar(
+            eligible, hard_targets, valid, self.rank_collar_frames
+        )
         eligible &= valid
 
         with torch.autocast(device_type=speaker_logits.device.type, enabled=False):
@@ -2529,6 +2553,48 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         loss = world_size * local_loss_sum / global_eligible_count.clamp_min(1.0)
         return loss
+
+    def _speech_bce_loss(self, speaker_logits, targets_pil, target_lens):
+        """
+        Compute PIL-aligned BCE on clean frames containing at least one active speaker.
+
+        BCE is first averaged over the fixed speaker-slot dimension, then reduced over
+        all eligible frames in the effective DDP batch. Silence, padding, and the
+        configured transition collar do not contribute.
+        """
+        if speaker_logits is None:
+            return targets_pil.new_zeros((), dtype=torch.float32)
+
+        num_frames = speaker_logits.shape[1]
+        hard_targets = targets_pil > 0.5
+        valid = (
+            torch.arange(num_frames, device=speaker_logits.device).unsqueeze(0)
+            < target_lens.to(speaker_logits.device).unsqueeze(1)
+        )
+        eligible = hard_targets.any(dim=-1)
+        eligible = self._exclude_transition_collar(
+            eligible, hard_targets, valid, self.speech_bce_collar_frames
+        )
+        eligible &= valid
+
+        with torch.autocast(device_type=speaker_logits.device.type, enabled=False):
+            element_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                speaker_logits.float(),
+                targets_pil.float(),
+                reduction="none",
+            )
+            per_frame_loss = element_loss.mean(dim=-1)
+            local_loss_sum = per_frame_loss.masked_select(eligible).sum()
+
+        global_eligible_count = eligible.sum().to(
+            device=speaker_logits.device, dtype=torch.float32
+        )
+        world_size = 1
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(global_eligible_count, op=dist.ReduceOp.SUM)
+            world_size = dist.get_world_size()
+
+        return world_size * local_loss_sum / global_eligible_count.clamp_min(1.0)
 
     @staticmethod
     def _speaker_count_metrics(preds, targets, target_lens):
@@ -2704,6 +2770,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             probs=preds, labels=self._soften_targets_for_loss(targets_pil, target_lens), target_lens=target_lens
         )
         rank_loss = self._speaker_rank_loss(speaker_logits, targets_pil, target_lens)
+        speech_bce_loss = self._speech_bce_loss(speaker_logits, targets_pil, target_lens)
         pairwise_ats_loss = self._pairwise_ats_loss(preds, target_lens)
         self_ats_loss = self._self_ats_loss(preds, target_lens)
         spkcount_loss = self._spkcount_loss(preds, targets, target_lens)
@@ -2717,6 +2784,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             self.ats_weight * ats_loss
             + self.pil_weight * pil_loss
             + self.rank_weight * rank_loss
+            + self.speech_bce_weight * speech_bce_loss
             + self.pairwise_ats_weight * pairwise_ats_loss
             + self.self_ats_weight * self_ats_loss
             + self.spkcount_weight * spkcount_loss
@@ -2740,6 +2808,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'ats_loss': ats_loss,
             'pil_loss': pil_loss,
             'rank_loss': rank_loss,
+            'speech_bce_loss': speech_bce_loss,
             'pairwise_ats_loss': pairwise_ats_loss,
             'self_ats_loss': self_ats_loss,
             'spkcount_loss': spkcount_loss,
@@ -2893,6 +2962,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             probs=preds, labels=self._soften_targets_for_loss(targets_pil, target_lens), target_lens=target_lens
         )
         val_rank_loss = self._speaker_rank_loss(speaker_logits, targets_pil, target_lens)
+        val_speech_bce_loss = self._speech_bce_loss(speaker_logits, targets_pil, target_lens)
         val_pairwise_ats_loss = self._pairwise_ats_loss(preds, target_lens)
         val_self_ats_loss = self._self_ats_loss(preds, target_lens)
         val_spkcount_loss = self._spkcount_loss(preds, targets, target_lens)
@@ -2906,6 +2976,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             self.ats_weight * val_ats_loss
             + self.pil_weight * val_pil_loss
             + self.rank_weight * val_rank_loss
+            + self.speech_bce_weight * val_speech_bce_loss
             + self.pairwise_ats_weight * val_pairwise_ats_loss
             + self.self_ats_weight * val_self_ats_loss
             + self.spkcount_weight * val_spkcount_loss
@@ -2932,6 +3003,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'val_ats_loss': val_ats_loss,
             'val_pil_loss': val_pil_loss,
             'val_rank_loss': val_rank_loss,
+            'val_speech_bce_loss': val_speech_bce_loss,
             'val_pairwise_ats_loss': val_pairwise_ats_loss,
             'val_self_ats_loss': val_self_ats_loss,
             'val_spkcount_loss': val_spkcount_loss,
@@ -3020,6 +3092,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         val_ats_loss_mean = torch.stack([x['val_ats_loss'] for x in outputs]).mean()
         val_pil_loss_mean = torch.stack([x['val_pil_loss'] for x in outputs]).mean()
         val_rank_loss_mean = torch.stack([x['val_rank_loss'] for x in outputs]).mean()
+        val_speech_bce_loss_mean = torch.stack([x['val_speech_bce_loss'] for x in outputs]).mean()
         val_pairwise_ats_loss_mean = torch.stack([x['val_pairwise_ats_loss'] for x in outputs]).mean()
         val_self_ats_loss_mean = torch.stack([x['val_self_ats_loss'] for x in outputs]).mean()
         val_spkcount_loss_mean = torch.stack([x['val_spkcount_loss'] for x in outputs]).mean()
@@ -3043,6 +3116,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'val_ats_loss': val_ats_loss_mean,
             'val_pil_loss': val_pil_loss_mean,
             'val_rank_loss': val_rank_loss_mean,
+            'val_speech_bce_loss': val_speech_bce_loss_mean,
             'val_pairwise_ats_loss': val_pairwise_ats_loss_mean,
             'val_self_ats_loss': val_self_ats_loss_mean,
             'val_spkcount_loss': val_spkcount_loss_mean,
