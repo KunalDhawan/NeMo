@@ -582,6 +582,29 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.phantom_threshold = float(self._cfg.get("phantom_threshold", 0.25))
         if not 0.0 <= self.phantom_threshold < 1.0:
             raise ValueError(f"phantom_threshold must be in [0, 1), got {self.phantom_threshold}")
+        # Hard-negative BCE for speaker activity before the speaker's first PIL-aligned
+        # target arrival. Predictions within the grace window before arrival are tolerated;
+        # never-active target channels remain eligible throughout the valid sequence.
+        self.prearrival_weight = float(self._cfg.get("prearrival_weight", 0.0))
+        if self.prearrival_weight < 0.0:
+            raise ValueError(f"prearrival_weight must be >= 0, got {self.prearrival_weight}")
+        self.prearrival_threshold = float(self._cfg.get("prearrival_threshold", 0.25))
+        if not 0.0 <= self.prearrival_threshold < 1.0:
+            raise ValueError(
+                f"prearrival_threshold must be in [0, 1), got {self.prearrival_threshold}"
+            )
+        self.prearrival_grace_frames = self._cfg.get("prearrival_grace_frames", 0)
+        if not isinstance(self.prearrival_grace_frames, int) or isinstance(
+            self.prearrival_grace_frames, bool
+        ):
+            raise TypeError(
+                "prearrival_grace_frames must be a non-negative integer, "
+                f"got {type(self.prearrival_grace_frames).__name__}: {self.prearrival_grace_frames}"
+            )
+        if self.prearrival_grace_frames < 0:
+            raise ValueError(
+                f"prearrival_grace_frames must be >= 0, got {self.prearrival_grace_frames}"
+            )
         # Distance used by the self-ATS loss: 'bce' (default; matches the other losses but has
         # an entropy floor, so the logged value is > 0 even when perfectly self-consistent) or
         # 'mse' (no floor: value is 0 when self-consistent, and a gentler bounded gradient).
@@ -2720,6 +2743,52 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             loss = (channel_loss.sum(dim=1) / num_spks).mean()
         return loss.to(preds.dtype)
 
+    def _prearrival_loss(self, preds, targets_pil, target_lens):
+        """
+        Penalize high-confidence speaker activity substantially before first arrival.
+
+        A frame/channel pair is eligible when its detached prediction exceeds
+        ``prearrival_threshold`` and the PIL-aligned speaker has no target onset within
+        the prefix ending ``prearrival_grace_frames`` after that frame. Speakers with no
+        target activity in the valid sequence remain eligible throughout. Selected-frame
+        negative BCE is averaged per channel, then affected channels are summed and
+        divided by the fixed number of model speaker slots before the batch mean.
+        """
+        num_frames, num_spks = preds.shape[1], preds.shape[2]
+        valid = (
+            torch.arange(num_frames, device=preds.device).unsqueeze(0)
+            < target_lens.to(preds.device).unsqueeze(1)
+        )
+        valid_expanded = valid.unsqueeze(-1)
+        hard_targets = (targets_pil > 0.5) & valid_expanded
+
+        first_onsets = find_first_nonzero(
+            hard_targets,
+            max_cap_val=num_frames,
+        )
+        has_onset = first_onsets < num_frames
+        frame_indices = torch.arange(num_frames, device=preds.device).view(1, -1, 1)
+        safely_before_arrival = (
+            ~has_onset.unsqueeze(1)
+            | (
+                frame_indices + self.prearrival_grace_frames
+                < first_onsets.unsqueeze(1)
+            )
+        )
+        selected = (
+            valid_expanded
+            & safely_before_arrival
+            & (preds.detach() > self.prearrival_threshold)
+        )
+
+        with torch.autocast(device_type=preds.device.type, enabled=False):
+            negative_bce = -torch.log1p(-preds.float().clamp(max=1.0 - self.eps))
+            selected_loss = torch.where(selected, negative_bce, torch.zeros_like(negative_bce))
+            selected_count = selected.sum(dim=1)
+            channel_loss = selected_loss.sum(dim=1) / selected_count.clamp_min(1)
+            loss = (channel_loss.sum(dim=1) / num_spks).mean()
+        return loss.to(preds.dtype)
+
     def _get_aux_train_evaluations(
         self, preds, targets, target_lens, activity_logits=None, speaker_logits=None
     ) -> dict:
@@ -2780,6 +2849,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         presence_loss = self._presence_loss(preds, targets_pil, target_lens)
         dice_loss = self._dice_loss(preds, targets_pil, target_lens)
         phantom_loss = self._phantom_loss(preds, targets_pil, target_lens)
+        prearrival_loss = self._prearrival_loss(preds, targets_pil, target_lens)
         loss = (
             self.ats_weight * ats_loss
             + self.pil_weight * pil_loss
@@ -2792,6 +2862,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             + self.presence_weight * presence_loss
             + self.dice_weight * dice_loss
             + self.phantom_weight * phantom_loss
+            + self.prearrival_weight * prearrival_loss
         )
 
         self._accuracy_train(preds, targets_pil, target_lens)
@@ -2816,6 +2887,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'presence_loss': presence_loss,
             'dice_loss': dice_loss,
             'phantom_loss': phantom_loss,
+            'prearrival_loss': prearrival_loss,
             'learning_rate': self._optimizer.param_groups[0]['lr'],
             'train_f1_acc': train_f1_acc,
             'train_precision': train_precision,
@@ -2972,6 +3044,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         val_presence_loss = self._presence_loss(preds, targets_pil, target_lens)
         val_dice_loss = self._dice_loss(preds, targets_pil, target_lens)
         val_phantom_loss = self._phantom_loss(preds, targets_pil, target_lens)
+        val_prearrival_loss = self._prearrival_loss(preds, targets_pil, target_lens)
         val_loss = (
             self.ats_weight * val_ats_loss
             + self.pil_weight * val_pil_loss
@@ -2984,6 +3057,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             + self.presence_weight * val_presence_loss
             + self.dice_weight * val_dice_loss
             + self.phantom_weight * val_phantom_loss
+            + self.prearrival_weight * val_prearrival_loss
         )
 
         self._accuracy_valid(preds, targets_pil, target_lens)
@@ -3011,6 +3085,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'val_presence_loss': val_presence_loss,
             'val_dice_loss': val_dice_loss,
             'val_phantom_loss': val_phantom_loss,
+            'val_prearrival_loss': val_prearrival_loss,
             'val_f1_acc': val_f1_acc,
             'val_precision': val_precision,
             'val_recall': val_recall,
@@ -3100,6 +3175,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         val_presence_loss_mean = torch.stack([x['val_presence_loss'] for x in outputs]).mean()
         val_dice_loss_mean = torch.stack([x['val_dice_loss'] for x in outputs]).mean()
         val_phantom_loss_mean = torch.stack([x['val_phantom_loss'] for x in outputs]).mean()
+        val_prearrival_loss_mean = torch.stack([x['val_prearrival_loss'] for x in outputs]).mean()
         val_f1_acc_mean = torch.stack([x['val_f1_acc'] for x in outputs]).mean()
         val_precision_mean = torch.stack([x['val_precision'] for x in outputs]).mean()
         val_recall_mean = torch.stack([x['val_recall'] for x in outputs]).mean()
@@ -3124,6 +3200,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'val_presence_loss': val_presence_loss_mean,
             'val_dice_loss': val_dice_loss_mean,
             'val_phantom_loss': val_phantom_loss_mean,
+            'val_prearrival_loss': val_prearrival_loss_mean,
             'val_f1_acc': val_f1_acc_mean,
             'val_precision': val_precision_mean,
             'val_recall': val_recall_mean,

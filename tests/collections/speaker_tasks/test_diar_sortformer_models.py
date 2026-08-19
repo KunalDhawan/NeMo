@@ -756,6 +756,57 @@ class TestSortformerEncLabelModelOffline:
         assert torch.count_nonzero(one_phantom.grad[0, 3]) == 0
 
     @pytest.mark.unit
+    def test_prearrival_loss_penalizes_only_activity_safely_before_first_onset(
+        self, sortformer_model
+    ):
+        model = sortformer_model.eval()
+        model.prearrival_threshold = 0.25
+        model.prearrival_grace_frames = 1
+
+        num_spks = model.sortformer_modules.n_spk
+        preds = torch.full((1, 7, num_spks), 0.1)
+        targets_pil = torch.zeros_like(preds)
+        target_lens = torch.tensor([6])
+        targets_pil[0, 2:, 0] = 1.0  # speaker 0 first arrives at frame 2
+        targets_pil[0, 5, 1] = 1.0  # speaker 1 first arrives at frame 5
+        targets_pil[0, 6, 3] = 1.0  # padding: speaker 3 is target-empty in valid frames
+
+        # Speaker 0: only frame 0 is earlier than the one-frame grace window.
+        preds[0, 0, 0] = 0.5
+        preds[0, 1, 0] = 0.9
+        preds[0, 3, 0] = 0.9
+        # Speaker 1: two selected frames are averaged within the channel.
+        preds[0, 1, 1] = 0.5
+        preds[0, 2, 1] = 0.75
+        preds[0, 4, 1] = 0.9
+        # Never-active speakers remain eligible throughout valid frames.
+        preds[0, 4, 2] = 0.6
+        preds[0, 5, 3] = 0.4
+        # Padding and sub-threshold predictions are ignored.
+        preds[0, 6, 3] = 0.9
+        preds.requires_grad_()
+
+        prearrival_loss = model._prearrival_loss(preds, targets_pil, target_lens)
+        channel_losses = torch.stack(
+            (
+                -torch.log(torch.tensor(0.5)),
+                (-torch.log(torch.tensor(0.5)) - torch.log(torch.tensor(0.25))) / 2,
+                -torch.log(torch.tensor(0.4)),
+                -torch.log(torch.tensor(0.6)),
+            )
+        )
+        assert torch.allclose(prearrival_loss, channel_losses.sum() / num_spks)
+
+        prearrival_loss.backward()
+        selected = torch.zeros_like(preds, dtype=torch.bool)
+        selected[0, 0, 0] = True
+        selected[0, 1:3, 1] = True
+        selected[0, 4, 2] = True
+        selected[0, 5, 3] = True
+        assert torch.all(preds.grad[selected] > 0)
+        assert torch.count_nonzero(preds.grad[~selected]) == 0
+
+    @pytest.mark.unit
     def test_global_speaker_count_metrics(self, sortformer_model):
         num_spks = sortformer_model.sortformer_modules.n_spk
         preds = torch.zeros(3, 4, num_spks)
@@ -793,6 +844,7 @@ class TestSortformerEncLabelModelOffline:
             'val_presence_loss',
             'val_dice_loss',
             'val_phantom_loss',
+            'val_prearrival_loss',
             'val_f1_acc',
             'val_precision',
             'val_recall',
@@ -813,6 +865,7 @@ class TestSortformerEncLabelModelOffline:
         assert torch.equal(metrics['val_presence_loss'], torch.tensor(2.0))
         assert torch.equal(metrics['val_dice_loss'], torch.tensor(2.0))
         assert torch.equal(metrics['val_phantom_loss'], torch.tensor(2.0))
+        assert torch.equal(metrics['val_prearrival_loss'], torch.tensor(2.0))
 
 
 class TestSortformerEncLabelModelStreaming:

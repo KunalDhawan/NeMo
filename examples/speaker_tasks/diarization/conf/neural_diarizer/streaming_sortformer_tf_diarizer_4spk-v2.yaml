@@ -40,6 +40,9 @@ model:
   dice_min_target_frames: 120 # Minimum target-positive frames required for a speaker channel to contribute to Dice (120 = 1.2s for osf=1)
   phantom_weight: 0.0 # Weight for hard-negative BCE on PIL-empty speaker channels; each extra phantom channel adds a penalty
   phantom_threshold: 0.25 # Only predictions above this probability contribute to the phantom loss
+  prearrival_weight: 0.0 # Weight for hard-negative BCE on speaker activity before first PIL target arrival
+  prearrival_threshold: 0.25 # Only predictions above this probability contribute to the prearrival loss
+  prearrival_grace_frames: 0 # Frames before first target arrival where early predictions are tolerated
   presence_window_radius: 3 # Presence max-pooling radius d in output frames, using [t-d, t+d] (3 = +/-240ms at 80ms output)
   presence_negative_margin: 0.4 # Locally absent channels are penalized only above this probability, preserving low-confidence hedging
   max_num_of_spks: 4
