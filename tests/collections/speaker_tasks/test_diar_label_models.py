@@ -16,7 +16,7 @@ import pytest
 import torch
 from omegaconf import DictConfig
 
-from nemo.collections.asr.losses import BCELoss
+from nemo.collections.asr.losses import BCELoss, BCEWithLogitsLoss
 from nemo.collections.asr.models import EncDecDiarLabelModel
 
 
@@ -205,3 +205,30 @@ class TestBCELoss:
         loss = BCELoss(reduction=reduction)
         result = loss(probs=probs, labels=labels, target_lens=target_lens)
         assert torch.allclose(result, expected_output), f"Expected {expected_output}, but got {result}"
+
+    @pytest.mark.unit
+    def test_with_logits_positive_weight_and_padding(self):
+        logits = torch.tensor(
+            [[[0.3, -0.7], [10.0, -10.0]]],
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        labels = torch.tensor(
+            [[[0.75, 0.0], [0.0, 1.0]]],
+            dtype=torch.float32,
+        )
+        target_lens = torch.tensor([1])
+        pos_weight = 1.5
+
+        loss = BCEWithLogitsLoss(reduction="mean", pos_weight=pos_weight)
+        result = loss(logits=logits, labels=labels, target_lens=target_lens)
+        expected = torch.nn.functional.binary_cross_entropy_with_logits(
+            logits[:, :1],
+            labels[:, :1],
+            pos_weight=torch.tensor(pos_weight),
+        )
+
+        assert torch.allclose(result, expected)
+        result.backward()
+        assert torch.count_nonzero(logits.grad[:, :1]) > 0
+        assert torch.count_nonzero(logits.grad[:, 1:]) == 0

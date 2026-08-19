@@ -102,9 +102,9 @@ def sortformer_model():
     }
 
     loss = {
-        '_target_': 'nemo.collections.asr.losses.bce_loss.BCELoss',
-        'weight': None,
+        '_target_': 'nemo.collections.asr.losses.bce_loss.BCEWithLogitsLoss',
         'reduction': 'mean',
+        'pos_weight': 1.0,
     }
 
     modelConfig = DictConfig(
@@ -387,6 +387,43 @@ class TestSortformerEncLabelModelOffline:
         activity_loss.backward()
         assert torch.count_nonzero(perfect_preds.grad[:, :3]) > 0
         assert torch.count_nonzero(perfect_preds.grad[:, 3:]) == 0
+
+    @pytest.mark.unit
+    def test_self_ats_bce_uses_logits_and_ignores_padding(self, sortformer_model):
+        model = sortformer_model.eval()
+        model.self_ats_metric = "bce"
+        model.self_ats_temperature = 0.5
+        num_spks = model.sortformer_modules.n_spk
+
+        sorted_logits = torch.full((1, 4, num_spks), -4.0)
+        sorted_logits[0, 0, 0] = 4.0
+        sorted_logits[0, 1, 1] = 4.0
+        sorted_logits[0, 2, 2] = 4.0
+        sorted_logits[0, 3, 3] = 10.0  # padding must not define an onset
+        sorted_logits.requires_grad_()
+
+        sorted_loss = model._self_ats_loss(sorted_logits, torch.tensor([3]))
+        assert sorted_loss > 0  # BCE entropy floor
+        sorted_loss.backward()
+        assert torch.allclose(
+            sorted_logits.grad,
+            torch.zeros_like(sorted_logits.grad),
+            atol=1e-6,
+        )
+
+        misordered_logits = sorted_logits.detach().clone()
+        misordered_logits[0, 0, 0] = -4.0
+        misordered_logits[0, 1, 0] = 4.0
+        misordered_logits[0, 0, 1] = 4.0
+        misordered_logits[0, 1, 1] = -4.0
+        misordered_logits.requires_grad_()
+
+        misordered_loss = model._self_ats_loss(
+            misordered_logits, torch.tensor([3])
+        )
+        misordered_loss.backward()
+        assert torch.count_nonzero(misordered_logits.grad[:, :3]) > 0
+        assert torch.count_nonzero(misordered_logits.grad[:, 3:]) == 0
 
     @pytest.mark.unit
     def test_speaker_rank_loss_matches_margin_formula_and_masks_frames(self, sortformer_model):
@@ -722,43 +759,44 @@ class TestSortformerEncLabelModelOffline:
         targets_pil[0, 0, 0] = 1.0
         target_lens = torch.tensor([3])
 
-        one_phantom = torch.full_like(targets_pil, 0.1)
+        one_phantom_probs = torch.full_like(targets_pil, 0.1)
         # Activity on a non-empty channel is outside the scope of this loss.
-        one_phantom[0, :3, 0] = 0.9
+        one_phantom_probs[0, :3, 0] = 0.9
         # Two selected frames on one empty channel.
-        one_phantom[0, 1, 1] = 0.5
-        one_phantom[0, 2, 1] = 0.75
+        one_phantom_probs[0, 1, 1] = 0.5
+        one_phantom_probs[0, 2, 1] = 0.75
         # An empty channel below the threshold and activity in padding are ignored.
-        one_phantom[0, 1, 2] = sortformer_model.phantom_threshold - 0.01
-        one_phantom[0, 3, 3] = 0.9
-        one_phantom.requires_grad_()
+        one_phantom_probs[0, 1, 2] = sortformer_model.phantom_threshold - 0.01
+        one_phantom_probs[0, 3, 3] = 0.9
+        one_phantom_logits = torch.logit(one_phantom_probs).requires_grad_()
 
         one_phantom_loss = sortformer_model._phantom_loss(
-            one_phantom, targets_pil, target_lens
+            one_phantom_logits, targets_pil, target_lens
         )
         expected_channel_loss = (-torch.log(torch.tensor(0.5)) - torch.log(torch.tensor(0.25))) / 2
         assert torch.allclose(one_phantom_loss, expected_channel_loss / num_spks)
 
         # The fixed speaker-slot denominator makes a second identical phantom
         # channel add an equal amount to the loss.
-        two_phantoms = one_phantom.detach().clone()
-        two_phantoms[0, 1, 2] = 0.5
-        two_phantoms[0, 2, 2] = 0.75
+        two_phantom_probs = one_phantom_probs.clone()
+        two_phantom_probs[0, 1, 2] = 0.5
+        two_phantom_probs[0, 2, 2] = 0.75
+        two_phantom_logits = torch.logit(two_phantom_probs)
         two_phantom_loss = sortformer_model._phantom_loss(
-            two_phantoms, targets_pil, target_lens
+            two_phantom_logits, targets_pil, target_lens
         )
         assert torch.allclose(two_phantom_loss, 2 * one_phantom_loss)
 
         one_phantom_loss.backward()
-        assert torch.all(one_phantom.grad[0, 1:3, 1] > 0)
-        assert torch.count_nonzero(one_phantom.grad[0, :, 0]) == 0
-        assert one_phantom.grad[0, 1, 2] == 0
-        assert torch.count_nonzero(one_phantom.grad[0, 3]) == 0
+        assert torch.all(one_phantom_logits.grad[0, 1:3, 1] > 0)
+        assert torch.count_nonzero(one_phantom_logits.grad[0, :, 0]) == 0
+        assert one_phantom_logits.grad[0, 1, 2] == 0
+        assert torch.count_nonzero(one_phantom_logits.grad[0, 3]) == 0
 
         sortformer_model.phantom_logmeanexp = True
         sortformer_model.phantom_logmeanexp_temperature = 0.5
         logmeanexp_loss = sortformer_model._phantom_loss(
-            one_phantom.detach(), targets_pil, target_lens
+            one_phantom_logits.detach(), targets_pil, target_lens
         )
         selected_losses = torch.stack(
             (-torch.log(torch.tensor(0.5)), -torch.log(torch.tensor(0.25)))
@@ -782,29 +820,31 @@ class TestSortformerEncLabelModelOffline:
         model.prearrival_grace_frames = 1
 
         num_spks = model.sortformer_modules.n_spk
-        preds = torch.full((1, 7, num_spks), 0.1)
-        targets_pil = torch.zeros_like(preds)
+        probs = torch.full((1, 7, num_spks), 0.1)
+        targets_pil = torch.zeros_like(probs)
         target_lens = torch.tensor([6])
         targets_pil[0, 2:, 0] = 1.0  # speaker 0 first arrives at frame 2
         targets_pil[0, 5, 1] = 1.0  # speaker 1 first arrives at frame 5
         targets_pil[0, 6, 3] = 1.0  # padding: speaker 3 is target-empty in valid frames
 
         # Speaker 0: only frame 0 is earlier than the one-frame grace window.
-        preds[0, 0, 0] = 0.5
-        preds[0, 1, 0] = 0.9
-        preds[0, 3, 0] = 0.9
+        probs[0, 0, 0] = 0.5
+        probs[0, 1, 0] = 0.9
+        probs[0, 3, 0] = 0.9
         # Speaker 1: two selected frames are averaged within the channel.
-        preds[0, 1, 1] = 0.5
-        preds[0, 2, 1] = 0.75
-        preds[0, 4, 1] = 0.9
+        probs[0, 1, 1] = 0.5
+        probs[0, 2, 1] = 0.75
+        probs[0, 4, 1] = 0.9
         # Never-active speakers remain eligible throughout valid frames.
-        preds[0, 4, 2] = 0.6
-        preds[0, 5, 3] = 0.4
+        probs[0, 4, 2] = 0.6
+        probs[0, 5, 3] = 0.4
         # Padding and sub-threshold predictions are ignored.
-        preds[0, 6, 3] = 0.9
-        preds.requires_grad_()
+        probs[0, 6, 3] = 0.9
+        speaker_logits = torch.logit(probs).requires_grad_()
 
-        prearrival_loss = model._prearrival_loss(preds, targets_pil, target_lens)
+        prearrival_loss = model._prearrival_loss(
+            speaker_logits, targets_pil, target_lens
+        )
         channel_losses = torch.stack(
             (
                 -torch.log(torch.tensor(0.5)),
@@ -816,18 +856,18 @@ class TestSortformerEncLabelModelOffline:
         assert torch.allclose(prearrival_loss, channel_losses.sum() / num_spks)
 
         prearrival_loss.backward()
-        selected = torch.zeros_like(preds, dtype=torch.bool)
+        selected = torch.zeros_like(speaker_logits, dtype=torch.bool)
         selected[0, 0, 0] = True
         selected[0, 1:3, 1] = True
         selected[0, 4, 2] = True
         selected[0, 5, 3] = True
-        assert torch.all(preds.grad[selected] > 0)
-        assert torch.count_nonzero(preds.grad[~selected]) == 0
+        assert torch.all(speaker_logits.grad[selected] > 0)
+        assert torch.count_nonzero(speaker_logits.grad[~selected]) == 0
 
         model.prearrival_logmeanexp = True
         model.prearrival_logmeanexp_temperature = 0.5
         logmeanexp_loss = model._prearrival_loss(
-            preds.detach(), targets_pil, target_lens
+            speaker_logits.detach(), targets_pil, target_lens
         )
         speaker_one_losses = torch.stack(
             (-torch.log(torch.tensor(0.5)), -torch.log(torch.tensor(0.25)))

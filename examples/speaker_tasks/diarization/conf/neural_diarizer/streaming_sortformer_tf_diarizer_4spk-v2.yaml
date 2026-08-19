@@ -261,9 +261,9 @@ model:
     pre_ln_final_layer_norm: True
   
   loss: 
-    _target_: nemo.collections.asr.losses.bce_loss.BCELoss
-    weight: null
+    _target_: nemo.collections.asr.losses.bce_loss.BCEWithLogitsLoss
     reduction: mean
+    pos_weight: 1.0
 
   lr: 0.0001
   optim:

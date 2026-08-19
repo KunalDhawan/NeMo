@@ -2334,9 +2334,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         )  # (N, N), True where i > j
         p_lower = p_before[:, lower_tri].clamp(max=1.0 - self.eps)  # (B, num_pairs)
         loss = -torch.log1p(-p_lower)  # BCE(P, target=0) = -log(1 - P)
-        return loss.mean().to(preds.dtype)
+        return loss.mean()
 
-    def _self_ats_loss(self, preds, target_lens):
+    def _self_ats_loss(self, speaker_logits, target_lens):
         """
         Compute a self-referential Arrival Time Sort (self-ATS) loss.
 
@@ -2366,43 +2366,67 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
               kept), avoiding spurious swap gradients between equally-onset channels.
 
         Args:
-            preds (torch.Tensor): Predicted probabilities of shape (B, T, N).
+            speaker_logits (torch.Tensor): Raw speaker logits of shape (B, T, N).
             target_lens (torch.Tensor): Valid sequence lengths of shape (B,).
 
         Returns:
             torch.Tensor: Scalar self-ATS loss.
         """
-        num_spks = preds.shape[2]
+        num_spks = speaker_logits.shape[2]
         if num_spks < 2:
-            return torch.zeros((), device=preds.device, dtype=preds.dtype)
+            return torch.zeros(
+                (), device=speaker_logits.device, dtype=speaker_logits.dtype
+            )
+        valid = (
+            torch.arange(
+                speaker_logits.shape[1], device=speaker_logits.device
+            ).unsqueeze(0)
+            < target_lens.to(speaker_logits.device).unsqueeze(1)
+        )
 
         # Predicted onset (first frame above threshold) per channel; empty channels -> T.
         # Temperature sharpening is monotonic and preserves the 0.5 threshold, so onsets (and
         # therefore the permutation) are computed from the original predictions.
-        onsets = find_first_nonzero(preds.detach(), max_cap_val=preds.shape[1])  # (B, N)
+        preds = torch.sigmoid(speaker_logits) * valid.unsqueeze(-1)
+        onsets = find_first_nonzero(
+            preds.detach(), max_cap_val=speaker_logits.shape[1]
+        )  # (B, N)
         # Permutation sorting channels by predicted onset; stable keeps current order on ties.
         perm = torch.argsort(onsets, dim=1, stable=True)  # (B, N)
 
-        # Optionally sharpen predictions; applied symmetrically so the loss stays
-        # zero/zero-gradient when sorted (see docstring). T == 1.0 leaves preds untouched.
-        preds_s = self._sharpen_probs(preds, self.self_ats_temperature)
+        # Sharpen in logit space; applying sigmoid produces the same probabilities as
+        # sigmoid(logit(preds) / T) without recovering logits from rounded probabilities.
+        logits_s = speaker_logits / self.self_ats_temperature
+        preds_s = torch.sigmoid(logits_s)
 
         # Onset-sorted target: position k receives the content of the k-th earliest channel.
-        index = perm.unsqueeze(1).expand(-1, preds.shape[1], -1)  # (B, T, N)
+        index = perm.unsqueeze(1).expand(
+            -1, speaker_logits.shape[1], -1
+        )  # (B, T, N)
         self_ats_target = torch.gather(preds_s, dim=2, index=index).detach()  # (B, T, N)
 
         if self.self_ats_metric == "mse":
             # Masked mean squared error over valid frames (no entropy floor; 0 when sorted).
-            num_frames = preds.shape[1]
-            valid = (
-                torch.arange(num_frames, device=preds.device).unsqueeze(0)
-                < target_lens.to(preds.device).unsqueeze(1)
-            ).to(preds.dtype)  # (B, T)
-            sq_err = ((preds_s - self_ats_target) ** 2) * valid.unsqueeze(-1)  # (B, T, N)
-            denom = valid.sum() * preds.shape[2]  # valid (frame, channel) element count
+            valid_float = valid.to(speaker_logits.dtype)
+            sq_err = (
+                (preds_s - self_ats_target) ** 2
+            ) * valid_float.unsqueeze(-1)  # (B, T, N)
+            denom = (
+                valid_float.sum() * speaker_logits.shape[2]
+            )  # valid (frame, channel) element count
             return sq_err.sum() / denom.clamp_min(1.0)
 
-        return self.loss(probs=preds_s, labels=self_ats_target, target_lens=target_lens)
+        with torch.autocast(device_type=speaker_logits.device.type, enabled=False):
+            element_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                logits_s.float(),
+                self_ats_target.float(),
+                reduction="none",
+            )
+            denominator = valid.sum() * speaker_logits.shape[2]
+            loss = (
+                element_loss * valid.unsqueeze(-1)
+            ).sum() / denominator.clamp_min(1)
+        return loss
 
     def _spkcount_loss(self, preds, targets, target_lens):
         """
@@ -2468,7 +2492,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             c_pred, c_gt, beta=1.0 / num_spks, reduction="none"
         ) * valid  # (B, T)
         loss = err.sum() / valid.sum().clamp_min(1.0)
-        return loss.to(preds.dtype)
+        return loss
 
     @staticmethod
     def _masked_cross_entropy(logits, labels, target_lens):
@@ -2486,7 +2510,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             < target_lens.to(logits.device).unsqueeze(1)
         )
         loss = loss * valid
-        return (loss.sum() / valid.sum().clamp_min(1)).to(logits.dtype)
+        return loss.sum() / valid.sum().clamp_min(1)
 
     def _activity_logits_from_speaker_preds(self, preds):
         """
@@ -2707,7 +2731,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             element_loss = positive_loss + negative_loss
         element_loss = element_loss * valid_expanded
         denominator = valid.sum() * num_spks
-        return (element_loss.sum() / denominator.clamp_min(1)).to(preds.dtype)
+        return element_loss.sum() / denominator.clamp_min(1)
 
     def _dice_loss(self, preds, targets_pil, target_lens):
         """
@@ -2735,7 +2759,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             target_frame_count = (targets_valid > 0.5).sum(dim=1)
             eligible_channels = target_frame_count >= self.dice_min_target_frames
             loss = ((1.0 - dice_score) * eligible_channels).mean()
-        return loss.to(preds.dtype)
+        return loss
 
     @staticmethod
     def _aggregate_selected_frame_losses(
@@ -2772,7 +2796,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         )
         return torch.where(has_selected, channel_loss, torch.zeros_like(channel_loss))
 
-    def _phantom_loss(self, preds, targets_pil, target_lens):
+    def _phantom_loss(self, speaker_logits, targets_pil, target_lens):
         """
         Penalize high-confidence predictions on PIL-aligned empty speaker channels.
 
@@ -2785,21 +2809,22 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         ground-truth speakers. Active channels, sub-threshold predictions, and padding
         contribute zero.
         """
-        num_frames, num_spks = preds.shape[1], preds.shape[2]
+        num_frames, num_spks = speaker_logits.shape[1], speaker_logits.shape[2]
         valid = (
-            torch.arange(num_frames, device=preds.device).unsqueeze(0)
-            < target_lens.to(preds.device).unsqueeze(1)
+            torch.arange(num_frames, device=speaker_logits.device).unsqueeze(0)
+            < target_lens.to(speaker_logits.device).unsqueeze(1)
         )
         valid_expanded = valid.unsqueeze(-1)
         empty_channels = ~((targets_pil > 0.5) & valid_expanded).any(dim=1)
+        preds = torch.sigmoid(speaker_logits.detach())
         selected = (
             valid_expanded
             & empty_channels.unsqueeze(1)
-            & (preds.detach() > self.phantom_threshold)
+            & (preds > self.phantom_threshold)
         )
 
-        with torch.autocast(device_type=preds.device.type, enabled=False):
-            negative_bce = -torch.log1p(-preds.float().clamp(max=1.0 - self.eps))
+        with torch.autocast(device_type=speaker_logits.device.type, enabled=False):
+            negative_bce = torch.nn.functional.softplus(speaker_logits.float())
             channel_loss = self._aggregate_selected_frame_losses(
                 negative_bce,
                 selected,
@@ -2807,9 +2832,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 temperature=self.phantom_logmeanexp_temperature,
             )
             loss = (channel_loss.sum(dim=1) / num_spks).mean()
-        return loss.to(preds.dtype)
+        return loss
 
-    def _prearrival_loss(self, preds, targets_pil, target_lens):
+    def _prearrival_loss(self, speaker_logits, targets_pil, target_lens):
         """
         Penalize high-confidence speaker activity substantially before first arrival.
 
@@ -2821,10 +2846,10 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         temperature-controlled log-mean-exp, then affected channels are summed and
         divided by the fixed number of model speaker slots before the batch mean.
         """
-        num_frames, num_spks = preds.shape[1], preds.shape[2]
+        num_frames, num_spks = speaker_logits.shape[1], speaker_logits.shape[2]
         valid = (
-            torch.arange(num_frames, device=preds.device).unsqueeze(0)
-            < target_lens.to(preds.device).unsqueeze(1)
+            torch.arange(num_frames, device=speaker_logits.device).unsqueeze(0)
+            < target_lens.to(speaker_logits.device).unsqueeze(1)
         )
         valid_expanded = valid.unsqueeze(-1)
         hard_targets = (targets_pil > 0.5) & valid_expanded
@@ -2834,7 +2859,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             max_cap_val=num_frames,
         )
         has_onset = first_onsets < num_frames
-        frame_indices = torch.arange(num_frames, device=preds.device).view(1, -1, 1)
+        frame_indices = torch.arange(
+            num_frames, device=speaker_logits.device
+        ).view(1, -1, 1)
         safely_before_arrival = (
             ~has_onset.unsqueeze(1)
             | (
@@ -2845,11 +2872,14 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         selected = (
             valid_expanded
             & safely_before_arrival
-            & (preds.detach() > self.prearrival_threshold)
+            & (
+                torch.sigmoid(speaker_logits.detach())
+                > self.prearrival_threshold
+            )
         )
 
-        with torch.autocast(device_type=preds.device.type, enabled=False):
-            negative_bce = -torch.log1p(-preds.float().clamp(max=1.0 - self.eps))
+        with torch.autocast(device_type=speaker_logits.device.type, enabled=False):
+            negative_bce = torch.nn.functional.softplus(speaker_logits.float())
             channel_loss = self._aggregate_selected_frame_losses(
                 negative_bce,
                 selected,
@@ -2857,7 +2887,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 temperature=self.prearrival_logmeanexp_temperature,
             )
             loss = (channel_loss.sum(dim=1) / num_spks).mean()
-        return loss.to(preds.dtype)
+        return loss
 
     def _get_aux_train_evaluations(
         self, preds, targets, target_lens, activity_logits=None, speaker_logits=None
@@ -2902,24 +2932,32 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         )
         # Soften only the loss targets (boundary + label smoothing); metrics below
         # keep using the original hard targets so F1/accuracy stay unaffected.
+        targets_ats_loss = self._soften_targets_for_loss(targets_ats, target_lens)
+        targets_pil_loss = self._soften_targets_for_loss(targets_pil, target_lens)
         ats_loss = self.loss(
-            probs=preds, labels=self._soften_targets_for_loss(targets_ats, target_lens), target_lens=target_lens
+            logits=speaker_logits,
+            labels=targets_ats_loss,
+            target_lens=target_lens,
         )
         pil_loss = self.loss(
-            probs=preds, labels=self._soften_targets_for_loss(targets_pil, target_lens), target_lens=target_lens
+            logits=speaker_logits,
+            labels=targets_pil_loss,
+            target_lens=target_lens,
         )
         rank_loss = self._speaker_rank_loss(speaker_logits, targets_pil, target_lens)
         speech_bce_loss = self._speech_bce_loss(speaker_logits, targets_pil, target_lens)
         pairwise_ats_loss = self._pairwise_ats_loss(preds, target_lens)
-        self_ats_loss = self._self_ats_loss(preds, target_lens)
+        self_ats_loss = self._self_ats_loss(speaker_logits, target_lens)
         spkcount_loss = self._spkcount_loss(preds, targets, target_lens)
         if self.activity_weight > 0.0 and self.activity_loss_mode == "speaker_preds":
             activity_logits = self._activity_logits_from_speaker_preds(preds)
         activity_loss = self._activity_loss(activity_logits, targets, target_lens)
         presence_loss = self._presence_loss(preds, targets_pil, target_lens)
         dice_loss = self._dice_loss(preds, targets_pil, target_lens)
-        phantom_loss = self._phantom_loss(preds, targets_pil, target_lens)
-        prearrival_loss = self._prearrival_loss(preds, targets_pil, target_lens)
+        phantom_loss = self._phantom_loss(speaker_logits, targets_pil, target_lens)
+        prearrival_loss = self._prearrival_loss(
+            speaker_logits, targets_pil, target_lens
+        )
         loss = (
             self.ats_weight * ats_loss
             + self.pil_weight * pil_loss
@@ -3097,24 +3135,34 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         # Soften only the loss targets (boundary + label smoothing); metrics below
         # keep using the original hard targets so F1/accuracy stay unaffected.
+        targets_ats_loss = self._soften_targets_for_loss(targets_ats, target_lens)
+        targets_pil_loss = self._soften_targets_for_loss(targets_pil, target_lens)
         val_ats_loss = self.loss(
-            probs=preds, labels=self._soften_targets_for_loss(targets_ats, target_lens), target_lens=target_lens
+            logits=speaker_logits,
+            labels=targets_ats_loss,
+            target_lens=target_lens,
         )
         val_pil_loss = self.loss(
-            probs=preds, labels=self._soften_targets_for_loss(targets_pil, target_lens), target_lens=target_lens
+            logits=speaker_logits,
+            labels=targets_pil_loss,
+            target_lens=target_lens,
         )
         val_rank_loss = self._speaker_rank_loss(speaker_logits, targets_pil, target_lens)
         val_speech_bce_loss = self._speech_bce_loss(speaker_logits, targets_pil, target_lens)
         val_pairwise_ats_loss = self._pairwise_ats_loss(preds, target_lens)
-        val_self_ats_loss = self._self_ats_loss(preds, target_lens)
+        val_self_ats_loss = self._self_ats_loss(speaker_logits, target_lens)
         val_spkcount_loss = self._spkcount_loss(preds, targets, target_lens)
         if self.activity_weight > 0.0 and self.activity_loss_mode == "speaker_preds":
             activity_logits = self._activity_logits_from_speaker_preds(preds)
         val_activity_loss = self._activity_loss(activity_logits, targets, target_lens)
         val_presence_loss = self._presence_loss(preds, targets_pil, target_lens)
         val_dice_loss = self._dice_loss(preds, targets_pil, target_lens)
-        val_phantom_loss = self._phantom_loss(preds, targets_pil, target_lens)
-        val_prearrival_loss = self._prearrival_loss(preds, targets_pil, target_lens)
+        val_phantom_loss = self._phantom_loss(
+            speaker_logits, targets_pil, target_lens
+        )
+        val_prearrival_loss = self._prearrival_loss(
+            speaker_logits, targets_pil, target_lens
+        )
         val_loss = (
             self.ats_weight * val_ats_loss
             + self.pil_weight * val_pil_loss

@@ -160,17 +160,25 @@ class BCEWithLogitsLoss(Loss, Typing):
     def __init__(
         self,
         reduction: str = 'mean',
+        pos_weight: float = 1.0,
     ):
         """
-        A custom loss function that supports class normalization,
-        weighted binary cross-entropy, and optional sorting.
+        Binary cross-entropy with logits over valid sequence frames.
 
         Args:
             reduction (str): Specifies the reduction to apply to the output,
                 options are 'mean', 'sum', or 'none'. Default is 'mean'.
+            pos_weight (float): Multiplicative weight on the positive BCE term.
+                ``1.0`` preserves standard unweighted BCE. Must be positive.
         """
         super().__init__()
-        self.loss_f = torch.nn.BCEWithLogitsLoss(reduction=reduction)
+        pos_weight = float(pos_weight)
+        if pos_weight <= 0.0:
+            raise ValueError(f"pos_weight must be > 0, got {pos_weight}")
+        self.loss_f = torch.nn.BCEWithLogitsLoss(
+            reduction=reduction,
+            pos_weight=torch.tensor(pos_weight),
+        )
 
     @typecheck()
     def forward(self, logits, labels, target_lens):
@@ -193,5 +201,6 @@ class BCEWithLogitsLoss(Loss, Typing):
         targets_list = [labels[k, : target_lens[k], :] for k in range(labels.shape[0])]
         logits = torch.cat(logits_list, dim=0)
         labels = torch.cat(targets_list, dim=0)
-        loss = self.loss_f(logits, labels)
+        with torch.autocast(device_type=logits.device.type, enabled=False):
+            loss = self.loss_f(logits.float(), labels.float())
         return loss
