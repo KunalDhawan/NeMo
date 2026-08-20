@@ -572,6 +572,12 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             raise ValueError(
                 f"dice_min_target_frames must be >= 1, got {self.dice_min_target_frames}"
             )
+        self.dice_duration_gamma = float(self._cfg.get("dice_duration_gamma", 0.0))
+        if not 0.0 <= self.dice_duration_gamma <= 1.0:
+            raise ValueError(
+                "dice_duration_gamma must be in [0, 1], "
+                f"got {self.dice_duration_gamma}"
+            )
         # Hard-negative BCE for phantom speakers. Only PIL-aligned channels with no
         # target activity are eligible, and only predictions above the threshold are
         # penalized. Each channel is reduced over its selected frames before the channel
@@ -2737,12 +2743,12 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         """
         Compute PIL-aligned soft Dice loss for target-present speaker channels.
 
-        Dice is reduced independently over time for every sample/speaker channel,
-        then channels with fewer than ``dice_min_target_frames`` positive hard-target
-        frames are zeroed before averaging over the fixed batch and model speaker-slot
-        dimensions. This preserves the eligible-channel gradient scale, leaves empty
-        channel suppression to the phantom loss, and leaves very short speakers to the
-        primary BCE criterion.
+        Dice is reduced independently over time for every sample/speaker channel.
+        Channels with fewer than ``dice_min_target_frames`` positive hard-target frames
+        are excluded. Each remaining channel is weighted by
+        ``target_mass ** dice_duration_gamma`` and the weighted mean is reduced over
+        the effective DDP batch. Gamma zero gives every eligible speaker equal weight;
+        gamma one weights speakers in proportion to target duration.
         """
         valid = (
             torch.arange(preds.shape[1], device=preds.device).unsqueeze(0)
@@ -2758,8 +2764,20 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             dice_score = (2.0 * intersection + 1.0) / (pred_mass + target_mass + 1.0)
             target_frame_count = (targets_valid > 0.5).sum(dim=1)
             eligible_channels = target_frame_count >= self.dice_min_target_frames
-            loss = ((1.0 - dice_score) * eligible_channels).mean()
-        return loss
+            channel_weights = torch.where(
+                eligible_channels,
+                target_mass.pow(self.dice_duration_gamma),
+                torch.zeros_like(target_mass),
+            ).detach()
+            local_weighted_loss = ((1.0 - dice_score) * channel_weights).sum()
+
+        global_weight_sum = channel_weights.sum()
+        world_size = 1
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(global_weight_sum, op=dist.ReduceOp.SUM)
+            world_size = dist.get_world_size()
+
+        return world_size * local_weighted_loss / global_weight_sum.clamp_min(1.0)
 
     @staticmethod
     def _aggregate_selected_frame_losses(

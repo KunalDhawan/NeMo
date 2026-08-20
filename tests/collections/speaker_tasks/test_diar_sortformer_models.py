@@ -753,6 +753,61 @@ class TestSortformerEncLabelModelOffline:
         assert eligible_speaker_loss > short_speaker_loss
 
     @pytest.mark.unit
+    def test_dice_loss_weights_speakers_by_target_duration(self, sortformer_model):
+        model = sortformer_model
+        model.dice_min_target_frames = 1
+        model.dice_duration_gamma = 0.5
+
+        targets_pil = torch.zeros(1, 4, 2)
+        targets_pil[0, 0, 0] = 1.0
+        targets_pil[0, :, 1] = 1.0
+        preds = torch.zeros_like(targets_pil, requires_grad=True)
+        target_lens = torch.tensor([4])
+
+        weighted_loss = model._dice_loss(preds, targets_pil, target_lens)
+        # With zero predictions and smooth=1, losses are 1/2 and 4/5.
+        # Gamma 0.5 gives target-mass weights sqrt(1)=1 and sqrt(4)=2.
+        expected_weighted = (
+            torch.tensor(0.5) + 2.0 * torch.tensor(0.8)
+        ) / 3.0
+        assert torch.allclose(weighted_loss, expected_weighted)
+
+        model.dice_duration_gamma = 0.0
+        equal_speaker_loss = model._dice_loss(preds, targets_pil, target_lens)
+        assert torch.allclose(
+            equal_speaker_loss,
+            (torch.tensor(0.5) + torch.tensor(0.8)) / 2.0,
+        )
+
+        weighted_loss.backward()
+        assert torch.count_nonzero(preds.grad) > 0
+
+    @pytest.mark.unit
+    def test_dice_loss_uses_global_ddp_weight_sum(self, sortformer_model, monkeypatch):
+        model = sortformer_model
+        model.dice_min_target_frames = 1
+        model.dice_duration_gamma = 0.5
+
+        targets_pil = torch.zeros(1, 4, 2)
+        targets_pil[0, 0, 0] = 1.0
+        targets_pil[0, :, 1] = 1.0
+        preds = torch.zeros_like(targets_pil)
+        target_lens = torch.tensor([4])
+
+        def fake_all_reduce(weight_sum, op):
+            del op
+            weight_sum.add_(5.0)
+
+        monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+        monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+        loss = model._dice_loss(preds, targets_pil, target_lens)
+        local_weighted_sum = torch.tensor(0.5) + 2.0 * torch.tensor(0.8)
+        assert torch.allclose(loss, 2.0 * local_weighted_sum / 8.0)
+
+    @pytest.mark.unit
     def test_phantom_loss_penalizes_only_high_confidence_empty_channels(self, sortformer_model):
         num_spks = sortformer_model.sortformer_modules.n_spk
         targets_pil = torch.zeros(1, 4, num_spks)

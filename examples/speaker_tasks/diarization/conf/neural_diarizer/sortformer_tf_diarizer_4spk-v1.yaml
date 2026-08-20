@@ -34,6 +34,7 @@ model:
   presence_weight: 0.0 # Weight for PIL-aligned local speaker-presence BCE; penalizes short fake speakers independent of segment duration
   dice_weight: 0.0 # Weight for PIL-aligned soft Dice loss with smooth=1; only target-present speaker channels contribute
   dice_min_target_frames: 15 # Minimum target-positive frames required for a speaker channel to contribute to Dice (15 = 1.2s)
+  dice_duration_gamma: 0.5 # Target-duration exponent for eligible-speaker weighting; 0 gives equal speaker weight
   phantom_weight: 0.0 # Weight for hard-negative BCE on PIL-empty speaker channels; each extra phantom channel adds a penalty
   phantom_threshold: 0.25 # Only predictions above this probability contribute to the phantom loss
   phantom_logmeanexp: false # Use temperature-controlled log-mean-exp instead of mean over selected frames
