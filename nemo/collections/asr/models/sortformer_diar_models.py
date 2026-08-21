@@ -317,6 +317,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         self.eps = 0.004   # bf16-safe epsilon
         self.negative_init_val = -99
+        self._reported_nonfinite_grad = False
         self.loss = instantiate(self._cfg.loss)
 
         # Loss-only target softening. These transforms are applied exclusively to the
@@ -3045,6 +3046,45 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                         f"{sched.max_steps} -> {max_steps} from trainer config."
                     )
                     sched.max_steps = max_steps
+
+    def on_before_optimizer_step(self, optimizer):
+        """
+        Report the first non-finite gradient encountered before an optimizer step.
+
+        Lightning calls this hook once gradients are accumulated and all-reduced, but
+        before clipping. That ordering is what makes the check useful: norm-based
+        clipping scales every gradient by a single shared coefficient, so one NaN
+        element turns the global norm into NaN and writes NaN into all parameters and
+        into the optimizer moment buffers, which training never recovers from. Under
+        bf16 there is no gradient scaler to detect this, so nothing else in the step
+        inspects finiteness.
+
+        Only the first event is reported; afterwards every step would repeat it.
+        """
+        if self._reported_nonfinite_grad:
+            return
+
+        grads = [param.grad for param in self.parameters() if param.grad is not None]
+        if not grads:
+            return
+
+        # Single host sync for the whole model. The per-parameter scan that names the
+        # culprit runs only after a hit, so the healthy path stays cheap.
+        if torch.stack([torch.isfinite(grad).all() for grad in grads]).all():
+            return
+
+        self._reported_nonfinite_grad = True
+        for name, param in self.named_parameters():
+            if param.grad is None or torch.isfinite(param.grad).all():
+                continue
+            logging.error(
+                f"Non-finite gradient at step {self.global_step} in '{name}': "
+                f"{torch.isnan(param.grad).sum().item()} NaNs, "
+                f"{torch.isinf(param.grad).sum().item()} Infs out of {param.grad.numel()} "
+                "elements. Gradient clipping will propagate this to every parameter. "
+                "Further occurrences will not be reported."
+            )
+            break
 
     def training_step(self, batch: list, batch_idx: int) -> dict:
         """
