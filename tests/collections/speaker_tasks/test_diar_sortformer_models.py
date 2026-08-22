@@ -658,6 +658,252 @@ class TestSortformerEncLabelModelOffline:
         )
 
     @pytest.mark.unit
+    def test_interior_focal_loss_uses_strict_regions_and_joint_class_mean(
+        self, sortformer_model
+    ):
+        model = sortformer_model.eval()
+        model.interior_focal_gamma = 2.0
+        model.interior_focal_positive_radius = 1
+        model.interior_focal_negative_radius = 1
+
+        speaker_logits = torch.linspace(-2.0, 2.0, 22).reshape(1, 11, 2)
+        speaker_logits.requires_grad_()
+        targets_pil = torch.zeros_like(speaker_logits)
+        targets_pil[0, 3:8, 0] = 1.0
+        targets_pil[0, 5, 1] = 1.0
+        target_lens = torch.tensor([11])
+
+        positive_eligible = torch.zeros_like(targets_pil, dtype=torch.bool)
+        positive_eligible[0, 4:7, 0] = True
+        negative_eligible = torch.zeros_like(targets_pil, dtype=torch.bool)
+        negative_eligible[0, [1, 9], 0] = True
+        negative_eligible[0, 1:4, 1] = True
+        negative_eligible[0, 7:10, 1] = True
+
+        focal_loss = model._interior_focal_loss(
+            speaker_logits, targets_pil, target_lens
+        )
+        positive_loss = (
+            torch.sigmoid(-speaker_logits).pow(model.interior_focal_gamma)
+            * torch.nn.functional.softplus(-speaker_logits)
+        )
+        negative_loss = (
+            torch.sigmoid(speaker_logits).pow(model.interior_focal_gamma)
+            * torch.nn.functional.softplus(speaker_logits)
+        )
+        expected = (
+            positive_loss.masked_select(positive_eligible).sum()
+            + negative_loss.masked_select(negative_eligible).sum()
+        ) / (positive_eligible.sum() + negative_eligible.sum())
+
+        assert torch.allclose(focal_loss, expected)
+
+        focal_loss.backward()
+        eligible = positive_eligible | negative_eligible
+        assert torch.count_nonzero(speaker_logits.grad[eligible]) > 0
+        assert torch.count_nonzero(speaker_logits.grad[~eligible]) == 0
+
+    @pytest.mark.unit
+    def test_interior_focal_loss_uses_global_ddp_eligible_count(
+        self, sortformer_model, monkeypatch
+    ):
+        model = sortformer_model.eval()
+        model.interior_focal_gamma = 2.0
+        model.interior_focal_positive_radius = 1
+        model.interior_focal_negative_radius = 1
+
+        speaker_logits = torch.linspace(-2.0, 2.0, 22).reshape(1, 11, 2)
+        targets_pil = torch.zeros_like(speaker_logits)
+        targets_pil[0, 3:8, 0] = 1.0
+        targets_pil[0, 5, 1] = 1.0
+        target_lens = torch.tensor([11])
+
+        positive_eligible = torch.zeros_like(targets_pil, dtype=torch.bool)
+        positive_eligible[0, 4:7, 0] = True
+        negative_eligible = torch.zeros_like(targets_pil, dtype=torch.bool)
+        negative_eligible[0, [1, 9], 0] = True
+        negative_eligible[0, 1:4, 1] = True
+        negative_eligible[0, 7:10, 1] = True
+        local_count = positive_eligible.sum() + negative_eligible.sum()
+        local_sum = (
+            (
+                torch.sigmoid(-speaker_logits).pow(model.interior_focal_gamma)
+                * torch.nn.functional.softplus(-speaker_logits)
+            )
+            .masked_select(positive_eligible)
+            .sum()
+            + (
+                torch.sigmoid(speaker_logits).pow(model.interior_focal_gamma)
+                * torch.nn.functional.softplus(speaker_logits)
+            )
+            .masked_select(negative_eligible)
+            .sum()
+        )
+
+        def fake_all_reduce(count, op):
+            del op
+            count.add_(7.0)
+
+        monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+        monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+        loss = model._interior_focal_loss(
+            speaker_logits, targets_pil, target_lens
+        )
+        assert torch.allclose(loss, 2.0 * local_sum / (local_count + 7.0))
+
+    @pytest.mark.unit
+    def test_purity_focal_loss_uses_soft_purity_weights(
+        self, sortformer_model
+    ):
+        model = sortformer_model.eval()
+        model.purity_focal_gamma = 2.0
+        model.purity_focal_power = 2.0
+        model.purity_focal_positive_radius = 1
+        model.purity_focal_negative_radius = 1
+
+        speaker_logits = torch.linspace(-2.0, 2.0, 22).reshape(1, 11, 2)
+        speaker_logits.requires_grad_()
+        targets_pil = torch.zeros_like(speaker_logits)
+        targets_pil[0, 3:8, 0] = 1.0
+        targets_pil[0, 5, 1] = 0.6
+        target_lens = torch.tensor([10])
+        valid = (
+            torch.arange(speaker_logits.shape[1]).unsqueeze(0)
+            < target_lens.unsqueeze(1)
+        ).unsqueeze(-1)
+        positive_support = targets_pil * valid
+        negative_support = (1.0 - targets_pil) * valid
+        positive_purity = torch.nn.functional.avg_pool1d(
+            positive_support.transpose(1, 2),
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            count_include_pad=True,
+        ).transpose(1, 2)
+        negative_purity = torch.nn.functional.avg_pool1d(
+            negative_support.transpose(1, 2),
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            count_include_pad=True,
+        ).transpose(1, 2)
+        positive_weight = (
+            positive_support
+            * positive_purity.pow(model.purity_focal_power)
+        )
+        negative_weight = (
+            negative_support
+            * negative_purity.pow(model.purity_focal_power)
+        )
+
+        focal_loss = model._purity_focal_loss(
+            speaker_logits, targets_pil, target_lens
+        )
+        positive_loss = (
+            torch.sigmoid(-speaker_logits).pow(model.purity_focal_gamma)
+            * torch.nn.functional.softplus(-speaker_logits)
+        )
+        negative_loss = (
+            torch.sigmoid(speaker_logits).pow(model.purity_focal_gamma)
+            * torch.nn.functional.softplus(speaker_logits)
+        )
+        expected = (
+            positive_weight * positive_loss
+            + negative_weight * negative_loss
+        ).sum() / (positive_weight.sum() + negative_weight.sum())
+
+        assert torch.allclose(focal_loss, expected)
+
+        focal_loss.backward()
+        assert torch.count_nonzero(speaker_logits.grad[:, :10]) > 0
+        assert torch.count_nonzero(speaker_logits.grad[:, 10:]) == 0
+
+        model.purity_focal_gamma = 0.0
+        model.purity_focal_power = 0.0
+        gamma_zero_loss = model._purity_focal_loss(
+            speaker_logits.detach(), targets_pil, target_lens
+        )
+        expected_bce = torch.nn.functional.binary_cross_entropy_with_logits(
+            speaker_logits.detach()[:, :10],
+            targets_pil[:, :10],
+        )
+        assert torch.allclose(gamma_zero_loss, expected_bce)
+
+    @pytest.mark.unit
+    def test_purity_focal_loss_uses_global_ddp_weight_sum(
+        self, sortformer_model, monkeypatch
+    ):
+        model = sortformer_model.eval()
+        model.purity_focal_gamma = 2.0
+        model.purity_focal_power = 2.0
+        model.purity_focal_positive_radius = 1
+        model.purity_focal_negative_radius = 1
+
+        speaker_logits = torch.linspace(-2.0, 2.0, 22).reshape(1, 11, 2)
+        targets_pil = torch.zeros_like(speaker_logits)
+        targets_pil[0, 3:8, 0] = 1.0
+        targets_pil[0, 5, 1] = 0.6
+        target_lens = torch.tensor([10])
+        valid = (
+            torch.arange(speaker_logits.shape[1]).unsqueeze(0)
+            < target_lens.unsqueeze(1)
+        ).unsqueeze(-1)
+        positive_support = targets_pil * valid
+        negative_support = (1.0 - targets_pil) * valid
+        positive_purity = torch.nn.functional.avg_pool1d(
+            positive_support.transpose(1, 2),
+            3,
+            stride=1,
+            padding=1,
+            count_include_pad=True,
+        ).transpose(1, 2)
+        negative_purity = torch.nn.functional.avg_pool1d(
+            negative_support.transpose(1, 2),
+            3,
+            stride=1,
+            padding=1,
+            count_include_pad=True,
+        ).transpose(1, 2)
+        positive_weight = (
+            positive_support
+            * positive_purity.pow(model.purity_focal_power)
+        )
+        negative_weight = (
+            negative_support
+            * negative_purity.pow(model.purity_focal_power)
+        )
+        positive_loss = (
+            torch.sigmoid(-speaker_logits).pow(model.purity_focal_gamma)
+            * torch.nn.functional.softplus(-speaker_logits)
+        )
+        negative_loss = (
+            torch.sigmoid(speaker_logits).pow(model.purity_focal_gamma)
+            * torch.nn.functional.softplus(speaker_logits)
+        )
+        local_sum = (
+            positive_weight * positive_loss
+            + negative_weight * negative_loss
+        ).sum()
+        local_weight_sum = positive_weight.sum() + negative_weight.sum()
+
+        def fake_all_reduce(weight_sum, op):
+            del op
+            weight_sum.add_(7.0)
+
+        monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+        monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+        loss = model._purity_focal_loss(
+            speaker_logits, targets_pil, target_lens
+        )
+        assert torch.allclose(loss, 2.0 * local_sum / (local_weight_sum + 7.0))
+
+    @pytest.mark.unit
     def test_pil_aligned_windowed_presence_loss(self, sortformer_model):
         model = sortformer_model.eval()
         num_spks = model.sortformer_modules.n_spk
@@ -976,6 +1222,8 @@ class TestSortformerEncLabelModelOffline:
             'val_pil_loss',
             'val_rank_loss',
             'val_speech_bce_loss',
+            'val_interior_focal_loss',
+            'val_purity_focal_loss',
             'val_pairwise_ats_loss',
             'val_self_ats_loss',
             'val_spkcount_loss',
@@ -1000,6 +1248,8 @@ class TestSortformerEncLabelModelOffline:
 
         assert torch.equal(metrics['val_rank_loss'], torch.tensor(2.0))
         assert torch.equal(metrics['val_speech_bce_loss'], torch.tensor(2.0))
+        assert torch.equal(metrics['val_interior_focal_loss'], torch.tensor(2.0))
+        assert torch.equal(metrics['val_purity_focal_loss'], torch.tensor(2.0))
         assert torch.equal(metrics['val_activity_loss'], torch.tensor(2.0))
         assert torch.equal(metrics['val_presence_loss'], torch.tensor(2.0))
         assert torch.equal(metrics['val_dice_loss'], torch.tensor(2.0))

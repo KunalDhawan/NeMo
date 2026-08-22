@@ -493,6 +493,70 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             raise ValueError(
                 f"speech_bce_collar_frames must be >= 0, got {self.speech_bce_collar_frames}"
             )
+        # PIL-aligned focal BCE on stable interiors of positive and negative regions.
+        # Positive and negative terms share one global eligible frame/channel denominator,
+        # preserving their natural class-frequency imbalance.
+        self.interior_focal_weight = float(self._cfg.get("interior_focal_weight", 0.0))
+        if self.interior_focal_weight < 0.0:
+            raise ValueError(
+                f"interior_focal_weight must be >= 0, got {self.interior_focal_weight}"
+            )
+        self.interior_focal_gamma = float(self._cfg.get("interior_focal_gamma", 2.0))
+        if self.interior_focal_gamma < 0.0:
+            raise ValueError(
+                f"interior_focal_gamma must be >= 0, got {self.interior_focal_gamma}"
+            )
+        self.interior_focal_positive_radius = self._cfg.get(
+            "interior_focal_positive_radius", 0
+        )
+        self.interior_focal_negative_radius = self._cfg.get(
+            "interior_focal_negative_radius", 0
+        )
+        for name, value in (
+            ("interior_focal_positive_radius", self.interior_focal_positive_radius),
+            ("interior_focal_negative_radius", self.interior_focal_negative_radius),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(
+                    f"{name} must be a non-negative integer, "
+                    f"got {type(value).__name__}: {value}"
+                )
+            if value < 0:
+                raise ValueError(f"{name} must be >= 0, got {value}")
+        # Soft-purity focal BCE. Center targets weight their positive/negative terms,
+        # and local target purity smoothly suppresses boundaries and short regions.
+        self.purity_focal_weight = float(self._cfg.get("purity_focal_weight", 0.0))
+        if self.purity_focal_weight < 0.0:
+            raise ValueError(
+                f"purity_focal_weight must be >= 0, got {self.purity_focal_weight}"
+            )
+        self.purity_focal_gamma = float(self._cfg.get("purity_focal_gamma", 2.0))
+        if self.purity_focal_gamma < 0.0:
+            raise ValueError(
+                f"purity_focal_gamma must be >= 0, got {self.purity_focal_gamma}"
+            )
+        self.purity_focal_power = float(self._cfg.get("purity_focal_power", 2.0))
+        if self.purity_focal_power < 0.0:
+            raise ValueError(
+                f"purity_focal_power must be >= 0, got {self.purity_focal_power}"
+            )
+        self.purity_focal_positive_radius = self._cfg.get(
+            "purity_focal_positive_radius", 0
+        )
+        self.purity_focal_negative_radius = self._cfg.get(
+            "purity_focal_negative_radius", 0
+        )
+        for name, value in (
+            ("purity_focal_positive_radius", self.purity_focal_positive_radius),
+            ("purity_focal_negative_radius", self.purity_focal_negative_radius),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(
+                    f"{name} must be a non-negative integer, "
+                    f"got {type(value).__name__}: {value}"
+                )
+            if value < 0:
+                raise ValueError(f"{name} must be >= 0, got {value}")
         # pairwise_ats_weight and self_ats_weight are applied as raw multipliers on top of the
         # normalized PIL/ATS combination (intentionally NOT normalized with them).
         self.pairwise_ats_weight = self._cfg.get("pairwise_ats_weight", 0.0)
@@ -2677,6 +2741,177 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         return world_size * local_loss_sum / global_eligible_count.clamp_min(1.0)
 
     @staticmethod
+    def _full_window_region_mask(frame_condition, valid, radius):
+        """Keep frames whose complete centered window satisfies ``frame_condition``."""
+        stable = frame_condition & valid.unsqueeze(-1)
+        if radius <= 0:
+            return stable
+
+        batch_size, num_frames, num_spks = stable.shape
+        kernel_size = 2 * radius + 1
+        flat_stable = stable.transpose(1, 2).reshape(
+            batch_size * num_spks, 1, num_frames
+        )
+        kernel = torch.ones(
+            (1, 1, kernel_size),
+            device=stable.device,
+            dtype=torch.float32,
+        )
+        window_count = torch.nn.functional.conv1d(
+            flat_stable.float(),
+            kernel,
+            padding=radius,
+        )
+        return (
+            window_count.eq(float(kernel_size))
+            .reshape(batch_size, num_spks, num_frames)
+            .transpose(1, 2)
+        )
+
+    @staticmethod
+    def _local_window_mean(values, radius):
+        """Compute a centered local mean with zero support outside the sequence."""
+        if radius <= 0:
+            return values
+
+        batch_size, num_frames, num_spks = values.shape
+        kernel_size = 2 * radius + 1
+        flat_values = values.transpose(1, 2).reshape(
+            batch_size * num_spks, 1, num_frames
+        )
+        kernel = torch.full(
+            (1, 1, kernel_size),
+            1.0 / kernel_size,
+            device=values.device,
+            dtype=torch.float32,
+        )
+        local_mean = torch.nn.functional.conv1d(
+            flat_values.float(),
+            kernel,
+            padding=radius,
+        )
+        return (
+            local_mean
+            .reshape(batch_size, num_spks, num_frames)
+            .transpose(1, 2)
+        )
+
+    def _interior_focal_loss(self, speaker_logits, targets_pil, target_lens):
+        """
+        Compute focal BCE on strict interiors of PIL-aligned activity and silence.
+
+        Positive frames require every target in the centered positive-radius window
+        to exceed 0.5. Negative frames analogously require every target in the
+        negative-radius window to be below 0.5. Windows crossing padding or sequence
+        boundaries are ineligible. Positive and negative losses share one global DDP
+        denominator, preserving their natural eligible-frame class imbalance.
+        """
+        if speaker_logits is None:
+            return targets_pil.new_zeros((), dtype=torch.float32)
+
+        num_frames = speaker_logits.shape[1]
+        valid = (
+            torch.arange(num_frames, device=speaker_logits.device).unsqueeze(0)
+            < target_lens.to(speaker_logits.device).unsqueeze(1)
+        )
+        positive_eligible = self._full_window_region_mask(
+            targets_pil > 0.5,
+            valid,
+            self.interior_focal_positive_radius,
+        )
+        negative_eligible = self._full_window_region_mask(
+            targets_pil < 0.5,
+            valid,
+            self.interior_focal_negative_radius,
+        )
+
+        with torch.autocast(device_type=speaker_logits.device.type, enabled=False):
+            logits_f = speaker_logits.float()
+            positive_loss = (
+                torch.sigmoid(-logits_f).pow(self.interior_focal_gamma)
+                * torch.nn.functional.softplus(-logits_f)
+            )
+            negative_loss = (
+                torch.sigmoid(logits_f).pow(self.interior_focal_gamma)
+                * torch.nn.functional.softplus(logits_f)
+            )
+            local_loss_sum = positive_loss.masked_select(
+                positive_eligible
+            ).sum() + negative_loss.masked_select(negative_eligible).sum()
+
+        global_eligible_count = (
+            positive_eligible.sum() + negative_eligible.sum()
+        ).to(device=speaker_logits.device, dtype=torch.float32)
+        world_size = 1
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(global_eligible_count, op=dist.ReduceOp.SUM)
+            world_size = dist.get_world_size()
+
+        return world_size * local_loss_sum / global_eligible_count.clamp_min(1.0)
+
+    def _purity_focal_loss(self, speaker_logits, targets_pil, target_lens):
+        """
+        Compute focal BCE weighted by local PIL target purity.
+
+        Positive and negative center weights are multiplied by their corresponding
+        centered-window target purity raised to ``purity_focal_power``.
+        Invalid and out-of-sequence frames contribute zero support, smoothly reducing
+        boundary weights. Positive and negative terms share one global DDP weight
+        denominator, preserving their effective weighted class imbalance.
+        """
+        if speaker_logits is None:
+            return targets_pil.new_zeros((), dtype=torch.float32)
+
+        num_frames = speaker_logits.shape[1]
+        valid = (
+            torch.arange(num_frames, device=speaker_logits.device).unsqueeze(0)
+            < target_lens.to(speaker_logits.device).unsqueeze(1)
+        )
+        valid_expanded = valid.unsqueeze(-1)
+        targets_f = targets_pil.float().clamp(min=0.0, max=1.0)
+        positive_support = targets_f * valid_expanded
+        negative_support = (1.0 - targets_f) * valid_expanded
+        positive_purity = self._local_window_mean(
+            positive_support,
+            self.purity_focal_positive_radius,
+        )
+        negative_purity = self._local_window_mean(
+            negative_support,
+            self.purity_focal_negative_radius,
+        )
+        positive_weight = (
+            positive_support
+            * positive_purity.pow(self.purity_focal_power)
+        ).detach()
+        negative_weight = (
+            negative_support
+            * negative_purity.pow(self.purity_focal_power)
+        ).detach()
+
+        with torch.autocast(device_type=speaker_logits.device.type, enabled=False):
+            logits_f = speaker_logits.float()
+            positive_loss = (
+                torch.sigmoid(-logits_f).pow(self.purity_focal_gamma)
+                * torch.nn.functional.softplus(-logits_f)
+            )
+            negative_loss = (
+                torch.sigmoid(logits_f).pow(self.purity_focal_gamma)
+                * torch.nn.functional.softplus(logits_f)
+            )
+            local_loss_sum = (
+                positive_weight * positive_loss
+                + negative_weight * negative_loss
+            ).sum()
+
+        global_weight_sum = positive_weight.sum() + negative_weight.sum()
+        world_size = 1
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(global_weight_sum, op=dist.ReduceOp.SUM)
+            world_size = dist.get_world_size()
+
+        return world_size * local_loss_sum / global_weight_sum.clamp_min(1.0)
+
+    @staticmethod
     def _speaker_count_metrics(preds, targets, target_lens):
         """Compute per-sample global speaker-count MAE and exact-match accuracy."""
         valid = (
@@ -2965,6 +3200,12 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         )
         rank_loss = self._speaker_rank_loss(speaker_logits, targets_pil, target_lens)
         speech_bce_loss = self._speech_bce_loss(speaker_logits, targets_pil, target_lens)
+        interior_focal_loss = self._interior_focal_loss(
+            speaker_logits, targets_pil, target_lens
+        )
+        purity_focal_loss = self._purity_focal_loss(
+            speaker_logits, targets_pil, target_lens
+        )
         pairwise_ats_loss = self._pairwise_ats_loss(preds, target_lens)
         self_ats_loss = self._self_ats_loss(speaker_logits, target_lens)
         spkcount_loss = self._spkcount_loss(preds, targets, target_lens)
@@ -2982,6 +3223,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             + self.pil_weight * pil_loss
             + self.rank_weight * rank_loss
             + self.speech_bce_weight * speech_bce_loss
+            + self.interior_focal_weight * interior_focal_loss
+            + self.purity_focal_weight * purity_focal_loss
             + self.pairwise_ats_weight * pairwise_ats_loss
             + self.self_ats_weight * self_ats_loss
             + self.spkcount_weight * spkcount_loss
@@ -3007,6 +3250,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'pil_loss': pil_loss,
             'rank_loss': rank_loss,
             'speech_bce_loss': speech_bce_loss,
+            'interior_focal_loss': interior_focal_loss,
+            'purity_focal_loss': purity_focal_loss,
             'pairwise_ats_loss': pairwise_ats_loss,
             'self_ats_loss': self_ats_loss,
             'spkcount_loss': spkcount_loss,
@@ -3207,6 +3452,12 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         )
         val_rank_loss = self._speaker_rank_loss(speaker_logits, targets_pil, target_lens)
         val_speech_bce_loss = self._speech_bce_loss(speaker_logits, targets_pil, target_lens)
+        val_interior_focal_loss = self._interior_focal_loss(
+            speaker_logits, targets_pil, target_lens
+        )
+        val_purity_focal_loss = self._purity_focal_loss(
+            speaker_logits, targets_pil, target_lens
+        )
         val_pairwise_ats_loss = self._pairwise_ats_loss(preds, target_lens)
         val_self_ats_loss = self._self_ats_loss(speaker_logits, target_lens)
         val_spkcount_loss = self._spkcount_loss(preds, targets, target_lens)
@@ -3226,6 +3477,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             + self.pil_weight * val_pil_loss
             + self.rank_weight * val_rank_loss
             + self.speech_bce_weight * val_speech_bce_loss
+            + self.interior_focal_weight * val_interior_focal_loss
+            + self.purity_focal_weight * val_purity_focal_loss
             + self.pairwise_ats_weight * val_pairwise_ats_loss
             + self.self_ats_weight * val_self_ats_loss
             + self.spkcount_weight * val_spkcount_loss
@@ -3254,6 +3507,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'val_pil_loss': val_pil_loss,
             'val_rank_loss': val_rank_loss,
             'val_speech_bce_loss': val_speech_bce_loss,
+            'val_interior_focal_loss': val_interior_focal_loss,
+            'val_purity_focal_loss': val_purity_focal_loss,
             'val_pairwise_ats_loss': val_pairwise_ats_loss,
             'val_self_ats_loss': val_self_ats_loss,
             'val_spkcount_loss': val_spkcount_loss,
@@ -3344,6 +3599,12 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         val_pil_loss_mean = torch.stack([x['val_pil_loss'] for x in outputs]).mean()
         val_rank_loss_mean = torch.stack([x['val_rank_loss'] for x in outputs]).mean()
         val_speech_bce_loss_mean = torch.stack([x['val_speech_bce_loss'] for x in outputs]).mean()
+        val_interior_focal_loss_mean = torch.stack(
+            [x['val_interior_focal_loss'] for x in outputs]
+        ).mean()
+        val_purity_focal_loss_mean = torch.stack(
+            [x['val_purity_focal_loss'] for x in outputs]
+        ).mean()
         val_pairwise_ats_loss_mean = torch.stack([x['val_pairwise_ats_loss'] for x in outputs]).mean()
         val_self_ats_loss_mean = torch.stack([x['val_self_ats_loss'] for x in outputs]).mean()
         val_spkcount_loss_mean = torch.stack([x['val_spkcount_loss'] for x in outputs]).mean()
@@ -3369,6 +3630,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'val_pil_loss': val_pil_loss_mean,
             'val_rank_loss': val_rank_loss_mean,
             'val_speech_bce_loss': val_speech_bce_loss_mean,
+            'val_interior_focal_loss': val_interior_focal_loss_mean,
+            'val_purity_focal_loss': val_purity_focal_loss_mean,
             'val_pairwise_ats_loss': val_pairwise_ats_loss_mean,
             'val_self_ats_loss': val_self_ats_loss_mean,
             'val_spkcount_loss': val_spkcount_loss_mean,

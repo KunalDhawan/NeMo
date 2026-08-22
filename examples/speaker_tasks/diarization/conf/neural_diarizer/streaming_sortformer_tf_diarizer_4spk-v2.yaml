@@ -25,6 +25,15 @@ model:
   rank_collar_frames: 0 # Output frames excluded on each side of every target-speaker transition
   speech_bce_weight: 0.0 # Weight for PIL-aligned BCE on non-silent frames; raw multiplier, 0 disables
   speech_bce_collar_frames: 0 # Output frames excluded on each side of target transitions for speech BCE
+  interior_focal_weight: 0.0 # Weight for focal BCE on stable interiors of target activity and silence
+  interior_focal_gamma: 2.0 # Focal exponent; 0 reduces to BCE over eligible interior frames
+  interior_focal_positive_radius: 10 # Positive frame requires activity throughout this +/- output-frame window
+  interior_focal_negative_radius: 10 # Negative frame requires silence throughout this +/- output-frame window
+  purity_focal_weight: 0.0 # Weight for focal BCE with soft local target-purity weighting
+  purity_focal_gamma: 2.0 # Focal exponent for the soft-purity loss
+  purity_focal_power: 2.0 # Exponent applied to local target-purity weights
+  purity_focal_positive_radius: 10 # Radius of the local target-activity purity window
+  purity_focal_negative_radius: 10 # Radius of the local target-silence purity window
   ats_tolerance: 0 # Arrival-time tolerance (output frames) for ATS targets; speakers within this many frames are treated as tied/reorderable (0 = exact sort)
   pairwise_ats_weight: 0.0 # Weight for onset-based pairwise ATS sort loss (raw multiplier, NOT normalized with pil/ats; 0 disables)
   pairwise_ats_temperature: 1.0 # Sharpen preds (T<1) before the pairwise-ATS survival product so faint hedges don't accumulate into a confident onset; 1.0 disables
