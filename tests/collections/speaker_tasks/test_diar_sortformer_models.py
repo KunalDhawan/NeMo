@@ -1113,6 +1113,84 @@ class TestSortformerEncLabelModelOffline:
         assert logmeanexp_loss > one_phantom_loss
 
     @pytest.mark.unit
+    def test_phantom_entry_loss_focuses_first_offending_chunk(self, sortformer_model):
+        model = sortformer_model.eval()
+        model.sortformer_modules.chunk_len = 3
+        model.upsample_factor = 1
+        assert model.phantom_entry_threshold == 0.5
+        assert model.phantom_threshold == 0.25
+
+        num_spks = model.sortformer_modules.n_spk
+        probs = torch.full((1, 10, num_spks), 0.1)
+        targets_pil = torch.zeros_like(probs)
+        targets_pil[0, 0, 0] = 1.0
+        target_lens = torch.tensor([9])
+
+        # Non-empty target channels are outside the scope of this loss.
+        probs[0, :9, 0] = 0.9
+        # Channel 1 first crosses threshold in chunk 1 (frames 3-5).
+        probs[0, 3, 1] = 0.3  # included by the lower aggregation threshold
+        probs[0, 4, 1] = 0.6
+        probs[0, 5, 1] = 0.8
+        probs[0, 6:8, 1] = 0.9  # later persistence is ignored
+        # Channel 2 stays below entry threshold until chunk 2.
+        probs[0, 1, 2] = 0.4
+        probs[0, 6, 2] = 0.3  # included once chunk 2 is chosen
+        probs[0, 7, 2] = 0.55
+        probs[0, 8, 2] = 0.7
+        # A lower-threshold value alone does not create an entry.
+        probs[0, 2, 3] = 0.4
+        # Activity in padding must not create an entry either.
+        probs[0, 9, 3] = 0.9
+        speaker_logits = torch.logit(probs).requires_grad_()
+
+        entry_loss = model._phantom_entry_loss(
+            speaker_logits, targets_pil, target_lens
+        )
+        channel_one_loss = (
+            -torch.log(torch.tensor(0.7))
+            - torch.log(torch.tensor(0.4))
+            - torch.log(torch.tensor(0.2))
+        ) / 3
+        channel_two_loss = (
+            -torch.log(torch.tensor(0.7))
+            - torch.log(torch.tensor(0.45))
+            - torch.log(torch.tensor(0.3))
+        ) / 3
+        assert torch.allclose(
+            entry_loss,
+            (channel_one_loss + channel_two_loss) / num_spks,
+        )
+
+        entry_loss.backward()
+        selected = torch.zeros_like(speaker_logits, dtype=torch.bool)
+        selected[0, 3:6, 1] = True
+        selected[0, 6:9, 2] = True
+        assert torch.all(speaker_logits.grad[selected] > 0)
+        assert torch.count_nonzero(speaker_logits.grad[~selected]) == 0
+
+        model.phantom_logmeanexp = True
+        model.phantom_logmeanexp_temperature = 0.5
+        logmeanexp_loss = model._phantom_entry_loss(
+            speaker_logits.detach(), targets_pil, target_lens
+        )
+
+        def logmeanexp_channel_loss(channel_probs):
+            frame_losses = -torch.log1p(-torch.tensor(channel_probs))
+            temperature = model.phantom_logmeanexp_temperature
+            return temperature * (
+                torch.logsumexp(frame_losses / temperature, dim=0)
+                - torch.log(torch.tensor(float(len(channel_probs))))
+            )
+
+        expected_logmeanexp = (
+            logmeanexp_channel_loss([0.3, 0.6, 0.8])
+            + logmeanexp_channel_loss([0.3, 0.55, 0.7])
+        ) / num_spks
+        assert torch.allclose(logmeanexp_loss, expected_logmeanexp)
+        assert logmeanexp_loss > entry_loss
+
+    @pytest.mark.unit
     def test_prearrival_loss_penalizes_only_activity_safely_before_first_onset(
         self, sortformer_model
     ):
@@ -1231,6 +1309,7 @@ class TestSortformerEncLabelModelOffline:
             'val_presence_loss',
             'val_dice_loss',
             'val_phantom_loss',
+            'val_phantom_entry_loss',
             'val_prearrival_loss',
             'val_f1_acc',
             'val_precision',
@@ -1254,6 +1333,7 @@ class TestSortformerEncLabelModelOffline:
         assert torch.equal(metrics['val_presence_loss'], torch.tensor(2.0))
         assert torch.equal(metrics['val_dice_loss'], torch.tensor(2.0))
         assert torch.equal(metrics['val_phantom_loss'], torch.tensor(2.0))
+        assert torch.equal(metrics['val_phantom_entry_loss'], torch.tensor(2.0))
         assert torch.equal(metrics['val_prearrival_loss'], torch.tensor(2.0))
 
 

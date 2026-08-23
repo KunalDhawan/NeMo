@@ -666,6 +666,21 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 "phantom_logmeanexp_temperature must be > 0, "
                 f"got {self.phantom_logmeanexp_temperature}"
             )
+        # Entry-focused companion to phantom loss. It penalizes only the first
+        # fixed-size streaming chunk where an empty channel exceeds the entry threshold.
+        self.phantom_entry_weight = float(self._cfg.get("phantom_entry_weight", 0.0))
+        if self.phantom_entry_weight < 0.0:
+            raise ValueError(
+                f"phantom_entry_weight must be >= 0, got {self.phantom_entry_weight}"
+            )
+        self.phantom_entry_threshold = float(
+            self._cfg.get("phantom_entry_threshold", 0.5)
+        )
+        if not 0.0 <= self.phantom_entry_threshold < 1.0:
+            raise ValueError(
+                "phantom_entry_threshold must be in [0, 1), "
+                f"got {self.phantom_entry_threshold}"
+            )
         # Hard-negative BCE for speaker activity before the speaker's first PIL-aligned
         # target arrival. Predictions within the grace window before arrival are tolerated;
         # never-active target channels remain eligible throughout the valid sequence.
@@ -3088,6 +3103,73 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             loss = (channel_loss.sum(dim=1) / num_spks).mean()
         return loss
 
+    def _phantom_entry_loss(self, speaker_logits, targets_pil, target_lens):
+        """
+        Penalize the first streaming chunk where a target-empty channel appears.
+
+        This is a simple proxy for cache-entry prevention: output frames are grouped
+        using the model's fixed training chunk length. The earliest chunk containing a
+        detached prediction above ``phantom_entry_threshold`` is selected per empty
+        channel, then negative BCE is averaged over frames in that chunk whose prediction
+        exceeds the lower regular ``phantom_threshold``. Later persistent phantom
+        activity is left to the regular phantom and primary BCE losses. Frame aggregation
+        reuses the regular phantom mean/log-mean-exp settings.
+        """
+        num_frames, num_spks = speaker_logits.shape[1], speaker_logits.shape[2]
+        valid = (
+            torch.arange(num_frames, device=speaker_logits.device).unsqueeze(0)
+            < target_lens.to(speaker_logits.device).unsqueeze(1)
+        )
+        valid_expanded = valid.unsqueeze(-1)
+        empty_channels = ~((targets_pil > 0.5) & valid_expanded).any(dim=1)
+        preds = torch.sigmoid(speaker_logits.detach())
+        entry_trigger = (
+            valid_expanded
+            & empty_channels.unsqueeze(1)
+            & (preds > self.phantom_entry_threshold)
+        )
+        aggregate_selected = (
+            valid_expanded
+            & empty_channels.unsqueeze(1)
+            & (preds > self.phantom_threshold)
+        )
+
+        chunk_frames = max(
+            int(self.sortformer_modules.chunk_len * self.upsample_factor),
+            1,
+        )
+        first_selected_frame = find_first_nonzero(
+            entry_trigger.float(),
+            max_cap_val=num_frames,
+        )
+        has_entry = entry_trigger.any(dim=1)
+        first_selected_chunk = torch.div(
+            first_selected_frame,
+            chunk_frames,
+            rounding_mode='floor',
+        )
+        frame_chunk = torch.div(
+            torch.arange(num_frames, device=speaker_logits.device),
+            chunk_frames,
+            rounding_mode='floor',
+        ).view(1, -1, 1)
+        entry_selected = (
+            aggregate_selected
+            & has_entry.unsqueeze(1)
+            & (frame_chunk == first_selected_chunk.unsqueeze(1))
+        )
+
+        with torch.autocast(device_type=speaker_logits.device.type, enabled=False):
+            negative_bce = torch.nn.functional.softplus(speaker_logits.float())
+            channel_loss = self._aggregate_selected_frame_losses(
+                negative_bce,
+                entry_selected,
+                use_logmeanexp=self.phantom_logmeanexp,
+                temperature=self.phantom_logmeanexp_temperature,
+            )
+            loss = (channel_loss.sum(dim=1) / num_spks).mean()
+        return loss
+
     def _prearrival_loss(self, speaker_logits, targets_pil, target_lens):
         """
         Penalize high-confidence speaker activity substantially before first arrival.
@@ -3215,6 +3297,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         presence_loss = self._presence_loss(preds, targets_pil, target_lens)
         dice_loss = self._dice_loss(preds, targets_pil, target_lens)
         phantom_loss = self._phantom_loss(speaker_logits, targets_pil, target_lens)
+        phantom_entry_loss = self._phantom_entry_loss(
+            speaker_logits, targets_pil, target_lens
+        )
         prearrival_loss = self._prearrival_loss(
             speaker_logits, targets_pil, target_lens
         )
@@ -3232,6 +3317,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             + self.presence_weight * presence_loss
             + self.dice_weight * dice_loss
             + self.phantom_weight * phantom_loss
+            + self.phantom_entry_weight * phantom_entry_loss
             + self.prearrival_weight * prearrival_loss
         )
 
@@ -3259,6 +3345,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'presence_loss': presence_loss,
             'dice_loss': dice_loss,
             'phantom_loss': phantom_loss,
+            'phantom_entry_loss': phantom_entry_loss,
             'prearrival_loss': prearrival_loss,
             'learning_rate': self._optimizer.param_groups[0]['lr'],
             'train_f1_acc': train_f1_acc,
@@ -3469,6 +3556,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         val_phantom_loss = self._phantom_loss(
             speaker_logits, targets_pil, target_lens
         )
+        val_phantom_entry_loss = self._phantom_entry_loss(
+            speaker_logits, targets_pil, target_lens
+        )
         val_prearrival_loss = self._prearrival_loss(
             speaker_logits, targets_pil, target_lens
         )
@@ -3486,6 +3576,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             + self.presence_weight * val_presence_loss
             + self.dice_weight * val_dice_loss
             + self.phantom_weight * val_phantom_loss
+            + self.phantom_entry_weight * val_phantom_entry_loss
             + self.prearrival_weight * val_prearrival_loss
         )
 
@@ -3516,6 +3607,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'val_presence_loss': val_presence_loss,
             'val_dice_loss': val_dice_loss,
             'val_phantom_loss': val_phantom_loss,
+            'val_phantom_entry_loss': val_phantom_entry_loss,
             'val_prearrival_loss': val_prearrival_loss,
             'val_f1_acc': val_f1_acc,
             'val_precision': val_precision,
@@ -3612,6 +3704,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         val_presence_loss_mean = torch.stack([x['val_presence_loss'] for x in outputs]).mean()
         val_dice_loss_mean = torch.stack([x['val_dice_loss'] for x in outputs]).mean()
         val_phantom_loss_mean = torch.stack([x['val_phantom_loss'] for x in outputs]).mean()
+        val_phantom_entry_loss_mean = torch.stack(
+            [x['val_phantom_entry_loss'] for x in outputs]
+        ).mean()
         val_prearrival_loss_mean = torch.stack([x['val_prearrival_loss'] for x in outputs]).mean()
         val_f1_acc_mean = torch.stack([x['val_f1_acc'] for x in outputs]).mean()
         val_precision_mean = torch.stack([x['val_precision'] for x in outputs]).mean()
@@ -3639,6 +3734,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'val_presence_loss': val_presence_loss_mean,
             'val_dice_loss': val_dice_loss_mean,
             'val_phantom_loss': val_phantom_loss_mean,
+            'val_phantom_entry_loss': val_phantom_entry_loss_mean,
             'val_prearrival_loss': val_prearrival_loss_mean,
             'val_f1_acc': val_f1_acc_mean,
             'val_precision': val_precision_mean,
