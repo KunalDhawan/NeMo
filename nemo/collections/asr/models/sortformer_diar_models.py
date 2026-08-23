@@ -3112,8 +3112,10 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         detached prediction above ``phantom_entry_threshold`` is selected per empty
         channel, then negative BCE is averaged over frames in that chunk whose prediction
         exceeds the lower regular ``phantom_threshold``. Later persistent phantom
-        activity is left to the regular phantom and primary BCE losses. Frame aggregation
-        reuses the regular phantom mean/log-mean-exp settings.
+        activity is left to the regular phantom and primary BCE losses. If a channel
+        never crosses the entry threshold, all of its frames above ``phantom_threshold``
+        are used as a fallback. Frame aggregation reuses the regular phantom
+        mean/log-mean-exp settings.
         """
         num_frames, num_spks = speaker_logits.shape[1], speaker_logits.shape[2]
         valid = (
@@ -3153,10 +3155,13 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             chunk_frames,
             rounding_mode='floor',
         ).view(1, -1, 1)
+        entry_or_fallback = (
+            has_entry.unsqueeze(1)
+            & (frame_chunk == first_selected_chunk.unsqueeze(1))
+        ) | ~has_entry.unsqueeze(1)
         entry_selected = (
             aggregate_selected
-            & has_entry.unsqueeze(1)
-            & (frame_chunk == first_selected_chunk.unsqueeze(1))
+            & entry_or_fallback
         )
 
         with torch.autocast(device_type=speaker_logits.device.type, enabled=False):

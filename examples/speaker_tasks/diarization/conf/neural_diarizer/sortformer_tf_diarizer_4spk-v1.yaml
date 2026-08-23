@@ -49,7 +49,7 @@ model:
   phantom_logmeanexp: false # Use temperature-controlled log-mean-exp instead of mean over selected frames
   phantom_logmeanexp_temperature: 0.5 # Lower values focus more strongly on the hardest selected frames
   phantom_entry_weight: 0.0 # Weight for negative BCE in the first chunk where an empty channel exceeds threshold
-  phantom_entry_threshold: 0.5 # Threshold choosing the first offending chunk; aggregation uses phantom_threshold
+  phantom_entry_threshold: 0.5 # Threshold choosing first chunk; channels never crossing it fall back to all >phantom_threshold frames
   prearrival_weight: 0.0 # Weight for hard-negative BCE on speaker activity before first PIL target arrival
   prearrival_threshold: 0.25 # Only predictions above this probability contribute to the prearrival loss
   prearrival_grace_frames: 0 # Frames before first target arrival where early predictions are tolerated

@@ -1138,9 +1138,9 @@ class TestSortformerEncLabelModelOffline:
         probs[0, 6, 2] = 0.3  # included once chunk 2 is chosen
         probs[0, 7, 2] = 0.55
         probs[0, 8, 2] = 0.7
-        # A lower-threshold value alone does not create an entry.
+        # A lower-threshold-only channel falls back to all such valid frames.
         probs[0, 2, 3] = 0.4
-        # Activity in padding must not create an entry either.
+        # Activity in padding must not contribute.
         probs[0, 9, 3] = 0.9
         speaker_logits = torch.logit(probs).requires_grad_()
 
@@ -1157,15 +1157,17 @@ class TestSortformerEncLabelModelOffline:
             - torch.log(torch.tensor(0.45))
             - torch.log(torch.tensor(0.3))
         ) / 3
+        channel_three_loss = -torch.log(torch.tensor(0.6))
         assert torch.allclose(
             entry_loss,
-            (channel_one_loss + channel_two_loss) / num_spks,
+            (channel_one_loss + channel_two_loss + channel_three_loss) / num_spks,
         )
 
         entry_loss.backward()
         selected = torch.zeros_like(speaker_logits, dtype=torch.bool)
         selected[0, 3:6, 1] = True
         selected[0, 6:9, 2] = True
+        selected[0, 2, 3] = True
         assert torch.all(speaker_logits.grad[selected] > 0)
         assert torch.count_nonzero(speaker_logits.grad[~selected]) == 0
 
@@ -1186,6 +1188,7 @@ class TestSortformerEncLabelModelOffline:
         expected_logmeanexp = (
             logmeanexp_channel_loss([0.3, 0.6, 0.8])
             + logmeanexp_channel_loss([0.3, 0.55, 0.7])
+            + logmeanexp_channel_loss([0.4])
         ) / num_spks
         assert torch.allclose(logmeanexp_loss, expected_logmeanexp)
         assert logmeanexp_loss > entry_loss
