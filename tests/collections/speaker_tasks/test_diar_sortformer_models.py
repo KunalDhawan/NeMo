@@ -1113,6 +1113,52 @@ class TestSortformerEncLabelModelOffline:
         assert logmeanexp_loss > one_phantom_loss
 
     @pytest.mark.unit
+    def test_speaker_existence_loss_pools_active_logits_per_channel(self, sortformer_model):
+        model = sortformer_model.eval()
+        model.speaker_existence_min_frames = 2
+        model.speaker_existence_temperature = 0.5
+
+        num_spks = model.sortformer_modules.n_spk
+        speaker_logits = torch.zeros(1, 6, num_spks)
+        targets_pil = torch.zeros_like(speaker_logits)
+        target_lens = torch.tensor([5])
+
+        targets_pil[0, :3, 0] = 1.0
+        speaker_logits[0, :3, 0] = torch.tensor([-2.0, 0.0, 2.0])
+        targets_pil[0, 3, 1] = 1.0  # too short to be eligible
+        speaker_logits[0, 3, 1] = -4.0
+        targets_pil[0, [1, 4], 2] = 1.0
+        speaker_logits[0, [1, 4], 2] = torch.tensor([-1.0, 1.0])
+        targets_pil[0, 5, 3] = 1.0  # padding must not create eligibility
+        speaker_logits[0, 5, 3] = 10.0
+        speaker_logits.requires_grad_()
+
+        existence_loss = model._speaker_existence_loss(
+            speaker_logits, targets_pil, target_lens
+        )
+
+        def pooled_positive_bce(logits):
+            temperature = model.speaker_existence_temperature
+            pooled_logit = temperature * (
+                torch.logsumexp(logits / temperature, dim=0)
+                - torch.log(torch.tensor(float(logits.numel())))
+            )
+            return torch.nn.functional.softplus(-pooled_logit)
+
+        expected = (
+            pooled_positive_bce(speaker_logits[0, :3, 0])
+            + pooled_positive_bce(speaker_logits[0, [1, 4], 2])
+        ) / num_spks
+        assert torch.allclose(existence_loss, expected)
+
+        existence_loss.backward()
+        selected = torch.zeros_like(speaker_logits, dtype=torch.bool)
+        selected[0, :3, 0] = True
+        selected[0, [1, 4], 2] = True
+        assert torch.all(speaker_logits.grad[selected] < 0)
+        assert torch.count_nonzero(speaker_logits.grad[~selected]) == 0
+
+    @pytest.mark.unit
     def test_phantom_entry_loss_focuses_first_offending_chunk(self, sortformer_model):
         model = sortformer_model.eval()
         model.sortformer_modules.chunk_len = 3
@@ -1312,6 +1358,7 @@ class TestSortformerEncLabelModelOffline:
             'val_presence_loss',
             'val_dice_loss',
             'val_phantom_loss',
+            'val_speaker_existence_loss',
             'val_phantom_entry_loss',
             'val_prearrival_loss',
             'val_f1_acc',
@@ -1336,6 +1383,7 @@ class TestSortformerEncLabelModelOffline:
         assert torch.equal(metrics['val_presence_loss'], torch.tensor(2.0))
         assert torch.equal(metrics['val_dice_loss'], torch.tensor(2.0))
         assert torch.equal(metrics['val_phantom_loss'], torch.tensor(2.0))
+        assert torch.equal(metrics['val_speaker_existence_loss'], torch.tensor(2.0))
         assert torch.equal(metrics['val_phantom_entry_loss'], torch.tensor(2.0))
         assert torch.equal(metrics['val_prearrival_loss'], torch.tensor(2.0))
 

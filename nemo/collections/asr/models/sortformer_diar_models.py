@@ -666,6 +666,41 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 "phantom_logmeanexp_temperature must be > 0, "
                 f"got {self.phantom_logmeanexp_temperature}"
             )
+        # Positive channel-level counterpart to phantom loss. For sufficiently long
+        # target-present speakers, active-frame logits are pooled with normalized
+        # log-mean-exp and trained as one positive speaker-existence decision.
+        self.speaker_existence_weight = float(
+            self._cfg.get("speaker_existence_weight", 0.0)
+        )
+        if self.speaker_existence_weight < 0.0:
+            raise ValueError(
+                "speaker_existence_weight must be >= 0, "
+                f"got {self.speaker_existence_weight}"
+            )
+        self.speaker_existence_min_frames = self._cfg.get(
+            "speaker_existence_min_frames", 1
+        )
+        if not isinstance(self.speaker_existence_min_frames, int) or isinstance(
+            self.speaker_existence_min_frames, bool
+        ):
+            raise TypeError(
+                "speaker_existence_min_frames must be a positive integer, "
+                f"got {type(self.speaker_existence_min_frames).__name__}: "
+                f"{self.speaker_existence_min_frames}"
+            )
+        if self.speaker_existence_min_frames < 1:
+            raise ValueError(
+                "speaker_existence_min_frames must be >= 1, "
+                f"got {self.speaker_existence_min_frames}"
+            )
+        self.speaker_existence_temperature = float(
+            self._cfg.get("speaker_existence_temperature", 0.5)
+        )
+        if self.speaker_existence_temperature <= 0.0:
+            raise ValueError(
+                "speaker_existence_temperature must be > 0, "
+                f"got {self.speaker_existence_temperature}"
+            )
         # Entry-focused companion to phantom loss. It penalizes only the first
         # fixed-size streaming chunk where an empty channel exceeds the entry threshold.
         self.phantom_entry_weight = float(self._cfg.get("phantom_entry_weight", 0.0))
@@ -3103,6 +3138,41 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             loss = (channel_loss.sum(dim=1) / num_spks).mean()
         return loss
 
+    def _speaker_existence_loss(self, speaker_logits, targets_pil, target_lens):
+        """
+        Require one channel-level detection decision for each sufficiently long speaker.
+
+        Active-frame logits are pooled per PIL-aligned channel using normalized
+        temperature-controlled log-mean-exp. Positive BCE on that pooled logit then
+        penalizes channels lacking strong speaker evidence. Ineligible short and empty
+        channels contribute zero. Channel terms are summed over the fixed output slots,
+        divided by ``num_spks``, and averaged over samples like phantom loss.
+        """
+        num_frames, num_spks = speaker_logits.shape[1], speaker_logits.shape[2]
+        valid = (
+            torch.arange(num_frames, device=speaker_logits.device).unsqueeze(0)
+            < target_lens.to(speaker_logits.device).unsqueeze(1)
+        ).unsqueeze(-1)
+        active = (targets_pil > 0.5) & valid
+        eligible_channels = (
+            active.sum(dim=1) >= self.speaker_existence_min_frames
+        )
+
+        with torch.autocast(device_type=speaker_logits.device.type, enabled=False):
+            pooled_logits = self._aggregate_selected_frame_losses(
+                speaker_logits.float(),
+                active,
+                use_logmeanexp=True,
+                temperature=self.speaker_existence_temperature,
+            )
+            channel_loss = torch.where(
+                eligible_channels,
+                torch.nn.functional.softplus(-pooled_logits),
+                torch.zeros_like(pooled_logits),
+            )
+            loss = (channel_loss.sum(dim=1) / num_spks).mean()
+        return loss
+
     def _phantom_entry_loss(self, speaker_logits, targets_pil, target_lens):
         """
         Penalize the first streaming chunk where a target-empty channel appears.
@@ -3302,6 +3372,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         presence_loss = self._presence_loss(preds, targets_pil, target_lens)
         dice_loss = self._dice_loss(preds, targets_pil, target_lens)
         phantom_loss = self._phantom_loss(speaker_logits, targets_pil, target_lens)
+        speaker_existence_loss = self._speaker_existence_loss(
+            speaker_logits, targets_pil, target_lens
+        )
         phantom_entry_loss = self._phantom_entry_loss(
             speaker_logits, targets_pil, target_lens
         )
@@ -3322,6 +3395,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             + self.presence_weight * presence_loss
             + self.dice_weight * dice_loss
             + self.phantom_weight * phantom_loss
+            + self.speaker_existence_weight * speaker_existence_loss
             + self.phantom_entry_weight * phantom_entry_loss
             + self.prearrival_weight * prearrival_loss
         )
@@ -3350,6 +3424,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'presence_loss': presence_loss,
             'dice_loss': dice_loss,
             'phantom_loss': phantom_loss,
+            'speaker_existence_loss': speaker_existence_loss,
             'phantom_entry_loss': phantom_entry_loss,
             'prearrival_loss': prearrival_loss,
             'learning_rate': self._optimizer.param_groups[0]['lr'],
@@ -3561,6 +3636,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         val_phantom_loss = self._phantom_loss(
             speaker_logits, targets_pil, target_lens
         )
+        val_speaker_existence_loss = self._speaker_existence_loss(
+            speaker_logits, targets_pil, target_lens
+        )
         val_phantom_entry_loss = self._phantom_entry_loss(
             speaker_logits, targets_pil, target_lens
         )
@@ -3581,6 +3659,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             + self.presence_weight * val_presence_loss
             + self.dice_weight * val_dice_loss
             + self.phantom_weight * val_phantom_loss
+            + self.speaker_existence_weight * val_speaker_existence_loss
             + self.phantom_entry_weight * val_phantom_entry_loss
             + self.prearrival_weight * val_prearrival_loss
         )
@@ -3612,6 +3691,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'val_presence_loss': val_presence_loss,
             'val_dice_loss': val_dice_loss,
             'val_phantom_loss': val_phantom_loss,
+            'val_speaker_existence_loss': val_speaker_existence_loss,
             'val_phantom_entry_loss': val_phantom_entry_loss,
             'val_prearrival_loss': val_prearrival_loss,
             'val_f1_acc': val_f1_acc,
@@ -3709,6 +3789,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         val_presence_loss_mean = torch.stack([x['val_presence_loss'] for x in outputs]).mean()
         val_dice_loss_mean = torch.stack([x['val_dice_loss'] for x in outputs]).mean()
         val_phantom_loss_mean = torch.stack([x['val_phantom_loss'] for x in outputs]).mean()
+        val_speaker_existence_loss_mean = torch.stack(
+            [x['val_speaker_existence_loss'] for x in outputs]
+        ).mean()
         val_phantom_entry_loss_mean = torch.stack(
             [x['val_phantom_entry_loss'] for x in outputs]
         ).mean()
@@ -3739,6 +3822,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'val_presence_loss': val_presence_loss_mean,
             'val_dice_loss': val_dice_loss_mean,
             'val_phantom_loss': val_phantom_loss_mean,
+            'val_speaker_existence_loss': val_speaker_existence_loss_mean,
             'val_phantom_entry_loss': val_phantom_entry_loss_mean,
             'val_prearrival_loss': val_prearrival_loss_mean,
             'val_f1_acc': val_f1_acc_mean,
