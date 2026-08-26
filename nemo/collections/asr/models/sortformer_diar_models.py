@@ -701,6 +701,14 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 "speaker_existence_temperature must be > 0, "
                 f"got {self.speaker_existence_temperature}"
             )
+        self.speaker_existence_threshold = float(
+            self._cfg.get("speaker_existence_threshold", 1.0)
+        )
+        if not 0.0 < self.speaker_existence_threshold <= 1.0:
+            raise ValueError(
+                "speaker_existence_threshold must be in (0, 1], "
+                f"got {self.speaker_existence_threshold}"
+            )
         # Entry-focused companion to phantom loss. It penalizes only the first
         # fixed-size streaming chunk where an empty channel exceeds the entry threshold.
         self.phantom_entry_weight = float(self._cfg.get("phantom_entry_weight", 0.0))
@@ -3144,7 +3152,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         Active-frame logits are pooled per PIL-aligned channel using normalized
         temperature-controlled log-mean-exp. Positive BCE on that pooled logit then
-        penalizes channels lacking strong speaker evidence. Ineligible short and empty
+        penalizes channels whose detached pooled confidence remains below
+        ``speaker_existence_threshold``. Ineligible short, empty, and already-confident
         channels contribute zero. Channel terms are summed over the fixed output slots,
         divided by ``num_spks``, and averaged over samples like phantom loss.
         """
@@ -3165,8 +3174,15 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 use_logmeanexp=True,
                 temperature=self.speaker_existence_temperature,
             )
+            if self.speaker_existence_threshold >= 1.0:
+                needs_detection = torch.ones_like(eligible_channels)
+            else:
+                needs_detection = (
+                    torch.sigmoid(pooled_logits.detach())
+                    < self.speaker_existence_threshold
+                )
             channel_loss = torch.where(
-                eligible_channels,
+                eligible_channels & needs_detection,
                 torch.nn.functional.softplus(-pooled_logits),
                 torch.zeros_like(pooled_logits),
             )

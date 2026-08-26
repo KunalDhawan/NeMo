@@ -1117,6 +1117,7 @@ class TestSortformerEncLabelModelOffline:
         model = sortformer_model.eval()
         model.speaker_existence_min_frames = 2
         model.speaker_existence_temperature = 0.5
+        assert model.speaker_existence_threshold == 1.0
 
         num_spks = model.sortformer_modules.n_spk
         speaker_logits = torch.zeros(1, 6, num_spks)
@@ -1157,6 +1158,16 @@ class TestSortformerEncLabelModelOffline:
         selected[0, [1, 4], 2] = True
         assert torch.all(speaker_logits.grad[selected] < 0)
         assert torch.count_nonzero(speaker_logits.grad[~selected]) == 0
+
+        model.speaker_existence_threshold = 0.75
+        dead_zone_loss = model._speaker_existence_loss(
+            speaker_logits.detach(), targets_pil, target_lens
+        )
+        # Channel 0 pools above 0.75 and is excluded; channel 2 remains below.
+        assert torch.allclose(
+            dead_zone_loss,
+            pooled_positive_bce(speaker_logits[0, [1, 4], 2]) / num_spks,
+        )
 
     @pytest.mark.unit
     def test_phantom_entry_loss_focuses_first_offending_chunk(self, sortformer_model):
