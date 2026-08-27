@@ -1480,11 +1480,14 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         target_len = torch.tensor([ts_tensor.shape[0]])
         return target_len
 
-    def _compute_spk_bias_weights(self, frame_level_target, candidate_indices, window_len):
+    def _compute_spk_bias_weights(
+        self, frame_level_target, candidate_indices, window_len, included_speakers=None
+    ):
         """Compute sampling weights for candidate start positions biased toward higher unique speaker counts.
 
         For each candidate window, counts how many distinct speakers have at least one
-        active frame in that window, then returns weight = 1 + alpha * n_unique_speakers.
+        active frame in that window or in ``included_speakers``, then returns
+        ``subsegment_nspk_bias ** n_unique_speakers``.
 
         Uses per-speaker prefix sums so cost is O(T*S + N*S) where S is small (max_spks).
 
@@ -1492,6 +1495,7 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
             frame_level_target: (T, S) binary/soft target tensor.
             candidate_indices: 1-D tensor of eligible start-frame indices.
             window_len: number of frames in the evaluation window.
+            included_speakers: optional (S,) mask of speakers already present.
 
         Returns:
             1-D float tensor of sampling weights aligned with candidate_indices.
@@ -1502,7 +1506,12 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         cumsum[1:] = torch.cumsum(active, dim=0)
         ends = torch.clamp(candidate_indices + window_len, max=T)
         window_activity = cumsum[ends] - cumsum[candidate_indices]  # (N, S)
-        unique_spk_counts = (window_activity > 0).float().sum(dim=1)  # (N,)
+        speaker_presence = window_activity > 0
+        if included_speakers is not None:
+            speaker_presence |= included_speakers.to(
+                device=speaker_presence.device, dtype=torch.bool
+            ).unsqueeze(0)
+        unique_spk_counts = speaker_presence.float().sum(dim=1)  # (N,)
         weights = self.subsegment_nspk_bias ** unique_spk_counts
         return weights
 
@@ -1571,12 +1580,19 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         safe[valid_boundaries] = silent_count == 2 * margin
         return safe
 
-    def _sample_start(self, frame_level_target, candidates, window_len):
+    def _sample_start(
+        self, frame_level_target, candidates, window_len, included_speakers=None
+    ):
         """Sample one candidate while preserving the existing speaker-count bias."""
         if candidates.numel() == 0:
             return None
         if self.subsegment_nspk_bias > 1.0:
-            weights = self._compute_spk_bias_weights(frame_level_target, candidates, window_len)
+            weights = self._compute_spk_bias_weights(
+                frame_level_target,
+                candidates,
+                window_len,
+                included_speakers=included_speakers,
+            )
             return candidates[torch.multinomial(weights, 1).item()].item()
         return candidates[random.randrange(candidates.numel())].item()
 
@@ -1669,8 +1685,14 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
             len2 = total_len - len1
             valid_second = second_start_mask & (frame_indices + len2 <= num_frames)
             valid_second &= ((frame_indices + len2 <= start1) | (frame_indices >= end1))
+            first_speakers = (
+                frame_level_target[start1:end1] > self.soft_label_thres
+            ).any(dim=0)
             start2 = self._sample_start(
-                frame_level_target, torch.where(valid_second)[0], len2
+                frame_level_target,
+                torch.where(valid_second)[0],
+                len2,
+                included_speakers=first_speakers,
             )
             if start2 is not None:
                 return [(start1, end1), (start2, start2 + len2)]

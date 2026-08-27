@@ -109,6 +109,25 @@ class TestAudioToSpeechE2ESpkDiarDataset:
         assert torch.equal(dataset._eligible_chunk_starts(target), expected)
 
     @pytest.mark.unit
+    def test_second_chunk_bias_counts_union_with_first_chunk(self):
+        dataset = self._selection_dataset()
+        dataset.subsegment_nspk_bias = 2.0
+        target = torch.zeros(12, 3)
+        target[0:2, 0] = 1
+        target[4:6, 0] = 1
+        target[8:10, 1:] = 1
+        first_chunk_speakers = target[0:2].any(dim=0)
+
+        weights = dataset._compute_spk_bias_weights(
+            target,
+            candidate_indices=torch.tensor([4, 8]),
+            window_len=2,
+            included_speakers=first_chunk_speakers,
+        )
+
+        assert torch.equal(weights, torch.tensor([2.0, 8.0]))
+
+    @pytest.mark.unit
     def test_two_chunk_selection_obeys_start_and_silence_rules(self):
         dataset = self._selection_dataset(
             min_first_speaker_frames=3,
