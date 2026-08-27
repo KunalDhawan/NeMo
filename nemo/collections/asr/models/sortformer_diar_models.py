@@ -709,6 +709,14 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 "speaker_existence_threshold must be in (0, 1], "
                 f"got {self.speaker_existence_threshold}"
             )
+        self.speaker_existence_target = str(
+            self._cfg.get("speaker_existence_target", "pil")
+        ).lower()
+        if self.speaker_existence_target not in ("pil", "ats"):
+            raise ValueError(
+                "speaker_existence_target must be 'pil' or 'ats', "
+                f"got '{self.speaker_existence_target}'"
+            )
         # Entry-focused companion to phantom loss. It penalizes only the first
         # fixed-size streaming chunk where an empty channel exceeds the entry threshold.
         self.phantom_entry_weight = float(self._cfg.get("phantom_entry_weight", 0.0))
@@ -3371,31 +3379,68 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             labels=targets_pil_loss,
             target_lens=target_lens,
         )
-        rank_loss = self._speaker_rank_loss(speaker_logits, targets_pil, target_lens)
-        speech_bce_loss = self._speech_bce_loss(speaker_logits, targets_pil, target_lens)
-        interior_focal_loss = self._interior_focal_loss(
-            speaker_logits, targets_pil, target_lens
+        zero_loss = speaker_logits.new_zeros((), dtype=torch.float32)
+        rank_loss = (
+            self._speaker_rank_loss(speaker_logits, targets_pil, target_lens)
+            if self.rank_weight > 0.0
+            else zero_loss
         )
-        purity_focal_loss = self._purity_focal_loss(
-            speaker_logits, targets_pil, target_lens
+        speech_bce_loss = (
+            self._speech_bce_loss(speaker_logits, targets_pil, target_lens)
+            if self.speech_bce_weight > 0.0
+            else zero_loss
         )
-        pairwise_ats_loss = self._pairwise_ats_loss(preds, target_lens)
+        interior_focal_loss = (
+            self._interior_focal_loss(speaker_logits, targets_pil, target_lens)
+            if self.interior_focal_weight > 0.0
+            else zero_loss
+        )
+        purity_focal_loss = (
+            self._purity_focal_loss(speaker_logits, targets_pil, target_lens)
+            if self.purity_focal_weight > 0.0
+            else zero_loss
+        )
+        pairwise_ats_loss = (
+            self._pairwise_ats_loss(preds, target_lens)
+            if self.pairwise_ats_weight > 0.0
+            else zero_loss
+        )
         self_ats_loss = self._self_ats_loss(speaker_logits, target_lens)
         spkcount_loss = self._spkcount_loss(preds, targets, target_lens)
-        if self.activity_weight > 0.0 and self.activity_loss_mode == "speaker_preds":
-            activity_logits = self._activity_logits_from_speaker_preds(preds)
-        activity_loss = self._activity_loss(activity_logits, targets, target_lens)
-        presence_loss = self._presence_loss(preds, targets_pil, target_lens)
-        dice_loss = self._dice_loss(preds, targets_pil, target_lens)
+        if self.activity_weight > 0.0:
+            if self.activity_loss_mode == "speaker_preds":
+                activity_logits = self._activity_logits_from_speaker_preds(preds)
+            activity_loss = self._activity_loss(activity_logits, targets, target_lens)
+        else:
+            activity_loss = zero_loss
+        presence_loss = (
+            self._presence_loss(preds, targets_pil, target_lens)
+            if self.presence_weight > 0.0
+            else zero_loss
+        )
+        dice_loss = (
+            self._dice_loss(preds, targets_pil, target_lens)
+            if self.dice_weight > 0.0
+            else zero_loss
+        )
         phantom_loss = self._phantom_loss(speaker_logits, targets_pil, target_lens)
+        speaker_existence_targets = (
+            targets_ats
+            if self.speaker_existence_target == "ats"
+            else targets_pil
+        )
         speaker_existence_loss = self._speaker_existence_loss(
-            speaker_logits, targets_pil, target_lens
+            speaker_logits, speaker_existence_targets, target_lens
         )
-        phantom_entry_loss = self._phantom_entry_loss(
-            speaker_logits, targets_pil, target_lens
+        phantom_entry_loss = (
+            self._phantom_entry_loss(speaker_logits, targets_pil, target_lens)
+            if self.phantom_entry_weight > 0.0
+            else zero_loss
         )
-        prearrival_loss = self._prearrival_loss(
-            speaker_logits, targets_pil, target_lens
+        prearrival_loss = (
+            self._prearrival_loss(speaker_logits, targets_pil, target_lens)
+            if self.prearrival_weight > 0.0
+            else zero_loss
         )
         loss = (
             self.ats_weight * ats_loss
@@ -3652,8 +3697,13 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         val_phantom_loss = self._phantom_loss(
             speaker_logits, targets_pil, target_lens
         )
+        speaker_existence_targets = (
+            targets_ats
+            if self.speaker_existence_target == "ats"
+            else targets_pil
+        )
         val_speaker_existence_loss = self._speaker_existence_loss(
-            speaker_logits, targets_pil, target_lens
+            speaker_logits, speaker_existence_targets, target_lens
         )
         val_phantom_entry_loss = self._phantom_entry_loss(
             speaker_logits, targets_pil, target_lens

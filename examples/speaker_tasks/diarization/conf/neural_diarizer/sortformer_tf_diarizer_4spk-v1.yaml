@@ -52,6 +52,7 @@ model:
   speaker_existence_min_frames: 6 # Minimum target-active duration required for a speaker channel
   speaker_existence_temperature: 0.5 # Log-mean-exp temperature for pooling active-frame logits
   speaker_existence_threshold: 1.0 # Channels at or above this pooled confidence receive no existence pressure
+  speaker_existence_target: pil # Target assignment used by existence loss: pil or ats
   phantom_entry_weight: 0.0 # Weight for negative BCE in the first chunk where an empty channel exceeds threshold
   phantom_entry_threshold: 0.5 # Threshold choosing first chunk; channels never crossing it fall back to all >phantom_threshold frames
   prearrival_weight: 0.0 # Weight for hard-negative BCE on speaker activity before first PIL target arrival

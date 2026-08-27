@@ -1115,6 +1115,7 @@ class TestSortformerEncLabelModelOffline:
     @pytest.mark.unit
     def test_speaker_existence_loss_pools_active_logits_per_channel(self, sortformer_model):
         model = sortformer_model.eval()
+        assert model.speaker_existence_target == "pil"
         model.speaker_existence_min_frames = 2
         model.speaker_existence_temperature = 0.5
         assert model.speaker_existence_threshold == 1.0
@@ -1168,6 +1169,53 @@ class TestSortformerEncLabelModelOffline:
             dead_zone_loss,
             pooled_positive_bce(speaker_logits[0, [1, 4], 2]) / num_spks,
         )
+
+    @pytest.mark.unit
+    def test_speaker_existence_loss_can_use_ats_targets(
+        self, sortformer_model, monkeypatch
+    ):
+        model = sortformer_model.train()
+        model.speaker_existence_target = "ats"
+        model.activity_weight = 0.0
+        model.presence_weight = 0.0
+        model._optimizer = SimpleNamespace(param_groups=[{"lr": 1e-3}])
+
+        num_spks = model.sortformer_modules.n_spk
+        speaker_logits = torch.zeros(1, 3, num_spks, requires_grad=True)
+        preds = torch.sigmoid(speaker_logits)
+        targets = torch.zeros_like(preds)
+        targets_pil = torch.zeros_like(targets)
+        targets_ats = torch.zeros_like(targets)
+        targets_pil[0, :, 0] = 1.0
+        targets_ats[0, :, 1] = 1.0
+
+        monkeypatch.setattr(
+            "nemo.collections.asr.models.sortformer_diar_models.get_pil_targets_hungarian",
+            lambda *args, **kwargs: (targets_pil, None),
+        )
+        monkeypatch.setattr(
+            "nemo.collections.asr.models.sortformer_diar_models.get_ats_targets_hungarian",
+            lambda *args, **kwargs: (targets_ats, None),
+        )
+        captured = {}
+
+        def capture_existence_targets(logits, existence_targets, target_lens):
+            del logits, target_lens
+            captured["targets"] = existence_targets
+            return torch.tensor(0.0)
+
+        monkeypatch.setattr(
+            model, "_speaker_existence_loss", capture_existence_targets
+        )
+        model._get_aux_train_evaluations(
+            preds,
+            targets,
+            torch.tensor([3]),
+            speaker_logits=speaker_logits,
+        )
+
+        assert torch.equal(captured["targets"], targets_ats)
+        model._reset_train_metrics()
 
     @pytest.mark.unit
     def test_phantom_entry_loss_focuses_first_offending_chunk(self, sortformer_model):
@@ -1351,6 +1399,108 @@ class TestSortformerEncLabelModelOffline:
 
         assert torch.allclose(count_mae, torch.tensor(1.0 / 3.0))
         assert torch.allclose(count_accuracy, torch.tensor(2.0 / 3.0))
+
+    @pytest.mark.unit
+    def test_training_skips_zero_weight_losses_except_requested_diagnostics(
+        self, sortformer_model, monkeypatch
+    ):
+        model = sortformer_model.train()
+        for weight_name in (
+            "rank_weight",
+            "speech_bce_weight",
+            "interior_focal_weight",
+            "purity_focal_weight",
+            "pairwise_ats_weight",
+            "self_ats_weight",
+            "spkcount_weight",
+            "activity_weight",
+            "presence_weight",
+            "dice_weight",
+            "phantom_weight",
+            "speaker_existence_weight",
+            "phantom_entry_weight",
+            "prearrival_weight",
+        ):
+            setattr(model, weight_name, 0.0)
+
+        def unexpected_call(*args, **kwargs):
+            del args, kwargs
+            pytest.fail("A zero-weight auxiliary loss was computed")
+
+        for method_name in (
+            "_speaker_rank_loss",
+            "_speech_bce_loss",
+            "_interior_focal_loss",
+            "_purity_focal_loss",
+            "_pairwise_ats_loss",
+            "_activity_logits_from_speaker_preds",
+            "_activity_loss",
+            "_presence_loss",
+            "_dice_loss",
+            "_phantom_entry_loss",
+            "_prearrival_loss",
+        ):
+            monkeypatch.setattr(model, method_name, unexpected_call)
+
+        diagnostic_calls = set()
+
+        def diagnostic_loss(name, value):
+            def compute(*args, **kwargs):
+                del args, kwargs
+                diagnostic_calls.add(name)
+                return torch.tensor(value)
+
+            return compute
+
+        diagnostic_values = {
+            "_self_ats_loss": 1.0,
+            "_spkcount_loss": 2.0,
+            "_phantom_loss": 3.0,
+            "_speaker_existence_loss": 4.0,
+        }
+        for method_name, value in diagnostic_values.items():
+            monkeypatch.setattr(
+                model, method_name, diagnostic_loss(method_name, value)
+            )
+
+        model._optimizer = SimpleNamespace(param_groups=[{"lr": 1e-3}])
+        speaker_logits = torch.zeros(
+            1, 4, model.sortformer_modules.n_spk, requires_grad=True
+        )
+        preds = torch.sigmoid(speaker_logits)
+        targets = torch.zeros_like(preds)
+        targets[0, 1:3, 0] = 1.0
+
+        metrics = model._get_aux_train_evaluations(
+            preds,
+            targets,
+            torch.tensor([4]),
+            speaker_logits=speaker_logits,
+        )
+
+        for metric_name in (
+            "rank_loss",
+            "speech_bce_loss",
+            "interior_focal_loss",
+            "purity_focal_loss",
+            "pairwise_ats_loss",
+            "activity_loss",
+            "presence_loss",
+            "dice_loss",
+            "phantom_entry_loss",
+            "prearrival_loss",
+        ):
+            assert torch.equal(metrics[metric_name], torch.tensor(0.0))
+
+        assert diagnostic_calls == set(diagnostic_values)
+        assert torch.equal(metrics["self_ats_loss"], torch.tensor(1.0))
+        assert torch.equal(metrics["spkcount_loss"], torch.tensor(2.0))
+        assert torch.equal(metrics["phantom_loss"], torch.tensor(3.0))
+        assert torch.equal(metrics["speaker_existence_loss"], torch.tensor(4.0))
+
+        metrics["loss"].backward()
+        assert torch.count_nonzero(speaker_logits.grad) > 0
+        model._reset_train_metrics()
 
     @pytest.mark.unit
     def test_multi_validation_epoch_end_includes_auxiliary_losses(self, sortformer_model):
