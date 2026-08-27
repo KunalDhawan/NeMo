@@ -96,6 +96,15 @@ model:
     shuffle: True
     num_workers: ${num_workers}
     validation_mode: False
+    # Long-session subsegment sampling
+    subsegment_mode: True
+    subsegment_min_len_sec: 30
+    subsegment_two_chunks_rate: 0
+    subsegment_min_chunk_len_sec: 10
+    subsegment_margin_frames: 10
+    subsegment_nspk_bias: 1.0
+    subsegment_min_first_spk_frames: 6
+    subsegment_boundary_silence_frames: 1
     # lhotse config
     use_lhotse: False
     use_bucketing: True
