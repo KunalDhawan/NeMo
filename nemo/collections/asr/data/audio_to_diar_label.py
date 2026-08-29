@@ -1161,6 +1161,7 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         subsegment_nspk_bias: float = 1.0,
         subsegment_min_first_spk_frames: int = 50,
         subsegment_boundary_silence_frames: int = 10,
+        subsegment_preload_sec: float = 0.0,
         opus_roundtrip_prob: float = 0.0,
         opus_roundtrip_compression_level: Optional[float] = None,
         validate_manifest_paths: bool = True,
@@ -1202,12 +1203,25 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         self.subsegment_nspk_bias = subsegment_nspk_bias
         self.subsegment_min_first_spk_frames = subsegment_min_first_spk_frames
         self.subsegment_boundary_silence_frames = subsegment_boundary_silence_frames
+        self.subsegment_preload_sec = float(subsegment_preload_sec)
         for name, value in (
             ("subsegment_min_first_spk_frames", self.subsegment_min_first_spk_frames),
             ("subsegment_boundary_silence_frames", self.subsegment_boundary_silence_frames),
         ):
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"{name} must be a positive integer, got {value!r}")
+        if self.subsegment_preload_sec < 0:
+            raise ValueError(
+                f"subsegment_preload_sec must be non-negative, got {self.subsegment_preload_sec}"
+            )
+        if (
+            self.subsegment_preload_sec > 0
+            and self.session_len_sec > 0
+            and self.subsegment_preload_sec < self.session_len_sec
+        ):
+            raise ValueError(
+                "subsegment_preload_sec cannot be shorter than session_len_sec"
+            )
         if not 0.0 <= opus_roundtrip_prob <= 1.0:
             raise ValueError(f"opus_roundtrip_prob must be between 0 and 1, got {opus_roundtrip_prob}")
         if opus_roundtrip_compression_level is not None and not 0.0 <= opus_roundtrip_compression_level <= 1.0:
@@ -1718,13 +1732,11 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
     def _create_subsegment(self, sample, offset):
         duration = sample.duration
 
-        # Pre-crop: for very long files, randomly select a window to avoid
-        # loading the entire file from disk (major I/O bottleneck for 30min+ files).
-        if self.session_len_sec > 0 and duration > self.session_len_sec * 6:
-            preload_dur = self.session_len_sec * 6
-            preload_start = random.uniform(0, duration - preload_dur)
+        # Pre-crop very long files before loading the waveform.
+        if self.subsegment_preload_sec > 0 and duration > self.subsegment_preload_sec:
+            preload_start = random.uniform(0, duration - self.subsegment_preload_sec)
             offset = offset + preload_start
-            duration = preload_dur
+            duration = self.subsegment_preload_sec
 
         audio_signal = self.featurizer.process(sample.audio_file, offset=offset, duration=duration)
         
@@ -2040,6 +2052,7 @@ class AudioToSpeechE2ESpkDiarDataset(_AudioToSpeechE2ESpkDiarDataset):
         subsegment_nspk_bias: float = 1.0,
         subsegment_min_first_spk_frames: int = 50,
         subsegment_boundary_silence_frames: int = 10,
+        subsegment_preload_sec: float = 0.0,
         opus_roundtrip_prob: float = 0.0,
         opus_roundtrip_compression_level: Optional[float] = None,
         validate_manifest_paths: bool = True,
@@ -2064,6 +2077,7 @@ class AudioToSpeechE2ESpkDiarDataset(_AudioToSpeechE2ESpkDiarDataset):
             subsegment_nspk_bias=subsegment_nspk_bias,
             subsegment_min_first_spk_frames=subsegment_min_first_spk_frames,
             subsegment_boundary_silence_frames=subsegment_boundary_silence_frames,
+            subsegment_preload_sec=subsegment_preload_sec,
             opus_roundtrip_prob=opus_roundtrip_prob,
             opus_roundtrip_compression_level=opus_roundtrip_compression_level,
             validate_manifest_paths=validate_manifest_paths,

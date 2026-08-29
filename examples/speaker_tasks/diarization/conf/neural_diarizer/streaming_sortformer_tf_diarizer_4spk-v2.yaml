@@ -117,6 +117,7 @@ model:
     subsegment_nspk_bias: 2.0
     subsegment_min_first_spk_frames: 50
     subsegment_boundary_silence_frames: 10
+    subsegment_preload_sec: 630
     # lhotse config
     use_lhotse: False
     use_bucketing: True
