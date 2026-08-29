@@ -16,12 +16,15 @@ import json
 import os
 import random
 import tempfile
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch.cuda
 
 from nemo.collections.asr.data.audio_to_diar_label import AudioToSpeechE2ESpkDiarDataset
 from nemo.collections.asr.parts.preprocessing.features import FilterbankFeatures, WaveformFeaturizer
+from nemo.collections.asr.parts.preprocessing.segment import AudioSegment
 from nemo.collections.asr.parts.utils.speaker_utils import get_vad_out_from_rttm_line, read_rttm_lines
 from nemo.collections.common.parts.preprocessing.collections import EndtoEndDiarizationSpeechLabel
 
@@ -48,12 +51,19 @@ def is_rttm_length_too_long(rttm_file_path, wav_len_in_sec):
 class TestAudioToSpeechE2ESpkDiarDataset:
 
     @staticmethod
-    def _selection_dataset(min_first_speaker_frames=5, boundary_silence_frames=2):
+    def _selection_dataset(
+        min_first_speaker_frames=5,
+        boundary_silence_frames=2,
+        start_guard_frames=0,
+        max_speakers=4,
+    ):
         dataset = object.__new__(AudioToSpeechE2ESpkDiarDataset)
         dataset.soft_label_thres = 0.5
         dataset.subsegment_min_first_spk_frames = min_first_speaker_frames
         dataset.subsegment_boundary_silence_frames = boundary_silence_frames
+        dataset.subsegment_start_guard_frames = start_guard_frames
         dataset.subsegment_nspk_bias = 1.0
+        dataset.max_spks = max_speakers
         return dataset
 
     @pytest.mark.unit
@@ -109,6 +119,23 @@ class TestAudioToSpeechE2ESpkDiarDataset:
         assert torch.equal(dataset._eligible_chunk_starts(target), expected)
 
     @pytest.mark.unit
+    def test_chunk_start_rejects_recent_different_speaker(self):
+        dataset = self._selection_dataset(
+            min_first_speaker_frames=3,
+            start_guard_frames=3,
+        )
+        target = torch.zeros(14, 2)
+        target[0:2, 1] = 1
+        target[8:13, 0] = 1
+
+        eligible = dataset._eligible_chunk_starts(target)
+
+        assert not eligible[4]  # Speaker 1 is present in the preceding three frames.
+        assert eligible[5]  # The preceding three frames are clear.
+        assert eligible[8]  # Starting with speaker 0 is also clear.
+        assert eligible[9]  # Previous activity from the same first speaker is allowed.
+
+    @pytest.mark.unit
     def test_second_chunk_bias_counts_union_with_first_chunk(self):
         dataset = self._selection_dataset()
         dataset.subsegment_nspk_bias = 2.0
@@ -126,6 +153,22 @@ class TestAudioToSpeechE2ESpkDiarDataset:
         )
 
         assert torch.equal(weights, torch.tensor([2.0, 8.0]))
+
+    @pytest.mark.unit
+    def test_single_chunk_rejects_windows_over_speaker_capacity(self):
+        dataset = self._selection_dataset(min_first_speaker_frames=2, max_speakers=2)
+        target = torch.zeros(30, 3)
+        target[0:3, 0] = 1
+        target[5:8, 1] = 1
+        target[10:13, 2] = 1
+        target[20:23, 0] = 1
+
+        random.seed(0)
+        bounds = dataset._sample_single_chunk_bounds(target, max_len=15, min_len=5)
+
+        assert bounds is not None
+        selected = dataset._slice_target_chunks(target, bounds)
+        assert selected.any(dim=0).sum() <= dataset.max_spks
 
     @pytest.mark.unit
     def test_two_chunk_selection_obeys_start_and_silence_rules(self):
@@ -156,6 +199,109 @@ class TestAudioToSpeechE2ESpkDiarDataset:
         assert end1 - start1 >= 8 and end2 - start2 >= 8
         assert (end1 - start1) + (end2 - start2) == 24
         assert end2 <= start1 or start2 >= end1
+
+    @pytest.mark.unit
+    def test_two_chunk_selection_rejects_unions_over_speaker_capacity(self):
+        dataset = self._selection_dataset(
+            min_first_speaker_frames=3,
+            boundary_silence_frames=2,
+            max_speakers=2,
+        )
+        target = torch.zeros(100, 3)
+        for start, end, speaker in (
+            (0, 5, 0),
+            (20, 25, 1),
+            (40, 45, 2),
+            (60, 65, 0),
+            (80, 85, 1),
+        ):
+            target[start:end, speaker] = 1
+
+        random.seed(0)
+        torch.manual_seed(0)
+        bounds = dataset._sample_two_chunk_bounds(target, total_len=30, min_chunk_len=10)
+
+        assert bounds is not None
+        selected = dataset._slice_target_chunks(target, bounds)
+        assert selected.any(dim=0).sum() <= dataset.max_spks
+
+    @pytest.mark.unit
+    def test_load_audio_chunks_reads_only_selected_ranges(self, monkeypatch):
+        dataset = self._selection_dataset()
+        dataset.feat_per_sec = 10
+
+        class Featurizer:
+            sample_rate = 100
+            int_values = False
+
+            @staticmethod
+            def process_segment(segment):
+                return torch.from_numpy(segment.samples)
+
+        dataset.featurizer = Featurizer()
+        calls = []
+
+        def fake_from_file(audio_file, target_sr, int_values, offset, duration):
+            calls.append((audio_file, offset, duration))
+            value = float(len(calls))
+            return AudioSegment(
+                np.full(round(duration * target_sr), value, dtype=np.float32),
+                target_sr,
+            )
+
+        monkeypatch.setattr(AudioSegment, "from_file", staticmethod(fake_from_file))
+
+        audio = dataset._load_audio_chunks("audio.wav", offset=5.0, bounds=[(10, 20), (40, 55)])
+
+        assert calls == [("audio.wav", 6.0, 1.0), ("audio.wav", 9.0, 1.5)]
+        assert audio.shape == (250,)
+        assert torch.all(audio[:100] == 1)
+        assert torch.all(audio[100:] == 2)
+
+    @pytest.mark.unit
+    def test_create_subsegment_plans_before_loading_audio(self, tmp_path):
+        rttm_path = tmp_path / "audio.rttm"
+        rttm_path.write_text(
+            "SPEAKER session 1 2.0 1.0 <NA> <NA> speaker_A <NA> <NA>\n",
+            encoding="utf-8",
+        )
+        sample = SimpleNamespace(
+            audio_file="audio.wav",
+            rttm_file=str(rttm_path),
+            duration=6.0,
+        )
+        dataset = self._selection_dataset()
+        dataset.feat_per_sec = 10
+        dataset.round_digits = 2
+        dataset.session_len_sec = 2
+        dataset.subsegment_min_len_sec = 1
+        dataset.subsegment_min_chunk_len_sec = 0.5
+        dataset.subsegment_two_chunks_rate = 0
+        dataset.min_subsegment_duration = 0.03
+        dataset.featurizer = SimpleNamespace(sample_rate=100)
+        dataset._sample_single_chunk_bounds = lambda *args, **kwargs: [(20, 40)]
+        dataset._maybe_apply_opus_roundtrip = lambda audio: audio
+        dataset.get_segment_timestamps = lambda duration, sample_rate: torch.tensor([20])
+        dataset.get_frame_count_from_time_series_length = lambda length: 20
+        dataset.get_soft_targets_seg = lambda feat_level_target, target_len: feat_level_target
+        load_calls = []
+
+        def fake_load(audio_file, offset, bounds):
+            load_calls.append((audio_file, offset, bounds))
+            return torch.zeros(200)
+
+        dataset._load_audio_chunks = fake_load
+
+        audio, audio_len, targets, target_len, speaker_names = dataset._create_subsegment(
+            sample, offset=0
+        )
+
+        assert load_calls == [("audio.wav", 0, [(20, 40)])]
+        assert audio.shape == (200,)
+        assert audio_len == 200
+        assert targets.shape == (20, dataset.max_spks)
+        assert target_len == 20
+        assert speaker_names[0] == "speaker_A"
 
     @pytest.mark.unit
     def test_e2e_speaker_diar_dataset(self, test_data_dir):

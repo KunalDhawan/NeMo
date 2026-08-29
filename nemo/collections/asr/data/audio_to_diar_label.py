@@ -23,6 +23,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
+from nemo.collections.asr.parts.preprocessing.segment import AudioSegment
 from nemo.collections.asr.parts.utils.offline_clustering import get_argmin_mat
 from nemo.collections.asr.parts.utils.speaker_utils import convert_rttm_line, get_subsegments, prepare_split_data
 from nemo.collections.common.parts.preprocessing.collections import (
@@ -1161,7 +1162,7 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         subsegment_nspk_bias: float = 1.0,
         subsegment_min_first_spk_frames: int = 50,
         subsegment_boundary_silence_frames: int = 10,
-        subsegment_preload_sec: float = 0.0,
+        subsegment_start_guard_frames: int = 10,
         opus_roundtrip_prob: float = 0.0,
         opus_roundtrip_compression_level: Optional[float] = None,
         validate_manifest_paths: bool = True,
@@ -1203,24 +1204,21 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         self.subsegment_nspk_bias = subsegment_nspk_bias
         self.subsegment_min_first_spk_frames = subsegment_min_first_spk_frames
         self.subsegment_boundary_silence_frames = subsegment_boundary_silence_frames
-        self.subsegment_preload_sec = float(subsegment_preload_sec)
+        self.subsegment_start_guard_frames = subsegment_start_guard_frames
         for name, value in (
             ("subsegment_min_first_spk_frames", self.subsegment_min_first_spk_frames),
             ("subsegment_boundary_silence_frames", self.subsegment_boundary_silence_frames),
         ):
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"{name} must be a positive integer, got {value!r}")
-        if self.subsegment_preload_sec < 0:
-            raise ValueError(
-                f"subsegment_preload_sec must be non-negative, got {self.subsegment_preload_sec}"
-            )
         if (
-            self.subsegment_preload_sec > 0
-            and self.session_len_sec > 0
-            and self.subsegment_preload_sec < self.session_len_sec
+            not isinstance(self.subsegment_start_guard_frames, int)
+            or isinstance(self.subsegment_start_guard_frames, bool)
+            or self.subsegment_start_guard_frames < 0
         ):
             raise ValueError(
-                "subsegment_preload_sec cannot be shorter than session_len_sec"
+                "subsegment_start_guard_frames must be a non-negative integer, "
+                f"got {self.subsegment_start_guard_frames!r}"
             )
         if not 0.0 <= opus_roundtrip_prob <= 1.0:
             raise ValueError(f"opus_roundtrip_prob must be between 0 and 1, got {opus_roundtrip_prob}")
@@ -1494,6 +1492,30 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         target_len = torch.tensor([ts_tensor.shape[0]])
         return target_len
 
+    def _window_speaker_presence(self, frame_level_target, candidate_indices, window_len):
+        """Return speaker presence for fixed-length candidate windows.
+
+        Windows start at ``candidate_indices``, extend for ``window_len`` feature
+        frames, and are clipped at the end of ``frame_level_target``.
+
+        Args:
+            frame_level_target: Target tensor of shape ``(T, S)``.
+            candidate_indices: Start indices of shape ``(N,)``.
+            window_len: Window length in feature frames.
+
+        Returns:
+            Boolean tensor of shape ``(N, S)``. An entry is true when the
+            corresponding speaker is active at least once in that window.
+        """
+        active = (frame_level_target > self.soft_label_thres).long()
+        num_frames, num_speakers = active.shape
+        activity_prefix = torch.zeros(
+            num_frames + 1, num_speakers, dtype=torch.long, device=active.device
+        )
+        activity_prefix[1:] = active.cumsum(dim=0)
+        ends = torch.clamp(candidate_indices + window_len, max=num_frames)
+        return activity_prefix[ends] - activity_prefix[candidate_indices] > 0
+
     def _compute_spk_bias_weights(
         self, frame_level_target, candidate_indices, window_len, included_speakers=None
     ):
@@ -1514,13 +1536,9 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         Returns:
             1-D float tensor of sampling weights aligned with candidate_indices.
         """
-        active = (frame_level_target > self.soft_label_thres).float()  # (T, S)
-        T, S = active.shape
-        cumsum = torch.zeros(T + 1, S)
-        cumsum[1:] = torch.cumsum(active, dim=0)
-        ends = torch.clamp(candidate_indices + window_len, max=T)
-        window_activity = cumsum[ends] - cumsum[candidate_indices]  # (N, S)
-        speaker_presence = window_activity > 0
+        speaker_presence = self._window_speaker_presence(
+            frame_level_target, candidate_indices, window_len
+        )
         if included_speakers is not None:
             speaker_presence |= included_speakers.to(
                 device=speaker_presence.device, dtype=torch.bool
@@ -1531,7 +1549,15 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
 
     @staticmethod
     def _next_true_indices(mask):
-        """Return the first true index at or after every position, or ``len(mask)``."""
+        """Find the first true value at or after each position.
+
+        Args:
+            mask: One-dimensional boolean tensor of length ``T``.
+
+        Returns:
+            Integer tensor of length ``T``. Each value is the first true index
+            at or after that position, or ``T`` when no such index exists.
+        """
         length = mask.shape[0]
         indices = torch.arange(length, device=mask.device)
         marked = torch.where(mask, indices, length)
@@ -1543,12 +1569,20 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         Silence before the first speaker is unrestricted. Once the first active frame
         is reached, it must contain exactly one speaker. That speaker must accumulate
         ``subsegment_min_first_spk_frames`` active frames before any other speaker
-        becomes active; intervening silence does not reset the count.
+        becomes active; intervening silence does not reset the count. A start is also
+        rejected when a different speaker was active during the preceding
+        ``subsegment_start_guard_frames`` frames.
+
+        Args:
+            frame_level_target: Target tensor of shape ``(T, S)``.
+
+        Returns:
+            Boolean tensor of length ``T`` marking eligible chunk starts.
         """
         active = frame_level_target > self.soft_label_thres
         num_frames, num_speakers = active.shape
-        if num_frames == 0:
-            return torch.zeros(0, dtype=torch.bool, device=active.device)
+        if num_frames == 0 or num_speakers == 0:
+            return torch.zeros(num_frames, dtype=torch.bool, device=active.device)
 
         frame_indices = torch.arange(num_frames, device=active.device)
         active_count = active.sum(dim=1)
@@ -1574,10 +1608,30 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         eligible = torch.zeros(num_frames, dtype=torch.bool, device=active.device)
         has_future_speech = next_active < num_frames
         eligible[has_future_speech] = qualifying_first_frame[next_active[has_future_speech]]
+        if self.subsegment_start_guard_frames > 0:
+            history_start = torch.clamp(
+                frame_indices - self.subsegment_start_guard_frames, min=0
+            )
+            history = activity_prefix[frame_indices] - activity_prefix[history_start]
+            first_active = next_active.clamp(max=num_frames - 1)
+            first_speaker = active[first_active].long().argmax(dim=1, keepdim=True)
+            first_speaker_history = history.gather(dim=1, index=first_speaker).squeeze(1)
+            other_speaker_history = history.sum(dim=1) - first_speaker_history
+            eligible &= other_speaker_history == 0
         return eligible
 
     def _silence_boundary_mask(self, frame_level_target):
-        """Mark boundaries surrounded by the configured number of silent frames."""
+        """Find boundaries protected by silence on both sides.
+
+        Boundary ``b`` is safe when every frame in ``[b-S, b+S)`` is silent,
+        where ``S`` is ``subsegment_boundary_silence_frames``.
+
+        Args:
+            frame_level_target: Target tensor of shape ``(T, S)``.
+
+        Returns:
+            Boolean tensor of length ``T + 1`` indexed by frame boundaries.
+        """
         num_frames = frame_level_target.shape[0]
         margin = self.subsegment_boundary_silence_frames
         boundaries = torch.arange(num_frames + 1, device=frame_level_target.device)
@@ -1597,7 +1651,18 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
     def _sample_start(
         self, frame_level_target, candidates, window_len, included_speakers=None
     ):
-        """Sample one candidate while preserving the existing speaker-count bias."""
+        """Sample one candidate, optionally with speaker-count bias.
+
+        Args:
+            frame_level_target: Target tensor of shape ``(T, S)``.
+            candidates: Candidate start indices of shape ``(N,)``.
+            window_len: Number of feature frames used to count speakers.
+            included_speakers: Optional ``(S,)`` mask included in the speaker
+                count, used to bias chunk two by the union with chunk one.
+
+        Returns:
+            Selected start index, or ``None`` when ``candidates`` is empty.
+        """
         if candidates.numel() == 0:
             return None
         if self.subsegment_nspk_bias > 1.0:
@@ -1611,7 +1676,20 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         return candidates[random.randrange(candidates.numel())].item()
 
     def _sample_single_chunk_bounds(self, frame_level_target, max_len, min_len):
-        """Sample one eligible chunk and return ``[(start, end)]``."""
+        """Sample one eligible chunk within the model speaker capacity.
+
+        Starts must satisfy the first-speaker rule and leave at least ``min_len``
+        frames. Candidates whose selected window contains more than ``max_spks``
+        unique speakers are excluded.
+
+        Args:
+            frame_level_target: Target tensor of shape ``(T, S)``.
+            max_len: Maximum selected length in feature frames.
+            min_len: Minimum selected length in feature frames.
+
+        Returns:
+            A one-element ``[(start, end)]`` list, or ``None``.
+        """
         num_frames = frame_level_target.shape[0]
         if num_frames < min_len:
             return None
@@ -1620,6 +1698,10 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         candidates = torch.where(
             eligible & (torch.arange(num_frames, device=eligible.device) <= num_frames - min_len)
         )[0]
+        speaker_presence = self._window_speaker_presence(
+            frame_level_target, candidates, max_len
+        )
+        candidates = candidates[speaker_presence.sum(dim=1) <= self.max_spks]
         start = self._sample_start(frame_level_target, candidates, max_len)
         if start is None:
             return None
@@ -1631,6 +1713,20 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         Chunk one is always returned first, irrespective of source chronology. Its
         end and chunk two's start each lie at the center of a ``2 * S``-frame
         silence region, yielding at least ``2 * S`` silent frames at the splice.
+        Both starts satisfy the first-speaker rule, both chunks meet
+        ``min_chunk_len``, and their speaker union does not exceed ``max_spks``.
+
+        First starts are tried in speaker-biased order. For each first start, one
+        capacity-valid ending is sampled. If it has no compatible second start,
+        selection continues with the next first start.
+
+        Args:
+            frame_level_target: Target tensor of shape ``(T, S)``.
+            total_len: Combined output length in feature frames.
+            min_chunk_len: Minimum length of either chunk in feature frames.
+
+        Returns:
+            ``[(start1, end1), (start2, end2)]``, or ``None``.
         """
         num_frames = frame_level_target.shape[0]
         if total_len < 2 * min_chunk_len or num_frames < total_len:
@@ -1639,6 +1735,14 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         eligible = self._eligible_chunk_starts(frame_level_target)
         safe_boundary = self._silence_boundary_mask(frame_level_target)
         frame_indices = torch.arange(num_frames, device=eligible.device)
+        speaker_activity = (frame_level_target > self.soft_label_thres).long()
+        speaker_activity_prefix = torch.zeros(
+            num_frames + 1,
+            speaker_activity.shape[1],
+            dtype=torch.long,
+            device=speaker_activity.device,
+        )
+        speaker_activity_prefix[1:] = speaker_activity.cumsum(dim=0)
         first_candidates = torch.where(
             eligible
             & (frame_indices + min_chunk_len + self.subsegment_boundary_silence_frames <= num_frames)
@@ -1694,17 +1798,30 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
             if end_candidates.numel() == 0:
                 continue
 
-            end1 = end_candidates[random.randrange(end_candidates.numel())].item()
-            len1 = end1 - start1
-            len2 = total_len - len1
+            first_speakers_by_end = (
+                speaker_activity_prefix[end_candidates] - speaker_activity_prefix[start1]
+            ) > 0
+            valid_capacity = first_speakers_by_end.sum(dim=1) <= self.max_spks
+            end_candidates = end_candidates[valid_capacity]
+            first_speakers_by_end = first_speakers_by_end[valid_capacity]
+            if end_candidates.numel() == 0:
+                continue
+
+            end_index = random.randrange(end_candidates.numel())
+            end1 = end_candidates[end_index].item()
+            first_speakers = first_speakers_by_end[end_index]
+            len2 = total_len - (end1 - start1)
             valid_second = second_start_mask & (frame_indices + len2 <= num_frames)
             valid_second &= ((frame_indices + len2 <= start1) | (frame_indices >= end1))
-            first_speakers = (
-                frame_level_target[start1:end1] > self.soft_label_thres
-            ).any(dim=0)
+            second_candidates = torch.where(valid_second)[0]
+            second_speakers = self._window_speaker_presence(
+                frame_level_target, second_candidates, len2
+            )
+            union_size = (second_speakers | first_speakers.unsqueeze(0)).sum(dim=1)
+            second_candidates = second_candidates[union_size <= self.max_spks]
             start2 = self._sample_start(
                 frame_level_target,
-                torch.where(valid_second)[0],
+                second_candidates,
                 len2,
                 included_speakers=first_speakers,
             )
@@ -1713,40 +1830,65 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
 
         return None
 
-    def _slice_chunks(self, audio_signal, frame_level_target, bounds):
-        """Slice and concatenate matching waveform and target chunks."""
-        samples_per_frame = self.featurizer.sample_rate / self.feat_per_sec
-        frame_level_target = torch.cat(
-            [frame_level_target[start:end] for start, end in bounds]
-        )
-        audio_signal = torch.cat(
-            [
-                audio_signal[
-                    int(start * samples_per_frame) : int(end * samples_per_frame)
-                ]
-                for start, end in bounds
-            ]
-        )
-        return audio_signal, frame_level_target
+    @staticmethod
+    def _slice_target_chunks(frame_level_target, bounds):
+        """Concatenate target ranges in output order.
+
+        Args:
+            frame_level_target: Target tensor of shape ``(T, S)``.
+            bounds: Ordered sequence of ``(start, end)`` frame pairs.
+
+        Returns:
+            Concatenated target tensor with the same speaker dimension.
+        """
+        return torch.cat([frame_level_target[start:end] for start, end in bounds])
+
+    def _load_audio_chunks(self, audio_file, offset, bounds):
+        """Load only selected source ranges and augment the combined waveform.
+
+        Each frame range is converted to an absolute audio offset and duration.
+        Loaded ranges are trimmed or zero-padded to the exact expected sample
+        count, concatenated in ``bounds`` order, and passed through the waveform
+        featurizer once so random augmentation is consistent across chunks.
+
+        Args:
+            audio_file: Audio path or paths accepted by ``AudioSegment``.
+            offset: Manifest-segment offset in seconds.
+            bounds: Ordered sequence of ``(start, end)`` feature-frame pairs.
+
+        Returns:
+            Waveform tensor containing only the selected ranges.
+        """
+        sample_rate = self.featurizer.sample_rate
+        samples_per_frame = sample_rate / self.feat_per_sec
+        chunks = []
+        for start, end in bounds:
+            segment = AudioSegment.from_file(
+                audio_file,
+                target_sr=sample_rate,
+                int_values=self.featurizer.int_values,
+                offset=offset + start / self.feat_per_sec,
+                duration=(end - start) / self.feat_per_sec,
+            )
+            samples = segment.samples
+            expected_samples = round((end - start) * samples_per_frame)
+            if samples.shape[0] < expected_samples:
+                pad_width = [(0, expected_samples - samples.shape[0])]
+                pad_width.extend([(0, 0)] * (samples.ndim - 1))
+                samples = np.pad(samples, pad_width)
+            chunks.append(samples[:expected_samples])
+
+        combined = AudioSegment(np.concatenate(chunks, axis=0), sample_rate)
+        return self.featurizer.process_segment(combined)
 
     def _create_subsegment(self, sample, offset):
         duration = sample.duration
 
-        # Pre-crop very long files before loading the waveform.
-        if self.subsegment_preload_sec > 0 and duration > self.subsegment_preload_sec:
-            preload_start = random.uniform(0, duration - self.subsegment_preload_sec)
-            offset = offset + preload_start
-            duration = self.subsegment_preload_sec
-
-        audio_signal = self.featurizer.process(sample.audio_file, offset=offset, duration=duration)
-        
         with open(sample.rttm_file, 'r') as f:
             rttm_lines = f.readlines()
-        
+
         rttm_timestamps, sess_to_global_spkids = extract_frame_info_from_rttm(offset, duration, rttm_lines)
         num_speakers = len(sess_to_global_spkids)
-        all_spks = list(sess_to_global_spkids.keys())
-
         frame_level_target = get_frame_targets_from_rttm(
             rttm_timestamps=rttm_timestamps,
             offset=offset,
@@ -1756,85 +1898,11 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
             max_spks=num_speakers,
         )
 
-        if num_speakers > self.max_spks:
-            active_frames_per_spk = frame_level_target.sum(dim=0)
-            weights = active_frames_per_spk.float()
-            if weights.sum() == 0:
-                weights = torch.ones(num_speakers)
-            spk_indices = torch.multinomial(weights, self.max_spks, replacement=False)
-            spks_tokeep = sorted(spk_indices.tolist())
-            #logging.info(
-            #    f"uniq_id: {sample.uniq_id}, active_frames_per_spk: {active_frames_per_spk.tolist()}, spks_tokeep: {spks_tokeep}"
-            #)
-        else:
-            spks_tokeep = all_spks
-
-        spks_todrop = [spk for spk in all_spks if spk not in spks_tokeep]
-
-        if spks_todrop:
-            samples_per_frame = int(self.featurizer.sample_rate / self.feat_per_sec)
-            activity_todrop = frame_level_target[:, spks_todrop].sum(dim=1) > 0
-
-            # Option B boundary margin: replace frames adjacent to excision boundaries
-            # with silence (audio) and zeros (targets) to remove residual energy from
-            # dropped speakers and provide an acoustic buffer at concatenation points.
-            if self.subsegment_margin_frames > 0:
-                margin = self.subsegment_margin_frames
-                # Dilate the excision mask to find boundary margin frames
-                activity_float = activity_todrop.float().unsqueeze(0).unsqueeze(0)
-                dilated = (
-                    torch.nn.functional.max_pool1d(
-                        activity_float,
-                        kernel_size=2 * margin + 1,
-                        stride=1,
-                        padding=margin,
-                    ).squeeze(0).squeeze(0)
-                    > 0
-                )
-                # Margin = frames in the dilated region but NOT in the original excision region
-                margin_mask = dilated & ~activity_todrop
-
-                # Zero out frame-level targets at margin frames
-                frame_level_target[margin_mask] = 0
-
-                # Replace audio at margin frames with low-level noise (avoids
-                # log(0) artifacts in log-mel feature extraction that pure zeros would cause)
-                audio_margin_mask = margin_mask.repeat_interleave(samples_per_frame)
-                margin_len = min(audio_signal.shape[0], audio_margin_mask.shape[0])
-                full_audio_margin = torch.zeros(audio_signal.shape[0], dtype=torch.bool)
-                full_audio_margin[:margin_len] = audio_margin_mask[:margin_len]
-                n_margin_samples = full_audio_margin.sum().item()
-                audio_signal[full_audio_margin] = torch.randn(n_margin_samples) * 1e-3
-
-            # Excise frames where dropped speakers are active
-            frames_to_keep_mask = ~activity_todrop
-            frame_level_target = frame_level_target[frames_to_keep_mask]
-
-            # Create a corresponding mask for the audio signal by expanding the frame mask
-            audio_mask = frames_to_keep_mask.repeat_interleave(samples_per_frame)
-
-            # Ensure audio_signal and audio_mask have the same length before applying mask
-            min_audio_len = min(audio_signal.shape[0], audio_mask.shape[0])
-            audio_signal = audio_signal[:min_audio_len]
-            audio_mask = audio_mask[:min_audio_len]
-
-            # Apply the mask to the audio signal
-            audio_signal = audio_signal[audio_mask]
-
-        frame_level_target = frame_level_target[:, spks_tokeep]
-        speaker_names = self._build_speaker_names(sess_to_global_spkids, columns=spks_tokeep)
-
-        if frame_level_target.shape[1] < self.max_spks:
-            pad_width = self.max_spks - frame_level_target.shape[1]
-            frame_level_target = torch.nn.functional.pad(frame_level_target, (0, pad_width), 'constant', 0)
-
-        # Select either one chunk or a silence-protected pair of chunks.
-        max_len_frames = int(self.session_len_sec * self.feat_per_sec)
-        min_len_frames = int(self.subsegment_min_len_sec * self.feat_per_sec)
-
         if self.session_len_sec > 0:
-            bounds = None
+            max_len_frames = int(self.session_len_sec * self.feat_per_sec)
+            min_len_frames = int(self.subsegment_min_len_sec * self.feat_per_sec)
             min_chunk_len_frames = int(self.subsegment_min_chunk_len_sec * self.feat_per_sec)
+            bounds = None
             if random.random() < self.subsegment_two_chunks_rate:
                 bounds = self._sample_two_chunk_bounds(
                     frame_level_target,
@@ -1847,17 +1915,38 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
                     max_len=max_len_frames,
                     min_len=min_len_frames,
                 )
-            if bounds is None:
-                return (
-                    torch.tensor([], dtype=audio_signal.dtype),
-                    torch.tensor(0).long(),
-                    torch.zeros((0, self.max_spks), dtype=frame_level_target.dtype),
-                    torch.tensor([0]).long(),
-                    [None] * self.max_spks,
-                )
-            audio_signal, frame_level_target = self._slice_chunks(
-                audio_signal, frame_level_target, bounds
+        else:
+            bounds = [(0, frame_level_target.shape[0])]
+            if (frame_level_target > self.soft_label_thres).any(dim=0).sum() > self.max_spks:
+                bounds = None
+
+        if bounds is None:
+            return (
+                torch.tensor([], dtype=torch.float),
+                torch.tensor(0).long(),
+                torch.zeros((0, self.max_spks), dtype=frame_level_target.dtype),
+                torch.tensor([0]).long(),
+                [None] * self.max_spks,
             )
+
+        frame_level_target = self._slice_target_chunks(frame_level_target, bounds)
+        spks_tokeep = torch.where(
+            (frame_level_target > self.soft_label_thres).any(dim=0)
+        )[0].tolist()
+        if len(spks_tokeep) > self.max_spks:
+            raise RuntimeError(
+                f"Selected subsegment has {len(spks_tokeep)} speakers, "
+                f"exceeding max_spks={self.max_spks}"
+            )
+        frame_level_target = frame_level_target[:, spks_tokeep]
+        speaker_names = self._build_speaker_names(sess_to_global_spkids, columns=spks_tokeep)
+        if frame_level_target.shape[1] < self.max_spks:
+            pad_width = self.max_spks - frame_level_target.shape[1]
+            frame_level_target = torch.nn.functional.pad(
+                frame_level_target, (0, pad_width), 'constant', 0
+            )
+
+        audio_signal = self._load_audio_chunks(sample.audio_file, offset, bounds)
 
         min_viable_samples = int(self.min_subsegment_duration * self.featurizer.sample_rate)
         if audio_signal.shape[0] < min_viable_samples:
@@ -2052,7 +2141,7 @@ class AudioToSpeechE2ESpkDiarDataset(_AudioToSpeechE2ESpkDiarDataset):
         subsegment_nspk_bias: float = 1.0,
         subsegment_min_first_spk_frames: int = 50,
         subsegment_boundary_silence_frames: int = 10,
-        subsegment_preload_sec: float = 0.0,
+        subsegment_start_guard_frames: int = 10,
         opus_roundtrip_prob: float = 0.0,
         opus_roundtrip_compression_level: Optional[float] = None,
         validate_manifest_paths: bool = True,
@@ -2077,7 +2166,7 @@ class AudioToSpeechE2ESpkDiarDataset(_AudioToSpeechE2ESpkDiarDataset):
             subsegment_nspk_bias=subsegment_nspk_bias,
             subsegment_min_first_spk_frames=subsegment_min_first_spk_frames,
             subsegment_boundary_silence_frames=subsegment_boundary_silence_frames,
-            subsegment_preload_sec=subsegment_preload_sec,
+            subsegment_start_guard_frames=subsegment_start_guard_frames,
             opus_roundtrip_prob=opus_roundtrip_prob,
             opus_roundtrip_compression_level=opus_roundtrip_compression_level,
             validate_manifest_paths=validate_manifest_paths,
