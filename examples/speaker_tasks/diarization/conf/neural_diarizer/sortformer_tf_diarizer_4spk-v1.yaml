@@ -98,13 +98,13 @@ model:
     validation_mode: False
     # Long-session subsegment sampling
     subsegment_mode: True
-    subsegment_min_len_sec: 30
+    subsegment_single_chunk_min_len_sec: 30
     subsegment_two_chunks_rate: 0
-    subsegment_min_chunk_len_sec: 10
+    subsegment_two_chunk_min_len_sec: 10
     subsegment_nspk_bias: 1.0
-    subsegment_min_first_spk_frames: 4
-    subsegment_boundary_silence_frames: 1
-    subsegment_start_guard_frames: 1
+    subsegment_start_guard_sec: 0.25
+    subsegment_min_first_spk_sec: 0.50
+    subsegment_splice_silence_sec: 0.10
     # lhotse config
     use_lhotse: False
     use_bucketing: True

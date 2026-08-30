@@ -24,9 +24,6 @@ https://docs.nvidia.com/nemo-framework/user-guide/latest/nemotoolkit
 
 Supported model types:
     - SortformerEncLabelModel: Original Sortformer with transformer+feedforward backend
-    - SortformerCLSEncLabelModel: CLS-based Sortformer with multiple backend support (trff, dotp, isd, jsd)
-
-The script automatically detects the model type from the checkpoint/nemo file.
 
 Usage for diarization inference:
 
@@ -57,7 +54,7 @@ from omegaconf import OmegaConf
 from pytorch_lightning import seed_everything
 
 from nemo.collections.asr.metrics.der import score_labels
-from nemo.collections.asr.models import SortformerCLSEncLabelModel, SortformerEncLabelModel
+from nemo.collections.asr.models import SortformerEncLabelModel
 from nemo.collections.asr.parts.utils.speaker_utils import (
     audio_rttm_map,
     get_uniqname_from_filepath,
@@ -75,52 +72,6 @@ from nemo.core.config import hydra_runner
 
 seed_everything(42)
 torch.backends.cudnn.deterministic = True
-
-
-def get_sortformer_model_class(model_path: str):
-    """
-    Determine the appropriate Sortformer model class based on the checkpoint/nemo file.
-    
-    Args:
-        model_path (str): Path to the .ckpt or .nemo model file.
-        
-    Returns:
-        Model class: Either SortformerCLSEncLabelModel or SortformerEncLabelModel.
-    """
-    if model_path.endswith(".nemo"):
-        # For .nemo files, extract and check the config
-        import tarfile
-        import tempfile
-        with tarfile.open(model_path, 'r') as tar:
-            # Try to extract the config file
-            try:
-                config_member = None
-                for member in tar.getmembers():
-                    if member.name.endswith('model_config.yaml'):
-                        config_member = member
-                        break
-                if config_member is not None:
-                    with tempfile.TemporaryDirectory() as tmpdir:
-                        tar.extract(config_member, tmpdir)
-                        config_path = os.path.join(tmpdir, config_member.name)
-                        model_cfg = OmegaConf.load(config_path)
-                        if hasattr(model_cfg, 'sortformer_cls_modules'):
-                            return SortformerCLSEncLabelModel
-            except Exception:
-                pass
-        return SortformerEncLabelModel
-    elif model_path.endswith(".ckpt"):
-        # For .ckpt files, load the checkpoint and check the config
-        checkpoint = torch.load(model_path, map_location='cpu')
-        if 'hyper_parameters' in checkpoint and 'cfg' in checkpoint['hyper_parameters']:
-            cfg = checkpoint['hyper_parameters']['cfg']
-            if isinstance(cfg, dict):
-                cfg = OmegaConf.create(cfg)
-            if hasattr(cfg, 'sortformer_cls_modules'):
-                return SortformerCLSEncLabelModel
-        return SortformerEncLabelModel
-    else:
-        raise ValueError(f"Unsupported model file format: {model_path}")
 
 
 @dataclass
@@ -431,16 +382,12 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         accelerator = 'gpu'
         map_location = torch.device(f'cuda:{cfg.cuda}')
 
-    # Detect model type (SortformerCLS or Sortformer) and load accordingly
-    model_class = get_sortformer_model_class(cfg.model_path)
-    logging.info(f"Detected model type: {model_class.__name__}")
-    
     if cfg.model_path.endswith(".ckpt"):
-        diar_model = model_class.load_from_checkpoint(
+        diar_model = SortformerEncLabelModel.load_from_checkpoint(
             checkpoint_path=cfg.model_path, map_location=map_location, strict=False
         )
     elif cfg.model_path.endswith(".nemo"):
-        diar_model = model_class.restore_from(restore_path=cfg.model_path, map_location=map_location)
+        diar_model = SortformerEncLabelModel.restore_from(restore_path=cfg.model_path, map_location=map_location)
     else:
         raise ValueError("cfg.model_path must end with .ckpt or .nemo!")
 
@@ -503,8 +450,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     # Streaming mode setup (only if enabled)
     if diar_model.streaming_mode:
         diar_model.async_streaming = cfg.async_streaming
-        # Handle both SortformerCLS (sortformer_cls_modules) and Sortformer (sortformer_modules)
-        modules = getattr(diar_model, 'sortformer_cls_modules', None) or diar_model.sortformer_modules
+        modules = diar_model.sortformer_modules
         modules.chunk_len = cfg.chunk_len
         modules.spkcache_len = cfg.spkcache_len
         modules.chunk_left_context = cfg.chunk_left_context

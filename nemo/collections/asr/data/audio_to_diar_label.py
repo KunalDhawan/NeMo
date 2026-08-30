@@ -14,11 +14,13 @@
 
 import io
 import importlib
+import math
 import os
 import random
 from collections import OrderedDict
+from numbers import Real
 from statistics import mode
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -253,6 +255,7 @@ def get_frame_targets_from_rttm(
     round_digits: int,
     feat_per_sec: int,
     max_spks: int,
+    dtype: torch.dtype = torch.float32,
 ):
     """
     Create a multi-dimensional vector sequence containing speaker timestamp information in RTTM.
@@ -266,9 +269,10 @@ def get_frame_targets_from_rttm(
         feat_per_sec (int):
             Number of feature frames per second.
             This quantity is determined by window_stride variable in preprocessing module.
-        target_spks (tuple):
-            Speaker indices that are generated from combinations. If there are only one or two speakers,
-            only a single target_spks variable is generated.
+        max_spks (int):
+            Number of speaker columns to allocate.
+        dtype (torch.dtype):
+            Output target dtype.
 
     Returns:
         feat_level_target (torch.tensor):
@@ -282,7 +286,7 @@ def get_frame_targets_from_rttm(
             f"Number of speakers in RTTM file {len(sorted_speakers)} exceeds the maximum number of speakers: "
             f"{max_spks}! Only {max_spks} first speakers remain, and this will affect frame metrics!"
         )
-    feat_level_target = torch.zeros(total_fr_len, max_spks)
+    feat_level_target = torch.zeros(total_fr_len, max_spks, dtype=dtype)
     for count, (stt, end, spk_rttm_key) in enumerate(zip(stt_list, end_list, speaker_list)):
         if end < offset or stt > offset + duration:
             continue
@@ -1098,6 +1102,33 @@ def extract_global_speaker_ids(
     return speaker_to_id
 
 
+class _SubsegmentActivity(NamedTuple):
+    """Compact, reusable frame-activity data used while planning source chunks.
+
+    Attributes:
+        activity: Boolean speaker activity with shape ``(T, S)``.
+        prefix: Per-speaker activity prefix counts with shape ``(T + 1, S)``;
+            ``prefix[t, s]`` counts active frames for speaker ``s`` before ``t``.
+        total_prefix: Total active speaker-frame prefix counts with shape
+            ``(T + 1,)``. Overlap contributes one count per active speaker.
+        active_count: Number of active speakers at each frame, shape ``(T,)``.
+        next_active: First active frame at or after each frame, or ``T`` when
+            no future speech exists, shape ``(T,)``.
+        first_speaker: First active speaker index at each frame. It is meaningful
+            only when ``active_count == 1``, shape ``(T,)``.
+        next_competitor: First frame at or after each frame where someone other
+            than ``first_speaker`` is active, or ``T`` if none exists, shape ``(T,)``.
+    """
+
+    activity: torch.Tensor
+    prefix: torch.Tensor
+    total_prefix: torch.Tensor
+    active_count: torch.Tensor
+    next_active: torch.Tensor
+    first_speaker: torch.Tensor
+    next_competitor: torch.Tensor
+
+
 class _AudioToSpeechE2ESpkDiarDataset(Dataset):
     """
     Dataset class that loads a json file containing paths to audio files,
@@ -1155,14 +1186,13 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         subsampling_factor: int = 8,
         device: str = 'cpu',
         subsegment_mode: bool = False,
-        subsegment_min_len_sec: float = 15.0,
+        subsegment_single_chunk_min_len_sec: float = 15.0,
+        subsegment_two_chunk_min_len_sec: float = 10.0,
         subsegment_two_chunks_rate: float = 0.0,
-        subsegment_min_chunk_len_sec: float = 10.0,
-        subsegment_margin_frames: int = 0,
         subsegment_nspk_bias: float = 1.0,
-        subsegment_min_first_spk_frames: int = 50,
-        subsegment_boundary_silence_frames: int = 10,
-        subsegment_start_guard_frames: int = 10,
+        subsegment_start_guard_sec: float = 0.25,
+        subsegment_min_first_spk_sec: float = 0.50,
+        subsegment_splice_silence_sec: float = 0.10,
         opus_roundtrip_prob: float = 0.0,
         opus_roundtrip_compression_level: Optional[float] = None,
         validate_manifest_paths: bool = True,
@@ -1197,29 +1227,48 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         self.device = device
         self.global_rank = global_rank
         self.subsegment_mode = subsegment_mode
-        self.subsegment_min_len_sec = subsegment_min_len_sec
         self.subsegment_two_chunks_rate = subsegment_two_chunks_rate
-        self.subsegment_min_chunk_len_sec = subsegment_min_chunk_len_sec
-        self.subsegment_margin_frames = subsegment_margin_frames
-        self.subsegment_nspk_bias = subsegment_nspk_bias
-        self.subsegment_min_first_spk_frames = subsegment_min_first_spk_frames
-        self.subsegment_boundary_silence_frames = subsegment_boundary_silence_frames
-        self.subsegment_start_guard_frames = subsegment_start_guard_frames
+
         for name, value in (
-            ("subsegment_min_first_spk_frames", self.subsegment_min_first_spk_frames),
-            ("subsegment_boundary_silence_frames", self.subsegment_boundary_silence_frames),
+            ("subsegment_single_chunk_min_len_sec", subsegment_single_chunk_min_len_sec),
+            ("subsegment_two_chunk_min_len_sec", subsegment_two_chunk_min_len_sec),
         ):
-            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-                raise ValueError(f"{name} must be a positive integer, got {value!r}")
-        if (
-            not isinstance(self.subsegment_start_guard_frames, int)
-            or isinstance(self.subsegment_start_guard_frames, bool)
-            or self.subsegment_start_guard_frames < 0
+            if isinstance(value, bool) or not isinstance(value, Real):
+                raise TypeError(f"{name} must be numeric, got {value!r}")
+            if not math.isfinite(float(value)) or value <= 0:
+                raise ValueError(f"{name} must be finite and > 0, got {value!r}")
+        self.subsegment_single_chunk_min_len_sec = float(
+            subsegment_single_chunk_min_len_sec
+        )
+        self.subsegment_two_chunk_min_len_sec = float(
+            subsegment_two_chunk_min_len_sec
+        )
+        if isinstance(subsegment_nspk_bias, bool) or not isinstance(
+            subsegment_nspk_bias, Real
         ):
-            raise ValueError(
-                "subsegment_start_guard_frames must be a non-negative integer, "
-                f"got {self.subsegment_start_guard_frames!r}"
+            raise TypeError(
+                f"subsegment_nspk_bias must be numeric, got {subsegment_nspk_bias!r}"
             )
+        if not math.isfinite(float(subsegment_nspk_bias)) or subsegment_nspk_bias < 1.0:
+            raise ValueError(
+                f"subsegment_nspk_bias must be finite and >= 1.0, got {subsegment_nspk_bias!r}"
+            )
+        self.subsegment_nspk_bias = float(subsegment_nspk_bias)
+        for name, value, allow_zero in (
+            ("subsegment_start_guard_sec", subsegment_start_guard_sec, True),
+            ("subsegment_min_first_spk_sec", subsegment_min_first_spk_sec, False),
+            ("subsegment_splice_silence_sec", subsegment_splice_silence_sec, False),
+        ):
+            if isinstance(value, bool) or not isinstance(value, Real):
+                raise TypeError(f"{name} must be numeric, got {value!r}")
+            if not math.isfinite(float(value)):
+                raise ValueError(f"{name} must be finite, got {value!r}")
+            if value < 0 or (not allow_zero and value == 0):
+                comparison = "non-negative" if allow_zero else "positive"
+                raise ValueError(f"{name} must be {comparison}, got {value!r}")
+        self.subsegment_start_guard_sec = float(subsegment_start_guard_sec)
+        self.subsegment_min_first_spk_sec = float(subsegment_min_first_spk_sec)
+        self.subsegment_splice_silence_sec = float(subsegment_splice_silence_sec)
         if not 0.0 <= opus_roundtrip_prob <= 1.0:
             raise ValueError(f"opus_roundtrip_prob must be between 0 and 1, got {opus_roundtrip_prob}")
         if opus_roundtrip_compression_level is not None and not 0.0 <= opus_roundtrip_compression_level <= 1.0:
@@ -1229,14 +1278,32 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
             )
         self.opus_roundtrip_prob = opus_roundtrip_prob
         self.opus_roundtrip_compression_level = opus_roundtrip_compression_level
-        if self.session_len_sec > 0:
-            assert self.subsegment_min_len_sec <= self.session_len_sec, (
-                f"subsegment_min_len_sec ({self.subsegment_min_len_sec}) cannot be greater than "
-                f"session_len_sec ({self.session_len_sec})"
+        if self.subsegment_mode and self.session_len_sec > 0:
+            session_len_frames = int(self.session_len_sec * self.feat_per_sec)
+            single_chunk_min_frames = self._seconds_to_feature_frames(
+                self.subsegment_single_chunk_min_len_sec
             )
-            assert self.subsegment_min_chunk_len_sec * 2 <= self.session_len_sec, (
-                "twice subsegment_min_chunk_len_sec cannot be greater than session_len_sec"
+            two_chunk_min_frames = self._seconds_to_feature_frames(
+                self.subsegment_two_chunk_min_len_sec
             )
+            if single_chunk_min_frames > session_len_frames:
+                raise ValueError(
+                    "subsegment_single_chunk_min_len_sec "
+                    f"({self.subsegment_single_chunk_min_len_sec}s -> {single_chunk_min_frames} frames) "
+                    f"cannot exceed session_len_sec "
+                    f"({self.session_len_sec}s -> {session_len_frames} frames)"
+                )
+            if (
+                self.subsegment_two_chunks_rate > 0
+                and 2 * two_chunk_min_frames > session_len_frames
+            ):
+                raise ValueError(
+                    "twice subsegment_two_chunk_min_len_sec "
+                    f"({self.subsegment_two_chunk_min_len_sec}s -> "
+                    f"{two_chunk_min_frames} frames each) cannot exceed "
+                    f"session_len_sec ({self.session_len_sec}s -> "
+                    f"{session_len_frames} frames) when two-chunk sampling is enabled"
+                )
 
     def __len__(self):
         return len(self.collection)
@@ -1492,358 +1559,444 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         target_len = torch.tensor([ts_tensor.shape[0]])
         return target_len
 
-    def _window_speaker_presence(self, frame_level_target, candidate_indices, window_len):
-        """Return speaker presence for fixed-length candidate windows.
-
-        Windows start at ``candidate_indices``, extend for ``window_len`` feature
-        frames, and are clipped at the end of ``frame_level_target``.
+    def _seconds_to_feature_frames(self, seconds: float) -> int:
+        """Convert a duration to the smallest containing feature-frame count.
 
         Args:
-            frame_level_target: Target tensor of shape ``(T, S)``.
-            candidate_indices: Start indices of shape ``(N,)``.
-            window_len: Window length in feature frames.
+            seconds: Non-negative duration in seconds.
 
         Returns:
-            Boolean tensor of shape ``(N, S)``. An entry is true when the
-            corresponding speaker is active at least once in that window.
+            Feature-frame count computed with ``ceil(seconds * feat_per_sec)``.
         """
-        active = (frame_level_target > self.soft_label_thres).long()
-        num_frames, num_speakers = active.shape
-        activity_prefix = torch.zeros(
-            num_frames + 1, num_speakers, dtype=torch.long, device=active.device
-        )
-        activity_prefix[1:] = active.cumsum(dim=0)
-        ends = torch.clamp(candidate_indices + window_len, max=num_frames)
-        return activity_prefix[ends] - activity_prefix[candidate_indices] > 0
+        return math.ceil(seconds * self.feat_per_sec)
 
-    def _compute_spk_bias_weights(
-        self, frame_level_target, candidate_indices, window_len, included_speakers=None
-    ):
-        """Compute sampling weights for candidate start positions biased toward higher unique speaker counts.
-
-        For each candidate window, counts how many distinct speakers have at least one
-        active frame in that window or in ``included_speakers``, then returns
-        ``subsegment_nspk_bias ** n_unique_speakers``.
-
-        Uses per-speaker prefix sums so cost is O(T*S + N*S) where S is small (max_spks).
+    def _prepare_subsegment_activity(
+        self, frame_level_target: torch.Tensor
+    ) -> _SubsegmentActivity:
+        """Build compact activity metadata once for all chunk-planning checks.
 
         Args:
-            frame_level_target: (T, S) binary/soft target tensor.
-            candidate_indices: 1-D tensor of eligible start-frame indices.
-            window_len: number of frames in the evaluation window.
-            included_speakers: optional (S,) mask of speakers already present.
+            frame_level_target: Boolean or soft target tensor of shape ``(T, S)``.
 
         Returns:
-            1-D float tensor of sampling weights aligned with candidate_indices.
+            Reusable activity, prefix-count, and next-event metadata.
         """
-        speaker_presence = self._window_speaker_presence(
-            frame_level_target, candidate_indices, window_len
+        activity = (
+            frame_level_target
+            if frame_level_target.dtype == torch.bool
+            else frame_level_target > self.soft_label_thres
         )
-        if included_speakers is not None:
-            speaker_presence |= included_speakers.to(
-                device=speaker_presence.device, dtype=torch.bool
-            ).unsqueeze(0)
-        unique_spk_counts = speaker_presence.float().sum(dim=1)  # (N,)
-        weights = self.subsegment_nspk_bias ** unique_spk_counts
-        return weights
+        num_frames, num_speakers = activity.shape
+        prefix = torch.zeros(
+            num_frames + 1, num_speakers, dtype=torch.int32, device=activity.device
+        )
+        total_prefix = torch.zeros(
+            num_frames + 1, dtype=torch.int32, device=activity.device
+        )
+        if num_frames == 0 or num_speakers == 0:
+            empty_frames = torch.zeros(num_frames, dtype=torch.int32, device=activity.device)
+            empty_indices = torch.zeros(num_frames, dtype=torch.long, device=activity.device)
+            return _SubsegmentActivity(
+                activity=activity,
+                prefix=prefix,
+                total_prefix=total_prefix,
+                active_count=empty_frames,
+                next_active=empty_indices,
+                first_speaker=empty_indices,
+                next_competitor=empty_indices,
+            )
+
+        activity_int = activity.to(torch.int32)
+        prefix[1:] = activity_int.cumsum(dim=0, dtype=torch.int32)
+        active_count = activity_int.sum(dim=1, dtype=torch.int32)
+        total_prefix[1:] = active_count.cumsum(dim=0, dtype=torch.int32)
+        frame_indices = torch.arange(num_frames, dtype=torch.int32, device=activity.device)
+        next_active = self._next_true_indices(active_count > 0, frame_indices).long()
+        first_speaker = activity_int.argmax(dim=1)
+
+        other_speaker_activity = active_count.unsqueeze(1) > activity_int
+        marked_other = torch.where(
+            other_speaker_activity, frame_indices.unsqueeze(1), num_frames
+        )
+        next_other = torch.flip(
+            torch.cummin(torch.flip(marked_other, dims=(0,)), dim=0).values,
+            dims=(0,),
+        )
+        next_competitor = next_other.gather(
+            dim=1, index=first_speaker.unsqueeze(1)
+        ).squeeze(1).long()
+
+        return _SubsegmentActivity(
+            activity=activity,
+            prefix=prefix,
+            total_prefix=total_prefix,
+            active_count=active_count,
+            next_active=next_active,
+            first_speaker=first_speaker,
+            next_competitor=next_competitor,
+        )
 
     @staticmethod
-    def _next_true_indices(mask):
+    def _chunk_speaker_presence(
+        activity_info: _SubsegmentActivity,
+        starts: torch.Tensor,
+        ends: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return speaker presence for aligned source-chunk bounds.
+
+        Args:
+            activity_info: Reusable compact activity metadata.
+            starts: Start indices of shape ``(N,)``.
+            ends: Exclusive end indices of shape ``(N,)``.
+
+        Returns:
+            Boolean speaker-presence tensor of shape ``(N, S)``.
+        """
+        return activity_info.prefix[ends] - activity_info.prefix[starts] > 0
+
+    @staticmethod
+    def _next_true_indices(
+        mask: torch.Tensor, frame_indices: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """Find the first true value at or after each position.
 
         Args:
             mask: One-dimensional boolean tensor of length ``T``.
+            frame_indices: Optional compact integer frame indices.
 
         Returns:
             Integer tensor of length ``T``. Each value is the first true index
             at or after that position, or ``T`` when no such index exists.
         """
         length = mask.shape[0]
-        indices = torch.arange(length, device=mask.device)
-        marked = torch.where(mask, indices, length)
+        if frame_indices is None:
+            frame_indices = torch.arange(length, dtype=torch.int32, device=mask.device)
+        marked = torch.where(mask, frame_indices, length)
         return torch.flip(torch.cummin(torch.flip(marked, dims=(0,)), dim=0).values, dims=(0,))
 
-    def _eligible_chunk_starts(self, frame_level_target):
-        """Find starts whose first speaker is established before another speaker appears.
-
-        Silence before the first speaker is unrestricted. Once the first active frame
-        is reached, it must contain exactly one speaker. That speaker must accumulate
-        ``subsegment_min_first_spk_frames`` active frames before any other speaker
-        becomes active; intervening silence does not reset the count. A start is also
-        rejected when a different speaker was active during the preceding
-        ``subsegment_start_guard_frames`` frames.
+    def _source_chunk_eligibility(
+        self,
+        activity_info: _SubsegmentActivity,
+        starts: torch.Tensor,
+        ends: torch.Tensor,
+    ) -> torch.Tensor:
+        """Evaluate the complete ATS-safe start policy for source chunks.
 
         Args:
-            frame_level_target: Target tensor of shape ``(T, S)``.
+            activity_info: Reusable compact activity metadata.
+            starts: Candidate source-chunk starts of shape ``(N,)``.
+            ends: Exclusive source-chunk ends of shape ``(N,)``.
 
         Returns:
-            Boolean tensor of length ``T`` marking eligible chunk starts.
+            Boolean eligibility mask of shape ``(N,)``.
         """
-        active = frame_level_target > self.soft_label_thres
-        num_frames, num_speakers = active.shape
-        if num_frames == 0 or num_speakers == 0:
-            return torch.zeros(num_frames, dtype=torch.bool, device=active.device)
+        if starts.numel() == 0:
+            return torch.zeros(0, dtype=torch.bool, device=starts.device)
 
-        frame_indices = torch.arange(num_frames, device=active.device)
-        active_count = active.sum(dim=1)
-        next_active = self._next_true_indices(active_count > 0)
-        activity_prefix = torch.zeros(
-            num_frames + 1, num_speakers, dtype=torch.long, device=active.device
+        starts = starts.long()
+        ends = ends.long()
+        num_frames, num_speakers = activity_info.activity.shape
+        if num_speakers == 0:
+            return torch.ones_like(starts, dtype=torch.bool)
+
+        guard_frames = self._seconds_to_feature_frames(self.subsegment_start_guard_sec)
+        minimum_frames = self._seconds_to_feature_frames(self.subsegment_min_first_spk_sec)
+        candidate_silent = activity_info.active_count[starts] == 0
+        effective_start = activity_info.next_active[starts]
+        has_speech = effective_start < ends
+
+        history_start = torch.clamp(starts - guard_frames, min=0)
+        history_total = (
+            activity_info.total_prefix[starts]
+            - activity_info.total_prefix[history_start]
         )
-        activity_prefix[1:] = active.long().cumsum(dim=0)
+        silence_history_safe = history_total == 0
+        all_silence_eligible = candidate_silent & ~has_speech & silence_history_safe
 
-        qualifying_first_frame = torch.zeros(num_frames, dtype=torch.bool, device=active.device)
-        for speaker in range(num_speakers):
-            other_active = active_count - active[:, speaker].long() > 0
-            next_other = self._next_true_indices(other_active)
-            speaker_frames = (
-                activity_prefix[next_other, speaker] - activity_prefix[frame_indices, speaker]
-            )
-            qualifying_first_frame |= (
-                (active_count == 1)
-                & active[:, speaker]
-                & (speaker_frames >= self.subsegment_min_first_spk_frames)
-            )
-
-        eligible = torch.zeros(num_frames, dtype=torch.bool, device=active.device)
-        has_future_speech = next_active < num_frames
-        eligible[has_future_speech] = qualifying_first_frame[next_active[has_future_speech]]
-        if self.subsegment_start_guard_frames > 0:
-            history_start = torch.clamp(
-                frame_indices - self.subsegment_start_guard_frames, min=0
-            )
-            history = activity_prefix[frame_indices] - activity_prefix[history_start]
-            first_active = next_active.clamp(max=num_frames - 1)
-            first_speaker = active[first_active].long().argmax(dim=1, keepdim=True)
-            first_speaker_history = history.gather(dim=1, index=first_speaker).squeeze(1)
-            other_speaker_history = history.sum(dim=1) - first_speaker_history
-            eligible &= other_speaker_history == 0
-        return eligible
-
-    def _silence_boundary_mask(self, frame_level_target):
-        """Find boundaries protected by silence on both sides.
-
-        Boundary ``b`` is safe when every frame in ``[b-S, b+S)`` is silent,
-        where ``S`` is ``subsegment_boundary_silence_frames``.
-
-        Args:
-            frame_level_target: Target tensor of shape ``(T, S)``.
-
-        Returns:
-            Boolean tensor of length ``T + 1`` indexed by frame boundaries.
-        """
-        num_frames = frame_level_target.shape[0]
-        margin = self.subsegment_boundary_silence_frames
-        boundaries = torch.arange(num_frames + 1, device=frame_level_target.device)
-        valid = (boundaries >= margin) & (boundaries + margin <= num_frames)
-        silence = (frame_level_target <= self.soft_label_thres).all(dim=1)
-        silence_prefix = torch.zeros(num_frames + 1, dtype=torch.long, device=silence.device)
-        silence_prefix[1:] = silence.long().cumsum(dim=0)
-
-        safe = torch.zeros(num_frames + 1, dtype=torch.bool, device=silence.device)
-        valid_boundaries = boundaries[valid]
-        silent_count = (
-            silence_prefix[valid_boundaries + margin] - silence_prefix[valid_boundaries - margin]
+        safe_effective_start = effective_start.clamp(max=max(num_frames - 1, 0))
+        first_speaker = activity_info.first_speaker[safe_effective_start]
+        exactly_one_speaker = activity_info.active_count[safe_effective_start] == 1
+        first_speaker_history = (
+            activity_info.prefix[starts, first_speaker]
+            - activity_info.prefix[history_start, first_speaker]
         )
-        safe[valid_boundaries] = silent_count == 2 * margin
-        return safe
+        active_history_safe = history_total - first_speaker_history == 0
+        history_safe = torch.where(
+            candidate_silent, silence_history_safe, active_history_safe
+        )
 
-    def _sample_start(
-        self, frame_level_target, candidates, window_len, included_speakers=None
-    ):
-        """Sample one candidate, optionally with speaker-count bias.
+        competitor = torch.minimum(
+            activity_info.next_competitor[safe_effective_start], ends
+        )
+        accumulated_activity = (
+            activity_info.prefix[competitor, first_speaker]
+            - activity_info.prefix[safe_effective_start, first_speaker]
+        )
+        condition_a = accumulated_activity >= minimum_frames
+
+        initial_run_end = safe_effective_start + minimum_frames
+        run_within_chunk = initial_run_end <= ends
+        safe_initial_run_end = initial_run_end.clamp(max=num_frames)
+        initial_run_activity = (
+            activity_info.prefix[safe_initial_run_end, first_speaker]
+            - activity_info.prefix[safe_effective_start, first_speaker]
+        )
+        condition_b = run_within_chunk & (initial_run_activity >= minimum_frames)
+
+        active_eligible = (
+            has_speech
+            & exactly_one_speaker
+            & history_safe
+            & (condition_a | condition_b)
+        )
+        return all_silence_eligible | active_eligible
+
+    def _splice_silence_masks(
+        self, activity_info: _SubsegmentActivity
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return valid chunk-one ends and chunk-two starts for splice silence.
 
         Args:
-            frame_level_target: Target tensor of shape ``(T, S)``.
-            candidates: Candidate start indices of shape ``(N,)``.
-            window_len: Number of feature frames used to count speakers.
-            included_speakers: Optional ``(S,)`` mask included in the speaker
-                count, used to bias chunk two by the union with chunk one.
+            activity_info: Reusable compact activity metadata.
 
         Returns:
-            Selected start index, or ``None`` when ``candidates`` is empty.
+            Two Boolean tensors of shape ``(T + 1,)``. The first marks
+            boundaries with a silent suffix; the second marks boundaries with
+            a silent prefix.
         """
-        if candidates.numel() == 0:
-            return None
-        if self.subsegment_nspk_bias > 1.0:
-            weights = self._compute_spk_bias_weights(
-                frame_level_target,
-                candidates,
-                window_len,
-                included_speakers=included_speakers,
-            )
-            return candidates[torch.multinomial(weights, 1).item()].item()
-        return candidates[random.randrange(candidates.numel())].item()
+        num_frames = activity_info.activity.shape[0]
+        silence_frames = self._seconds_to_feature_frames(
+            self.subsegment_splice_silence_sec
+        )
+        boundaries = torch.arange(
+            num_frames + 1, dtype=torch.long, device=activity_info.activity.device
+        )
+        total_prefix = activity_info.total_prefix
 
-    def _sample_single_chunk_bounds(self, frame_level_target, max_len, min_len):
-        """Sample one eligible chunk within the model speaker capacity.
+        safe_end = torch.zeros(num_frames + 1, dtype=torch.bool, device=boundaries.device)
+        end_boundaries = boundaries[boundaries >= silence_frames]
+        safe_end[end_boundaries] = (
+            total_prefix[end_boundaries] - total_prefix[end_boundaries - silence_frames]
+        ) == 0
 
-        Starts must satisfy the first-speaker rule and leave at least ``min_len``
-        frames. Candidates whose selected window contains more than ``max_spks``
-        unique speakers are excluded.
+        safe_start = torch.zeros(num_frames + 1, dtype=torch.bool, device=boundaries.device)
+        start_boundaries = boundaries[boundaries + silence_frames <= num_frames]
+        safe_start[start_boundaries] = (
+            total_prefix[start_boundaries + silence_frames] - total_prefix[start_boundaries]
+        ) == 0
+        return safe_end, safe_start
+
+    def _sample_single_chunk_bounds(
+        self, activity_info: _SubsegmentActivity, max_len: int, min_len: int
+    ) -> Optional[List[Tuple[int, int]]]:
+        """Filter all starts by ATS safety and capacity, then sample one chunk.
+
+        A non-empty source no longer than ``min_len`` is evaluated as the sole
+        full-source candidate rather than rejected for its duration.
 
         Args:
-            frame_level_target: Target tensor of shape ``(T, S)``.
+            activity_info: Reusable compact activity metadata.
             max_len: Maximum selected length in feature frames.
             min_len: Minimum selected length in feature frames.
 
         Returns:
             A one-element ``[(start, end)]`` list, or ``None``.
         """
-        num_frames = frame_level_target.shape[0]
-        if num_frames < min_len:
+        num_frames, num_speakers = activity_info.activity.shape
+        if num_frames == 0:
             return None
 
-        eligible = self._eligible_chunk_starts(frame_level_target)
-        candidates = torch.where(
-            eligible & (torch.arange(num_frames, device=eligible.device) <= num_frames - min_len)
-        )[0]
-        speaker_presence = self._window_speaker_presence(
-            frame_level_target, candidates, max_len
-        )
-        candidates = candidates[speaker_presence.sum(dim=1) <= self.max_spks]
-        start = self._sample_start(frame_level_target, candidates, max_len)
-        if start is None:
+        if num_frames <= min_len:
+            candidates = torch.zeros(
+                1, dtype=torch.long, device=activity_info.activity.device
+            )
+            ends = torch.full_like(candidates, num_frames)
+        else:
+            num_candidates = num_frames - min_len + 1
+            candidates = torch.arange(
+                num_candidates, dtype=torch.long, device=activity_info.activity.device
+            )
+            ends = torch.clamp(candidates + max_len, max=num_frames)
+        eligible = self._source_chunk_eligibility(activity_info, candidates, ends)
+        candidates = candidates[eligible]
+        ends = ends[eligible]
+
+        speaker_counts = None
+        if num_speakers > self.max_spks or self.subsegment_nspk_bias > 1.0:
+            speaker_presence = self._chunk_speaker_presence(
+                activity_info, candidates, ends
+            )
+            speaker_counts = speaker_presence.sum(dim=1)
+            if num_speakers > self.max_spks:
+                within_capacity = speaker_counts <= self.max_spks
+                candidates = candidates[within_capacity]
+                speaker_counts = speaker_counts[within_capacity]
+
+        if candidates.numel() == 0:
             return None
+
+        if self.subsegment_nspk_bias == 1.0:
+            start = candidates[random.randrange(candidates.numel())].item()
+        else:
+            weights = self.subsegment_nspk_bias**speaker_counts
+            start = candidates[torch.multinomial(weights, 1).item()].item()
         return [(start, min(start + max_len, num_frames))]
 
-    def _sample_two_chunk_bounds(self, frame_level_target, total_len, min_chunk_len):
-        """Sample two non-overlapping chunks with a silence-protected splice.
+    def _sample_two_chunk_bounds(
+        self,
+        activity_info: _SubsegmentActivity,
+        total_len: int,
+        min_chunk_len: int,
+    ) -> Optional[List[Tuple[int, int]]]:
+        """Sample one two-chunk plan with a shortened-second-chunk fallback.
 
-        Chunk one is always returned first, irrespective of source chronology. Its
-        end and chunk two's start each lie at the center of a ``2 * S``-frame
-        silence region, yielding at least ``2 * S`` silent frames at the splice.
-        Both starts satisfy the first-speaker rule, both chunks meet
-        ``min_chunk_len``, and their speaker union does not exceed ``max_spks``.
-
-        First starts are tried in speaker-biased order. For each first start, one
-        capacity-valid ending is sampled. If it has no compatible second start,
-        selection continues with the next first start.
+        The method samples one first-chunk length and one compatible first chunk.
+        It first tries to use all remaining target length for chunk two. If no
+        full-length second candidate survives, it evaluates one maximum
+        geometrically available shorter chunk per splice-safe second start and
+        samples among the longest eligible candidates. It does not retry another
+        first length or first chunk.
 
         Args:
-            frame_level_target: Target tensor of shape ``(T, S)``.
+            activity_info: Reusable compact activity metadata.
             total_len: Combined output length in feature frames.
             min_chunk_len: Minimum length of either chunk in feature frames.
 
         Returns:
             ``[(start1, end1), (start2, end2)]``, or ``None``.
         """
-        num_frames = frame_level_target.shape[0]
-        if total_len < 2 * min_chunk_len or num_frames < total_len:
+        num_frames = activity_info.activity.shape[0]
+        if total_len < 2 * min_chunk_len:
             return None
 
-        eligible = self._eligible_chunk_starts(frame_level_target)
-        safe_boundary = self._silence_boundary_mask(frame_level_target)
-        frame_indices = torch.arange(num_frames, device=eligible.device)
-        speaker_activity = (frame_level_target > self.soft_label_thres).long()
-        speaker_activity_prefix = torch.zeros(
-            num_frames + 1,
-            speaker_activity.shape[1],
-            dtype=torch.long,
-            device=speaker_activity.device,
+        # Sample one split and derive fixed-length chunk-one candidates from safe ends.
+        splice_safe_end, splice_safe_start = self._splice_silence_masks(activity_info)
+        length1 = random.randint(min_chunk_len, total_len - min_chunk_len)
+        remaining = total_len - length1
+
+        end1_candidates = torch.where(splice_safe_end)[0]
+        start1_candidates = end1_candidates - length1
+        valid_start = start1_candidates >= 0
+        start1_candidates = start1_candidates[valid_start]
+        end1_candidates = end1_candidates[valid_start]
+        if start1_candidates.numel() == 0:
+            return None
+
+        # Keep only ATS-safe, capacity-valid first chunks, then sample exactly one.
+        first_eligible = self._source_chunk_eligibility(
+            activity_info, start1_candidates, end1_candidates
         )
-        speaker_activity_prefix[1:] = speaker_activity.cumsum(dim=0)
-        first_candidates = torch.where(
-            eligible
-            & (frame_indices + min_chunk_len + self.subsegment_boundary_silence_frames <= num_frames)
-        )[0]
-        if first_candidates.numel() == 0:
+        start1_candidates = start1_candidates[first_eligible]
+        end1_candidates = end1_candidates[first_eligible]
+        if start1_candidates.numel() == 0:
             return None
 
-        if self.subsegment_nspk_bias > 1.0:
-            weights = self._compute_spk_bias_weights(
-                frame_level_target, first_candidates, total_len - min_chunk_len
-            )
-            first_order = torch.multinomial(weights, first_candidates.numel(), replacement=False)
+        first_speaker_presence = self._chunk_speaker_presence(
+            activity_info, start1_candidates, end1_candidates
+        )
+        first_speaker_counts = first_speaker_presence.sum(dim=1)
+        within_capacity = first_speaker_counts <= self.max_spks
+        start1_candidates = start1_candidates[within_capacity]
+        end1_candidates = end1_candidates[within_capacity]
+        first_speaker_presence = first_speaker_presence[within_capacity]
+        first_speaker_counts = first_speaker_counts[within_capacity]
+        if start1_candidates.numel() == 0:
+            return None
+
+        if self.subsegment_nspk_bias == 1.0:
+            first_index = random.randrange(start1_candidates.numel())
         else:
-            first_order = torch.randperm(first_candidates.numel(), device=first_candidates.device)
+            first_weights = self.subsegment_nspk_bias**first_speaker_counts
+            first_index = torch.multinomial(first_weights, 1).item()
+        start1 = start1_candidates[first_index].item()
+        end1 = end1_candidates[first_index].item()
+        first_speakers = first_speaker_presence[first_index]
 
-        second_start_mask = eligible & safe_boundary[:-1]
-        second_start_prefix = torch.zeros(
-            num_frames + 1, dtype=torch.long, device=eligible.device
+        # Compute non-overlapping source capacity before or after the selected first chunk.
+        start2_candidates = torch.where(splice_safe_start[:-1])[0]
+        available = torch.where(
+            start2_candidates < start1,
+            start1 - start2_candidates,
+            torch.where(
+                start2_candidates >= end1,
+                num_frames - start2_candidates,
+                torch.zeros_like(start2_candidates),
+            ),
         )
-        second_start_prefix[1:] = second_start_mask.long().cumsum(dim=0)
-        safe_ends = torch.where(safe_boundary)[0]
 
-        for first_index in first_order.tolist():
-            start1 = first_candidates[first_index].item()
-            min_end1 = start1 + min_chunk_len
-            max_end1 = min(
-                start1 + total_len - min_chunk_len,
-                num_frames - self.subsegment_boundary_silence_frames,
-            )
-            end_candidates = safe_ends[
-                (safe_ends >= min_end1) & (safe_ends <= max_end1)
-            ]
-            if end_candidates.numel() == 0:
-                continue
+        # Prefer a second chunk that consumes the complete remaining target length.
+        full_length = available >= remaining
+        full_starts = start2_candidates[full_length]
+        full_ends = full_starts + remaining
+        full_eligible = self._source_chunk_eligibility(
+            activity_info, full_starts, full_ends
+        )
+        full_starts = full_starts[full_eligible]
+        full_ends = full_ends[full_eligible]
+        full_speaker_presence = self._chunk_speaker_presence(
+            activity_info, full_starts, full_ends
+        )
+        full_union_counts = (
+            full_speaker_presence | first_speakers.unsqueeze(0)
+        ).sum(dim=1)
+        full_capacity = full_union_counts <= self.max_spks
+        full_starts = full_starts[full_capacity]
+        full_union_counts = full_union_counts[full_capacity]
+        if full_starts.numel() > 0:
+            if self.subsegment_nspk_bias == 1.0:
+                second_index = random.randrange(full_starts.numel())
+            else:
+                second_weights = self.subsegment_nspk_bias**full_union_counts
+                second_index = torch.multinomial(second_weights, 1).item()
+            start2 = full_starts[second_index].item()
+            return [(start1, end1), (start2, start2 + remaining)]
 
-            len2_by_end = total_len - (end_candidates - start1)
-            before_last_start = start1 - len2_by_end
-            before_exists = torch.zeros_like(before_last_start, dtype=torch.bool)
-            has_before_range = before_last_start >= 0
-            before_exists[has_before_range] = (
-                second_start_prefix[before_last_start[has_before_range] + 1] > 0
-            )
+        # Otherwise evaluate one maximum shortened candidate per safe second start.
+        length2_candidates = torch.minimum(
+            available, torch.full_like(available, remaining)
+        )
+        long_enough = length2_candidates >= min_chunk_len
+        short_starts = start2_candidates[long_enough]
+        short_lengths = length2_candidates[long_enough]
+        short_ends = short_starts + short_lengths
+        short_eligible = self._source_chunk_eligibility(
+            activity_info, short_starts, short_ends
+        )
+        short_starts = short_starts[short_eligible]
+        short_lengths = short_lengths[short_eligible]
+        short_ends = short_ends[short_eligible]
+        short_speaker_presence = self._chunk_speaker_presence(
+            activity_info, short_starts, short_ends
+        )
+        short_union_counts = (
+            short_speaker_presence | first_speakers.unsqueeze(0)
+        ).sum(dim=1)
+        short_capacity = short_union_counts <= self.max_spks
+        short_starts = short_starts[short_capacity]
+        short_lengths = short_lengths[short_capacity]
+        short_union_counts = short_union_counts[short_capacity]
+        if short_starts.numel() == 0:
+            return None
 
-            after_last_start = num_frames - len2_by_end
-            has_after_range = after_last_start >= end_candidates
-            after_exists = torch.zeros_like(has_after_range)
-            after_exists[has_after_range] = (
-                second_start_prefix[after_last_start[has_after_range] + 1]
-                - second_start_prefix[end_candidates[has_after_range]]
-                > 0
-            )
-            end_candidates = end_candidates[before_exists | after_exists]
-            if end_candidates.numel() == 0:
-                continue
+        # Restrict fallback sampling to the longest surviving shortened chunks.
+        longest_length = short_lengths.max()
+        longest = short_lengths == longest_length
+        short_starts = short_starts[longest]
+        short_union_counts = short_union_counts[longest]
+        if self.subsegment_nspk_bias == 1.0:
+            second_index = random.randrange(short_starts.numel())
+        else:
+            second_weights = self.subsegment_nspk_bias**short_union_counts
+            second_index = torch.multinomial(second_weights, 1).item()
+        start2 = short_starts[second_index].item()
+        return [(start1, end1), (start2, start2 + longest_length.item())]
 
-            first_speakers_by_end = (
-                speaker_activity_prefix[end_candidates] - speaker_activity_prefix[start1]
-            ) > 0
-            valid_capacity = first_speakers_by_end.sum(dim=1) <= self.max_spks
-            end_candidates = end_candidates[valid_capacity]
-            first_speakers_by_end = first_speakers_by_end[valid_capacity]
-            if end_candidates.numel() == 0:
-                continue
-
-            end_index = random.randrange(end_candidates.numel())
-            end1 = end_candidates[end_index].item()
-            first_speakers = first_speakers_by_end[end_index]
-            len2 = total_len - (end1 - start1)
-            valid_second = second_start_mask & (frame_indices + len2 <= num_frames)
-            valid_second &= ((frame_indices + len2 <= start1) | (frame_indices >= end1))
-            second_candidates = torch.where(valid_second)[0]
-            second_speakers = self._window_speaker_presence(
-                frame_level_target, second_candidates, len2
-            )
-            union_size = (second_speakers | first_speakers.unsqueeze(0)).sum(dim=1)
-            second_candidates = second_candidates[union_size <= self.max_spks]
-            start2 = self._sample_start(
-                frame_level_target,
-                second_candidates,
-                len2,
-                included_speakers=first_speakers,
-            )
-            if start2 is not None:
-                return [(start1, end1), (start2, start2 + len2)]
-
-        return None
-
-    @staticmethod
-    def _slice_target_chunks(frame_level_target, bounds):
-        """Concatenate target ranges in output order.
-
-        Args:
-            frame_level_target: Target tensor of shape ``(T, S)``.
-            bounds: Ordered sequence of ``(start, end)`` frame pairs.
-
-        Returns:
-            Concatenated target tensor with the same speaker dimension.
-        """
-        return torch.cat([frame_level_target[start:end] for start, end in bounds])
-
-    def _load_audio_chunks(self, audio_file, offset, bounds):
+    def _load_audio_chunks(
+        self,
+        audio_file: Union[str, List[str]],
+        offset: float,
+        bounds: Sequence[Tuple[int, int]],
+    ) -> torch.Tensor:
         """Load only selected source ranges and augment the combined waveform.
 
         Each frame range is converted to an absolute audio offset and duration.
@@ -1881,7 +2034,29 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         combined = AudioSegment(np.concatenate(chunks, axis=0), sample_rate)
         return self.featurizer.process_segment(combined)
 
-    def _create_subsegment(self, sample, offset):
+    def _create_subsegment(
+        self, sample: Any, offset: float
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        List[Optional[str]],
+    ]:
+        """Plan, load, and label one ATS-safe training subsegment.
+
+        Planning uses RTTM-derived Boolean activity before waveform I/O. The
+        method attempts two-chunk sampling according to its configured rate,
+        falls back to single-chunk sampling, loads only accepted source ranges,
+        and returns an empty sample when no valid bounds exist.
+
+        Args:
+            sample: Manifest item containing audio, RTTM, duration, and identity fields.
+            offset: Manifest-segment offset in seconds.
+
+        Returns:
+            ``(audio_signal, audio_length, targets, target_length, speaker_names)``.
+        """
         duration = sample.duration
 
         with open(sample.rttm_file, 'r') as f:
@@ -1896,28 +2071,34 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
             round_digits=self.round_digits,
             feat_per_sec=self.feat_per_sec,
             max_spks=num_speakers,
+            dtype=torch.bool,
         )
+        activity_info = self._prepare_subsegment_activity(frame_level_target)
 
         if self.session_len_sec > 0:
             max_len_frames = int(self.session_len_sec * self.feat_per_sec)
-            min_len_frames = int(self.subsegment_min_len_sec * self.feat_per_sec)
-            min_chunk_len_frames = int(self.subsegment_min_chunk_len_sec * self.feat_per_sec)
+            single_chunk_min_len_frames = self._seconds_to_feature_frames(
+                self.subsegment_single_chunk_min_len_sec
+            )
+            two_chunk_min_len_frames = self._seconds_to_feature_frames(
+                self.subsegment_two_chunk_min_len_sec
+            )
             bounds = None
             if random.random() < self.subsegment_two_chunks_rate:
                 bounds = self._sample_two_chunk_bounds(
-                    frame_level_target,
+                    activity_info,
                     total_len=max_len_frames,
-                    min_chunk_len=min_chunk_len_frames,
+                    min_chunk_len=two_chunk_min_len_frames,
                 )
             if bounds is None:
                 bounds = self._sample_single_chunk_bounds(
-                    frame_level_target,
+                    activity_info,
                     max_len=max_len_frames,
-                    min_len=min_len_frames,
+                    min_len=single_chunk_min_len_frames,
                 )
         else:
             bounds = [(0, frame_level_target.shape[0])]
-            if (frame_level_target > self.soft_label_thres).any(dim=0).sum() > self.max_spks:
+            if frame_level_target.any(dim=0).sum() > self.max_spks:
                 bounds = None
 
         if bounds is None:
@@ -1929,16 +2110,16 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
                 [None] * self.max_spks,
             )
 
-        frame_level_target = self._slice_target_chunks(frame_level_target, bounds)
-        spks_tokeep = torch.where(
-            (frame_level_target > self.soft_label_thres).any(dim=0)
-        )[0].tolist()
+        frame_level_target = torch.cat(
+            [frame_level_target[start:end] for start, end in bounds]
+        )
+        spks_tokeep = torch.where(frame_level_target.any(dim=0))[0].tolist()
         if len(spks_tokeep) > self.max_spks:
             raise RuntimeError(
                 f"Selected subsegment has {len(spks_tokeep)} speakers, "
                 f"exceeding max_spks={self.max_spks}"
             )
-        frame_level_target = frame_level_target[:, spks_tokeep]
+        frame_level_target = frame_level_target[:, spks_tokeep].float()
         speaker_names = self._build_speaker_names(sess_to_global_spkids, columns=spks_tokeep)
         if frame_level_target.shape[1] < self.max_spks:
             pad_width = self.max_spks - frame_level_target.shape[1]
@@ -1946,6 +2127,7 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
                 frame_level_target, (0, pad_width), 'constant', 0
             )
 
+        del activity_info
         audio_signal = self._load_audio_chunks(sample.audio_file, offset, bounds)
 
         min_viable_samples = int(self.min_subsegment_duration * self.featurizer.sample_rate)
@@ -2134,14 +2316,13 @@ class AudioToSpeechE2ESpkDiarDataset(_AudioToSpeechE2ESpkDiarDataset):
         device: str,
         subsampling_factor: int = 8,
         subsegment_mode: bool = False,
-        subsegment_min_len_sec: float = 15.0,
+        subsegment_single_chunk_min_len_sec: float = 15.0,
+        subsegment_two_chunk_min_len_sec: float = 10.0,
         subsegment_two_chunks_rate: float = 0.0,
-        subsegment_min_chunk_len_sec: float = 10.0,
-        subsegment_margin_frames: int = 0,
         subsegment_nspk_bias: float = 1.0,
-        subsegment_min_first_spk_frames: int = 50,
-        subsegment_boundary_silence_frames: int = 10,
-        subsegment_start_guard_frames: int = 10,
+        subsegment_start_guard_sec: float = 0.25,
+        subsegment_min_first_spk_sec: float = 0.50,
+        subsegment_splice_silence_sec: float = 0.10,
         opus_roundtrip_prob: float = 0.0,
         opus_roundtrip_compression_level: Optional[float] = None,
         validate_manifest_paths: bool = True,
@@ -2159,14 +2340,13 @@ class AudioToSpeechE2ESpkDiarDataset(_AudioToSpeechE2ESpkDiarDataset):
             soft_targets=soft_targets,
             device=device,
             subsegment_mode=subsegment_mode,
-            subsegment_min_len_sec=subsegment_min_len_sec,
+            subsegment_single_chunk_min_len_sec=subsegment_single_chunk_min_len_sec,
+            subsegment_two_chunk_min_len_sec=subsegment_two_chunk_min_len_sec,
             subsegment_two_chunks_rate=subsegment_two_chunks_rate,
-            subsegment_min_chunk_len_sec=subsegment_min_chunk_len_sec,
-            subsegment_margin_frames=subsegment_margin_frames,
             subsegment_nspk_bias=subsegment_nspk_bias,
-            subsegment_min_first_spk_frames=subsegment_min_first_spk_frames,
-            subsegment_boundary_silence_frames=subsegment_boundary_silence_frames,
-            subsegment_start_guard_frames=subsegment_start_guard_frames,
+            subsegment_start_guard_sec=subsegment_start_guard_sec,
+            subsegment_min_first_spk_sec=subsegment_min_first_spk_sec,
+            subsegment_splice_silence_sec=subsegment_splice_silence_sec,
             opus_roundtrip_prob=opus_roundtrip_prob,
             opus_roundtrip_compression_level=opus_roundtrip_compression_level,
             validate_manifest_paths=validate_manifest_paths,
