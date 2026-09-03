@@ -48,7 +48,8 @@ model:
   dice_weight: 0.0 # Weight for PIL-aligned soft Dice loss with smooth=1; only target-present speaker channels contribute
   dice_min_target_frames: 50 # Minimum target-positive frames required for a speaker channel to contribute to Dice (120 = 1.2s for osf=1)
   dice_duration_gamma: 0.5 # Target-duration exponent for eligible-speaker weighting; 0 gives equal speaker weight
-  phantom_weight: 0.0 # Weight for hard-negative BCE on PIL-empty speaker channels; each extra phantom channel adds a penalty
+  phantom_weight: 0.0 # Weight for hard-negative BCE on target-empty speaker channels; each extra phantom channel adds a penalty
+  phantom_target: pil # Empty-channel assignment for phantom and phantom-entry losses: pil, ats, or consensus (empty under both)
   phantom_threshold: 0.25 # Only predictions above this probability contribute to the phantom loss
   phantom_logmeanexp: false # Use temperature-controlled log-mean-exp instead of mean over selected frames
   phantom_logmeanexp_temperature: 0.5 # Lower values focus more strongly on the hardest selected frames

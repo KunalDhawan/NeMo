@@ -116,6 +116,7 @@ def sortformer_model():
             'presence_weight': 0.1,
             'presence_window_radius': 1,
             'presence_negative_margin': 0.4,
+            'phantom_target': 'pil',
             'max_num_of_spks': 4,
             'model_defaults': DictConfig(model_defaults),
             'encoder': DictConfig(encoder),
@@ -1055,6 +1056,7 @@ class TestSortformerEncLabelModelOffline:
 
     @pytest.mark.unit
     def test_phantom_loss_penalizes_only_high_confidence_empty_channels(self, sortformer_model):
+        assert sortformer_model.phantom_target == "pil"
         num_spks = sortformer_model.sortformer_modules.n_spk
         targets_pil = torch.zeros(1, 4, num_spks)
         targets_pil[0, 0, 0] = 1.0
@@ -1111,6 +1113,43 @@ class TestSortformerEncLabelModelOffline:
         )
         assert torch.allclose(logmeanexp_loss, expected_logmeanexp / num_spks)
         assert logmeanexp_loss > one_phantom_loss
+
+    @pytest.mark.unit
+    def test_phantom_target_supports_pil_ats_and_consensus(self, sortformer_model):
+        targets_pil = torch.zeros(1, 3, 4)
+        targets_ats = torch.zeros_like(targets_pil)
+        targets_pil[0, 0, 0] = 1.0
+        targets_pil[0, 1, 2] = 1.0
+        targets_ats[0, 0, 0] = 1.0
+        targets_ats[0, 2, 1] = 1.0
+
+        expected_targets = {
+            "pil": targets_pil,
+            "ats": targets_ats,
+            "consensus": torch.maximum(targets_pil, targets_ats),
+        }
+        for phantom_target, expected in expected_targets.items():
+            sortformer_model.phantom_target = phantom_target
+            actual = sortformer_model._get_phantom_targets(
+                targets_pil, targets_ats
+            )
+            assert torch.equal(actual, expected)
+
+        consensus_targets = expected_targets["consensus"]
+        consensus_empty = ~(consensus_targets > 0.5).any(dim=1)
+        assert torch.equal(
+            consensus_empty,
+            torch.tensor([[False, False, False, True]]),
+        )
+
+    @pytest.mark.unit
+    def test_phantom_target_rejects_unknown_mode(self, sortformer_model):
+        sortformer_model._cfg.phantom_target = "unknown"
+        with pytest.raises(
+            ValueError,
+            match="phantom_target must be 'pil', 'ats', or 'consensus'",
+        ):
+            sortformer_model._init_loss_weights()
 
     @pytest.mark.unit
     def test_speaker_existence_loss_pools_active_logits_per_channel(self, sortformer_model):

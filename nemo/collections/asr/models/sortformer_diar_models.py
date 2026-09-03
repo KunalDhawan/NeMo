@@ -643,13 +643,20 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 "dice_duration_gamma must be in [0, 1], "
                 f"got {self.dice_duration_gamma}"
             )
-        # Hard-negative BCE for phantom speakers. Only PIL-aligned channels with no
-        # target activity are eligible, and only predictions above the threshold are
-        # penalized. Each channel is reduced over its selected frames before the channel
-        # losses are summed and divided by the fixed number of model speaker slots.
+        # Hard-negative BCE for phantom speakers. Only channels with no activity under
+        # the configured PIL/ATS/consensus target are eligible, and only predictions above
+        # the threshold are penalized. Each channel is reduced over its selected frames
+        # before the channel losses are summed and divided by the fixed number of model
+        # speaker slots.
         self.phantom_weight = float(self._cfg.get("phantom_weight", 0.0))
         if self.phantom_weight < 0.0:
             raise ValueError(f"phantom_weight must be >= 0, got {self.phantom_weight}")
+        self.phantom_target = str(self._cfg.get("phantom_target", "pil")).lower()
+        if self.phantom_target not in ("pil", "ats", "consensus"):
+            raise ValueError(
+                "phantom_target must be 'pil', 'ats', or 'consensus', "
+                f"got '{self.phantom_target}'"
+            )
         self.phantom_threshold = float(self._cfg.get("phantom_threshold", 0.25))
         if not 0.0 <= self.phantom_threshold < 1.0:
             raise ValueError(f"phantom_threshold must be in [0, 1), got {self.phantom_threshold}")
@@ -3120,11 +3127,23 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         )
         return torch.where(has_selected, channel_loss, torch.zeros_like(channel_loss))
 
-    def _phantom_loss(self, speaker_logits, targets_pil, target_lens):
-        """
-        Penalize high-confidence predictions on PIL-aligned empty speaker channels.
+    def _get_phantom_targets(self, targets_pil, targets_ats):
+        """Select targets used to identify empty channels for phantom losses.
 
-        A channel is eligible only when its hard PIL target is zero over every valid
+        Consensus considers a channel empty only when both PIL and ATS consider it empty,
+        represented by the elementwise union of their active targets.
+        """
+        if self.phantom_target == "pil":
+            return targets_pil
+        if self.phantom_target == "ats":
+            return targets_ats
+        return torch.maximum(targets_pil, targets_ats)
+
+    def _phantom_loss(self, speaker_logits, phantom_targets, target_lens):
+        """
+        Penalize high-confidence predictions on target-empty speaker channels.
+
+        A channel is eligible only when its selected hard target is zero over every valid
         frame. Within each eligible channel, negative BCE is aggregated over frames whose
         detached prediction exceeds ``phantom_threshold`` using either the mean or
         temperature-controlled log-mean-exp. Channel losses are then summed and divided
@@ -3139,7 +3158,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             < target_lens.to(speaker_logits.device).unsqueeze(1)
         )
         valid_expanded = valid.unsqueeze(-1)
-        empty_channels = ~((targets_pil > 0.5) & valid_expanded).any(dim=1)
+        empty_channels = ~((phantom_targets > 0.5) & valid_expanded).any(dim=1)
         preds = torch.sigmoid(speaker_logits.detach())
         selected = (
             valid_expanded
@@ -3201,7 +3220,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             loss = (channel_loss.sum(dim=1) / num_spks).mean()
         return loss
 
-    def _phantom_entry_loss(self, speaker_logits, targets_pil, target_lens):
+    def _phantom_entry_loss(self, speaker_logits, phantom_targets, target_lens):
         """
         Penalize the first streaming chunk where a target-empty channel appears.
 
@@ -3221,7 +3240,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             < target_lens.to(speaker_logits.device).unsqueeze(1)
         )
         valid_expanded = valid.unsqueeze(-1)
-        empty_channels = ~((targets_pil > 0.5) & valid_expanded).any(dim=1)
+        empty_channels = ~((phantom_targets > 0.5) & valid_expanded).any(dim=1)
         preds = torch.sigmoid(speaker_logits.detach())
         entry_trigger = (
             valid_expanded
@@ -3427,7 +3446,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             if self.dice_weight > 0.0
             else zero_loss
         )
-        phantom_loss = self._phantom_loss(speaker_logits, targets_pil, target_lens)
+        phantom_targets = self._get_phantom_targets(targets_pil, targets_ats)
+        phantom_loss = self._phantom_loss(speaker_logits, phantom_targets, target_lens)
         speaker_existence_targets = (
             targets_ats
             if self.speaker_existence_target == "ats"
@@ -3437,7 +3457,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             speaker_logits, speaker_existence_targets, target_lens
         )
         phantom_entry_loss = (
-            self._phantom_entry_loss(speaker_logits, targets_pil, target_lens)
+            self._phantom_entry_loss(speaker_logits, phantom_targets, target_lens)
             if self.phantom_entry_weight > 0.0
             else zero_loss
         )
@@ -3698,8 +3718,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         val_activity_loss = self._activity_loss(activity_logits, targets, target_lens)
         val_presence_loss = self._presence_loss(preds, targets_pil, target_lens)
         val_dice_loss = self._dice_loss(preds, targets_pil, target_lens)
+        phantom_targets = self._get_phantom_targets(targets_pil, targets_ats)
         val_phantom_loss = self._phantom_loss(
-            speaker_logits, targets_pil, target_lens
+            speaker_logits, phantom_targets, target_lens
         )
         speaker_existence_targets = (
             targets_ats
@@ -3710,7 +3731,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             speaker_logits, speaker_existence_targets, target_lens
         )
         val_phantom_entry_loss = self._phantom_entry_loss(
-            speaker_logits, targets_pil, target_lens
+            speaker_logits, phantom_targets, target_lens
         )
         val_prearrival_loss = self._prearrival_loss(
             speaker_logits, targets_pil, target_lens
